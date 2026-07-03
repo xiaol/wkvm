@@ -129,16 +129,188 @@ class SinkRingLayer(DynamicLayer):
         return self.sink + self.window
 
 
-def build_cache(model, mode: str, sink: int, window: int) -> DynamicCache:
+class BankedRingLayer(SinkRingLayer):
+    """PoC-2: sink+ring plus a capacity-bounded multi-state bank of evicted KV.
+
+    Evicted ring tokens accumulate in a pending buffer; every `seg` evicted
+    tokens are folded into one bank *segment state* consisting of `reps`
+    pseudo-KV slots: slot 0 is the segment summary (mean key, mean value) and
+    slots 1..reps-1 are the segment's top *representatives* — the exact (K,V)
+    of the tokens whose keys are most novel w.r.t. the segment mean (cosine,
+    averaged over KV heads). Keys are post-RoPE, but full-attention layers use
+    partial_rotary_factor=0.25, so 3/4 of key dims are position-free and the
+    novelty score is dominated by content, not position.
+
+    Readout is option (a) of the PoC-2 spec: bank slots are ordinary KV entries
+    inside self.keys/values ([sink | bank | pending | ring], chronological), so
+    they enter stock softmax attention through the exact same imputed-position
+    causal mask as the ring — no modeling-code changes.
+
+    Capacity: when the bank exceeds k_states segments, the two most similar
+    adjacent segments merge (count-weighted mean summary; representatives
+    re-selected by novelty against the merged mean) — DLA-style capacity-
+    bounded adjacent merging, so footprint stays flat at any context length.
+    Batch ops (repeat/reorder) are not supported: PoC quality path is B=1.
+    """
+
+    def __init__(self, sink=16, window=1024, k_states=16, seg=512, reps=8,
+                 coord=None, is_leader=True):
+        super().__init__(sink, window)
+        self.k_states, self.seg, self.reps = int(k_states), int(seg), int(reps)
+        self._segs: list[dict] = []
+        self._folded = 0  # evicted tokens folded into segments so far
+        # Cross-layer selection sharing: deep-layer keys/values are not needle-
+        # selective (verified empirically: novelty picks the needle tokens
+        # perfectly at layers 5/11 and fails at 17/23), so the shallowest banked
+        # layer is the *leader* whose representative indices and merge decisions
+        # are logged to `coord` and replayed by follower layers. Layers run in
+        # order and share the identical eviction schedule, so the op log aligns.
+        self.coord, self.is_leader = coord, is_leader
+        self._op_cursor = 0
+
+    def _decide(self, kind, compute):
+        """Leader computes a structural decision and logs it; followers replay."""
+        if self.coord is None or self.is_leader:
+            op = (kind, *compute())
+            if self.coord is not None:
+                self.coord.append(op)
+        else:
+            op = self.coord[self._op_cursor]
+            assert op[0] == kind, f"bank op log desync: {op[0]} != {kind}"
+        self._op_cursor += 1
+        return op
+
+    def lazy_initialization(self, key_states, value_states):
+        super().lazy_initialization(key_states, value_states)
+        B, H, _, D = key_states.shape
+        empty = lambda: torch.zeros(B, H, 0, D, dtype=self.dtype, device=self.device)
+        self._sink_k, self._sink_v = empty(), empty()
+        self._ring_k, self._ring_v = empty(), empty()
+        self._pend_k, self._pend_v = empty(), empty()
+
+    def _fold_segment(self):
+        S = self.seg
+        cut_k, cut_v = self._pend_k[:, :, :S], self._pend_v[:, :, :S]
+        self._pend_k, self._pend_v = self._pend_k[:, :, S:], self._pend_v[:, :, S:]
+        mean_k, mean_v = cut_k.mean(2, keepdim=True), cut_v.mean(2, keepdim=True)
+        rep_k = rep_v = None
+        if self.reps > 1:
+            def compute():
+                cos = torch.nn.functional.cosine_similarity(
+                    cut_k.float(), mean_k.float(), dim=-1)      # [B, H, S]
+                novelty = (1.0 - cos).mean(1)                    # [B, S]
+                return (novelty[0].topk(min(self.reps - 1, S)).indices.sort().values,)
+            _, idx = self._decide("fold", compute)
+            rep_k, rep_v = cut_k[:, :, idx], cut_v[:, :, idx]
+        start_abs = self.sink + self._folded
+        rep_abs = (idx + start_abs).tolist() if self.reps > 1 else []
+        self._folded += S
+        self._segs.append(dict(mk=mean_k, mv=mean_v, rk=rep_k, rv=rep_v, n=S,
+                               span=(start_abs, start_abs + S), rep_abs=rep_abs))
+
+    def _merge_once(self):
+        """Merge the two most similar adjacent segments (novelty re-selection).
+        Pair choice and kept-representative indices come from the leader."""
+        def compute():
+            sims = [
+                torch.nn.functional.cosine_similarity(
+                    self._segs[j]["mk"].float(), self._segs[j + 1]["mk"].float(), dim=-1
+                ).mean().item()
+                for j in range(len(self._segs) - 1)
+            ]
+            j = max(range(len(sims)), key=sims.__getitem__)
+            keep = None
+            if self.reps > 1:
+                a, b = self._segs[j], self._segs[j + 1]
+                n = a["n"] + b["n"]
+                mk = (a["mk"] * a["n"] + b["mk"] * b["n"]) / n
+                pool_k = torch.cat([a["rk"], b["rk"]], dim=2)
+                cos = torch.nn.functional.cosine_similarity(pool_k.float(), mk.float(), dim=-1)
+                novelty = (1.0 - cos).mean(1)
+                keep = novelty[0].topk(min(self.reps - 1, pool_k.shape[2])).indices.sort().values
+            return j, keep
+
+        _, i, keep = self._decide("merge", compute)
+        a, b = self._segs[i], self._segs[i + 1]
+        n = a["n"] + b["n"]
+        mk = (a["mk"] * a["n"] + b["mk"] * b["n"]) / n
+        mv = (a["mv"] * a["n"] + b["mv"] * b["n"]) / n
+        rk = rv = None
+        rep_abs = []
+        if self.reps > 1:
+            pool_k = torch.cat([a["rk"], b["rk"]], dim=2)
+            pool_v = torch.cat([a["rv"], b["rv"]], dim=2)
+            pool_abs = a["rep_abs"] + b["rep_abs"]
+            rk, rv = pool_k[:, :, keep], pool_v[:, :, keep]
+            rep_abs = [pool_abs[j] for j in keep.tolist()]
+        self._segs[i : i + 2] = [dict(mk=mk, mv=mv, rk=rk, rv=rv, n=n,
+                                      span=(a["span"][0], b["span"][1]), rep_abs=rep_abs)]
+
+    def _materialize(self):
+        parts_k, parts_v = [self._sink_k], [self._sink_v]
+        for s in self._segs:
+            parts_k.append(s["mk"]); parts_v.append(s["mv"])
+            if s["rk"] is not None:
+                parts_k.append(s["rk"]); parts_v.append(s["rv"])
+        parts_k += [self._pend_k, self._ring_k]
+        parts_v += [self._pend_v, self._ring_v]
+        self.keys = torch.cat([p for p in parts_k if p.numel()], dim=2)
+        self.values = torch.cat([p for p in parts_v if p.numel()], dim=2)
+
+    def n_bank_slots(self) -> int:
+        return sum(1 + (0 if s["rk"] is None else s["rk"].shape[2]) for s in self._segs)
+
+    def update(self, key_states, value_states, *args, **kwargs):
+        if not self.is_initialized:
+            self.lazy_initialization(key_states, value_states)
+        assert key_states.shape[0] == 1, "BankedRingLayer is B=1 (PoC quality path)"
+        # This step's attention sees everything stored so far + the new tokens.
+        ret_k = torch.cat([self.keys, key_states], dim=-2) if self.keys.numel() else key_states
+        ret_v = torch.cat([self.values, value_states], dim=-2) if self.values.numel() else value_states
+        self.cumulative_length += key_states.shape[-2]
+
+        # Bookkeeping: new tokens -> ring; fill sink; overflow -> pending -> bank.
+        rk = torch.cat([self._ring_k, key_states], dim=2)
+        rv = torch.cat([self._ring_v, value_states], dim=2)
+        deficit = self.sink - self._sink_k.shape[2]
+        if deficit > 0:
+            take = min(deficit, rk.shape[2])
+            self._sink_k = torch.cat([self._sink_k, rk[:, :, :take]], dim=2)
+            self._sink_v = torch.cat([self._sink_v, rv[:, :, :take]], dim=2)
+            rk, rv = rk[:, :, take:], rv[:, :, take:]
+        if rk.shape[2] > self.window:
+            cut = rk.shape[2] - self.window
+            self._pend_k = torch.cat([self._pend_k, rk[:, :, :cut]], dim=2)
+            self._pend_v = torch.cat([self._pend_v, rv[:, :, :cut]], dim=2)
+            rk, rv = rk[:, :, cut:], rv[:, :, cut:]
+        self._ring_k, self._ring_v = rk, rv
+        while self._pend_k.shape[2] >= self.seg:
+            self._fold_segment()
+        while len(self._segs) > self.k_states:
+            self._merge_once()
+        self._materialize()
+        return ret_k, ret_v
+
+    def batch_repeat_interleave(self, repeats: int):
+        raise NotImplementedError("BankedRingLayer does not support batch replication")
+
+
+def build_cache(model, mode: str, args) -> DynamicCache:
     cfg = model.config.get_text_config(decoder=True)
     cache = DynamicCache(config=model.config)
-    if mode == "ring":
+    if mode in ("ring", "banked"):
         n_owned = cfg.num_hidden_layers - getattr(cfg, "num_kv_shared_layers", 0)
         ring_idx = [
             i for i in range(n_owned) if cfg.layer_types[i] == "full_attention"
         ]
-        for i in ring_idx:
-            cache.layers[i] = SinkRingLayer(sink=sink, window=window)
+        coord = [] if getattr(args, "select", "shared") == "shared" else None
+        for j, i in enumerate(ring_idx):
+            if mode == "ring":
+                cache.layers[i] = SinkRingLayer(sink=args.sink, window=args.window)
+            else:
+                cache.layers[i] = BankedRingLayer(
+                    sink=args.sink, window=args.window, k_states=args.k_states,
+                    seg=args.seg, reps=args.reps, coord=coord, is_leader=(j == 0))
     return cache
 
 
@@ -319,7 +491,7 @@ def free_cache(cache):
 # --------------------------------------------------------------------------- #
 def warmup(model, tok, args):
     """Stabilize GPU clocks so per-run decode timings are comparable."""
-    cache = build_cache(model, "full", args.sink, args.window)
+    cache = build_cache(model, "full", args)
     prompt = build_plain_prompt(tok, 256)
     chunked_prefill(model, cache, prompt, args.chunk)
     greedy_decode(model, cache, prompt[:, -1:], 32)
@@ -342,7 +514,7 @@ def run_bench(model, tok, args):
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
             base = torch.cuda.memory_allocated()
-            cache = build_cache(model, mode, args.sink, args.window)
+            cache = build_cache(model, mode, args)
             oom = False
             nll = float("nan")
             tps = float("nan")
@@ -407,7 +579,7 @@ def run_needle(model, tok, args):
     for ctx in [900, args.ctx]:
         for mode in modes:
             prompt = build_needle_prompt(tok, ctx)
-            cache = build_cache(model, mode, args.sink, args.window)
+            cache = build_cache(model, mode, args)
             logits = chunked_prefill(model, cache, prompt, args.chunk)
             first = logits[:, -1].argmax(dim=-1, keepdim=True)
             rest, _ = greedy_decode(model, cache, first, 31)
@@ -454,7 +626,7 @@ def run_concurrency(model, tok, args):
         rows = []
         for B in ladder_b:
             gc.collect(); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
-            cache = build_cache(model, mode, args.sink, args.window)
+            cache = build_cache(model, mode, args)
             row = dict(B=B, ok=False, green=False, agg=float("nan"),
                        per=float("nan"), cache_mib=float("nan"),
                        peak_gib=float("nan"), resv_gib=float("nan"))
@@ -501,6 +673,84 @@ def run_concurrency(model, tok, args):
     return tables
 
 
+def _needle_once(model, tok, args, mode, ctx):
+    """Returns (hit, one-line output, cache MiB, bank slots on first ring layer)."""
+    import copy
+    a = copy.copy(args)
+    prompt = build_needle_prompt(tok, ctx)
+    cache = build_cache(model, mode, a)
+    logits = chunked_prefill(model, cache, prompt, args.chunk)
+    first = logits[:, -1].argmax(dim=-1, keepdim=True)
+    rest, _ = greedy_decode(model, cache, first, 31)
+    out_ids = torch.cat([first, rest], dim=1)[0].tolist()
+    cut = next((i for i, t in enumerate(out_ids) if t in (1, 106)), len(out_ids))
+    text = tok.decode(out_ids[:cut], skip_special_tokens=True).strip().split("\n")[0][:100]
+    mib = cache_bytes(cache) / 2**20
+    slots = next((l.n_bank_slots() for l in cache.layers
+                  if isinstance(l, BankedRingLayer)), 0)
+    free_cache(cache)
+    return "BLUE-742" in text, text, mib, slots
+
+
+def run_bank(model, tok, args):
+    """PoC-2 driver: correctness at 900, NLL@8192, K x seg recall sweep."""
+    warmup(model, tok, args)
+
+    # --- acceptance 3: ring-exactness below window (banked == full at 900) ---
+    print("\n# correctness @ ctx 900 (< sink+window: bank must be empty)")
+    nlls = {}
+    for mode in ["full", "ring", "banked"]:
+        cache = build_cache(model, mode, args)
+        nll, _ = last_token_nll(model, cache, build_plain_prompt(tok, 900), args.chunk)
+        nlls[mode] = nll
+        free_cache(cache)
+        print(f"  NLL(last128)@900 {mode:6s} = {nll:.6f}")
+    hit900, txt900, _, _ = _needle_once(model, tok, args, "banked", 900)
+    print(f"  needle@900 banked recalled={hit900} out: {txt900!r}")
+
+    # --- acceptance 5: NLL@8192 banked vs ring ---
+    print("\n# NLL(last128) @ ctx 8192")
+    for mode in ["full", "ring", "banked"]:
+        cache = build_cache(model, mode, args)
+        nll, _ = last_token_nll(model, cache, build_plain_prompt(tok, 8192), args.chunk)
+        free_cache(cache)
+        print(f"  NLL(last128)@8192 {mode:6s} = {nll:.4f}")
+
+    # --- needle sweep: K_STATES x seg x ctx ---
+    print(f"\n# needle sweep (reps={args.reps}: 1 mean + {args.reps - 1} representatives"
+          f" per segment; sink={args.sink}, window={args.window})")
+    import copy
+    rows = []
+    for K in [4, 16, 64]:
+        for seg in [256, 512]:
+            a = copy.copy(args)
+            a.k_states, a.seg = K, seg
+            row = dict(K=K, seg=seg)
+            for ctx in [8192, 16384, 32768]:
+                hit, text, mib, slots = _needle_once(model, tok, a, "banked", ctx)
+                row[ctx] = hit
+                row[f"mib{ctx}"] = mib
+                row[f"slots{ctx}"] = slots
+                print(f"[bank K={K:3d} seg={seg:3d} ctx={ctx:6d}] recalled={hit} "
+                      f"cache={mib:.1f}MiB bank_slots/layer={slots} out: {text!r}")
+            rows.append(row)
+    # reference rows
+    ring_ref = {ctx: _needle_once(model, tok, args, "ring", ctx) for ctx in [8192]}
+
+    print("\n### PoC-2 needle recall (BLUE-742 @ ~token 200)\n")
+    print("| K_STATES | seg | recall@8k | recall@16k | recall@32k "
+          "| bank slots/layer @32k | cache MiB @8k/16k/32k |")
+    print("|---|---|---|---|---|---|---|")
+    for r in rows:
+        print(f"| {r['K']} | {r['seg']} | {r[8192]} | {r[16384]} | {r[32768]} "
+              f"| {r['slots32768']} | {r['mib8192']:.1f} / {r['mib16384']:.1f} "
+              f"/ {r['mib32768']:.1f} |")
+    print(f"\nring reference @8k: recalled={ring_ref[8192][0]} "
+          f"(cache {ring_ref[8192][2]:.1f} MiB); "
+          f"NLL@900 full/ring/banked = {nlls['full']:.6f}/{nlls['ring']:.6f}/{nlls['banked']:.6f}")
+    return rows
+
+
 def run_batch(model, tok, args):
     prompts = [
         "Write one sentence about the ocean.",
@@ -525,8 +775,7 @@ def run_batch(model, tok, args):
     B = input_ids.shape[0]
 
     gc.collect(); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
-    cache = build_cache(model, args.mode if args.mode != "both" else "ring",
-                        args.sink, args.window)
+    cache = build_cache(model, args.mode if args.mode != "both" else "ring", args)
     pos = (attn.cumsum(-1) - 1).clamp(min=0)
     with torch.inference_mode():
         out = model(input_ids=input_ids, attention_mask=attn, position_ids=pos,
@@ -550,8 +799,8 @@ def run_batch(model, tok, args):
 # --------------------------------------------------------------------------- #
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("cmd", choices=["bench", "needle", "batch", "concurrency"])
-    ap.add_argument("--mode", choices=["full", "ring", "both"], default="both")
+    ap.add_argument("cmd", choices=["bench", "needle", "batch", "concurrency", "bank"])
+    ap.add_argument("--mode", choices=["full", "ring", "banked", "both"], default="both")
     ap.add_argument("--sink", type=int, default=16)
     ap.add_argument("--window", type=int, default=1024)
     ap.add_argument("--ctx", type=int, default=8192, help="needle context length")
@@ -563,6 +812,15 @@ def main():
                     help="context tokens per virtual session (concurrency)")
     ap.add_argument("--ladder", type=int, nargs="*", default=None,
                     help="override concurrency batch-size ladder")
+    ap.add_argument("--k-states", type=int, default=16,
+                    help="bank capacity in segments (banked mode)")
+    ap.add_argument("--seg", type=int, default=512,
+                    help="evicted tokens per bank segment (banked mode)")
+    ap.add_argument("--reps", type=int, default=8,
+                    help="pseudo-KV slots per segment: 1 mean + reps-1 representatives")
+    ap.add_argument("--select", choices=["shared", "per-layer"], default="shared",
+                    help="representative selection: leader-layer shared indices "
+                         "(default) or per-layer novelty")
     ap.add_argument("--ctxs", type=int, nargs="*", default=None,
                     help="override bench context lengths")
     ap.add_argument("--model-path", default=None)
@@ -592,6 +850,8 @@ def main():
         run_batch(model, tok, args)
     elif args.cmd == "concurrency":
         run_concurrency(model, tok, args)
+    elif args.cmd == "bank":
+        run_bank(model, tok, args)
 
 
 if __name__ == "__main__":

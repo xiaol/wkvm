@@ -150,6 +150,78 @@ the 20 stock sliding-window layers plus eager repeat_kv transients, so B_max ~ 6
 shared 24 GB card; the RECURRENT_MODE.md §4 estimate of ~90 concurrent @ W=1k is consistent
 with the measured per-slot size.
 
+## PoC-2: state bank (banked mode)
+
+**Goal**: close the 8k needle gap at constant footprint by folding evicted KV into a
+capacity-bounded multi-state bank on the 4 ring layers. **Method chosen**: pseudo-KV
+readout (option (a) of the spec) — bank states live as ordinary KV slots inside the cache
+(`[sink | bank | pending | ring]`, chronological), entering stock softmax attention through
+the same imputed-position causal mask as the ring. No modeling-code changes.
+
+- **Folding**: every `seg` evicted tokens become one segment state of `reps=8` slots:
+  slot 0 = segment summary (mean key, mean value); slots 1..7 = the segment's top
+  *representatives* — exact post-RoPE (K,V) of the tokens whose keys are most novel vs the
+  segment mean (cosine, head-averaged). Fixed boundaries (simplest policy from the design
+  doc); post-RoPE keys mean kept entries stay positionally valid, StreamingLLM-style.
+- **Capacity**: when the bank exceeds K_STATES segments, the two most similar adjacent
+  segments merge — count-weighted mean summary, representatives re-selected by novelty
+  against the merged mean (DLA-style capacity-bounded adjacent merging). Footprint is
+  therefore flat at any context length.
+- **The finding that made it work — cross-layer selection sharing**: per-layer key novelty
+  picks the needle tokens *perfectly* at shallow banked layers (5, 11 select exactly
+  ` BLUE`,`-`,`7`,`4`,`2`) and *fails* at deep ones (17, 23 pick filler tokens; value-novelty
+  and NoPE-dims-only scoring fail there too — the needle signature is smeared by depth).
+  Since layer 23 feeds the 3 KV-shared full-attention layers (29/35/41), deep-bank quality
+  is decisive: with per-layer selection the 8k needle still failed. Fix: the shallowest
+  banked layer is the *leader*; its representative indices and merge decisions are logged
+  and replayed by the deeper banked layers (identical eviction schedule, so the op log
+  aligns). This mirrors the RWKV-MS finding that the shallow band carries memory.
+  `--select per-layer` keeps the failing ablation available.
+
+### Acceptance
+
+| check | result |
+|---|---|
+| (1) needle @8192 banked | **recalled** (`'BLUE-742'`; full recalls, plain ring fails) |
+| (2) footprint flat vs ctx | 36.9–44.4 MiB at 8k/16k/32k (vs ring 36.2 flat, full 149→533 MiB growing) |
+| (3) ring-exactness below window | NLL(last128)@900 = **0.549035 for full, ring, banked — identical**; needle@900 banked recalled |
+| (4) deeper eviction | recall survives at 16k AND 32k in **all 6 configs**, incl. K=4 (needle reps survive the merge chain) |
+| (5) NLL@8192 | banked **0.2572** <= ring 0.3090 (and < full 0.2833 — see caveat) |
+
+### Needle recall sweep (BLUE-742 @ ~token 200; reps=8, sink=16, window=1024)
+
+| K_STATES | seg | recall@8k | recall@16k | recall@32k | bank slots/layer @32k | cache MiB @8k/16k/32k |
+|---|---|---|---|---|---|---|
+| 4 | 256 | True | True | True | 32 | 36.9 / 36.9 / 36.9 |
+| 4 | 512 | True | True | True | 32 | 36.9 / 36.9 / 36.9 |
+| 16 | 256 | True | True | True | 128 | 38.4 / 38.4 / 38.4 |
+| 16 | 512 | True | True | True | 128 | 38.2 / 38.4 / 38.4 |
+| 64 | 256 | True | True | True | 512 | 39.9 / 43.9 / 44.4 |
+| 64 | 512 | True | True | True | 496 | 38.2 / 40.2 / 44.2 |
+
+Pseudo-slot cost: K_STATES x reps, i.e. 32 slots/layer at K=4 and 128 at K=16 — tiny vs the
+1024-slot ring (512 at K=64 is the ceiling case). The banked cache is a fixed ~37–44 MiB
+object, +0.7–8 MiB over plain ring.
+
+### Honest limits
+
+- **Training-free, single synthetic needle task ≠ general quality.** One planted fact in
+  repetitive filler is the easiest recall target: its keys are extreme novelty outliers.
+  Real long-context quality (RULER/LongBench, multi-needle, paraphrase queries) is
+  untested — that is what the learned RWKV-MS sidecar is for later.
+- NLL@8192 beating even full KV is a filler artifact: mean-summary slots of a repeated
+  paragraph are excellent predictors of more repeated paragraph. Read it as "the bank does
+  not hurt" (acceptance 5), not as improved language modeling.
+- The mean-summary slot (the actual "compressed state") is not what closed the gap — the
+  exact-KV representatives were. Linear-attention readout (option (b)) and an RWKV-7-style
+  associative fold remain unexplored here; what shipped is importance-sampled eviction
+  (SnapKV/H2O-adjacent) organized as a segmented, merge-bounded, flat-footprint bank.
+- Leader-based selection assumes shallow-layer token saliency transfers to deep layers —
+  true here and consistent with the shallow-band memory finding, but unvalidated beyond
+  this task.
+- B=1 only (`batch_repeat_interleave` intentionally raises on banked layers); folding adds
+  host-side Python per eviction event, fine at chunk granularity.
+
 ## Repro
 
 ```
@@ -159,6 +231,8 @@ HF_HUB_OFFLINE=1 /home/xiaol/X/HRM-Text/.venv/bin/python experiments/gemma_recur
 HF_HUB_OFFLINE=1 /home/xiaol/X/HRM-Text/.venv/bin/python experiments/gemma_recurrent_poc.py batch
 HF_HUB_OFFLINE=1 /home/xiaol/X/HRM-Text/.venv/bin/python experiments/gemma_recurrent_poc.py concurrency
 HF_HUB_OFFLINE=1 /home/xiaol/X/HRM-Text/.venv/bin/python experiments/gemma_recurrent_poc.py concurrency --mode ring --ladder 96 112
+HF_HUB_OFFLINE=1 /home/xiaol/X/HRM-Text/.venv/bin/python experiments/gemma_recurrent_poc.py bank
+HF_HUB_OFFLINE=1 /home/xiaol/X/HRM-Text/.venv/bin/python experiments/gemma_recurrent_poc.py needle --mode banked --ctx 8192
 ```
 
 Note: model weights live on the NTFS volume mounted at
