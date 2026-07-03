@@ -1,0 +1,28 @@
+[rwkv7_fast_v3a] start model=/run/media/xiaol/B214449214445C0B/wkvm_bench/weights/RWKV-x070-World-2.9B-v3-20250211-ctx4096.pth wkv=fp16 emb=cpu batched_rkv=off cmix_sparse=no-fc lowrank_weight=both orig_linear_groups=att_c2c,ffn_key,head pp=off
+[rwkv7_fast_v3a] fixed fast path: ln=v3a linear=v3a/splitk lowrank=7/4 nofc_rows=by_C row20_t=by_C nofc_t512_rows>=8
+[rwkv7_fast_v3a] loading CUDA extensions v3a_ops + fast_ops + wkv=fp16
+[rwkv7_fast_v3a] CUDA extensions loaded in 0.036s
+[rwkv7_fast_v3a] loading weights from /run/media/xiaol/B214449214445C0B/wkvm_bench/weights/RWKV-x070-World-2.9B-v3-20250211-ctx4096.pth
+[rwkv7_fast_v3a] weights mmap loaded in 0.101s tensors=1059
+[rwkv7_fast_v3a] detected model C=2560 H=40 N=64 V=65536
+[rwkv7_fast_v3a] cmix no-fc path: rows<=19 row20_t<=5
+[rwkv7_fast_v3a] moving and preprocessing weights to CUDA emb=cpu
+[rwkv7_fast_v3a] model ready in 1.873s L=32 C=2560 H=40 N=64 V=65536
+[rwkv7_fast_v3a] gpu_mem used=7.63GiB allocated=5.37GiB reserved=5.45GiB total=23.51GiB
+csv_header,label,B,T,iters,p10_ms,p50_ms,p90_ms,tok_s_p50
+RESULT B=1 T=1 iters=10 p10_ms=5.1219 p50_ms=5.1231 p90_ms=5.1327 tok_s_p50=195.20
+csv,rwkv7_fast_v3a,1,1,10,5.121946,5.123072,5.132713,195.195377
+RESULT B=8 T=1 iters=10 p10_ms=9.5090 p50_ms=9.5210 p90_ms=9.7376 tok_s_p50=840.25
+csv,rwkv7_fast_v3a,8,1,10,9.508998,9.521024,9.737626,840.245777
+RESULT B=32 T=1 iters=10 p10_ms=8.8972 p50_ms=8.9011 p90_ms=9.1401 tok_s_p50=3595.05
+csv,rwkv7_fast_v3a,32,1,10,8.897155,8.901120,9.140121,3595.053132
+RESULT B=64 T=1 iters=10 p10_ms=10.5702 p50_ms=10.5917 p90_ms=10.7939 tok_s_p50=6042.44
+csv,rwkv7_fast_v3a,64,1,10,10.570211,10.591744,10.793885,6042.442144
+RESULT B=128 T=1 iters=10 p10_ms=12.5870 p50_ms=12.6008 p90_ms=12.8083 tok_s_p50=10158.11
+csv,rwkv7_fast_v3a,128,1,10,12.586953,12.600768,12.808294,10158.111310
+RESULT B=256 T=1 iters=10 p10_ms=20.1075 p50_ms=20.1456 p90_ms=20.3420 tok_s_p50=12707.46
+csv,rwkv7_fast_v3a,256,1,10,20.107542,20.145648,20.342026,12707.459197
+RESULT B=512 T=1 iters=10 p10_ms=36.3776 p50_ms=36.4951 p90_ms=36.7562 tok_s_p50=14029.27
+csv,rwkv7_fast_v3a,512,1,10,36.377598,36.495136,36.756236,14029.266704
+RESULT B=1024 T=1 iters=10 p10_ms=66.6415 p50_ms=66.6849 p90_ms=66.8551 tok_s_p50=15355.79
+csv,rwkv7_fast_v3a,1024,1,10,66.641480,66.684925,66.855132,15355.794414

@@ -23,7 +23,7 @@ Full-attention layers in hybrid models (Qwen3-Next / Kimi-Linear class) run in a
 
 ## Status
 
-M0: core bookkeeping — state arena allocator and the no-phases scheduler, pure Python, unit-tested without a GPU (the scheduler never touches a tensor; it schedules token counts against slot ids).
+**M2**: the engine serves RWKV-7 end to end — no-phases scheduler driving FLA-kernel decode from arena state slots, continuous batching (batch-vs-sequential token-identical), per-batch-bucket CUDA graphs, 8.1k tok/s at B=256 on a 4090 (1.5B). Plus a measured PoC of **recurrent mode** for transformers on gemma-4-E4B (constant footprint + segmented state bank; needle recall to 32k). See [`docs/COMPARISON.md`](docs/COMPARISON.md) for head-to-head numbers vs vLLM, SGLang, and Albatross on the same GPU, and `experiments/results/` for all raw tables.
 
 ```bash
 python -m unittest discover -s tests -v
