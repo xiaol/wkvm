@@ -22,7 +22,7 @@ from wkvm.core.arena import StateArena  # noqa: E402
 from wkvm.models.rwkv7 import load_rwkv7  # noqa: E402
 from wkvm.runner import RWKV7Runner, RWKV7StateBank  # noqa: E402
 
-DEFAULT_MODEL = "/run/media/xiaol/B214449214445C0B/wkvm_bench/weights/fla/rwkv7-0.1B-world"
+DEFAULT_MODEL = "/run/media/xiaol/B214449214445C0B/wkvm_bench/weights/fla/rwkv7-191M-world"
 
 
 def bench(runner: RWKV7Runner, arena: StateArena, batch: int,
