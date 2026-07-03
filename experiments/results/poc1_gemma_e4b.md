@@ -100,6 +100,56 @@ test below is the sharp one.)
 4. The NLL drift at 8k is measured on repetitive synthetic filler; real long-document
    perplexity-vs-position curves (RECURRENT_MODE.md §5 eval plan) remain to be run.
 
+## Concurrency (virtual sessions)
+
+`... gemma_recurrent_poc.py concurrency` — each virtual session has **4096 tokens of
+context** (16384 for the long-ctx probes); ONE session is prefilled and its cache tensors
+are replicated across the batch dim to B real copies (`batch_repeat_interleave` — honest
+memory cost, throwaway quality; each row gets a distinct first token so decode paths
+diverge). Batched greedy decode of 128 tokens/session, eager attention. Budget: 21.07 GiB
+torch-usable on the shared GPU (~2 GiB other process); **green = completed with >= 1 GiB
+headroom on peak reserved**; B_max = largest green B.
+
+### ring @ 4096 ctx/session — B_max = 64 (B=96 runs but breaks the 1 GiB headroom; B=112 hard-OOMs)
+
+| B | cache MiB total | per-slot MiB | peak alloc GiB | peak reserved GiB | agg tok/s | per-stream tok/s | status |
+|---|---|---|---|---|---|---|---|
+| 8 | 290 | 36.2 | 14.67 | 15.36 | 310.1 | 38.76 | green |
+| 16 | 579 | 36.2 | 14.80 | 15.39 | 503.6 | 31.48 | green |
+| 32 | 1159 | 36.2 | 15.70 | 16.10 | 669.1 | 20.91 | green |
+| 64 | 2318 | 36.2 | 17.49 | 18.24 | 835.4 | 13.05 | green |
+| 96 | 3476 | 36.2 | 19.28 | 20.44 | 869.5 | 9.06 | over-budget |
+| 112 | - | - | - | 20.63 | - | - | OOM |
+| 128 | - | - | - | 20.65 | - | - | OOM |
+
+### full @ 4096 ctx/session — B_max = 8
+
+| B | cache MiB total | per-slot MiB | peak alloc GiB | peak reserved GiB | agg tok/s | per-stream tok/s | status |
+|---|---|---|---|---|---|---|---|
+| 8 | 688 | 86.0 | 18.44 | 19.89 | 208.3 | 26.04 | green |
+| 16 | 1375 | 86.0 | 16.30 | 20.55 | 317.3 | 19.83 | over-budget |
+| 32 | - | - | - | 20.63 | - | - | OOM |
+
+### long-context probes (ctx/session 16384)
+
+| mode | B | cache MiB total | per-slot MiB | peak reserved GiB | agg tok/s | per-stream tok/s | status |
+|---|---|---|---|---|---|---|---|
+| full | 8 | 2224 | 278.0 | 20.65 | 109.2 | 13.65 | over-budget (B_max = 0) |
+| full | 16 | - | - | 20.26 | - | - | OOM |
+| ring | 64 | 2318 | 36.2 | 19.51 | 782.1 | 12.22 | green (matches ring@4096: same 36.2 MiB/slot, 782 vs 835 tok/s) |
+
+**Read:** Ring admits **8x more sessions than full KV at 4k context (B_max 64 vs 8), and the
+gap is unbounded in context length — at 16k full KV cannot green-light even B=8 (B_max 0),
+while ring's B=64 numbers are unchanged from 4k (same 36.2 MiB/slot, ~780 vs ~835 tok/s),
+because a ring slot is a fixed 36.2 MiB object versus full KV's 86 MiB at 4k / 278 MiB at
+16k and growing.** Aggregate throughput scales sub-linearly and saturates around B=64
+(~835 tok/s; B=96 adds only +4%): eager-attention compute + per-step Python overhead becomes
+the bottleneck before memory does — a serving-stack finding (CUDA graphs / fused attention
+are the fix), not a property of the ring cache. Ring's memory ceiling here is dominated by
+the 20 stock sliding-window layers plus eager repeat_kv transients, so B_max ~ 64–96 on a
+shared 24 GB card; the RECURRENT_MODE.md §4 estimate of ~90 concurrent @ W=1k is consistent
+with the measured per-slot size.
+
 ## Repro
 
 ```
@@ -107,6 +157,8 @@ HF_HUB_OFFLINE=1 /home/xiaol/X/HRM-Text/.venv/bin/python experiments/gemma_recur
 HF_HUB_OFFLINE=1 /home/xiaol/X/HRM-Text/.venv/bin/python experiments/gemma_recurrent_poc.py bench --mode full --ctxs 32768 --chunk 1024
 HF_HUB_OFFLINE=1 /home/xiaol/X/HRM-Text/.venv/bin/python experiments/gemma_recurrent_poc.py needle --ctx 8192
 HF_HUB_OFFLINE=1 /home/xiaol/X/HRM-Text/.venv/bin/python experiments/gemma_recurrent_poc.py batch
+HF_HUB_OFFLINE=1 /home/xiaol/X/HRM-Text/.venv/bin/python experiments/gemma_recurrent_poc.py concurrency
+HF_HUB_OFFLINE=1 /home/xiaol/X/HRM-Text/.venv/bin/python experiments/gemma_recurrent_poc.py concurrency --mode ring --ladder 96 112
 ```
 
 Note: model weights live on the NTFS volume mounted at

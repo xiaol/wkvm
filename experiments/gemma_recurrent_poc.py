@@ -424,6 +424,83 @@ def run_needle(model, tok, args):
     return results
 
 
+def run_concurrency(model, tok, args):
+    """Virtual-session concurrency sweep. Prefill ONE session of ctx-per-session
+    tokens, then replicate its cache tensors across the batch dim to B (real
+    copies via the layer API's batch_repeat_interleave — honest memory cost,
+    throwaway quality) and decode batched greedy with a distinct first token per
+    row. B_max = largest B that completes with >= 1 GiB device headroom."""
+    steps = args.decode_tokens
+    headroom = 1 << 30
+    # Total bytes torch could ever use: free device memory now + what it holds.
+    avail = torch.cuda.mem_get_info()[0] + torch.cuda.memory_reserved()
+    print(f"# concurrency: torch-usable {avail / 2**30:.2f} GiB, headroom 1 GiB, "
+          f"decode {steps} tok/session")
+    word_ids = tok(" one two three four five six seven eight nine ten red blue"
+                   " green gold iron salt north south east west",
+                   add_special_tokens=False).input_ids
+
+    ladder = args.ladder or [8, 16, 32, 64, 128, 192, 256, 320, 384]
+    modes = ["ring", "full"] if args.mode == "both" else [args.mode]
+    plans = [(m, args.ctx_per_session, ladder) for m in modes]
+    if args.mode == "both":
+        plans.append(("full", 16384, [8, 16]))  # long-ctx collapse of full KV
+        plans.append(("ring", 16384, [64]))     # must match ring @ 4096
+
+    warmup(model, tok, args)
+    tables = []
+    for mode, ctx, ladder_b in plans:
+        prompt = build_plain_prompt(tok, ctx)
+        rows = []
+        for B in ladder_b:
+            gc.collect(); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
+            cache = build_cache(model, mode, args.sink, args.window)
+            row = dict(B=B, ok=False, green=False, agg=float("nan"),
+                       per=float("nan"), cache_mib=float("nan"),
+                       peak_gib=float("nan"), resv_gib=float("nan"))
+            try:
+                chunked_prefill(model, cache, prompt, args.chunk)
+                for layer in cache.layers:
+                    layer.batch_repeat_interleave(B)
+                first = torch.tensor(
+                    [[word_ids[i % len(word_ids)]] for i in range(B)], dtype=torch.long)
+                _, elapsed = greedy_decode(model, cache, first, steps)
+                resv = torch.cuda.max_memory_reserved()
+                row.update(ok=True, agg=B * steps / elapsed, per=steps / elapsed,
+                           cache_mib=cache_bytes(cache) / 2**20,
+                           peak_gib=torch.cuda.max_memory_allocated() / 2**30,
+                           resv_gib=resv / 2**30, green=resv <= avail - headroom)
+            except torch.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                row["resv_gib"] = torch.cuda.max_memory_reserved() / 2**30
+            free_cache(cache)
+            rows.append(row)
+            print(f"[conc {mode:4s} ctx={ctx:5d} B={B:3d}] ok={row['ok']} "
+                  f"green={row['green']} agg={row['agg']:.1f}tok/s "
+                  f"per={row['per']:.2f} cache={row['cache_mib']:.0f}MiB "
+                  f"reserved={row['resv_gib']:.2f}GiB")
+            if not row["ok"]:
+                break  # OOM: larger B is hopeless
+        tables.append((mode, ctx, rows))
+
+    for mode, ctx, rows in tables:
+        green_bs = [r["B"] for r in rows if r["green"]]
+        print(f"\n### concurrency {mode} @ ctx/session {ctx} — "
+              f"B_max(green) = {max(green_bs) if green_bs else 0}\n")
+        print("| B | cache MiB total | per-slot MiB | peak alloc GiB "
+              "| peak reserved GiB | agg tok/s | per-stream tok/s | status |")
+        print("|---|---|---|---|---|---|---|---|")
+        for r in rows:
+            if not r["ok"]:
+                print(f"| {r['B']} | - | - | - | {r['resv_gib']:.2f} | - | - | OOM |")
+            else:
+                status = "green" if r["green"] else "over-budget"
+                print(f"| {r['B']} | {r['cache_mib']:.0f} | {r['cache_mib']/r['B']:.1f} "
+                      f"| {r['peak_gib']:.2f} | {r['resv_gib']:.2f} "
+                      f"| {r['agg']:.1f} | {r['per']:.2f} | {status} |")
+    return tables
+
+
 def run_batch(model, tok, args):
     prompts = [
         "Write one sentence about the ocean.",
@@ -473,18 +550,25 @@ def run_batch(model, tok, args):
 # --------------------------------------------------------------------------- #
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("cmd", choices=["bench", "needle", "batch"])
+    ap.add_argument("cmd", choices=["bench", "needle", "batch", "concurrency"])
     ap.add_argument("--mode", choices=["full", "ring", "both"], default="both")
     ap.add_argument("--sink", type=int, default=16)
     ap.add_argument("--window", type=int, default=1024)
     ap.add_argument("--ctx", type=int, default=8192, help="needle context length")
     ap.add_argument("--chunk", type=int, default=2048, help="prefill chunk size")
-    ap.add_argument("--decode-tokens", type=int, default=64)
+    ap.add_argument("--decode-tokens", type=int, default=None,
+                    help="decode steps (default: 64; 128 for concurrency)")
     ap.add_argument("--batch-size", type=int, default=8)
+    ap.add_argument("--ctx-per-session", type=int, default=4096,
+                    help="context tokens per virtual session (concurrency)")
+    ap.add_argument("--ladder", type=int, nargs="*", default=None,
+                    help="override concurrency batch-size ladder")
     ap.add_argument("--ctxs", type=int, nargs="*", default=None,
                     help="override bench context lengths")
     ap.add_argument("--model-path", default=None)
     args = ap.parse_args()
+    if args.decode_tokens is None:
+        args.decode_tokens = 128 if args.cmd == "concurrency" else 64
 
     path = resolve_model_path(args.model_path)
     print(f"# loading {path} (text tower only, eager, bf16)")
@@ -506,6 +590,8 @@ def main():
         run_needle(model, tok, args)
     elif args.cmd == "batch":
         run_batch(model, tok, args)
+    elif args.cmd == "concurrency":
+        run_concurrency(model, tok, args)
 
 
 if __name__ == "__main__":
