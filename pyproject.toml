@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wkvm"
+version = "0.0.1"
+description = "A hypervisor for model state: state-native inference engine for RWKV/GDN/Mamba hybrids with durable, forkable, mutable state handles"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "xiaol" }]
+keywords = ["rwkv", "inference", "llm", "linear-attention", "serving"]
+
+[project.optional-dependencies]
+# M0 core is dependency-free on purpose: the scheduler and arena are pure
+# bookkeeping and must stay unit-testable without a GPU or torch.
+gpu = ["torch>=2.6"]
+
+[tool.setuptools.packages.find]
+include = ["wkvm*"]
