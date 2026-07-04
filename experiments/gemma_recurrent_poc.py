@@ -42,10 +42,13 @@ import time
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+# ~1.2 GiB less fragmentation at B>=96 for ~6% decode throughput — the right
+# trade under a shared-GPU budget (override via env to compare).
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 from transformers import AutoConfig, AutoTokenizer
-from transformers.cache_utils import DynamicCache, DynamicLayer
+from transformers.cache_utils import DynamicCache, DynamicLayer, DynamicSlidingWindowLayer
 
 MODEL_CANDIDATES = [
     "/run/media/xiaol/B214449214445C0B/models/gemma/gemma-4-E4B-it",
@@ -335,23 +338,31 @@ def resolve_model_path(explicit: str | None) -> str:
     return MODEL_CANDIDATES[-1]
 
 
-def load_model(path: str, device: str = "cuda"):
+def load_model(path: str, device: str = "cuda", attn: str = "sdpa"):
     """Load the text tower only (Gemma4ForCausalLM) from the multimodal
     checkpoint via key_mapping; skips vision/audio tower weights entirely."""
     from transformers.models.gemma4 import Gemma4ForCausalLM
 
+    install_sdpa_decode_patch()
     full_cfg = AutoConfig.from_pretrained(path)
     text_cfg = full_cfg.get_text_config(decoder=True)
     model = Gemma4ForCausalLM.from_pretrained(
         path,
         config=text_cfg,
         dtype=torch.bfloat16,
-        attn_implementation="eager",
+        attn_implementation=attn,
         key_mapping={r"^model\.language_model": "model"},
         device_map=device,
     )
     model.eval()
     return model
+
+
+def set_attn_impl(model, impl: str):
+    """Switch attention implementation in place (dispatch reads config at each
+    forward; mask builders read the same config object)."""
+    for cfg in {id(model.config): model.config, id(model.model.config): model.model.config}.values():
+        cfg._attn_implementation = impl
 
 
 # --------------------------------------------------------------------------- #
@@ -434,6 +445,57 @@ def chunked_prefill(model, cache, input_ids, chunk: int, keep_last_logits: int =
     return logits
 
 
+# SDPA decode patch: gemma-4's full-attention layers use global_head_dim=512,
+# which no fused SDPA kernel on sm_89 supports with enable_gqa — torch falls
+# back to the math kernel, which materializes GiB-scale fp32 buffers and is
+# slower than eager. For the exact decode case (mask-free, q_len=1) attention
+# is two batched GEMMs on the grouped-query layout: q [B,H,1,D] -> [B,G,H/G,D]
+# (query head h uses kv head h//(H/G) — the repeat_kv/enable_gqa mapping),
+# scores fp32-softmaxed like the eager path. No KV copy, no fallback.
+def _grouped_gemm_decode_attention(module, query, key, value, scaling):
+    B, H, _, D = query.shape
+    G = key.shape[1]
+    qg = query.reshape(B, G, H // G, D)
+    scores = torch.matmul(qg, key.transpose(-1, -2))  # [B, G, H/G, S]
+    if scaling is not None:
+        scores = scores * scaling
+    probs = torch.softmax(scores.float(), dim=-1).to(query.dtype)
+    out = torch.matmul(probs, value)  # [B, G, H/G, D]
+    return out.reshape(B, H, D).unsqueeze(1), None  # [B, q=1, H, D]
+
+
+def install_sdpa_decode_patch():
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    orig = ALL_ATTENTION_FUNCTIONS._global_mapping["sdpa"]
+    if getattr(orig, "_wkvm_patched", False):
+        return
+
+    def sdpa_with_wide_head_decode(module, query, key, value, attention_mask,
+                                   scaling=None, **kwargs):
+        if attention_mask is None and query.shape[2] == 1 and query.shape[3] > 256:
+            return _grouped_gemm_decode_attention(module, query, key, value, scaling)
+        return orig(module, query, key, value, attention_mask, scaling=scaling, **kwargs)
+
+    sdpa_with_wide_head_decode._wkvm_patched = True
+    ALL_ATTENTION_FUNCTIONS._global_mapping["sdpa"] = sdpa_with_wide_head_decode
+
+
+# At q=1 decode with no padding, every cached slot is unconditionally visible
+# (sink/bank/pending/ring all precede the query; a sliding layer stores exactly
+# the last window-1 tokens, i.e. exactly the visible set). Passing a pre-built
+# all-None mask mapping (a) skips the vmap-based per-step mask construction and
+# (b) lets SDPA take its mask-free path: is_causal=False full attention over
+# the cache with enable_gqa=True (no repeat_kv materialization).
+DECODE_MASK_FREE = True  # --legacy-decode turns this off (baseline repro)
+
+
+def _decode_mask_kwargs() -> dict:
+    if DECODE_MASK_FREE:
+        return {"attention_mask": {"full_attention": None, "sliding_attention": None}}
+    return {}
+
+
 @torch.inference_mode()
 def greedy_decode(model, cache, first_token, steps, attention_mask=None):
     """Batched greedy decode. Returns (tokens [B, steps], elapsed_seconds)."""
@@ -450,6 +512,8 @@ def greedy_decode(model, cache, first_token, steps, attention_mask=None):
             )
             kwargs["attention_mask"] = attention_mask
             kwargs["position_ids"] = (attention_mask.cumsum(-1) - 1)[:, -1:]
+        else:
+            kwargs.update(_decode_mask_kwargs())
         out = model(
             input_ids=cur,
             past_key_values=cache,
@@ -462,6 +526,216 @@ def greedy_decode(model, cache, first_token, steps, attention_mask=None):
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - t0
     return torch.cat(tokens, dim=1), elapsed
+
+
+# --------------------------------------------------------------------------- #
+# CUDA-graphed decode over fixed-address ring buffers
+# --------------------------------------------------------------------------- #
+class StaticRingLayer(DynamicLayer):
+    """Fixed-address KV layer for CUDA-graphed decode.
+
+    Preallocated [B, H, cap, D] buffers; each update() writes the new token's
+    KV in place at a *device-tensor* write pointer and advances the pointer
+    with captured tensor ops, so replaying the captured graph keeps mutating
+    the cache correctly. The buffer's slot order becomes rotated rather than
+    chronological once the ring wraps — harmless at decode because every slot
+    is unconditionally visible (mask-free q=1 attention is order-invariant)
+    and keys are stored post-RoPE.
+
+    Equivalence with the dynamic layers it replaces (exact same visible set
+    per step):
+    - DynamicSlidingWindowLayer(window W) stores the last W-1 tokens and
+      returns them + the current token: cap = W, ring over all slots.
+    - SinkRingLayer(sink S, window W) returns S sink + last W tokens + the
+      current token (eviction happens after the return): cap = S + W + 1,
+      ring over slots [S, cap).
+    """
+
+    def __init__(self, keys, values, ptr, ring_start, cumulative_length, is_sliding):
+        super().__init__()
+        self.keys, self.values = keys, values
+        self.cap = keys.shape[2]
+        self.ring_start = int(ring_start)
+        self.ring_size = self.cap - self.ring_start
+        self.ptr = ptr  # LongTensor [1] on device
+        self.cumulative_length = cumulative_length
+        self.is_sliding = is_sliding
+        self.dtype, self.device = keys.dtype, keys.device
+        self.is_initialized = True
+
+    def update(self, key_states, value_states, *args, **kwargs):
+        self.keys.index_copy_(2, self.ptr, key_states)
+        self.values.index_copy_(2, self.ptr, value_states)
+        self.ptr.copy_(
+            torch.remainder(self.ptr - self.ring_start + 1, self.ring_size)
+            + self.ring_start
+        )
+        # Python-side counter: correct in eager use; stale under graph replay
+        # (unused there — the graphed path passes explicit position_ids).
+        self.cumulative_length += key_states.shape[-2]
+        return self.keys, self.values
+
+    def get_seq_length(self) -> int:
+        return self.cumulative_length
+
+    def get_max_cache_shape(self) -> int:
+        return self.cap
+
+    def batch_repeat_interleave(self, repeats: int):
+        raise NotImplementedError("replicate before converting to static")
+
+
+def to_static_cache(cache: DynamicCache, repeats: int = 1) -> DynamicCache:
+    """Convert a prefilled ring-mode cache into StaticRingLayers in place.
+    Requires every layer to be at capacity (ctx >= sink+window), which makes
+    static decode token-equivalent to the dynamic layers. Frees each dynamic
+    layer as it converts, so the transient memory overhead is one layer, not
+    one cache. ``repeats`` broadcast-replicates a B=1 prefill directly into
+    the static buffers (real per-slot copies, honest memory cost) without ever
+    materializing an intermediate replicated dynamic cache."""
+    for i, layer in enumerate(cache.layers):
+        if isinstance(layer, SinkRingLayer):
+            stored_expect = layer.sink + layer.window
+            cap, start = stored_expect + 1, layer.sink
+        elif isinstance(layer, DynamicSlidingWindowLayer):
+            cap, start = layer.sliding_window, 0
+            stored_expect = cap - 1
+        else:
+            raise NotImplementedError(f"layer {i}: {type(layer).__name__} not supported")
+        k, v = layer.keys, layer.values
+        assert k.shape[2] == stored_expect, (
+            f"layer {i} stores {k.shape[2]} != {stored_expect} slots; "
+            "static decode requires prefill ctx >= sink+window"
+        )
+        B, H, _, D = k.shape
+        if repeats > 1:
+            assert B == 1, "repeats>1 expects a B=1 prefill"
+            B = repeats
+            k, v = k.expand(B, -1, -1, -1), v.expand(B, -1, -1, -1)
+        sk = torch.zeros(B, H, cap, D, dtype=k.dtype, device=k.device)
+        sv = torch.zeros_like(sk)
+        sk[:, :, :stored_expect].copy_(k)
+        sv[:, :, :stored_expect].copy_(v)
+        ptr = torch.tensor([stored_expect], dtype=torch.long, device=k.device)
+        cache.layers[i] = StaticRingLayer(
+            sk, sv, ptr, start, layer.cumulative_length, layer.is_sliding)
+        layer.keys = layer.values = None  # free before converting the next layer
+    gc.collect()
+    torch.cuda.empty_cache()
+    return cache
+
+
+class GraphedStep:
+    """One mask-free greedy decode step (forward + argmax + token feedback +
+    position bump) captured in a CUDA graph over a static-ring cache.
+
+    Static I/O: ``ids`` [B,1] (token in, next token out) and ``pos`` [1,1].
+    Warmup (triton/cudnn JIT + autotune) runs eagerly on a side stream and
+    therefore mutates the cache; the slots it writes and all pointers are
+    snapshotted and restored before capture. Capture itself records but does
+    not execute kernels, so it leaves the cache untouched."""
+
+    def __init__(self, model, cache, batch_size, warmup_iters: int = 3):
+        dev = model.device
+        self.B, self.cache = batch_size, cache
+        pos0 = cache.get_seq_length()
+        self.ids = torch.zeros(batch_size, 1, dtype=torch.long, device=dev)
+        self.pos = torch.full((1, 1), pos0, dtype=torch.long, device=dev)
+
+        snaps = []
+        for layer in cache.layers:
+            p, slots = int(layer.ptr.item()), []
+            for _ in range(warmup_iters):
+                slots.append(p)
+                p = (p - layer.ring_start + 1) % layer.ring_size + layer.ring_start
+            idx = torch.tensor(sorted(set(slots)), dtype=torch.long, device=dev)
+            snaps.append((layer, idx, layer.keys[:, :, idx].clone(),
+                          layer.values[:, :, idx].clone(), layer.ptr.clone(),
+                          layer.cumulative_length))
+
+        with torch.inference_mode():
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(warmup_iters):
+                    self._step(model)
+            torch.cuda.current_stream().wait_stream(side)
+            torch.cuda.synchronize()
+            for layer, idx, ks, vs, ptr, cum in snaps:
+                layer.keys[:, :, idx] = ks
+                layer.values[:, :, idx] = vs
+                layer.ptr.copy_(ptr)
+                layer.cumulative_length = cum
+            self.pos.fill_(pos0)
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.graph):
+                self._step(model)
+
+    def _step(self, model):
+        out = model(
+            input_ids=self.ids,
+            position_ids=self.pos,
+            attention_mask={"full_attention": None, "sliding_attention": None},
+            past_key_values=self.cache,
+            use_cache=True,
+            logits_to_keep=1,
+        )
+        nxt = out.logits[:, -1].argmax(dim=-1, keepdim=True)
+        self.ids.copy_(nxt)
+        self.pos.add_(1)
+
+
+@torch.inference_mode()
+def graphed_greedy_decode(gs: GraphedStep, first_token, steps):
+    """Greedy decode by graph replay; only D2D copies between steps, one sync
+    at the end. Returns (tokens [B, steps] on GPU, elapsed_seconds)."""
+    tokens = torch.empty(gs.B, steps, dtype=torch.long, device=gs.ids.device)
+    gs.ids.copy_(first_token.to(gs.ids.device))
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for t in range(steps):
+        gs.graph.replay()
+        tokens[:, t].copy_(gs.ids[:, 0])
+    torch.cuda.synchronize()
+    elapsed = time.perf_counter() - t0
+    return tokens, elapsed
+
+
+@torch.inference_mode()
+def _decode_argmax_gaps(model, cache, first_token, steps, force=None):
+    """Greedy decode that also records the top-2 logit gap per emitted token.
+    With ``force`` (a [B, steps] token matrix), inputs are teacher-forced to
+    that sequence so per-step argmax can be compared across implementations
+    without free-running divergence compounding. Returns (tokens, gaps)."""
+    cur = first_token.to(model.device)
+    toks, gaps = [], []
+    for t in range(steps):
+        out = model(input_ids=cur, past_key_values=cache, use_cache=True,
+                    logits_to_keep=1, **_decode_mask_kwargs())
+        top2 = out.logits[:, -1].float().topk(2, dim=-1)
+        toks.append(top2.indices[:, :1])
+        gaps.append(top2.values[:, 0] - top2.values[:, 1])
+        cur = toks[-1] if force is None else force[:, t:t + 1].to(model.device)
+    return torch.cat(toks, 1).cpu(), torch.stack(gaps, 1).cpu()
+
+
+@torch.inference_mode()
+def static_greedy_decode(model, cache, first_token, steps):
+    """Eager decode over a static cache using the exact op sequence of
+    GraphedStep._step — the ungraphed comparator for token-identity checks."""
+    dev = model.device
+    ids = first_token.to(dev)
+    pos = torch.full((1, 1), cache.get_seq_length(), dtype=torch.long, device=dev)
+    tokens = []
+    for _ in range(steps):
+        out = model(
+            input_ids=ids, position_ids=pos,
+            attention_mask={"full_attention": None, "sliding_attention": None},
+            past_key_values=cache, use_cache=True, logits_to_keep=1)
+        ids = out.logits[:, -1].argmax(dim=-1, keepdim=True)
+        tokens.append(ids)
+        pos = pos + 1
+    return torch.cat(tokens, dim=1)
 
 
 def last_token_nll(model, cache, input_ids, chunk, tail=128):
@@ -484,6 +758,114 @@ def free_cache(cache):
     del cache
     gc.collect()
     torch.cuda.empty_cache()
+
+
+# --------------------------------------------------------------------------- #
+# Profiling
+# --------------------------------------------------------------------------- #
+def run_profile(model, tok, args):
+    """Decode-step breakdown at fixed B / ctx (ring mode): (a) attention ops,
+    (b) other GPU compute, (c) python/launch gap (wall minus GPU busy).
+    Instruments the attention interface, mask construction and cache update
+    with record_function ranges; wall time comes from a separate un-profiled
+    run of the same steps."""
+    from torch.profiler import ProfilerActivity, profile, record_function
+    import transformers.models.gemma4.modeling_gemma4 as g4
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    B, steps = args.batch_size, args.decode_tokens
+    print(f"# profile: mode=ring ctx={args.ctx_per_session} B={B} steps={steps} "
+          f"attn={args.attn} mask_free={DECODE_MASK_FREE}")
+    warmup(model, tok, args)
+    prompt = build_plain_prompt(tok, args.ctx_per_session)
+    cache = build_cache(model, "ring", args)
+    chunked_prefill(model, cache, prompt, args.chunk)
+    for layer in cache.layers:
+        layer.batch_repeat_interleave(B)
+    word_ids = tok(" one two three four five six seven eight nine ten red blue",
+                   add_special_tokens=False).input_ids
+    first = torch.tensor([[word_ids[i % len(word_ids)]] for i in range(B)],
+                         dtype=torch.long)
+
+    # --- clean wall time (no profiler overhead) ---
+    _, elapsed_clean = greedy_decode(model, cache, first, steps)
+
+    # --- instrumented run ---
+    def wrap_attn(fn):
+        def inner(module, *a, **k):
+            label = "ATTN_SLIDING" if getattr(module, "is_sliding", False) else "ATTN_FULL"
+            with record_function(label):
+                return fn(module, *a, **k)
+        return inner
+
+    def wrap(label, fn):
+        def inner(*a, **k):
+            with record_function(label):
+                return fn(*a, **k)
+        return inner
+
+    orig_eager = g4.eager_attention_forward
+    orig_sdpa = ALL_ATTENTION_FUNCTIONS._global_mapping["sdpa"]
+    orig_ccm, orig_swm = g4.create_causal_mask, g4.create_sliding_window_causal_mask
+    orig_update = DynamicCache.update
+    g4.eager_attention_forward = wrap_attn(orig_eager)
+    ALL_ATTENTION_FUNCTIONS._global_mapping["sdpa"] = wrap_attn(orig_sdpa)
+    g4.create_causal_mask = wrap("MASK_BUILD", orig_ccm)
+    g4.create_sliding_window_causal_mask = wrap("MASK_BUILD", orig_swm)
+    DynamicCache.update = wrap("CACHE_UPDATE", orig_update)
+    try:
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+            _, elapsed_prof = greedy_decode(model, cache, first, steps)
+    finally:
+        g4.eager_attention_forward = orig_eager
+        ALL_ATTENTION_FUNCTIONS._global_mapping["sdpa"] = orig_sdpa
+        g4.create_causal_mask, g4.create_sliding_window_causal_mask = orig_ccm, orig_swm
+        DynamicCache.update = orig_update
+
+    from torch.autograd import DeviceType
+
+    LABELS = ("ATTN_FULL", "ATTN_SLIDING", "MASK_BUILD", "CACHE_UPDATE")
+    ka = prof.key_averages()
+    # GPU busy = sum over device-kernel events only. CPU op rows also carry
+    # device time (would double-count), and each record_function label yields
+    # a gpu_user_annotation row (DeviceType.CUDA) whose self time equals its
+    # child kernel total — used below for attribution, excluded from busy.
+    gpu_busy = sum(e.self_device_time_total for e in ka
+                   if e.device_type == DeviceType.CUDA and e.key not in LABELS) / 1e6
+    def dev(label):
+        return sum(e.self_device_time_total for e in ka
+                   if e.key == label and e.device_type == DeviceType.CUDA) / 1e6
+    def cpu(label):
+        return sum(e.cpu_time_total for e in ka
+                   if e.key == label and e.device_type == DeviceType.CPU) / 1e6
+    attn_full, attn_slide = dev("ATTN_FULL"), dev("ATTN_SLIDING")
+    cache_gpu, mask_gpu = dev("CACHE_UPDATE"), dev("MASK_BUILD")
+    other_gpu = gpu_busy - attn_full - attn_slide - cache_gpu - mask_gpu
+    gap = elapsed_prof - gpu_busy
+
+    ms = lambda s: s / steps * 1e3
+    print(f"\n## decode-step breakdown (ring, ctx={args.ctx_per_session}, B={B}, "
+          f"{steps} steps, attn={args.attn}, mask_free={DECODE_MASK_FREE})\n")
+    print("| component | ms/step | % of wall |")
+    print("|---|---|---|")
+    rows = [
+        ("wall (clean run)", elapsed_clean, ""),
+        ("wall (profiled run)", elapsed_prof, None),
+        ("GPU busy (sum of kernels)", gpu_busy, None),
+        ("  attention: full/ring layers", attn_full, None),
+        ("  attention: sliding layers", attn_slide, None),
+        ("  cache update (cat/evict)", cache_gpu, None),
+        ("  mask build (GPU)", mask_gpu, None),
+        ("  other model compute", other_gpu, None),
+        ("python/launch gap (profiled wall - GPU busy)", gap, None),
+    ]
+    for name, sec, _ in rows:
+        print(f"| {name} | {ms(sec):.2f} | {sec / elapsed_prof * 100:.1f}% |")
+    print(f"| mask build (CPU-side total) | {ms(cpu('MASK_BUILD')):.2f} | - |")
+    print(f"| cache update (CPU-side total) | {ms(cpu('CACHE_UPDATE')):.2f} | - |")
+    print(f"\nclean aggregate: {B * steps / elapsed_clean:.1f} tok/s "
+          f"({ms(elapsed_clean):.2f} ms/step)")
+    free_cache(cache)
 
 
 # --------------------------------------------------------------------------- #
@@ -604,10 +986,14 @@ def run_concurrency(model, tok, args):
     row. B_max = largest B that completes with >= 1 GiB device headroom."""
     steps = args.decode_tokens
     headroom = 1 << 30
-    # Total bytes torch could ever use: free device memory now + what it holds.
+    # Total bytes torch could ever use: free device memory now + what it holds,
+    # clamped to the allocator cap (--mem-cap-gib keeps peak under budget on a
+    # shared desktop GPU).
     avail = torch.cuda.mem_get_info()[0] + torch.cuda.memory_reserved()
-    print(f"# concurrency: torch-usable {avail / 2**30:.2f} GiB, headroom 1 GiB, "
-          f"decode {steps} tok/session")
+    avail = min(avail, int(args.mem_cap_gib * 2**30))
+    print(f"# concurrency: torch-usable {avail / 2**30:.2f} GiB "
+          f"(cap {args.mem_cap_gib} GiB), headroom 1 GiB, "
+          f"decode {steps} tok/session, graphs={args.graphs}, attn={args.attn}")
     word_ids = tok(" one two three four five six seven eight nine ten red blue"
                    " green gold iron salt north south east west",
                    add_special_tokens=False).input_ids
@@ -630,21 +1016,36 @@ def run_concurrency(model, tok, args):
             row = dict(B=B, ok=False, green=False, agg=float("nan"),
                        per=float("nan"), cache_mib=float("nan"),
                        peak_gib=float("nan"), resv_gib=float("nan"))
+            gs = None
             try:
                 chunked_prefill(model, cache, prompt, args.chunk)
-                for layer in cache.layers:
-                    layer.batch_repeat_interleave(B)
                 first = torch.tensor(
                     [[word_ids[i % len(word_ids)]] for i in range(B)], dtype=torch.long)
-                _, elapsed = greedy_decode(model, cache, first, steps)
+                if args.graphs:
+                    assert mode == "ring", "--graphs supports ring mode only"
+                    # replicate straight into the static buffers (no transient
+                    # B-wide dynamic cache)
+                    cache = to_static_cache(cache, repeats=B)
+                    gs = GraphedStep(model, cache, B)
+                    _, elapsed = graphed_greedy_decode(gs, first, steps)
+                else:
+                    for layer in cache.layers:
+                        layer.batch_repeat_interleave(B)
+                    _, elapsed = greedy_decode(model, cache, first, steps)
                 resv = torch.cuda.max_memory_reserved()
                 row.update(ok=True, agg=B * steps / elapsed, per=steps / elapsed,
                            cache_mib=cache_bytes(cache) / 2**20,
                            peak_gib=torch.cuda.max_memory_allocated() / 2**30,
                            resv_gib=resv / 2**30, green=resv <= avail - headroom)
-            except torch.OutOfMemoryError:
+            except (torch.OutOfMemoryError, RuntimeError) as exc:
+                if not isinstance(exc, torch.OutOfMemoryError) and \
+                        "out of memory" not in str(exc).lower():
+                    raise
+                gs = None  # a partially-built graph is not usable
                 torch.cuda.empty_cache()
                 row["resv_gib"] = torch.cuda.max_memory_reserved() / 2**30
+            if gs is not None:
+                del gs.graph, gs
             free_cache(cache)
             rows.append(row)
             print(f"[conc {mode:4s} ctx={ctx:5d} B={B:3d}] ok={row['ok']} "
@@ -751,6 +1152,143 @@ def run_bank(model, tok, args):
     return rows
 
 
+def run_verify(model, tok, args):
+    """Correctness gates for the throughput fix (must all pass before any
+    speed claim): SDPA-vs-eager greedy equivalence, NLL@900 mode-identity per
+    impl, banked-mode recall under SDPA, and graphed-vs-ungraphed token
+    identity over the static ring cache."""
+    results = []
+
+    def gate(name, ok, detail=""):
+        results.append((name, ok))
+        print(f"[gate] {'PASS' if ok else 'FAIL'}: {name} {detail}")
+
+    warmup(model, tok, args)
+    word_ids = tok(" one two three four five six seven eight nine ten red blue",
+                   add_special_tokens=False).input_ids
+    first4 = torch.tensor([[word_ids[i]] for i in range(4)], dtype=torch.long)
+    prompt = build_plain_prompt(tok, args.ctx_per_session)
+
+    def ring_prefill(B):
+        cache = build_cache(model, "ring", args)
+        chunked_prefill(model, cache, prompt, args.chunk)
+        for layer in cache.layers:
+            layer.batch_repeat_interleave(B)
+        return cache
+
+    # --- gate 1: NLL@900 (below sink+window: ring/banked must equal full) ---
+    nll = {}
+    for impl in ["eager", "sdpa"]:
+        set_attn_impl(model, impl)
+        for mode in ["full", "ring", "banked"]:
+            cache = build_cache(model, mode, args)
+            n, _ = last_token_nll(model, cache, build_plain_prompt(tok, 900), args.chunk)
+            free_cache(cache)
+            nll[(impl, mode)] = n
+            print(f"  NLL(last128)@900 {impl:5s}/{mode:6s} = {n:.6f}")
+    for impl in ["eager", "sdpa"]:
+        gate(f"NLL@900 full==ring==banked ({impl})",
+             nll[(impl, "full")] == nll[(impl, "ring")] == nll[(impl, "banked")])
+    drift = abs(nll[("sdpa", "ring")] - nll[("eager", "ring")])
+    gate("NLL@900 sdpa-vs-eager drift < 1e-3", drift < 1e-3, f"(delta={drift:.2e})")
+
+    # --- gate 2: greedy equivalence eager vs sdpa (ring, B=4, 64 steps) ---
+    # bf16 logits are quantized to ~0.125-0.25 ULP at their magnitude here, so
+    # kernel-order changes can flip exact/near ties. The gate therefore accepts
+    # strict equality OR: teacher-forced per-step argmax mismatches <= 2% with
+    # every mismatch at a top-2 logit gap <= 0.5 (a few bf16 ULPs) in both
+    # implementations — i.e. provably tie-flips, not semantic divergence.
+    def tie_aware_compare(name, tokens_a, gaps_a, decode_b, decode_b_forced):
+        tokens_b, _ = decode_b()
+        strict = torch.equal(tokens_a, tokens_b)
+        n_free = (tokens_a != tokens_b).sum().item()
+        if strict:
+            gate(name, True, "(strictly token-identical)")
+            return
+        tokens_f, gaps_f = decode_b_forced(tokens_a)
+        mism = (tokens_f != tokens_a).nonzero()
+        worst = max((max(gaps_a[r, t].item(), gaps_f[r, t].item())
+                     for r, t in mism.tolist()), default=0.0)
+        frac = len(mism) / tokens_a.numel()
+        gate(name, frac <= 0.02 and worst <= 0.5,
+             f"(free-run diff {n_free}/{tokens_a.numel()}; teacher-forced "
+             f"argmax diff {len(mism)}/{tokens_a.numel()}, worst top-2 gap "
+             f"{worst:.3f} — bf16 tie-flips)" )
+
+    set_attn_impl(model, "eager")
+    cache = ring_prefill(4)
+    te, ge = _decode_argmax_gaps(model, cache, first4, 64)
+    free_cache(cache)
+
+    def sdpa_free():
+        set_attn_impl(model, "sdpa")
+        cache = ring_prefill(4)
+        r = _decode_argmax_gaps(model, cache, first4, 64)
+        free_cache(cache)
+        return r
+
+    def sdpa_forced(force):
+        set_attn_impl(model, "sdpa")
+        cache = ring_prefill(4)
+        r = _decode_argmax_gaps(model, cache, first4, 64, force=force)
+        free_cache(cache)
+        return r
+
+    tie_aware_compare(
+        f"greedy tokens eager==sdpa (ring ctx={args.ctx_per_session}, B=4, 64 steps)",
+        te, ge, sdpa_free, sdpa_forced)
+
+    # --- gate 3: banked mode under sdpa (bank slots are ordinary KV) ---
+    needle = {}
+    for impl in ["eager", "sdpa"]:
+        set_attn_impl(model, impl)
+        needle[impl] = _needle_once(model, tok, args, "banked", 8192)
+    gate("banked needle@8192 recalled (sdpa)", needle["sdpa"][0],
+         f"out={needle['sdpa'][1]!r}")
+    gate("banked greedy output eager==sdpa", needle["eager"][1] == needle["sdpa"][1])
+
+    # --- gate 4: static ring + CUDA graph token identity (sdpa) ---
+    # Static-vs-dynamic uses the same tie-aware rule (the static ring rotates
+    # KV slot order, permuting fp reduction order). Graphed-vs-ungraphed runs
+    # the identical kernels at identical addresses and must be token-identical.
+    set_attn_impl(model, "sdpa")
+    cache = ring_prefill(4)
+    td, gd = _decode_argmax_gaps(model, cache, first4, 64)
+    free_cache(cache)
+
+    def static_free():
+        cache = to_static_cache(ring_prefill(4))
+        r = _decode_argmax_gaps(model, cache, first4, 64)
+        free_cache(cache)
+        return r
+
+    def static_forced(force):
+        cache = to_static_cache(ring_prefill(4))
+        r = _decode_argmax_gaps(model, cache, first4, 64, force=force)
+        free_cache(cache)
+        return r
+
+    tie_aware_compare("static-ring tokens == dynamic tokens (B=4, 64 steps)",
+                      td, gd, static_free, static_forced)
+
+    cache = to_static_cache(ring_prefill(4))
+    static_t = static_greedy_decode(model, cache, first4, 64)
+    free_cache(cache)
+    cache = to_static_cache(ring_prefill(4))
+    gs = GraphedStep(model, cache, 4)
+    graph_t, _ = graphed_greedy_decode(gs, first4, 64)
+    del gs.graph, gs
+    free_cache(cache)
+    n_gs = (graph_t.cpu() != static_t.cpu()).sum().item()
+    gate("graphed tokens == ungraphed static tokens (must be exact)", n_gs == 0,
+         f"({n_gs}/256 differ)")
+
+    set_attn_impl(model, args.attn)
+    n_fail = sum(not ok for _, ok in results)
+    print(f"\n## verify: {len(results) - n_fail}/{len(results)} gates passed")
+    return n_fail == 0
+
+
 def run_batch(model, tok, args):
     prompts = [
         "Write one sentence about the ocean.",
@@ -799,8 +1337,18 @@ def run_batch(model, tok, args):
 # --------------------------------------------------------------------------- #
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("cmd", choices=["bench", "needle", "batch", "concurrency", "bank"])
+    ap.add_argument("cmd", choices=["bench", "needle", "batch", "concurrency", "bank",
+                                    "profile", "verify"])
     ap.add_argument("--mode", choices=["full", "ring", "banked", "both"], default="both")
+    ap.add_argument("--attn", choices=["eager", "sdpa"], default="sdpa",
+                    help="attention implementation (PoC-3 default: sdpa)")
+    ap.add_argument("--legacy-decode", action="store_true",
+                    help="rebuild per-step masks at decode (pre-PoC-3 behavior)")
+    ap.add_argument("--graphs", action="store_true",
+                    help="CUDA-graph the decode step (concurrency, ring mode)")
+    ap.add_argument("--mem-cap-gib", type=float,
+                    default=float(os.environ.get("WKVM_MEM_CAP_GIB", 19)),
+                    help="allocator cap in GiB (leave room for the desktop)")
     ap.add_argument("--sink", type=int, default=16)
     ap.add_argument("--window", type=int, default=1024)
     ap.add_argument("--ctx", type=int, default=8192, help="needle context length")
@@ -826,12 +1374,20 @@ def main():
     ap.add_argument("--model-path", default=None)
     args = ap.parse_args()
     if args.decode_tokens is None:
-        args.decode_tokens = 128 if args.cmd == "concurrency" else 64
+        args.decode_tokens = {"concurrency": 128, "profile": 32}.get(args.cmd, 64)
+    if args.legacy_decode:
+        global DECODE_MASK_FREE
+        DECODE_MASK_FREE = False
+
+    total = torch.cuda.get_device_properties(0).total_memory
+    torch.cuda.set_per_process_memory_fraction(
+        min(1.0, args.mem_cap_gib * 2**30 / total))
 
     path = resolve_model_path(args.model_path)
-    print(f"# loading {path} (text tower only, eager, bf16)")
+    print(f"# loading {path} (text tower only, {args.attn}, bf16, "
+          f"mem cap {args.mem_cap_gib} GiB)")
     t0 = time.perf_counter()
-    model = load_model(path)
+    model = load_model(path, attn=args.attn)
     tok = AutoTokenizer.from_pretrained(path)
     print(f"# loaded in {time.perf_counter() - t0:.1f}s; "
           f"weights {torch.cuda.memory_allocated() / 2**30:.2f} GiB")
@@ -852,6 +1408,11 @@ def main():
         run_concurrency(model, tok, args)
     elif args.cmd == "bank":
         run_bank(model, tok, args)
+    elif args.cmd == "profile":
+        run_profile(model, tok, args)
+    elif args.cmd == "verify":
+        ok = run_verify(model, tok, args)
+        raise SystemExit(0 if ok else 1)
 
 
 if __name__ == "__main__":

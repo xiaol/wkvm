@@ -222,6 +222,138 @@ object, +0.7–8 MiB over plain ring.
 - B=1 only (`batch_repeat_interleave` intentionally raises on banked layers); folding adds
   host-side Python per eviction event, fine at chunk granularity.
 
+## PoC-3: throughput fix (SDPA + mask-free decode + CUDA-graphed static ring)
+
+**Goal**: close the 4k-context aggregate-throughput gap vs vLLM (COMPARISON.md §2:
+835 tok/s @ B=64 ours vs 1,356 tok/s @ 38 seqs vLLM). Run date 2026-07-04; same GPU,
+desktop process ~1.2 GB (vs 2.0–2.4 GB during PoC-1). **New, stricter budget**: the
+allocator is hard-capped at 19 GiB (`--mem-cap-gib`, keeps peak under 19 GB on the
+shared desktop), so green = peak reserved <= 18 GiB — PoC-1's green line was 20.07 GiB.
+Baseline reproduced under today's conditions: 810.5 tok/s @ B=64 (32-step timing),
+consistent with the recorded 835.4 (128-step).
+
+### Profile first (`profile` subcommand; ring, ctx 4096, 32 decode steps)
+
+Per-step breakdown via torch.profiler with record_function ranges around the attention
+interface, mask construction and cache update; "GPU busy" sums device-kernel events
+only; wall from a separate un-profiled run of the same steps.
+
+| ms/step | eager B=32 | eager B=64 | fixed B=32 | fixed B=64 |
+|---|---|---|---|---|
+| wall (clean) | 49.0 | 79.0 | 29.6 | 38.3 |
+| GPU busy | 47.9 (91%) | 74.3 (95%) | 25.2 | 34.1 |
+| attention (full/ring layers) | 10.7 | 20.0 | 1.4 | 2.6 |
+| attention (sliding layers) | 14.8 | 26.7 | 1.2 | 2.6 |
+| cache update (cat/evict) | 4.7 | 9.4 | 4.4 | 9.6 |
+| other model compute | 17.4 | 17.8 | 18.3 | 19.3 |
+| python/launch gap | 4.8 | 4.3 | 3.4–10.4 | 3.3 |
+| mask build (CPU-side, overlapped) | 13.2 | 18.7 | 0.0 | 0.0 |
+
+The measured bottleneck at B=64 was **eager attention: 46.7 of 79 ms/step (59% of
+wall)** — repeat_kv materialization (2 KV heads -> 8) over every cached slot on all 42
+attention calls plus fp32 attn-weight buffers — with per-step mask construction burning
+another 13–19 ms of CPU (overlapped at these batch sizes, but it becomes the wall once
+attention shrinks). Python/launch gap was only ~5% — so CUDA graphs alone would NOT
+have fixed this; the profile redirected the effort to attention first. "Other model
+compute" is flat in B (weight-bandwidth-bound GEMMs, ~14 GiB of weights read per step)
+— that is what makes larger B nearly free once attention is fixed.
+
+### What changed (all in `experiments/gemma_recurrent_poc.py`)
+
+1. **SDPA + mask-free decode** (`--attn sdpa` is the new default). At q=1 decode with
+   no padding, every cached slot is unconditionally visible (sink/bank/pending/ring all
+   precede the query; a sliding layer stores exactly the last window-1 tokens). We pass
+   a pre-built `{"full_attention": None, "sliding_attention": None}` mask mapping, which
+   (a) skips the vmap-based per-step mask build entirely and (b) lets SDPA take its
+   mask-free path: `is_causal=False` full attention over the cache with `enable_gqa=True`
+   — no repeat_kv copy at all. Sliding-layer attention: 26.7 -> 2.6 ms/step at B=64.
+2. **Grouped-GEMM decode attention for the wide full-attention heads.** gemma-4's
+   full-attention layers use `global_head_dim=512`; no fused SDPA kernel on sm_89
+   supports that with GQA, and torch's math fallback materializes GiB-scale fp32
+   buffers (OOMed at B=64 under the 19 GiB cap and was *slower* than eager). For the
+   exact decode case (mask None, q=1, head_dim>256) we patch the sdpa interface with a
+   two-GEMM grouped-query path (q [B,8,1,512] viewed as [B,2,4,512] — the enable_gqa
+   head mapping — then fp32 softmax like the eager path): full-layer attention 20.0 ->
+   2.6 ms/step at B=64, no big buffer.
+3. **CUDA-graphed decode step** (`--graphs`), reusing the M2 GraphedDecode recipe
+   (static input/position tensors, side-stream warmup, capture, replay). What had to
+   differ from M2: the HF DynamicCache mutates by `torch.cat` (fresh addresses every
+   step — unreplayable), so the prefilled cache is first converted to **StaticRingLayers**
+   (`to_static_cache`): fixed-address [B,H,cap,D] buffers written in place at a
+   *device-tensor* write pointer that advances with captured tensor ops. Slot order
+   rotates instead of staying chronological — harmless because decode attention is
+   mask-free (order-invariant) and keys are post-RoPE. Capacities chosen for exact
+   equivalence with the dynamic layers' per-step visible set (sliding: cap=window;
+   ring: cap=sink+window+1, ring over [sink, cap)). The whole step — forward, argmax,
+   token feedback, position bump — is captured; the decode loop is `graph.replay()`
+   plus one D2D copy per step, one sync at the end (fix 2c: no per-step H2D/D2H).
+   Cache eviction thereby also became a 1-slot `index_copy_` instead of the per-step
+   cat/evict pair (9.6 ms/step at B=64 in the table above).
+4. **Memory**: batch replication now broadcasts the B=1 prefill *directly into* the
+   static buffers (no transient B-wide dynamic cache; still real per-slot copies), and
+   `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is the script default (~1.2 GiB
+   less fragmentation at B>=96 for a few % decode throughput). B=128 went from
+   hard-OOM to completing within the cap.
+
+### Correctness gates (`verify` subcommand — 8/8 pass, run before any speed claim)
+
+| gate | result |
+|---|---|
+| NLL(last128)@900 full==ring==banked, eager | PASS — 0.549035 all three (bit-identical) |
+| NLL(last128)@900 full==ring==banked, sdpa | PASS — 0.548670 all three (bit-identical) |
+| NLL@900 sdpa-vs-eager drift | PASS — 3.65e-4 (<1e-3) |
+| greedy tokens eager==sdpa (ring ctx 4096, B=4, 64 steps) | PASS (tie-aware) — free-run 16/256 differ; teacher-forced argmax differs on 2/256, both at top-2 logit gaps <= 0.375 (1–3 bf16 ULPs; one exact 0.0 tie in eager). Numeric tie-flips, not semantic divergence. |
+| banked needle@8192 recalled under sdpa | PASS — 'BLUE-742' (bank slots are ordinary KV; SDPA doesn't care) |
+| banked greedy output eager==sdpa | PASS — identical first line |
+| static-ring tokens == dynamic tokens (B=4, 64 steps) | PASS — strictly token-identical this run |
+| graphed tokens == ungraphed static tokens | PASS — 0/256 differ (exact, as required: same kernels, same addresses) |
+
+### Before/after: concurrency ladder, ring @ ctx/session 4096 (128-tok greedy decode)
+
+Before = PoC-1 recorded numbers (eager, masked decode, green line 20.07 GiB).
+After = SDPA+mask-free (`sdpa`) and +CUDA graphs (`graphed`), green line **18.0 GiB**
+(19 GiB hard cap, 1 GiB headroom — stricter than before).
+
+| B | before agg tok/s | sdpa agg tok/s | graphed agg tok/s | graphed per-stream | graphed peak resv GiB | status (new budget) |
+|---|---|---|---|---|---|---|
+| 8 | 310.1 | 385.6 | 447.1 | 55.89 | 14.58 | green |
+| 16 | 503.6 | 701.1 | 854.6 | 53.41 | 14.62 | green |
+| 32 | 669.1 | 1,181.0 | 1,566.3 | 48.95 | 15.27 | green |
+| 64 | 835.4 | 1,820.6 | 2,730.8 | 42.67 | 16.42 | green |
+| 96 | 869.5 (over-budget) | 2,021.3 (over) | 3,544.9 | 36.93 | 17.64 | **green — new B_max** |
+| 112 | OOM | 1,860.7 (over) | 3,983.2 | 35.56 | 18.21 | over-budget |
+| 128 | OOM | OOM | 4,344.2 | 33.94 | 18.84 | over-budget (in-cap) |
+| 144 | OOM | OOM | OOM | - | 18.95 | OOM |
+
+ctx/session 16384 (graphed) is **identical within noise** — 2,770.4 @ B=64, 3,585.1 @
+B=96 (green), 4,330.0 @ B=128 — the flat-slot property carries through the fix.
+
+### New B_max / saturation
+
+- **B_max(green) = 96** (was 64) at **3,545 tok/s** — 4.2x the old green-ceiling
+  throughput, under a ~2 GiB *stricter* budget. Hard ceiling B=128 @ 4,344 tok/s
+  (5.2x), OOM at 144.
+- **The old saturation point is gone**: before, B=64->96 added +4%; now 64->96 adds
+  +30% and 96->128 adds +23% (0.69 scaling efficiency — bending but still climbing).
+  Throughput no longer flattens before memory runs out: **the ceiling is memory again**,
+  dominated by the 20 stock sliding-window layers (21 of every 36.3 MiB/slot) — i.e.
+  exactly the arena/slot-shrinking work (paged sliding slabs, smaller windows) that was
+  always the roadmap, not kernel overhead.
+- Per-stream decode also improved at every B (55.9 tok/s @ B=8 vs 38.8 before).
+
+### Honest limits
+
+- The 2 teacher-forced argmax flips per 256 tokens (bf16 ULP ties) mean greedy streams
+  are reproducible-modulo-ties across attention impls, exactly as between any two
+  kernel stacks; graphed-vs-ungraphed is bitwise exact.
+- `--graphs` requires prefill >= sink+window per layer (static ring must be full) and
+  is ring-mode only; banked mode keeps the eager path (its per-step host-side folding
+  is inherently uncapturable — and it is the B=1 quality path anyway).
+- The concurrency numbers remain replicated-cache virtual sessions (honest memory,
+  throwaway quality), 128-token steady-state decode with no arrivals/scheduler.
+- Old bench/needle/bank tables above were measured with eager attention
+  (`--attn eager --legacy-decode` reproduces that path); PoC-3 changed the defaults.
+
 ## Repro
 
 ```
@@ -233,6 +365,12 @@ HF_HUB_OFFLINE=1 /home/xiaol/X/HRM-Text/.venv/bin/python experiments/gemma_recur
 HF_HUB_OFFLINE=1 /home/xiaol/X/HRM-Text/.venv/bin/python experiments/gemma_recurrent_poc.py concurrency --mode ring --ladder 96 112
 HF_HUB_OFFLINE=1 /home/xiaol/X/HRM-Text/.venv/bin/python experiments/gemma_recurrent_poc.py bank
 HF_HUB_OFFLINE=1 /home/xiaol/X/HRM-Text/.venv/bin/python experiments/gemma_recurrent_poc.py needle --mode banked --ctx 8192
+# PoC-3 (throughput fix):
+HF_HUB_OFFLINE=1 .../python experiments/gemma_recurrent_poc.py profile --attn eager --legacy-decode --batch-size 32 --ctx-per-session 4096   # before
+HF_HUB_OFFLINE=1 .../python experiments/gemma_recurrent_poc.py profile --batch-size 64 --ctx-per-session 4096                               # after
+HF_HUB_OFFLINE=1 .../python experiments/gemma_recurrent_poc.py verify --ctx-per-session 4096                                                # 8 gates
+HF_HUB_OFFLINE=1 .../python experiments/gemma_recurrent_poc.py concurrency --mode ring --graphs --ctx-per-session 4096  --ladder 8 16 32 64 96 112 128 144
+HF_HUB_OFFLINE=1 .../python experiments/gemma_recurrent_poc.py concurrency --mode ring --graphs --ctx-per-session 16384 --ladder 8 16 32 64 96 112 128 144
 ```
 
 Note: model weights live on the NTFS volume mounted at

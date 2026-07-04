@@ -18,26 +18,28 @@ The structural difference: vLLM and SGLang index *reusable KV by token prefix*; 
 
 ## 2. Measured: gemma-4-E4B-it, 4090, concurrency & memory
 
-Same model, same GPU, same measurement shape (N concurrent sessions at ctx tokens each, 128-token greedy decode). wkvm numbers are the PoC recurrent mode (sink16 + ring1024 on the 4 KV-owning global layers; eager attention, no CUDA graphs yet).
+Same model, same GPU, same measurement shape (N concurrent sessions at ctx tokens each, 128-token greedy decode). wkvm numbers are the PoC recurrent mode (sink16 + ring1024 on the 4 KV-owning global layers) after the PoC-3 throughput fix: SDPA/GQA mask-free decode + CUDA-graphed static-ring decode step (`experiments/results/poc1_gemma_e4b.md` §PoC-3, run 2026-07-04). Note the wkvm re-run used a *stricter* budget than the 2026-07-03 vLLM run: allocator hard-capped at 19 GiB, green = peak reserved <= 18 GiB (the PoC-1 green line was 20.07 GiB).
 
 **Concurrency (max resident sessions within budget):**
 
-| ctx/session | wkvm recurrent mode (PoC) | vLLM 0.24.0 | SGLang 0.5.14 | HF full-KV (eager baseline) |
+| ctx/session | wkvm recurrent mode (PoC-3) | vLLM 0.24.0 | SGLang 0.5.14¹ | HF full-KV (eager baseline) |
 |---|---|---|---|---|
-| 4,096 | **64** (36.2 MiB/slot) | 38 (84 MiB/seq) | DNF¹ | 8 (86 MiB/seq) |
-| 16,384 | **64** (36.2 MiB/slot, unchanged) | 9 (276 MiB/seq) | DNF¹ | 0 within headroom |
-| 32,768+ | **64** (unchanged) | ~4 (would need 552 MiB/seq) | DNF¹ | OOM |
+| 4,096 | **96** (36.3 MiB/slot; 128 within the 19 GiB hard cap) | 38 (84 MiB/seq) | 6 (25,360-token pool) | 8 (86 MiB/seq) |
+| 16,384 | **96** (36.3 MiB/slot, unchanged) | 9 (276 MiB/seq) | 1 | 0 within headroom |
+| 32,768+ | **96** (unchanged² ) | ~4 (would need 552 MiB/seq) | 0 | OOM |
 
 **Aggregate decode throughput (greedy, 128 new tokens/stream):**
 
-| ctx | wkvm PoC (eager attention, no graphs) | vLLM (FlashInfer + CUDA graphs) | SGLang |
+| ctx | wkvm PoC-3 (SDPA + CUDA graphs) | vLLM (FlashInfer + CUDA graphs) | SGLang 0.5.14¹ (triton attn) |
 |---|---|---|---|
-| 4,096 | 835 tok/s @ B=64 | **1,356 tok/s** @ 38 seqs | DNF¹ |
-| 16,384 | **782 tok/s** @ B=64 | 286 tok/s @ 9 seqs (capacity-starved) | DNF¹ |
+| 4,096 | **3,545 tok/s** @ B=96 green (2,731 @ B=64; 4,344 @ B=128 in-cap) | 1,356 tok/s @ 38 seqs | 410 tok/s @ N=64 (6 concurrent, rest queued) |
+| 16,384 | **3,585 tok/s** @ B=96 green | 286 tok/s @ 9 seqs (capacity-starved) | 68 tok/s @ N=8 (1 concurrent) |
 
-¹ SGLang 0.5.14 could not serve this model on this machine after 7 documented attempts (SWA/full-KV pool configurator starvation on 24GB, a `Gemma4TextModel` attribute bug in its tc_piecewise graph backend, and a `nvidia-cutlass-dsl` internal compiler error on the CUDA 13.1 toolchain that survives every user-facing flashinfer kill-switch). Full chain in `wkvm_bench/results_sglang.md`. This is an operational finding about breadth-surface fragility, not an architectural verdict — the same venv-toolchain family served vLLM first try.
+¹ SGLang required **9 attempts and three root-cause fixes** to serve this model on this machine (fixed 2026-07-05; full forensic chain in `experiments/results/bench_sglang_gemma4e4b.md`): (i) SWA/full-KV pool configurator starvation on 24GB — manual joint tuning of `max_running_requests` × eviction interval × mem-fraction; (ii) a `Gemma4TextModel` attribute bug in its tc_piecewise prefill graph backend — worked around by disabling prefill graphs; (iii) a **corrupted `nvidia-cutlass-dsl` install** (mixed-version files, NVIDIA/cutlass#3132 failure mode) producing an MLIR ICE that survived every user-facing kill-switch because `sgl_kernel` imports flashinfer behind its own availability flag — fixed by clean reinstall of the same version, CPU-repro-verified; plus (iv) the tvm-ffi JIT then needed the GCC15/glibc `rsqrtf` CPATH shim. Its numbers here carry real handicaps it could shed on a friendlier stack: triton attention backend, no prefill graphs, and multimodal tower weights resident (vLLM's run zeroed them via `limit_mm_per_prompt`), which is much of why its KV pool is 25,360 tokens vs vLLM's 161,584 at comparable mem-fraction. Treat SGLang's row as "what surviving the JIT-chain gauntlet cost", not its potential.
 
-Read: vLLM wins per-step efficiency at short context (its kernel stack vs our eager-attention prototype — an M2 gap, not physics); wkvm wins on *capacity*, and past ~8k context capacity dominates: at 16k the PoC's 64 flat slots deliver 2.7× vLLM's aggregate throughput on the same GPU. vLLM's own hybrid-KV accounting (sliding layers bounded, 18 shared) is genuinely good — the 84 MiB/seq at 4k is honest engineering — but the 4 full-attention layers still grow without bound, and that is the whole difference. Quality caveat: wkvm's recurrent mode is exact only below the ring window; beyond it, recall comes from the PoC-2 state bank (needle verified to 32k) — full-KV semantics it is not.
+² not re-run at 32k; measured identical at 4k and 16k (flat slots), and ring state is context-independent by construction.
+
+Read: with the PoC-3 fix (profile-driven: eager attention was 59% of the decode step; replaced with SDPA/GQA mask-free decode plus a grouped-GEMM path for the head_dim-512 global layers, then the whole step CUDA-graphed over a fixed-address static ring cache) wkvm now beats vLLM at short context too, not just on capacity: **2,731 tok/s at vLLM-comparable concurrency (B=64) and 3,545 tok/s at its own green B_max=96 vs vLLM's 1,356 — ~2–2.6×** — measured under a ~2 GiB stricter memory budget, and 12.5× at 16k where vLLM is capacity-starved. Two honest qualifiers, in fairness order: (1) this is *not* a same-semantics win — vLLM serves full-KV attention; wkvm's recurrent mode is exact only below the ring window, with beyond-window recall from the PoC-2 state bank (needle-verified to 32k, not general-quality-verified) — vLLM cannot be configured to do this, but a user who needs full-KV semantics gets no benefit from our number; (2) the wkvm ladder is replicated-cache virtual sessions in steady-state decode (no arrivals, no scheduler, no HTTP), while vLLM's number includes its engine loop — shape-matched to its offline `LLM` path but not identical plumbing. Greedy outputs across the fix are verified: 8/8 gates (graphed vs ungraphed bitwise token-identical; SDPA-vs-eager differs only at bf16-ULP logit ties, 2/256 teacher-forced). vLLM's hybrid-KV accounting (sliding layers bounded, 18 shared) remains honest engineering — but its 4 full-attention layers still grow without bound, and past ~8k that is the whole difference. Throughput now scales to the memory wall (no pre-memory saturation: +30% from B=64→96, +23% from 96→128); the ceiling is the 20 stock sliding-window layers' 21 MiB of every 36.3 MiB slot — an arena/paging target, not kernel overhead.
 
 ## 3. Measured: RWKV-7, 4090, decode throughput
 
@@ -79,13 +81,13 @@ Albatross `faster3a_2605`, RWKV-7 World 2.9B fp16, pre-built sm_89 kernels (cons
 ## 5. Honest read
 
 **Where wkvm wins (measured or structural):**
-1. **Long-context concurrency on transformers** (measured): 64 flat slots at any context vs vLLM's 38→9→~4 as context grows; 2.7× vLLM's aggregate throughput at 16k on the same GPU, with the eager-attention prototype. The gap widens with context, unboundedly.
+1. **Long-context concurrency on transformers** (measured): 96 flat slots at any context (under a 19 GiB cap; 128 at the hard ceiling) vs vLLM's 38→9→~4 as context grows; after PoC-3 (SDPA/GQA + CUDA-graphed static ring) also ~2–2.6× vLLM's aggregate throughput at 4k and 12.5× at 16k on the same GPU. The capacity gap widens with context, unboundedly.
 2. **Long-context recall at flat footprint** (measured): the PoC-2 segmented state bank recovers needle recall to 32k in 37–44 MiB/slot — a capability class (constant-memory approximate attention) neither incumbent ships as a serving mode.
 3. **Linear-model serving exists at all** (structural + measured): zero RWKV support in either incumbent; wkvm M2 serves RWKV-7 with continuous batching + exact admission + CUDA graphs at 8k tok/s (1.5B, B=256, 19 GiB) — Albatross-class physics with a real serving layer.
 4. **State-slot economics** (measured): 12.2 MiB/session at 1.5B, 2.3 MiB at 191M, admission = counting — the substrate the M3 durable-handle API (fork/hibernate/mutate) needs, which prefix-keyed caches structurally cannot offer.
 5. **Operational surface** (observed in this exercise): wkvm's whole stack is ~3k LOC with one JIT dependency (triton via fla); SGLang's breadth surface (pool configurator × graph backends × cutlass-DSL JIT chain) failed to boot this model on this toolchain in 7 attempts.
 
-**Where the incumbents win, today and durably:** breadth (models × quant × hardware), kernel maturity (FlashInfer/FA3 vs our eager-attention PoC), operational polish (metrics, distributed serving, APIs), and community. At equal scope wkvm never catches vLLM on mainstream dense transformers with full-KV semantics — that is not the game.
+**Where the incumbents win, today and durably:** breadth (models × quant × hardware), kernel maturity (FlashInfer/FA3 and paged prefill vs our SDPA-decode PoC — our *prefill* is still stock masked SDPA), operational polish (metrics, distributed serving, APIs), and community. At equal scope wkvm never catches vLLM on mainstream dense transformers with full-KV semantics — that is not the game.
 
 **Where Albatross wins:** peak RWKV decode throughput per GPU from hand-tuned CUDA (its entire codebase optimizes one model on one GPU). wkvm's bet is that Albatross-class physics + a real serving layer (admission, batching, durable state) is worth more than the last 30% of kernel tuning — and Albatross has no answer for hybrids, transformers, or sessions.
 
