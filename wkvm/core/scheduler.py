@@ -50,6 +50,10 @@ class Scheduler:
         self.waiting: deque[Request] = deque()
         self.running: list[Request] = []
         self.requests: dict[str, Request] = {}
+        # Called with each finishing request BEFORE its slots are released —
+        # the one moment end-of-life state is still addressable (the engine
+        # uses it for snapshot-on-finish; see wkvm/store.py).
+        self.on_finish: "Callable[[Request], None] | None" = None
 
     # -- intake ------------------------------------------------------------
 
@@ -150,9 +154,27 @@ class Scheduler:
                     req.status = RequestStatus.FINISHED_LENGTH
                     break
             if req.status.is_finished:
+                if self.on_finish is not None:
+                    self.on_finish(req)
                 self._release(req)
                 finished.append(req)
         return finished
+
+    def add_resumed_request(self, request: Request, slots: dict[str, int]) -> None:
+        """Admit a request whose state already occupies arena slots (loaded
+        from a StateStore handle). It enters RUNNING directly — resume is just
+        a request with a nonzero starting point under the no-phases invariant,
+        so the ordinary loop schedules its gap like any other request."""
+        if request.req_id in self.requests:
+            raise ValueError(f"duplicate req_id {request.req_id}")
+        if len(self.running) >= self.config.max_running_requests:
+            raise RuntimeError("no running capacity for resumed request")
+        if request.num_scheduled_gap < 1:
+            raise ValueError("resumed request has no schedulable gap")
+        request.slots = slots
+        request.status = RequestStatus.RUNNING
+        self.requests[request.req_id] = request
+        self.running.append(request)
 
     # -- internals -----------------------------------------------------------
 

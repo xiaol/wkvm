@@ -23,7 +23,7 @@ Rationale for every design choice lives in `docs/ANGLE.md` §5 and `docs/RECURRE
 - Minimal OpenAI-compatible HTTP frontend in its own process; engine speaks token ids only.
 - Exit: Albatross-comparison benchmark — decode tok/s vs batch size, flat VRAM chart.
 
-## M3 — StateStore + Durable State API (the moat)
+## M3 — StateStore + Durable State API (the moat) — ✅ DONE 2026-07-06 (see experiments/results/m3_results.md)
 
 - Position-indexed checkpoint store (boundary snapshots every N tokens), GPU → pinned host → NVMe tiering.
 - `/v1/states`: create-from-prompt, save/load (safetensors), fork (COW slot copy), pin, delete; sessions = named states; hibernate/resume; rollback-to-checkpoint.

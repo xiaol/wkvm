@@ -1,0 +1,78 @@
+=== M3 run 2026-07-06T23:29:28.384839 ===
+--- unit tests ---
+
+[parity/plumbing] max abs last-logit diff: 0.000e+00
+
+Loading weights:   0%|          | 0/399 [00:00<?, ?it/s]
+Loading weights: 100%|██████████| 399/399 [00:00<00:00, 18683.18it/s]
+ok
+test_2_fork_isolation (test_store_gpu.TestStateStore.test_2_fork_isolation) ... ok
+test_3_mutate_provenance_and_effect (test_store_gpu.TestStateStore.test_3_mutate_provenance_and_effect) ... ok
+test_4_rebuild_from_cold_index (test_store_gpu.TestStateStore.test_4_rebuild_from_cold_index) ... ok
+test_5_fingerprint_mismatch_rejected (test_store_gpu.TestStateStore.test_5_fingerprint_mismatch_rejected) ... ok
+
+----------------------------------------------------------------------
+Ran 29 tests in 110.714s
+
+OK
+sys:1: DeprecationWarning: builtin type swigvarlink has no __module__ attribute
+--- unit tests: exit 0 ---
+--- demo fleet ---
+/home/xiaol/X/HRM-Text/.venv/lib/python3.12/site-packages/fla/layers/rwkv7.py:148: UserWarning: According to Bo, you are using a potentially buggy FLA implementation of RWKV. If you plan to report any numbers based on this implementation, we strongly recommend cross-checking with the official repo: https://github.com/BlinkDL/RWKV-LM. Bo may disagree with results reported from this version.
+  warnings.warn(
+
+Loading weights:   0%|          | 0/399 [00:00<?, ?it/s]
+Loading weights: 100%|██████████| 399/399 [00:00<00:00, 17249.84it/s]
+[transformers] `use_return_dict` is deprecated! Use `return_dict` instead!
+[fleet] creating 2000 sessions (continuous batching, 64 slots)
+[fleet] created+snapshotted in 31.7s; WARM tier 4.46 GiB for 2000 sessions (2.29 MiB/session)
+[fleet] evicted 500 to COLD (safetensors) in 4.9s
+[fleet] resume-to-next-token WARM: n=224 p50=8.2ms p99=9.5ms max=35.7ms
+[fleet] resume-to-next-token COLD: n=76 p50=8.6ms p99=17.6ms max=18.4ms
+[fleet] exactness: 16/16 interrupted+resumed == uninterrupted
+--- demo fleet: exit 0 ---
+--- demo agent ---
+/home/xiaol/X/HRM-Text/.venv/lib/python3.12/site-packages/fla/layers/rwkv7.py:148: UserWarning: According to Bo, you are using a potentially buggy FLA implementation of RWKV. If you plan to report any numbers based on this implementation, we strongly recommend cross-checking with the official repo: https://github.com/BlinkDL/RWKV-LM. Bo may disagree with results reported from this version.
+  warnings.warn(
+
+Loading weights:   0%|          | 0/399 [00:00<?, ?it/s]
+Loading weights: 100%|██████████| 399/399 [00:00<00:00, 23403.68it/s]
+[transformers] `use_return_dict` is deprecated! Use `return_dict` instead!
+[agent:1] turn 0: ' Wei is a ferret that is a member of the genus of the ferret family. They are known for their intelligence, playfulness, and curiosity. They' -> agent@0
+[agent:1] turn 1: ' Wei is a ferret that is a member of the genus of the ferret family. They are known for their intelligence, playfulness, and curiosity. They' -> agent@1
+[agent:1] turn 2: ' Wei is a ferret that is a member of the genus of the ferret family. They are known for their intelligence, playfulness, and curiosity. They' -> agent@2
+[agent:1] persisted agent@2; reference continuation written. Exiting.
+/home/xiaol/X/HRM-Text/.venv/lib/python3.12/site-packages/fla/layers/rwkv7.py:148: UserWarning: According to Bo, you are using a potentially buggy FLA implementation of RWKV. If you plan to report any numbers based on this implementation, we strongly recommend cross-checking with the official repo: https://github.com/BlinkDL/RWKV-LM. Bo may disagree with results reported from this version.
+  warnings.warn(
+
+Loading weights:   0%|          | 0/399 [00:00<?, ?it/s]
+Loading weights: 100%|██████████| 399/399 [00:00<00:00, 18909.91it/s]
+[transformers] `use_return_dict` is deprecated! Use `return_dict` instead!
+[agent:2] RESTART-EXACT: True (agent@2 across process boundary)
+[agent:2] forked 64 handles in 544.8ms (O(name) each); 8 decoded together in 0.35s, 8 distinct continuations
+[agent:2] mutate(decay 0.2): continuation changed=True, parent still exact=True, provenance='decay'<-agent@2
+[agent] both phases green: state survived a real process restart.
+--- demo agent: exit 0 ---
+--- demo parity ---
+/home/xiaol/X/HRM-Text/.venv/lib/python3.12/site-packages/fla/layers/rwkv7.py:148: UserWarning: According to Bo, you are using a potentially buggy FLA implementation of RWKV. If you plan to report any numbers based on this implementation, we strongly recommend cross-checking with the official repo: https://github.com/BlinkDL/RWKV-LM. Bo may disagree with results reported from this version.
+  warnings.warn(
+
+Loading weights:   0%|          | 0/399 [00:00<?, ?it/s]
+Loading weights: 100%|██████████| 399/399 [00:00<00:00, 18836.91it/s]
+[transformers] `use_return_dict` is deprecated! Use `return_dict` instead!
+In file included from /home/xiaol/.local/share/uv/python/cpython-3.12.13-linux-x86_64-gnu/include/python3.12/Python.h:12,
+                 from /tmp/tmpjecb3zqp/__triton_launcher.c:7:
+/home/xiaol/.local/share/uv/python/cpython-3.12.13-linux-x86_64-gnu/include/python3.12/pyconfig.h:1877:9: warning: ‘_POSIX_C_SOURCE’ redefined
+ 1877 | #define _POSIX_C_SOURCE 200809L
+      |         ^~~~~~~~~~~~~~~
+In file included from /usr/include/x86_64-linux-gnu/bits/libc-header-start.h:33,
+                 from /usr/include/stdlib.h:26,
+                 from /home/xiaol/X/HRM-Text/.venv/lib/python3.12/site-packages/triton/backends/nvidia/include/cuda.h:56,
+                 from /tmp/tmpjecb3zqp/__triton_launcher.c:2:
+/usr/include/features.h:319:10: note: this is the location of the previous definition
+  319 | # define _POSIX_C_SOURCE        202405L
+      |          ^~~~~~~~~~~~~~~
+[parity] 8 rollouts x 64 tokens: max|dlogprob|=1.38e-01 mean=1.99e-02 rollouts within 5e-3 everywhere: 0/8
+[parity] server path = chunked prefill + fused_recurrent decode; trainer path = one chunk_rwkv7 forward (use_cache=False). Same fla kernels, bf16 activations — residual diff is accumulation order.
+--- demo parity: exit 0 ---
+=== M3 run complete rc=0 2026-07-06T23:32:46.668092 ===

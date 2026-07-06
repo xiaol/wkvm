@@ -23,6 +23,8 @@ Full-attention layers in hybrid models (Qwen3-Next / Kimi-Linear class) run in a
 
 ## Status
 
+**M3 — the Durable State API is real and measured** (`experiments/results/m3_results.md`): named/versioned/forkable/**mutable** state handles over a tiered StateStore (GPU slot / pinned host / NVMe safetensors) with `/v1/states`. Demos on one 4090: 2000 hibernated sessions at 2.29 MiB each resuming in **p50 8.2ms / p99 9.5ms** (16/16 exactness); an agent session surviving a **real process restart bit-exactly**, forked 64× at 8.5ms/fork, and mutated (`decay`) with recorded provenance while its parent stays intact — the operation prefix-keyed caches cannot represent. Trainer/server logprob drift quantified honestly (mean 2e-2 at bf16 across fused-vs-chunked paths; trainer-identical chunked rescoring available by construction).
+
 **M2**: the engine serves RWKV-7 end to end — no-phases scheduler driving FLA-kernel decode from arena state slots, continuous batching (batch-vs-sequential token-identical), per-batch-bucket CUDA graphs, 8.1k tok/s at B=256 on a 4090 (1.5B). Plus a measured PoC of **recurrent mode** for transformers on gemma-4-E4B (constant footprint + segmented state bank; needle recall to 32k). See [`docs/COMPARISON.md`](docs/COMPARISON.md) for head-to-head numbers vs vLLM, SGLang, and Albatross on the same GPU, and `experiments/results/` for all raw tables.
 
 ```bash

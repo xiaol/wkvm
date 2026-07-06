@@ -191,3 +191,79 @@ class Engine:
         return sample_token(
             logits, self._params[req.req_id], self._generators[req.req_id]
         )
+
+    # -- durable state (M3) ---------------------------------------------------
+
+    def attach_store(self, store_dir) -> None:
+        """Create the StateStore and wire snapshot-on-finish."""
+        from wkvm.store import StateStore
+
+        self.store = StateStore(self.bank, store_dir)
+        self._save_on_finish: dict[str, str] = {}
+        self._finish_handles: dict[str, str] = {}
+        self.scheduler.on_finish = self._snapshot_on_finish
+
+    def _snapshot_on_finish(self, req: Request) -> None:
+        name = self._save_on_finish.pop(req.req_id, None)
+        if name is not None:
+            self._finish_handles[req.req_id] = self.store.save(
+                name,
+                req.slots,
+                num_computed_tokens=req.num_computed_tokens,
+                token_ids=req.prompt_token_ids + req.output_token_ids,
+            )
+
+    def save_on_finish(self, req_id: str, name: str) -> None:
+        """Arm an automatic snapshot for when this request finishes."""
+        self._save_on_finish[req_id] = name
+
+    def snapshot_request(self, req_id: str, name: str) -> str:
+        """Snapshot a RUNNING request's state as-of-now; it keeps running."""
+        req = self.scheduler.requests[req_id]
+        if not req.slots:
+            raise ValueError(f"{req_id} holds no slots (not running)")
+        # Full known-token list; it may exceed num_computed_tokens (a sampled
+        # but unfed token, or an unprefilled remainder) — that surplus IS the
+        # schedulable gap a resume starts from.
+        return self.store.save(
+            name,
+            req.slots,
+            num_computed_tokens=req.num_computed_tokens,
+            token_ids=req.prompt_token_ids + req.output_token_ids,
+        )
+
+    def hibernate(self, req_id: str, name: str) -> str:
+        """Snapshot a running session and release its slot."""
+        handle = self.snapshot_request(req_id, name)
+        self.abort_request(req_id)
+        return handle
+
+    def submit_from_handle(
+        self,
+        handle: str,
+        suffix_tokens: list[int] | None = None,
+        max_new_tokens: int = 128,
+        params: SamplingParams = SamplingParams(),
+    ) -> Request:
+        """Resume a stored state as a live request.
+
+        The record's token list may run one past its computed count (a
+        sampled-but-unfed token); together with any suffix that gap is what
+        the scheduler sees — resume needs no special path in the loop."""
+        slots = self.arena.allocate()
+        try:
+            record = self.store.load(handle, slots)
+            tokens = list(record.token_ids) + list(suffix_tokens or [])
+            if len(tokens) <= record.num_computed_tokens:
+                raise ValueError(f"{handle}: nothing to schedule (add suffix tokens)")
+        except Exception:
+            self.arena.free(slots)
+            raise
+        req = Request(prompt_token_ids=tokens, max_new_tokens=max_new_tokens)
+        req.num_computed_tokens = record.num_computed_tokens
+        self.scheduler.add_resumed_request(req, slots)
+        self._params[req.req_id] = params
+        self._generators[req.req_id] = make_generator(params, self.runner.device)
+        return req
+
+    resume = submit_from_handle
