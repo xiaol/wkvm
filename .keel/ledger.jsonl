@@ -1,0 +1,19 @@
+{"type": "init", "profile": "default", "ts": "2026-07-07T00:25:57"}
+{"type": "goal", "text": "Prove where/how much recurrent mode hurts transformer quality: full-KV vs ring vs ring+bank on gemma-4-E4B, depth-stratified synthetic grid + position-resolved NLL", "ts": "2026-07-07T00:25:57"}
+{"type": "phase", "pid": "p1", "title": "Build quality_eval.py harness (grid + nll subcommands, 3 modes, smoke mode)", "check": "cd /home/xiaol/X/wkvm && HF_HUB_OFFLINE=1 /home/xiaol/X/HRM-Text/.venv/bin/python experiments/quality_eval.py grid --smoke 2>&1 | grep -q GRID_OK", "ts": "2026-07-07T00:25:57"}
+{"type": "phase", "pid": "p2", "title": "Run depth-stratified synthetic grid (needle single/multi-key/aggregation x ctx 8k/16k/32k x depth bins x modes)", "check": "grep -c '^| ' experiments/results/quality_grid.md | awk '{exit !($1>=30)}'", "ts": "2026-07-07T00:25:57"}
+{"type": "phase", "pid": "p3", "title": "Position-resolved NLL on natural long docs, 3 modes, position-binned deltas", "check": "grep -q NLL_CURVE_OK experiments/results/quality_nll.md", "ts": "2026-07-07T00:25:57"}
+{"type": "phase", "pid": "p4", "title": "Analysis doc + COMPARISON update + commit/push", "check": "cd /home/xiaol/X/wkvm && git log --oneline -1 | grep -qi 'quality' && test -f docs/RECURRENT_MODE_QUALITY.md", "ts": "2026-07-07T00:25:57"}
+{"type": "claim", "pid": "p1", "agent": "poc-agent", "ts": "2026-07-07T00:27:18"}
+{"type": "finding", "text": "smoke preview: with NON-repetitive filler, banked mode already misses the evicted-depth needle at ctx2048/depth0.2 (ring also 0.00, full 1.00; in-ring depth 0.8 all modes 1.00). PoC-2's 18/18 recall was flattered by repetitive filler as suspected.", "ts": "2026-07-07T00:33:33"}
+{"type": "phase_status", "pid": "p1", "status": "done", "ts": "2026-07-07T00:33:58"}
+{"type": "check_result", "pid": "p1", "ok": true, "code": 0, "tail": "", "ts": "2026-07-07T00:33:58"}
+{"type": "claim", "pid": "p2", "agent": "poc-agent", "ts": "2026-07-07T00:33:58"}
+{"type": "finding", "text": "grid done, 45 rows: full=1.00 on t1/t2 everywhere incl 32k(chunk1024, no OOM), t3~0.83 (model's own aggregation ceiling). ring=0.00 at every evicted depth, recalls only in-ring (8k depth0.9). banked with honest non-repetitive filler: t1 recovers well but imperfect (0.33-1.00, mean~0.75), t2 collapses at 16k/32k mid depths (0.00 at 16k depths 0.1-0.7; distractor facts compete for rep slots through merge chain), t3 worst (0.00-0.67). One inversion: t3@8k depth0.9 banked 0.17 < ring 0.50.", "ts": "2026-07-07T00:48:45"}
+{"type": "phase_status", "pid": "p2", "status": "done", "ts": "2026-07-07T00:48:45"}
+{"type": "check_result", "pid": "p2", "ok": true, "code": 0, "tail": "", "ts": "2026-07-07T00:48:45"}
+{"type": "claim", "pid": "p3", "agent": "poc-agent", "ts": "2026-07-07T00:48:45"}
+{"type": "finding", "text": "nll done, 6 docs x 16k (2 tex, 2 md, 2 py): bins 0-2k exact (delta 0.0000, chunked-eviction granularity makes divergence start at 2k). ring delta vs full grows +0.32@2-3k to +0.81@15-16k (peak +1.36@12-13k, high per-doc std 0.38-0.83). banked recovers only ~0.05-0.13 nats of the ring gap everywhere (e.g. +0.61 vs +0.74 @4-5k) - the bank helps targeted recall, barely helps general LM. NO NLL@8k-style inversion on natural text: both lossy modes strictly worse than full past the window, confirming PoC-2's ppl inversion was repetitive-filler artifact.", "ts": "2026-07-07T00:50:34"}
+{"type": "phase_status", "pid": "p3", "status": "done", "ts": "2026-07-07T00:50:34"}
+{"type": "check_result", "pid": "p3", "ok": true, "code": 0, "tail": "", "ts": "2026-07-07T00:50:34"}
+{"type": "phase_status", "pid": "p4", "status": "in_progress", "ts": "2026-07-07T00:53:18"}
