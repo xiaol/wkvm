@@ -48,6 +48,20 @@ Three findings:
 
 Remaining gaps for the learned path (RWKV-MS sidecar) to close: t2's 0.51-vs-1.00 residue and the +0.3–1.4-nat NLL band. The tradeoff ledger for routed-value-m64: same flat footprint class (~4.5 extra MiB/slot for 576 vs 128 pseudo-slots on 4 layers), one online-clustering pass per evicted chunk, zero training.
 
+## Update 2026-07-07 (2): t2 diagnosed by trace, then fixed — span-atomic routing
+
+Before fixing t2's 0.51, we instrumented it (`experiments/t2_trace.py`, results in `t2_trace*.md`): per failed fact, which slots its tokens landed in, whether its answer reps survived, and the attention mass they won. Verdict — **92% of failures were binding scatter** (per-token routing tears the 5–6-token code across slots; name/answer co-location broken in 86% of all evicted facts), 8% sibling eviction, **0% readout** (surviving reps always won attention — but partial reps produced confident hallucinations like `AURORA-001`). Diagnose-then-fix beat guessing: the readout stage we might have "fixed" was never broken.
+
+**The fix (`routed-span-m64`, still training-free):** route sentence-spans as indivisible units — assigned by their *most-novel token's value* (span means re-collided all eight template facts into one slot; the re-trace caught that in one iteration) — plus greedy farthest-point span retention with a near-duplicate floor so redundant filler can't consume slot budget.
+
+| mode | t1 | t2 | t3 | overall (full = 0.95) |
+|---|---|---|---|---|
+| banked (temporal) | 0.80 | 0.33 | 0.21 | 0.45 |
+| routed-value-m64 | 1.00 | 0.51 | 0.86 | 0.79 |
+| **routed-span-m64** | **1.00** | **0.89** (0.93 @16k/32k) | 0.81 | **0.90** |
+
+Honest notes: t3 dips 0.86→0.81 (sentence granularity slightly hurts scattered single-item lists); NLL unchanged (still a retrieval device); the span bank costs ~88 MiB/slot at 32k vs the ring's 36 — bounded (ceiling 64 slots × 145 tokens) but no longer tiny. The re-traced residue (all 5 remaining failures) is **evicted-by-sibling under slot budget** — genuinely similar facts overflowing one slot's 144 tokens — zero scatter, zero readout. That residue is exactly what a slot-paging tier (spill hot slots' full KV to pinned host, page in on demand) removes, and now it has a price tag: it buys the last 0.11 of t2 and nothing else.
+
 ## Method notes (for reuse)
 
 Three modes share one harness; everything batch-1 (bf16 batch-shape flips excluded); synthetics generated from the tokenizer with varied natural-ish filler; NLL is teacher-forced with the cache evolving exactly as in generation, binned per 1k positions with per-doc std; the `NLL_CURVE_OK` marker is emitted only after the pre-eviction exactness gate passes (bins 0–2k within 1e-3). Ledger: `.keel/ledger.jsonl` (findings e8/e12/e16 record the filler-artifact discovery and grid/NLL provenance).

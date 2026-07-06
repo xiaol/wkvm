@@ -54,11 +54,37 @@ def parse_mode(mode, chunk=2048):
     for p in parts[1:]:
         if p in ("key", "resid", "value"):
             cfg.route_on = p
+        elif p == "span":  # span-atomic routing + diversity retention (p9)
+            cfg.span = True
+            cfg.route_on = "value"
         elif p.startswith("m") and p[1:].isdigit():
             cfg.m_slots = int(p[1:])
         else:
             raise ValueError(f"bad mode suffix {p!r} in {mode!r}")
     return base, cfg
+
+
+_BREAK_CACHE = {}
+
+
+def break_mask_for(tok, ids):
+    """Sentence-break mask per token position (token decodes to .!?/newline)."""
+    mask = []
+    for tid in ids:
+        b = _BREAK_CACHE.get(tid)
+        if b is None:
+            b = any(c in tok.decode([tid]) for c in ".!?\n")
+            _BREAK_CACHE[tid] = b
+        mask.append(b)
+    return mask
+
+
+def prepare_cache(model, tok, mode, ids, chunk=2048):
+    base, cfg = parse_mode(mode, chunk)
+    cache = P.build_cache(model, base, cfg)
+    if getattr(cfg, "span", False):
+        P.set_span_break_mask(cache, break_mask_for(tok, ids))
+    return cache
 
 
 # --------------------------------------------------------------------------- #
@@ -162,7 +188,9 @@ def task_t2(tok, rng, ctx, depth):
     ins = [(int(d * (budget - 64)), f"The code for project {n} is {values[n]}. ")
            for n, d in zip(_NAMES, fact_depths)]
     mid = build_middle(tok, rng, budget, ins)
-    return assemble_prompt(tok, mid, query), (lambda out: float(values[name] in out)), 32
+    scorer = lambda out: float(values[name] in out)
+    scorer.meta = dict(values=values, target=name, facts=[t for _, t in ins])
+    return assemble_prompt(tok, mid, query), scorer, 32
 
 
 def task_t3(tok, rng, ctx, depth):
@@ -187,8 +215,7 @@ TASKS = [("t1-needle", task_t1), ("t2-multikey", task_t2), ("t3-aggregate", task
 # --------------------------------------------------------------------------- #
 @torch.inference_mode()
 def gen_answer(model, tok, prompt, mode, gen_len, chunk):
-    base, cfg = parse_mode(mode, chunk)
-    cache = P.build_cache(model, base, cfg)
+    cache = prepare_cache(model, tok, mode, prompt[0].tolist(), chunk)
     logits = P.chunked_prefill(model, cache, prompt, chunk)
     first = logits[:, -1].argmax(dim=-1, keepdim=True)
     rest, _ = P.greedy_decode(model, cache, first, gen_len - 1)
@@ -372,8 +399,7 @@ def run_nll(model, tok, args):
     for dname, used, ids_list in docs:
         ids = torch.tensor([ids_list], dtype=torch.long)
         for mode in modes:
-            base, cfg = parse_mode(mode)
-            cache = P.build_cache(model, base, cfg)
+            cache = prepare_cache(model, tok, mode, ids_list)
             t0 = time.perf_counter()
             nll = per_token_nll(model, cache, ids, chunk=2048)
             P.free_cache(cache)

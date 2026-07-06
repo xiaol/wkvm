@@ -323,12 +323,14 @@ class RoutedBankLayer(SinkRingLayer):
     """
 
     def __init__(self, sink=16, window=1024, m_slots=16, reps=8, route_on="resid",
-                 momentum=0.9, route_chunk=256, coord=None, is_leader=True):
+                 momentum=0.9, route_chunk=256, coord=None, is_leader=True, trace=False):
         super().__init__(sink, window)
         self.m_slots, self.reps, self.route_on = int(m_slots), int(reps), route_on
         self.momentum, self.route_chunk = momentum, int(route_chunk)
         self.coord, self.is_leader = coord, is_leader
         self._op_cursor = 0
+        self.trace = trace
+        self._evicted = 0  # tokens routed so far; n-th evicted token has abs pos sink+n
 
     _decide = BankedRingLayer._decide  # leader logs decisions, followers replay
 
@@ -349,6 +351,10 @@ class RoutedBankLayer(SinkRingLayer):
         self._cent = None
         self._scores = [None] * M
         self._gmean, self._gcnt = None, 0
+        # diagnostics: absolute positions of kept reps per slot; full routed-token
+        # assignment log kept only when trace=True
+        self._rep_pos = [[] for _ in range(M)]
+        self._assign_chunks = []
 
     def _route_decisions(self, cut_k, cut_v):
         """Leader: features -> centroid init/EMA -> assignments + rep keeps."""
@@ -392,6 +398,10 @@ class RoutedBankLayer(SinkRingLayer):
     def _route_fold(self, cut_k, cut_v):
         _, assign, keeps = self._decide(
             "route", lambda: self._route_decisions(cut_k, cut_v))
+        abs_start = self.sink + self._evicted
+        self._evicted += cut_k.shape[2]
+        if self.trace:
+            self._assign_chunks.append((abs_start, list(assign)))
         assign = torch.tensor(assign, device=self.device)
         for s in keeps:
             tok_idx = (assign == s).nonzero()[:, 0]
@@ -407,6 +417,31 @@ class RoutedBankLayer(SinkRingLayer):
             # every layer, so the leader's keep-indices transfer directly
             self._slot_rk[s] = cand_k[:, :, keep]
             self._slot_rv[s] = cand_v[:, :, keep]
+            cand_pos = self._rep_pos[s] + [abs_start + int(i) for i in tok_idx.tolist()]
+            self._rep_pos[s] = [cand_pos[j] for j in keeps[s]]
+
+    def assignment_of(self, pos: int):
+        """Trace helper: slot the evicted token at absolute `pos` was routed to
+        (None if in sink/pending/ring, or if trace was off)."""
+        for abs_start, assign in self._assign_chunks:
+            if abs_start <= pos < abs_start + len(assign):
+                return assign[pos - abs_start]
+        return None
+
+    def slot_layout(self):
+        """Trace helper: (kind, slot, abs_pos) per materialized KV index, taken
+        from the CURRENT stored state (call before the query-token forward)."""
+        out = [("sink", None, p) for p in range(self._sink_k.shape[2])]
+        for s in range(self.m_slots):
+            if self._slot_cnt[s] > 0:
+                out.append(("slot_mean", s, None))
+                out += [("slot_rep", s, p) for p in self._rep_pos[s]]
+        pend_start = self.sink + self._evicted
+        out += [("pending", None, pend_start + i) for i in range(self._pend_k.shape[2])]
+        ring_len = self._ring_k.shape[2]
+        out += [("ring", None, self.cumulative_length - ring_len + i)
+                for i in range(ring_len)]
+        return out
 
     def _materialize(self):
         parts_k, parts_v = [self._sink_k], [self._sink_v]
@@ -458,6 +493,251 @@ class RoutedBankLayer(SinkRingLayer):
         raise NotImplementedError("RoutedBankLayer does not support batch replication")
 
 
+class RoutedSpanLayer(RoutedBankLayer):
+    """p9 fixes over RoutedBankLayer, guided by the p8 trace (92% of t2 failures
+    were route-SCATTER: per-token routing tears multi-token facts apart).
+
+    f1 SPAN-ATOMIC ROUTING: evicted tokens are grouped into contiguous spans
+    split at sentence punctuation (break mask supplied by the harness via
+    `break_mask`, since the cache layer never sees token ids; fallback: fixed
+    24-token spans). Each span is routed as one unit by its mean VALUE vector
+    (RoPE-free — the e38/e44 finding), so a fact's name and code always land in
+    the same slot.
+
+    f2 WITHIN-SLOT DIVERSITY RETENTION: per-slot span retention is greedy
+    farthest-point selection in value-feature space under a token budget, so
+    sibling facts sharing a slot stop evicting each other.
+
+    Slots activate lazily: farthest-point init over the first chunk's spans;
+    while capacity remains, a span whose best centroid cosine < novelty_thresh
+    opens a fresh slot (needed because the first chunk may hold fewer spans
+    than M). Chunks are routed only up to the last sentence break; the partial
+    tail stays in pending (attended exactly) until its sentence completes.
+    """
+
+    def __init__(self, *args, span_budget=144, max_span=48, novelty_thresh=0.85,
+                 fallback_span=24, dup_floor=0.10, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.span_budget, self.max_span = int(span_budget), int(max_span)
+        self.novelty_thresh, self.fallback_span = novelty_thresh, int(fallback_span)
+        # Near-duplicate floor: greedy selection stops adding a candidate whose
+        # min feature-distance to the kept set is below this, so redundant
+        # filler never consumes budget and the (large) span_budget is spent
+        # only in slots whose content is genuinely diverse — e.g. the one slot
+        # where all template-sharing facts collide. Capacity self-allocates by
+        # content diversity instead of uniformly per slot.
+        self.dup_floor = dup_floor
+        self.break_mask = None  # list[bool] per prompt position, set by harness
+
+    def lazy_initialization(self, key_states, value_states):
+        super().lazy_initialization(key_states, value_states)
+        self._slot_spans = [[] for _ in range(self.m_slots)]  # dicts: k,v,pos,feat
+        self._n_active = 0
+
+    # ---- leader-side decisions ------------------------------------------- #
+    def _split_spans(self, abs_start, T):
+        """Span boundaries [start, end) relative to the chunk; returns
+        (spans, n_routed) where tokens >= n_routed stay pending."""
+        bm = self.break_mask
+        breaks = []
+        for i in range(T):
+            p = abs_start + i
+            if bm is not None and p < len(bm):
+                if bm[p]:
+                    breaks.append(i)
+            elif (i + 1) % self.fallback_span == 0:
+                breaks.append(i)
+        if not breaks:  # no sentence structure: fixed spans, route everything
+            spans = [(a, min(a + self.fallback_span, T))
+                     for a in range(0, T, self.fallback_span)]
+            return spans, T
+        n_routed = breaks[-1] + 1
+        spans, start = [], 0
+        for b in breaks:
+            end = b + 1
+            while end - start > self.max_span:  # safety split of run-ons
+                spans.append((start, start + self.max_span))
+                start += self.max_span
+            spans.append((start, end))
+            start = end
+        return spans, n_routed
+
+    def _span_feats(self, cut_v, spans):
+        """Span routing feature = value vector of the span's most globally-novel
+        token. Span MEANS wash out the one distinguishing token of template
+        sentences (verified: all 8 t2 fact spans then collide in 1-2 slots and
+        evict each other); the most-novel token is exactly the code/name that
+        must separate them."""
+        F = torch.nn.functional
+        vf = cut_v[0].permute(1, 0, 2).reshape(cut_v.shape[2], -1).float()
+        m = vf.mean(0)
+        tot = self._gcnt + vf.shape[0]
+        self._gmean = m if self._gmean is None else \
+            (self._gmean * self._gcnt + m * vf.shape[0]) / tot
+        self._gcnt = tot
+        nov = 1.0 - F.cosine_similarity(vf, self._gmean.unsqueeze(0), dim=-1)
+        feats = torch.stack([vf[a + int(nov[a:b].argmax())] for a, b in spans])
+        return F.normalize(feats, dim=-1)
+
+    def _route_decisions_span(self, cut_k, cut_v):
+        F = torch.nn.functional
+        abs_start = self.sink + self._evicted
+        spans, n_routed = self._split_spans(abs_start, cut_k.shape[2])
+        feats = self._span_feats(cut_v, spans)
+        if self._cent is None:  # farthest-point init over available spans
+            n0 = min(self.m_slots, feats.shape[0])
+            chosen = [feats[0]]
+            sims = feats @ feats[0]
+            for _ in range(n0 - 1):
+                nxt = int(sims.argmin())
+                chosen.append(feats[nxt])
+                sims = torch.maximum(sims, feats @ feats[nxt])
+            self._cent = torch.zeros(self.m_slots, feats.shape[1],
+                                     device=feats.device)
+            self._cent[:n0] = torch.stack(chosen)
+            self._n_active = n0
+        assign = []
+        for j in range(feats.shape[0]):
+            sims = feats[j] @ F.normalize(self._cent[: self._n_active], dim=-1).T
+            best = int(sims.argmax())
+            if float(sims[best]) < self.novelty_thresh and self._n_active < self.m_slots:
+                best = self._n_active  # open a fresh slot for novel content
+                self._cent[best] = feats[j]
+                self._n_active += 1
+            else:
+                self._cent[best] = self.momentum * self._cent[best] + \
+                    (1 - self.momentum) * feats[j]
+            assign.append(best)
+        # f2: per-slot greedy farthest-point retention under token budget
+        keeps, self._pending_feats = {}, {}
+        for s in set(assign):
+            old = self._slot_spans[s]
+            cand_feats = [sp["feat"] for sp in old] + \
+                [feats[j] for j in range(len(spans)) if assign[j] == s]
+            cand_len = [sp["k"].shape[2] for sp in old] + \
+                [b - a for j, (a, b) in enumerate(spans) if assign[j] == s]
+            X = torch.stack(cand_feats)
+            first = int((1.0 - X @ F.normalize(X.mean(0), dim=-1)).argmax())
+            sel, used = [first], cand_len[first]
+            mind = 1.0 - X @ X[first]
+            while used < self.span_budget:
+                mind[torch.tensor(sel)] = -1
+                nxt = int(mind.argmax())
+                if float(mind[nxt]) < self.dup_floor or \
+                        used + cand_len[nxt] > self.span_budget:
+                    break
+                sel.append(nxt)
+                used += cand_len[nxt]
+                mind = torch.minimum(mind, 1.0 - X @ X[nxt])
+            keeps[s] = sorted(sel)
+            self._pending_feats[s] = [cand_feats[j] for j in keeps[s]]
+        return spans, assign, keeps, n_routed
+
+    # ---- shared apply path ------------------------------------------------ #
+    def _route_fold(self, cut_k, cut_v):
+        op = self._decide("route_span",
+                          lambda: self._route_decisions_span(cut_k, cut_v))
+        _, spans, assign, keeps, n_routed = op
+        abs_start = self.sink + self._evicted
+        self._evicted += n_routed
+        if self.trace:
+            tok_assign = [None] * n_routed
+            for j, (a, b) in enumerate(spans):
+                for i in range(a, b):
+                    tok_assign[i] = assign[j]
+            self._assign_chunks.append((abs_start, tok_assign))
+        for s in keeps:
+            new_spans = []
+            for j, (a, b) in enumerate(spans):
+                if assign[j] == s:
+                    new_spans.append(dict(
+                        k=cut_k[:, :, a:b], v=cut_v[:, :, a:b],
+                        pos=list(range(abs_start + a, abs_start + b)), feat=None))
+                    n_new = b - a
+                    cnt = self._slot_cnt[s]
+                    self._slot_mk[:, :, s] = (self._slot_mk[:, :, s] * cnt +
+                                              cut_k[:, :, a:b].float().sum(2)) / (cnt + n_new)
+                    self._slot_mv[:, :, s] = (self._slot_mv[:, :, s] * cnt +
+                                              cut_v[:, :, a:b].float().sum(2)) / (cnt + n_new)
+                    self._slot_cnt[s] = cnt + n_new
+            cand = self._slot_spans[s] + new_spans
+            self._slot_spans[s] = [cand[j] for j in keeps[s]]
+            if self.is_leader or self.coord is None:
+                for sp, f in zip(self._slot_spans[s], self._pending_feats[s]):
+                    sp["feat"] = f
+            self._rep_pos[s] = [p for sp in self._slot_spans[s] for p in sp["pos"]]
+        return n_routed
+
+    def _materialize(self):
+        parts_k, parts_v = [self._sink_k], [self._sink_v]
+        for s in range(self.m_slots):
+            if self._slot_cnt[s] > 0:
+                parts_k.append(self._slot_mk[:, :, s : s + 1].to(self.dtype))
+                parts_v.append(self._slot_mv[:, :, s : s + 1].to(self.dtype))
+                for sp in self._slot_spans[s]:
+                    parts_k.append(sp["k"])
+                    parts_v.append(sp["v"])
+        parts_k += [self._pend_k, self._ring_k]
+        parts_v += [self._pend_v, self._ring_v]
+        self.keys = torch.cat([p for p in parts_k if p.numel()], dim=2)
+        self.values = torch.cat([p for p in parts_v if p.numel()], dim=2)
+
+    def slot_layout(self):
+        out = [("sink", None, p) for p in range(self._sink_k.shape[2])]
+        for s in range(self.m_slots):
+            if self._slot_cnt[s] > 0:
+                out.append(("slot_mean", s, None))
+                out += [("slot_rep", s, p)
+                        for sp in self._slot_spans[s] for p in sp["pos"]]
+        pend_start = self.sink + self._evicted
+        out += [("pending", None, pend_start + i) for i in range(self._pend_k.shape[2])]
+        ring_len = self._ring_k.shape[2]
+        out += [("ring", None, self.cumulative_length - ring_len + i)
+                for i in range(ring_len)]
+        return out
+
+    def n_bank_slots(self) -> int:
+        return sum(1 + sum(sp["k"].shape[2] for sp in self._slot_spans[s])
+                   for s in range(self.m_slots) if self._slot_cnt[s] > 0)
+
+    def update(self, key_states, value_states, *args, **kwargs):
+        if not self.is_initialized:
+            self.lazy_initialization(key_states, value_states)
+        assert key_states.shape[0] == 1, "RoutedSpanLayer is B=1 (PoC quality path)"
+        ret_k = torch.cat([self.keys, key_states], dim=-2) if self.keys.numel() else key_states
+        ret_v = torch.cat([self.values, value_states], dim=-2) if self.values.numel() else value_states
+        self.cumulative_length += key_states.shape[-2]
+
+        rk = torch.cat([self._ring_k, key_states], dim=2)
+        rv = torch.cat([self._ring_v, value_states], dim=2)
+        deficit = self.sink - self._sink_k.shape[2]
+        if deficit > 0:
+            take = min(deficit, rk.shape[2])
+            self._sink_k = torch.cat([self._sink_k, rk[:, :, :take]], dim=2)
+            self._sink_v = torch.cat([self._sink_v, rv[:, :, :take]], dim=2)
+            rk, rv = rk[:, :, take:], rv[:, :, take:]
+        if rk.shape[2] > self.window:
+            cut = rk.shape[2] - self.window
+            self._pend_k = torch.cat([self._pend_k, rk[:, :, :cut]], dim=2)
+            self._pend_v = torch.cat([self._pend_v, rv[:, :, :cut]], dim=2)
+            rk, rv = rk[:, :, cut:], rv[:, :, cut:]
+        self._ring_k, self._ring_v = rk, rv
+        if self._pend_k.shape[2] >= self.route_chunk:
+            n = self._route_fold(self._pend_k, self._pend_v)
+            self._pend_k = self._pend_k[:, :, n:]
+            self._pend_v = self._pend_v[:, :, n:]
+        self._materialize()
+        return ret_k, ret_v
+
+
+def set_span_break_mask(cache, mask):
+    """Attach a sentence-break mask (list[bool] per prompt position) to all
+    RoutedSpanLayers of a cache (leader reads it for span splitting)."""
+    for layer in cache.layers:
+        if isinstance(layer, RoutedSpanLayer):
+            layer.break_mask = mask
+
+
 def build_cache(model, mode: str, args) -> DynamicCache:
     cfg = model.config.get_text_config(decoder=True)
     cache = DynamicCache(config=model.config)
@@ -475,11 +755,13 @@ def build_cache(model, mode: str, args) -> DynamicCache:
                     sink=args.sink, window=args.window, k_states=args.k_states,
                     seg=args.seg, reps=args.reps, coord=coord, is_leader=(j == 0))
             else:
-                cache.layers[i] = RoutedBankLayer(
+                cls = RoutedSpanLayer if getattr(args, "span", False) else RoutedBankLayer
+                cache.layers[i] = cls(
                     sink=args.sink, window=args.window,
                     m_slots=getattr(args, "m_slots", 16), reps=args.reps,
                     route_on=getattr(args, "route_on", "resid"),
-                    coord=coord, is_leader=(j == 0))
+                    coord=coord, is_leader=(j == 0),
+                    trace=getattr(args, "trace", False))
     return cache
 
 
