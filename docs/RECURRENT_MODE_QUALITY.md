@@ -29,6 +29,25 @@ Depth and context matter: t1 recovery is strong at 8k–16k and decays by 32k (0
 - **The path for the rest is learned, not clever**: these numbers are the training-free ceiling. The RWKV-MS sidecar (trained memory adapters, tau2 0.70 vs 0.20 base) is the credible route to closing the t2/t3/NLL gaps, and this harness is now the regression suite for it — same three conditions plus a fourth: `sidecar`.
 - The honest sales pitch stays what the physics supports: **10× session capacity at zero in-window cost and precisely-mapped out-of-window cost** — a trade the user chooses per workload with this document as the map, not a free lunch.
 
+## Update 2026-07-07: the training-free routed bank (SelectingMemory's idea, no learned parameters)
+
+Replacing the bank's *temporal* segmentation with *content* routing — online spherical clustering into M slots, centroids EMA-updated, decided at the leader layer and replayed downward — changes the recall picture substantially (full tables regenerated in `quality_grid.md`):
+
+| mode (evicted-depth recall) | t1 needle | t2 multi-key | t3 aggregate | overall (full = 0.95) |
+|---|---|---|---|---|
+| ring | 0.07 | 0.07 | 0.04 | 0.06 |
+| banked (temporal segments) | 0.80 | 0.33 | 0.21 | 0.45 |
+| routed-value, M=16 (matched budget) | 1.00 | 0.29 | 0.38 | 0.56 |
+| **routed-value, M=64** | **1.00** | **0.51** | **0.86** | **0.79** |
+
+Three findings:
+
+1. **The routing feature must be RoPE-free.** Raw-key and residual-key clustering are *position-contaminated* — post-RoPE keys cluster by position, not content, and at M=16 they score 0.00, worse than the temporal bank they replace. **Value vectors carry no RoPE and win outright** (0.625 vs 0.25/0.00 in the sweep). Most KV-compression work clusters keys; on RoPE models that is quietly broken, and this grid demonstrates it.
+2. **Allocation and capacity both contribute, and the comparison says how much.** At matched pseudo-slot budget (M=16 ≈ banked's 128 slots), content routing wins t1 (1.00 vs 0.80) and t3 (0.38 vs 0.21) but ties on t2 — the interference task also needs capacity (M=64, 576 max pseudo-slots, reaches 0.51 with 1.00 cells at 32k, and t3 0.86 ≈ the model's own full-attention ceiling).
+3. **NLL is unmoved** (+0.10 nats @2–3k → +0.84 @15–16k, ~0.1 better than banked early, converging deep): routing is a **retrieval device, not language-model repair** — consistent with everything else training-free in this document.
+
+Remaining gaps for the learned path (RWKV-MS sidecar) to close: t2's 0.51-vs-1.00 residue and the +0.3–1.4-nat NLL band. The tradeoff ledger for routed-value-m64: same flat footprint class (~4.5 extra MiB/slot for 576 vs 128 pseudo-slots on 4 layers), one online-clustering pass per evicted chunk, zero training.
+
 ## Method notes (for reuse)
 
 Three modes share one harness; everything batch-1 (bf16 batch-shape flips excluded); synthetics generated from the tokenizer with varied natural-ish filler; NLL is teacher-forced with the cache evolving exactly as in generation, binned per 1k positions with per-doc std; the `NLL_CURVE_OK` marker is emitted only after the pre-eviction exactness gate passes (bins 0–2k within 1e-3). Ledger: `.keel/ledger.jsonl` (findings e8/e12/e16 record the filler-artifact discovery and grid/NLL provenance).

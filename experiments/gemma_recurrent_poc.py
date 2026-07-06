@@ -298,10 +298,170 @@ class BankedRingLayer(SinkRingLayer):
         raise NotImplementedError("BankedRingLayer does not support batch replication")
 
 
+class RoutedBankLayer(SinkRingLayer):
+    """Training-free ROUTED bank (SelectingMemory/Raven idea, zero learned params).
+
+    Instead of temporal segments (BankedRingLayer), evicted tokens are routed to
+    M persistent slots by online spherical clustering of their features at the
+    LEADER layer (deep-layer keys smear — PoC-2 finding), with assignments and
+    rep-retention decisions replayed on follower layers via the same op-log.
+
+    Per slot: running mean-K/mean-V summary (fp32 accumulators) + up to `reps`
+    exact post-RoPE (K,V) representatives. A slot mixes tokens from arbitrary
+    positions — safe for the pseudo-KV readout, because exact reps carry their
+    own RoPE'd positions and the causal mask makes every cached slot visible;
+    nothing re-derives position from slot order.
+
+    Routing features (`route_on`): "key" = raw keys; "resid" = keys minus the
+    running global key mean (strips the shared syntactic-template component —
+    the known t2 risk); "value" = value vectors (no RoPE at all).
+    Assignment: cosine argmax to M centroids; touched centroids get an EMA
+    update (momentum 0.9); untouched slots never decay (the Raven property).
+    Init: deterministic farthest-point (k-means++-style) from the first evicted
+    chunk. Rep retention: keep the most centroid-DISTANT reps (novel within
+    slot); on overflow the least distant are dropped. No temporal merge.
+    """
+
+    def __init__(self, sink=16, window=1024, m_slots=16, reps=8, route_on="resid",
+                 momentum=0.9, route_chunk=256, coord=None, is_leader=True):
+        super().__init__(sink, window)
+        self.m_slots, self.reps, self.route_on = int(m_slots), int(reps), route_on
+        self.momentum, self.route_chunk = momentum, int(route_chunk)
+        self.coord, self.is_leader = coord, is_leader
+        self._op_cursor = 0
+
+    _decide = BankedRingLayer._decide  # leader logs decisions, followers replay
+
+    def lazy_initialization(self, key_states, value_states):
+        super().lazy_initialization(key_states, value_states)
+        B, H, _, D = key_states.shape
+        empty = lambda: torch.zeros(B, H, 0, D, dtype=self.dtype, device=self.device)
+        self._sink_k, self._sink_v = empty(), empty()
+        self._ring_k, self._ring_v = empty(), empty()
+        self._pend_k, self._pend_v = empty(), empty()
+        M = self.m_slots
+        self._slot_mk = torch.zeros(B, H, M, D, dtype=torch.float32, device=self.device)
+        self._slot_mv = torch.zeros_like(self._slot_mk)
+        self._slot_cnt = [0] * M
+        self._slot_rk = [None] * M
+        self._slot_rv = [None] * M
+        # leader-only routing state
+        self._cent = None
+        self._scores = [None] * M
+        self._gmean, self._gcnt = None, 0
+
+    def _route_decisions(self, cut_k, cut_v):
+        """Leader: features -> centroid init/EMA -> assignments + rep keeps."""
+        F = torch.nn.functional
+        T = cut_k.shape[2]
+        src = cut_v if self.route_on == "value" else cut_k
+        f = src[0].permute(1, 0, 2).reshape(T, -1).float()           # [T, H*D]
+        if self.route_on == "resid":
+            m = f.mean(0)
+            tot = self._gcnt + T
+            self._gmean = m if self._gmean is None else \
+                (self._gmean * self._gcnt + m * T) / tot
+            self._gcnt = tot
+            f = f - self._gmean
+        fn = F.normalize(f, dim=-1)
+        if self._cent is None:  # deterministic farthest-point init
+            assert T >= self.m_slots, "first evicted chunk smaller than M"
+            chosen = [fn[0]]
+            sims = fn @ fn[0]
+            for _ in range(self.m_slots - 1):
+                nxt = int(sims.argmin())
+                chosen.append(fn[nxt])
+                sims = torch.maximum(sims, fn @ fn[nxt])
+            self._cent = torch.stack(chosen)                         # [M, F]
+        assign = (fn @ F.normalize(self._cent, dim=-1).T).argmax(-1)  # [T]
+        touched = assign.unique().tolist()
+        for s in touched:  # EMA on touched slots only; untouched never decay
+            self._cent[s] = self.momentum * self._cent[s] + \
+                (1 - self.momentum) * f[assign == s].mean(0)
+        dist = 1.0 - (fn * F.normalize(self._cent, dim=-1)[assign]).sum(-1)  # [T]
+        keeps = {}
+        for s in touched:
+            tok_idx = (assign == s).nonzero()[:, 0]
+            old = self._scores[s]
+            cand = dist[tok_idx] if old is None else torch.cat([old, dist[tok_idx]])
+            keep = cand.topk(min(self.reps, cand.shape[0])).indices.sort().values
+            keeps[s] = keep.tolist()
+            self._scores[s] = cand[keep]
+        return assign.tolist(), keeps
+
+    def _route_fold(self, cut_k, cut_v):
+        _, assign, keeps = self._decide(
+            "route", lambda: self._route_decisions(cut_k, cut_v))
+        assign = torch.tensor(assign, device=self.device)
+        for s in keeps:
+            tok_idx = (assign == s).nonzero()[:, 0]
+            ks, vs = cut_k[:, :, tok_idx], cut_v[:, :, tok_idx]
+            n_new, cnt = tok_idx.numel(), self._slot_cnt[s]
+            self._slot_mk[:, :, s] = (self._slot_mk[:, :, s] * cnt + ks.float().sum(2)) / (cnt + n_new)
+            self._slot_mv[:, :, s] = (self._slot_mv[:, :, s] * cnt + vs.float().sum(2)) / (cnt + n_new)
+            self._slot_cnt[s] = cnt + n_new
+            cand_k = ks if self._slot_rk[s] is None else torch.cat([self._slot_rk[s], ks], dim=2)
+            cand_v = vs if self._slot_rv[s] is None else torch.cat([self._slot_rv[s], vs], dim=2)
+            keep = torch.tensor(keeps[s], device=self.device)
+            # candidate order is [old reps..., new tokens in chunk order] on
+            # every layer, so the leader's keep-indices transfer directly
+            self._slot_rk[s] = cand_k[:, :, keep]
+            self._slot_rv[s] = cand_v[:, :, keep]
+
+    def _materialize(self):
+        parts_k, parts_v = [self._sink_k], [self._sink_v]
+        for s in range(self.m_slots):
+            if self._slot_cnt[s] > 0:
+                parts_k.append(self._slot_mk[:, :, s : s + 1].to(self.dtype))
+                parts_v.append(self._slot_mv[:, :, s : s + 1].to(self.dtype))
+                parts_k.append(self._slot_rk[s])
+                parts_v.append(self._slot_rv[s])
+        parts_k += [self._pend_k, self._ring_k]
+        parts_v += [self._pend_v, self._ring_v]
+        self.keys = torch.cat([p for p in parts_k if p.numel()], dim=2)
+        self.values = torch.cat([p for p in parts_v if p.numel()], dim=2)
+
+    def n_bank_slots(self) -> int:
+        return sum(1 + self._slot_rk[s].shape[2]
+                   for s in range(self.m_slots) if self._slot_cnt[s] > 0)
+
+    def update(self, key_states, value_states, *args, **kwargs):
+        if not self.is_initialized:
+            self.lazy_initialization(key_states, value_states)
+        assert key_states.shape[0] == 1, "RoutedBankLayer is B=1 (PoC quality path)"
+        ret_k = torch.cat([self.keys, key_states], dim=-2) if self.keys.numel() else key_states
+        ret_v = torch.cat([self.values, value_states], dim=-2) if self.values.numel() else value_states
+        self.cumulative_length += key_states.shape[-2]
+
+        rk = torch.cat([self._ring_k, key_states], dim=2)
+        rv = torch.cat([self._ring_v, value_states], dim=2)
+        deficit = self.sink - self._sink_k.shape[2]
+        if deficit > 0:
+            take = min(deficit, rk.shape[2])
+            self._sink_k = torch.cat([self._sink_k, rk[:, :, :take]], dim=2)
+            self._sink_v = torch.cat([self._sink_v, rv[:, :, :take]], dim=2)
+            rk, rv = rk[:, :, take:], rv[:, :, take:]
+        if rk.shape[2] > self.window:
+            cut = rk.shape[2] - self.window
+            self._pend_k = torch.cat([self._pend_k, rk[:, :, :cut]], dim=2)
+            self._pend_v = torch.cat([self._pend_v, rv[:, :, :cut]], dim=2)
+            rk, rv = rk[:, :, cut:], rv[:, :, cut:]
+        self._ring_k, self._ring_v = rk, rv
+        if self._pend_k.shape[2] >= self.route_chunk:
+            pk, pv = self._pend_k, self._pend_v
+            self._pend_k, self._pend_v = pk[:, :, :0], pv[:, :, :0]
+            self._route_fold(pk, pv)
+        self._materialize()
+        return ret_k, ret_v
+
+    def batch_repeat_interleave(self, repeats: int):
+        raise NotImplementedError("RoutedBankLayer does not support batch replication")
+
+
 def build_cache(model, mode: str, args) -> DynamicCache:
     cfg = model.config.get_text_config(decoder=True)
     cache = DynamicCache(config=model.config)
-    if mode in ("ring", "banked"):
+    if mode in ("ring", "banked", "routed"):
         n_owned = cfg.num_hidden_layers - getattr(cfg, "num_kv_shared_layers", 0)
         ring_idx = [
             i for i in range(n_owned) if cfg.layer_types[i] == "full_attention"
@@ -310,10 +470,16 @@ def build_cache(model, mode: str, args) -> DynamicCache:
         for j, i in enumerate(ring_idx):
             if mode == "ring":
                 cache.layers[i] = SinkRingLayer(sink=args.sink, window=args.window)
-            else:
+            elif mode == "banked":
                 cache.layers[i] = BankedRingLayer(
                     sink=args.sink, window=args.window, k_states=args.k_states,
                     seg=args.seg, reps=args.reps, coord=coord, is_leader=(j == 0))
+            else:
+                cache.layers[i] = RoutedBankLayer(
+                    sink=args.sink, window=args.window,
+                    m_slots=getattr(args, "m_slots", 16), reps=args.reps,
+                    route_on=getattr(args, "route_on", "resid"),
+                    coord=coord, is_leader=(j == 0))
     return cache
 
 
@@ -1339,7 +1505,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("cmd", choices=["bench", "needle", "batch", "concurrency", "bank",
                                     "profile", "verify"])
-    ap.add_argument("--mode", choices=["full", "ring", "banked", "both"], default="both")
+    ap.add_argument("--mode", choices=["full", "ring", "banked", "routed", "both"],
+                    default="both")
     ap.add_argument("--attn", choices=["eager", "sdpa"], default="sdpa",
                     help="attention implementation (PoC-3 default: sdpa)")
     ap.add_argument("--legacy-decode", action="store_true",
@@ -1369,6 +1536,10 @@ def main():
     ap.add_argument("--select", choices=["shared", "per-layer"], default="shared",
                     help="representative selection: leader-layer shared indices "
                          "(default) or per-layer novelty")
+    ap.add_argument("--m-slots", type=int, default=16,
+                    help="routed mode: number of persistent bank slots")
+    ap.add_argument("--route-on", choices=["key", "resid", "value"], default="resid",
+                    help="routed mode: routing feature")
     ap.add_argument("--ctxs", type=int, nargs="*", default=None,
                     help="override bench context lengths")
     ap.add_argument("--model-path", default=None)

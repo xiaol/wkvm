@@ -34,13 +34,31 @@ import torch
 import gemma_recurrent_poc as P
 
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
-MODES = ["full", "ring", "banked"]
+DEFAULT_MODES = "full,ring,banked,routed"
 
 
 def make_cfg(chunk=2048):
-    """Cache/config namespace consumed by P.build_cache. Banked = PoC-2 default."""
+    """Cache/config namespace consumed by P.build_cache. Banked = PoC-2 default;
+    routed default = resid routing, M=16 (variant sweep in quality_grid.md)."""
     return SimpleNamespace(sink=16, window=1024, k_states=16, seg=256, reps=8,
-                           select="shared", chunk=chunk)
+                           select="shared", chunk=chunk, m_slots=16, route_on="resid")
+
+
+def parse_mode(mode, chunk=2048):
+    """Mode spec -> (base mode for build_cache, cfg). Routed variants encode
+    routing feature and slot count: e.g. 'routed-key-m64', 'routed-value-m16'."""
+    cfg = make_cfg(chunk)
+    parts = mode.split("-")
+    base = parts[0]
+    assert base in ("full", "ring", "banked", "routed"), f"bad mode {mode}"
+    for p in parts[1:]:
+        if p in ("key", "resid", "value"):
+            cfg.route_on = p
+        elif p.startswith("m") and p[1:].isdigit():
+            cfg.m_slots = int(p[1:])
+        else:
+            raise ValueError(f"bad mode suffix {p!r} in {mode!r}")
+    return base, cfg
 
 
 # --------------------------------------------------------------------------- #
@@ -169,8 +187,8 @@ TASKS = [("t1-needle", task_t1), ("t2-multikey", task_t2), ("t3-aggregate", task
 # --------------------------------------------------------------------------- #
 @torch.inference_mode()
 def gen_answer(model, tok, prompt, mode, gen_len, chunk):
-    cfg = make_cfg(chunk)
-    cache = P.build_cache(model, mode, cfg)
+    base, cfg = parse_mode(mode, chunk)
+    cache = P.build_cache(model, base, cfg)
     logits = P.chunked_prefill(model, cache, prompt, chunk)
     first = logits[:, -1].argmax(dim=-1, keepdim=True)
     rest, _ = P.greedy_decode(model, cache, first, gen_len - 1)
@@ -180,22 +198,17 @@ def gen_answer(model, tok, prompt, mode, gen_len, chunk):
     return tok.decode(ids[:cut], skip_special_tokens=True)
 
 
-def run_grid(model, tok, args):
-    smoke = args.smoke
-    ctxs = [2048] if smoke else [8192, 16384, 32768]
-    depths = [0.2, 0.8] if smoke else [0.1, 0.3, 0.5, 0.7, 0.9]
-    n_seeds = {"t1-needle": 1 if smoke else 3,
-               "t2-multikey": 1 if smoke else 3,
-               "t3-aggregate": 1}
+def grid_cells(model, tok, modes, ctxs, depths, n_seeds, tasks=TASKS):
+    """Shared cell runner: returns rows of {ctx, task, depth, <mode scores>}."""
     rows = []
     for ctx in ctxs:
-        for tname, tfn in TASKS:
+        for tname, tfn in tasks:
             for depth in depths:
-                cell = {m: [] for m in MODES}
+                cell = {m: [] for m in modes}
                 for seed in range(n_seeds[tname]):
                     rng = random.Random(f"{ctx}/{tname}/{depth}/{seed}")
                     prompt, scorer, gen_len = tfn(tok, rng, ctx, depth)
-                    for mode in MODES:
+                    for mode in modes:
                         chunk = 1024 if (mode == "full" and ctx >= 32768) else 2048
                         try:
                             out = gen_answer(model, tok, prompt, mode, gen_len, chunk)
@@ -204,37 +217,73 @@ def run_grid(model, tok, args):
                             torch.cuda.empty_cache()
                             cell[mode].append(None)
                 score = {m: (None if any(v is None for v in cell[m])
-                             else sum(cell[m]) / len(cell[m])) for m in MODES}
-                rows.append(dict(ctx=ctx, task=tname, depth=depth, **score))
-                fmt = {m: ("N/A" if score[m] is None else f"{score[m]:.2f}") for m in MODES}
-                print(f"[grid ctx={ctx:5d} {tname:12s} depth={depth:.1f}] "
-                      f"full={fmt['full']} ring={fmt['ring']} banked={fmt['banked']}",
-                      flush=True)
+                             else sum(cell[m]) / len(cell[m])) for m in modes}
+                rows.append(dict(ctx=ctx, task=tname, depth=depth, scores=score))
+                fmt = " ".join(f"{m}={'N/A' if score[m] is None else f'{score[m]:.2f}'}"
+                               for m in modes)
+                print(f"[grid ctx={ctx:5d} {tname:12s} depth={depth:.1f}] {fmt}", flush=True)
+    return rows
+
+
+def _table(rows, modes):
+    lines = ["| ctx | task | depth | " + " | ".join(modes) + " |",
+             "|---" * (3 + len(modes)) + "|"]
+    for r in rows:
+        vals = " | ".join("N/A" if r["scores"][m] is None else f"{r['scores'][m]:.2f}"
+                          for m in modes)
+        lines.append(f"| {r['ctx']} | {r['task']} | {r['depth']:.1f} | {vals} |")
+    return lines
+
+
+def run_grid(model, tok, args):
+    smoke = args.smoke
+    modes = args.modes.split(",")
+    ctxs = [2048] if smoke else [8192, 16384, 32768]
+    depths = [0.2, 0.8] if smoke else [0.1, 0.3, 0.5, 0.7, 0.9]
+    n_seeds = {"t1-needle": 1 if smoke else 3,
+               "t2-multikey": 1 if smoke else 3,
+               "t3-aggregate": 1}
+    rows = grid_cells(model, tok, modes, ctxs, depths, n_seeds)
     lines = [
-        "# Quality grid: full vs ring vs banked (gemma-4-E4B-it)",
+        "# Quality grid: full vs ring vs banked vs routed (gemma-4-E4B-it)",
         "",
         f"Depth-stratified synthetic recall; greedy, substring-scored, batch-1. "
         f"Filler = cycled varied sentences (non-repetitive). "
         f"t1/t2: mean of 3 seeds; t3: fraction of 6 items in 48-token output, 1 seed. "
-        f"ring = sink16+window1024; banked = +bank K=16/seg=256/reps=8 leader-select. "
+        f"ring = sink16+window1024; banked = temporal-segment bank K=16/seg=256/reps=8, "
+        f"leader-select; routed-* = training-free routed bank (Raven-style content "
+        f"routing: M persistent slots, cosine routing at the leader layer, EMA "
+        f"centroids, untouched slots never decay; suffix = routing feature + M). "
         f"full@32k uses prefill chunk 1024.",
         "",
-        "| ctx | task | depth | full | ring | banked |",
-        "|---|---|---|---|---|---|",
-    ]
-    for r in rows:
-        f = {m: ("N/A" if r[m] is None else f"{r[m]:.2f}") for m in MODES}
-        lines.append(f"| {r['ctx']} | {r['task']} | {r['depth']:.1f} "
-                     f"| {f['full']} | {f['ring']} | {f['banked']} |")
+    ] + _table(rows, modes)
     text = "\n".join(lines) + "\n"
     if not smoke:
         os.makedirs(RESULTS_DIR, exist_ok=True)
         with open(os.path.join(RESULTS_DIR, "quality_grid.md"), "w") as fh:
             fh.write(text)
+            if getattr(args, "append_text", None):
+                fh.write(args.append_text)
         print(f"\nwrote {os.path.join(RESULTS_DIR, 'quality_grid.md')}")
     else:
         print(text)
     return rows
+
+
+def run_sweep(model, tok, args):
+    """Cheap routed-variant sweep to pick finalists: t1+t2 @8k, depths 0.1/0.5,
+    2 seeds, all routing features x M."""
+    variants = [f"routed-{f}-m{m}" for f in ("key", "resid", "value") for m in (16, 64)]
+    modes = ["banked"] + variants
+    n_seeds = {"t1-needle": 2, "t2-multikey": 2, "t3-aggregate": 1}
+    rows = grid_cells(model, tok, modes, [8192], [0.1, 0.5], n_seeds,
+                      tasks=TASKS[:2])
+    print("\n### Routed-variant sweep (t1/t2 @ ctx 8192, depths 0.1/0.5, 2 seeds)\n")
+    for line in _table(rows, modes):
+        print(line)
+    means = {m: sum(r["scores"][m] for r in rows) / len(rows) for m in modes}
+    print("\nvariant means:", {m: round(v, 3) for m, v in means.items()})
+    return rows, means
 
 
 # --------------------------------------------------------------------------- #
@@ -317,11 +366,14 @@ def run_nll(model, tok, args):
         docs = docs[:2]
     bin_size = 1024
     n_bins = doc_len // bin_size
+    modes = args.modes.split(",")
+    assert modes[0] == "full", "nll modes must start with full (delta baseline)"
     per_doc = {}  # (doc, mode) -> [bin means]
     for dname, used, ids_list in docs:
         ids = torch.tensor([ids_list], dtype=torch.long)
-        for mode in MODES:
-            cache = P.build_cache(model, mode, make_cfg())
+        for mode in modes:
+            base, cfg = parse_mode(mode)
+            cache = P.build_cache(model, base, cfg)
             t0 = time.perf_counter()
             nll = per_token_nll(model, cache, ids, chunk=2048)
             P.free_cache(cache)
@@ -329,7 +381,7 @@ def run_nll(model, tok, args):
             bins = [nll[(pos >= b * bin_size) & (pos < (b + 1) * bin_size)].mean().item()
                     for b in range(n_bins)]
             per_doc[(dname, mode)] = bins
-            print(f"[nll {dname:16s} {mode:6s}] mean={nll.mean().item():.4f} "
+            print(f"[nll {dname:16s} {mode:18s}] mean={nll.mean().item():.4f} "
                   f"bin0={bins[0]:.4f} last={bins[-1]:.4f} ({time.perf_counter()-t0:.0f}s)",
                   flush=True)
 
@@ -343,24 +395,26 @@ def run_nll(model, tok, args):
         sd = (sum((x - m) ** 2 for x in ds) / max(1, len(ds) - 1)) ** 0.5
         return m, sd
 
-    lines = ["# Position-resolved NLL: full vs ring vs banked (gemma-4-E4B-it)", "",
+    lossy = [m for m in modes if m != "full"]
+    lines = ["# Position-resolved NLL: full vs recurrent modes (gemma-4-E4B-it)", "",
              f"{len(docs)} natural documents x {doc_len} tokens, teacher-forced with "
              f"chunk-2048 prefill (cache evolves as in generation; divergence "
              f"granularity is one chunk). Modes as in quality_grid.md. Provenance:", ""]
     for dname, used, _ in docs:
         lines.append(f"- {dname}: {', '.join(used[:6])}{' ...' if len(used) > 6 else ''}")
-    lines += ["", "| pos bin | full | ring | banked | d(ring-full) ± std | d(banked-full) ± std |",
-              "|---|---|---|---|---|---|"]
+    hdr = "| pos bin | " + " | ".join(modes) + " | " + \
+          " | ".join(f"d({m}-full) ± std" for m in lossy) + " |"
+    lines += ["", hdr, "|---" * (1 + len(modes) + len(lossy)) + "|"]
     for b in range(n_bins):
-        dr, sr = delta_stats("ring", b)
-        db, sb = delta_stats("banked", b)
-        lines.append(f"| {b}k-{b + 1}k | {agg('full', b):.4f} | {agg('ring', b):.4f} "
-                     f"| {agg('banked', b):.4f} | {dr:+.4f} ± {sr:.4f} | {db:+.4f} ± {sb:.4f} |")
-    dr0 = max(abs(per_doc[(d, "ring")][0] - per_doc[(d, "full")][0]) for d, _, _ in docs)
-    db0 = max(abs(per_doc[(d, "banked")][0] - per_doc[(d, "full")][0]) for d, _, _ in docs)
-    ok = dr0 < 1e-3 and db0 < 1e-3
-    lines += ["", f"Sanity (pre-eviction exactness): bin 0-1k max |delta| vs full: "
-              f"ring {dr0:.2e}, banked {db0:.2e} -> {'PASS' if ok else 'FAIL'}", ""]
+        vals = " | ".join(f"{agg(m, b):.4f}" for m in modes)
+        deltas = " | ".join("{:+.4f} ± {:.4f}".format(*delta_stats(m, b)) for m in lossy)
+        lines.append(f"| {b}k-{b + 1}k | {vals} | {deltas} |")
+    max_d0 = {m: max(abs(per_doc[(d, m)][0] - per_doc[(d, "full")][0]) for d, _, _ in docs)
+              for m in lossy}
+    ok = all(v < 1e-3 for v in max_d0.values())
+    lines += ["", "Sanity (pre-eviction exactness): bin 0-1k max |delta| vs full: " +
+              ", ".join(f"{m} {v:.2e}" for m, v in max_d0.items()) +
+              f" -> {'PASS' if ok else 'FAIL'}", ""]
     lines.append("NLL_CURVE_OK" if ok else "NLL_CURVE_FAIL")
     text = "\n".join(lines) + "\n"
     if not smoke:
@@ -376,9 +430,11 @@ def run_nll(model, tok, args):
 # --------------------------------------------------------------------------- #
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("cmd", choices=["grid", "nll"])
+    ap.add_argument("cmd", choices=["grid", "nll", "sweep"])
     ap.add_argument("--smoke", action="store_true",
                     help="tiny grid (ctx 2048) + tiny nll (2 docs x 4k); prints GRID_OK")
+    ap.add_argument("--modes", default=DEFAULT_MODES,
+                    help="comma list; routed variants like routed-key-m64")
     ap.add_argument("--model-path", default=None)
     args = ap.parse_args()
 
@@ -395,6 +451,8 @@ def main():
         return
     if args.cmd == "grid":
         run_grid(model, tok, args)
+    elif args.cmd == "sweep":
+        run_sweep(model, tok, args)
     else:
         run_nll(model, tok, args)
 

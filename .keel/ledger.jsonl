@@ -17,3 +17,19 @@
 {"type": "phase_status", "pid": "p3", "status": "done", "ts": "2026-07-07T00:50:34"}
 {"type": "check_result", "pid": "p3", "ok": true, "code": 0, "tail": "", "ts": "2026-07-07T00:50:34"}
 {"type": "phase_status", "pid": "p4", "status": "in_progress", "ts": "2026-07-07T00:53:18"}
+{"type": "phase_status", "pid": "p4", "status": "done", "ts": "2026-07-07T00:53:26"}
+{"type": "check_result", "pid": "p4", "ok": true, "code": 0, "tail": "", "ts": "2026-07-07T00:53:26"}
+{"type": "artifact", "text": "quality proof committed", "refs": ["docs/RECURRENT_MODE_QUALITY.md"], "ts": "2026-07-07T00:53:26"}
+{"type": "phase", "pid": "p5", "title": "Implement training-free routed bank (online key-cluster routing, leader replay) as 4th mode in PoC + quality_eval", "check": "cd /home/xiaol/X/wkvm && HF_HUB_OFFLINE=1 /home/xiaol/X/HRM-Text/.venv/bin/python experiments/quality_eval.py grid --smoke --modes full,ring,banked,routed 2>&1 | grep -q GRID_OK", "ts": "2026-07-07T01:21:48"}
+{"type": "phase", "pid": "p6", "title": "Run grid + NLL with routed column (variant sweep, best honest variant reported)", "check": "grep -c 'routed' experiments/results/quality_grid.md | awk '{exit !($1>=15)}' && grep -q NLL_CURVE_OK experiments/results/quality_nll.md", "ts": "2026-07-07T01:21:48"}
+{"type": "phase", "pid": "p7", "title": "Routed-bank analysis in RECURRENT_MODE_QUALITY.md + commit/push", "check": "cd /home/xiaol/X/wkvm && git log --oneline -1 | grep -qi routed && grep -qi 'routed bank' docs/RECURRENT_MODE_QUALITY.md", "ts": "2026-07-07T01:21:48"}
+{"type": "decision", "text": "training-free routing only (user constraint): online key-clustering router, no learned parameters; learned router deferred", "ts": "2026-07-07T01:21:48"}
+{"type": "claim", "pid": "p5", "agent": "poc-agent", "ts": "2026-07-07T01:23:49"}
+{"type": "phase_status", "pid": "p5", "status": "done", "ts": "2026-07-07T01:31:53"}
+{"type": "check_result", "pid": "p5", "ok": true, "code": 0, "tail": "", "ts": "2026-07-07T01:31:53"}
+{"type": "claim", "pid": "p6", "agent": "poc-agent", "ts": "2026-07-07T01:31:53"}
+{"type": "finding", "text": "variant sweep (t1/t2@8k, means): routed-value-m64 0.625 > routed-value-m16 0.50 > banked 0.375 > routed-key-m64 = routed-resid-m64 0.25 > routed-key-m16 = routed-resid-m16 0.00. VALUE routing (no RoPE) is the only feature that beats temporal banking; raw/residual KEY clustering is position-contaminated and at M=16 loses the needle entirely (worse than banked). Residual-mean subtraction did NOT rescue key routing. Finalists for full grid: routed-value-m16, routed-value-m64.", "ts": "2026-07-07T01:34:32"}
+{"type": "finding", "text": "full grid 5 modes done: routed-value-m64 overall 0.79 vs banked 0.45, ring 0.06, full 0.95. Per task: t1 1.00 (holds banked's 0.80->1.00), t2 0.51 (vs banked 0.33; at 32k it scores 0.87 avg incl 1.00 cells - content routing does separate the template-sharing facts when M=64), t3 0.86 = full's own ceiling. routed-value-m16 (banked's budget class): t1 1.00, t3 0.38, but t2 0.29 ~ banked. NLL: routed-value-m64 delta +0.10@2-3k -> +0.84@15-16k, ~0.1nat better than banked in early bins, converges to ring/banked deep; still a recall device, not LM repair. NLL_CURVE_OK, bins 0-2k exact for all 4 lossy modes.", "ts": "2026-07-07T02:00:00"}
+{"type": "phase_status", "pid": "p6", "status": "done", "ts": "2026-07-07T02:00:00"}
+{"type": "check_result", "pid": "p6", "ok": true, "code": 0, "tail": "", "ts": "2026-07-07T02:00:00"}
+{"type": "phase_status", "pid": "p7", "status": "in_progress", "ts": "2026-07-07T02:02:07"}
