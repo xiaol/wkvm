@@ -4,11 +4,13 @@
 
 > WKV + KVM: states are the VMs — create, snapshot, fork, hibernate, resume, live-migrate. The engine is the hypervisor.
 
-## Demo
+## Routed-Span Demo
 
-[![Gemma recurrent-mode serving demo](experiments/results/gemma_wkvm_style_demo.gif)](experiments/results/gemma_wkvm_style_demo.mp4)
+[![Gemma routed-span recurrent-mode demo](experiments/results/gemma_routed_span_demo.gif)](experiments/results/gemma_routed_span_demo.mp4)
 
-Full-quality MP4: [`experiments/results/gemma_wkvm_style_demo.mp4`](experiments/results/gemma_wkvm_style_demo.mp4)
+Full-quality MP4: [`experiments/results/gemma_routed_span_demo.mp4`](experiments/results/gemma_routed_span_demo.mp4)
+
+Previous ring/concurrency demo: [`experiments/results/gemma_wkvm_style_demo.mp4`](experiments/results/gemma_wkvm_style_demo.mp4)
 
 ## Why
 
