@@ -113,3 +113,14 @@
 {"type": "check_result", "pid": "p15", "ok": true, "code": 0, "tail": "", "ts": "2026-07-07T15:22:40"}
 {"type": "check_result", "pid": "p16", "ok": true, "code": 0, "tail": "ROUTED_SPAN_BENCH_OK", "ts": "2026-07-07T15:22:40"}
 {"type": "check_result", "pid": "p17", "ok": true, "code": 0, "tail": "", "ts": "2026-07-07T15:22:40"}
+{"type": "check_result", "pid": "p1", "ok": true, "code": 0, "tail": "", "ts": "2026-07-07T15:26:01"}
+{"type": "check_result", "pid": "p2", "ok": true, "code": 0, "tail": "", "ts": "2026-07-07T15:26:01"}
+{"type": "check_result", "pid": "p3", "ok": true, "code": 0, "tail": "", "ts": "2026-07-07T15:26:01"}
+{"type": "check_result", "pid": "p5", "ok": true, "code": 0, "tail": "", "ts": "2026-07-07T15:26:35"}
+{"type": "check_result", "pid": "p8", "ok": true, "code": 0, "tail": "", "ts": "2026-07-07T15:26:35"}
+{"type": "check_result", "pid": "p9", "ok": true, "code": 0, "tail": "", "ts": "2026-07-07T15:26:35"}
+{"type": "check_result", "pid": "p13", "ok": true, "code": 0, "tail": "", "ts": "2026-07-07T15:26:35"}
+{"type": "check_result", "pid": "p14", "ok": true, "code": 0, "tail": "", "ts": "2026-07-07T15:26:35"}
+{"type": "check_result", "pid": "p15", "ok": true, "code": 0, "tail": "", "ts": "2026-07-07T15:26:35"}
+{"type": "check_result", "pid": "p16", "ok": true, "code": 0, "tail": "ROUTED_SPAN_BENCH_OK", "ts": "2026-07-07T15:26:35"}
+{"type": "check_result", "pid": "p17", "ok": true, "code": 0, "tail": "", "ts": "2026-07-07T15:26:35"}
