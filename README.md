@@ -12,6 +12,28 @@ Full-quality MP4: [`experiments/results/gemma_routed_span_demo.mp4`](experiments
 
 Previous ring/concurrency demo: [`experiments/results/gemma_wkvm_style_demo.mp4`](experiments/results/gemma_wkvm_style_demo.mp4)
 
+## Routed-span vs vLLM/SGLang
+
+Gemma-4-E4B-it on one RTX 4090. vLLM and SGLang are full-KV transformer engines; wkvm here is the patched-HF routed-span recurrent-mode PoC (`sink16 + ring1024 + routed span bank m64`), so this is a memory/throughput comparison, not a same-semantics quality claim.
+
+**Single long prompt + long output**: 13,824-token prompt + 512-token output, greedy decode, `ignore_eos=True`.
+
+| engine | semantics | facts recovered | prefill+1st | full wall | decode tok/s | e2e output tok/s | memory observed | raw result |
+|---|---|---:|---:|---:|---:|---:|---|---|
+| wkvm routed-span m64 | approximate recurrent | yes | 1.380s | 11.237s | 51.8 | 45.6 | 14.67 GiB reserved; 52.9 MiB cache | [`json`](experiments/results/long_gen_13824_512_wkvm_routed_span_m64.json) |
+| vLLM 0.24.0 | full KV | yes | 1.813s | 8.251s | 79.4 | 62.1 | 22.54 GiB device used; 18.42 GiB alloc | [`json`](experiments/results/long_gen_13824_512_vllm.json) |
+| SGLang 0.5.14 | full KV | yes | 1.257s | 8.515s | 70.4 | 60.1 | 21.79 GiB peak device | [`json`](experiments/results/long_gen_13824_512_sglang.json) |
+
+**Distinct long-prompt concurrency**: wkvm row is the fresh routed-span run at 13,824 context tokens/session and 128 decode tokens/session. vLLM/SGLang rows are the nearest tracked full-KV engine capacity runs at 16,384 context tokens/session and 128 decode tokens/session, included to anchor the incumbent memory shape.
+
+| engine | workload | resident sessions | aggregate decode | memory/capacity note | latency note | source |
+|---|---|---:|---:|---|---|---|
+| wkvm routed-span m64 | 13,824 ctx, distinct prompts | **16 green**; 32/48 completed over headroom | **643.9 tok/s** green; 1039.4 tok/s over headroom | 15.97 GiB reserved, 913 MiB routed cache; green means 19 GiB cap with 1 GiB headroom | p50=p95 3.181s decode | [`json`](experiments/results/gemma_routed_span_distinct_concurrency.json) |
+| vLLM 0.24.0 | nearest 16,384 ctx full-KV run | 9 cap; N=8 measured | 285.6 tok/s | 21.81 GiB device used; 18.26 GiB alloc | wall 13.42s at N=8; p50/p95 not recorded | [`bench`](experiments/results/bench_vllm_gemma4e4b.md) |
+| SGLang 0.5.14 | nearest 16,384 ctx full-KV run | 1 true concurrent; N=8 queue-limited | 68 tok/s | 25,360-token KV pool on this stack | queue-limited; p50/p95 not recorded | [`bench`](experiments/results/bench_sglang_gemma4e4b.md) |
+
+Readout: routed-span is slower for one exact long generation than vLLM/SGLang full-KV, but it keeps many independent long sessions resident under a tighter memory line. The measured advantage is bounded-memory long-context concurrency when approximate recurrent semantics are acceptable; it is not a replacement for full-KV serving when exact transformer behavior is required.
+
 ## Why
 
 For linear/hybrid models, per-request memory is **constant and tiny** (an RWKV-7 7B state is ~20MB — ~1000× smaller than long-context KV). Built around that physics instead of paged KV, an engine gets:

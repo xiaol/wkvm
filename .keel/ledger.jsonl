@@ -135,3 +135,8 @@
 {"type": "artifact", "text": "Measured distinct routed-span concurrency artifact", "refs": ["experiments/results/gemma_routed_span_distinct_concurrency.json"], "ts": "2026-07-07T19:40:28"}
 {"type": "phase_status", "pid": "p19", "status": "done", "ts": "2026-07-07T19:40:37"}
 {"type": "check_result", "pid": "p19", "ok": true, "code": 0, "tail": "ROUTED_SPAN_DISTINCT_OK", "ts": "2026-07-07T19:40:37"}
+{"type": "phase", "pid": "p20", "title": "Document routed-span comparison table vs vLLM/SGLang", "check": "cd /home/xiaol/X/wkvm && grep -q 'Routed-span vs vLLM/SGLang' README.md && grep -q '13,824-token prompt + 512-token output' README.md && grep -q '643.9 tok/s' README.md", "ts": "2026-07-07T20:01:40"}
+{"type": "phase_status", "pid": "p20", "status": "in_progress", "ts": "2026-07-07T20:01:46"}
+{"type": "check_result", "pid": "p20", "ok": false, "code": 1, "tail": "", "ts": "2026-07-07T20:03:29"}
+{"type": "phase_status", "pid": "p20", "status": "done", "ts": "2026-07-07T20:03:54"}
+{"type": "check_result", "pid": "p20", "ok": true, "code": 0, "tail": "", "ts": "2026-07-07T20:03:54"}
