@@ -36,6 +36,7 @@ Run (offline, no HF_HOME override):
 
 import argparse
 import gc
+import hashlib
 import json
 import math
 import os
@@ -823,6 +824,286 @@ def cache_bytes(cache: DynamicCache) -> int:
     return total
 
 
+def percentile(xs: list[float], pct: float) -> float | None:
+    if not xs:
+        return None
+    vals = sorted(xs)
+    k = (len(vals) - 1) * pct
+    lo, hi = math.floor(k), math.ceil(k)
+    if lo == hi:
+        return vals[lo]
+    return vals[lo] * (hi - k) + vals[hi] * (k - lo)
+
+
+class DistinctCacheMergeError(RuntimeError):
+    pass
+
+
+def _drop_tensors(obj):
+    if isinstance(obj, torch.Tensor):
+        return None
+    if isinstance(obj, dict):
+        for k in list(obj):
+            obj[k] = _drop_tensors(obj[k])
+        return obj
+    if isinstance(obj, list):
+        for i, v in enumerate(obj):
+            obj[i] = _drop_tensors(v)
+        return obj
+    return obj
+
+
+def clear_layer_tensors(layer):
+    for name, value in list(layer.__dict__.items()):
+        setattr(layer, name, _drop_tensors(value))
+
+
+def _move_tensors(obj, device):
+    if isinstance(obj, torch.Tensor):
+        return obj.to(device)
+    if isinstance(obj, dict):
+        for k in list(obj):
+            obj[k] = _move_tensors(obj[k], device)
+        return obj
+    if isinstance(obj, list):
+        for i, v in enumerate(obj):
+            obj[i] = _move_tensors(v, device)
+        return obj
+    return obj
+
+
+def move_cache_tensors(cache, device):
+    for layer in cache.layers:
+        for name, value in list(layer.__dict__.items()):
+            setattr(layer, name, _move_tensors(value, device))
+        if hasattr(layer, "device"):
+            layer.device = torch.device(device)
+    return cache
+
+
+def _cat_batch(ts: list[torch.Tensor], what: str) -> torch.Tensor:
+    if any(t is None for t in ts):
+        raise DistinctCacheMergeError(f"{what}: missing tensor")
+    tail = ts[0].shape[1:]
+    if any(t.shape[0] != 1 or t.shape[1:] != tail for t in ts):
+        raise DistinctCacheMergeError(
+            f"{what}: incompatible shapes {[tuple(t.shape) for t in ts[:4]]}"
+        )
+    return torch.cat(ts, dim=0).contiguous()
+
+
+def _routed_span_signature(layer: RoutedSpanLayer) -> tuple:
+    slots = []
+    for spans in layer._slot_spans:
+        slots.append(tuple(tuple(sp["pos"]) for sp in spans))
+    return (
+        layer.cumulative_length,
+        layer._evicted,
+        layer._n_active,
+        tuple(layer._slot_cnt),
+        layer._sink_k.shape[2],
+        layer._pend_k.shape[2],
+        layer._ring_k.shape[2],
+        tuple(slots),
+    )
+
+
+class PaddedRoutedSpanDecodeLayer(RoutedSpanLayer):
+    """Decode-only batched routed-span layer for distinct prompt layouts.
+
+    KV rows are padded to the row-wise max materialized length and an explicit
+    attention mask hides pad slots. New decode tokens append to all rows at the
+    shared valid tail, preserving per-row visible sets without a native paged
+    layout. This is a measurement shim, not the optimized serving design.
+    """
+
+    def __init__(self, keys, values, valid_mask, cumulative_length, route_chunk,
+                 pending_tail, template: RoutedSpanLayer):
+        self.keys = keys
+        self.values = values
+        self.valid_mask = valid_mask.contiguous()
+        self.cumulative_length = int(cumulative_length)
+        self.route_chunk = int(route_chunk)
+        self._pending_tail = int(pending_tail)
+        self.is_initialized = True
+        self.is_sliding = False
+        self.dtype, self.device = keys.dtype, keys.device
+        self.sink = template.sink
+        self.window = template.window
+        self.m_slots = template.m_slots
+        self.reps = template.reps
+        self.route_on = template.route_on
+        self.momentum = template.momentum
+        self.break_mask = None
+
+    def update(self, key_states, value_states, *args, **kwargs):
+        if key_states.shape[-2] != 1:
+            raise NotImplementedError("PaddedRoutedSpanDecodeLayer is decode-only")
+        if self._pending_tail + key_states.shape[-2] >= self.route_chunk:
+            raise NotImplementedError(
+                "padded routed-span decode would cross route_chunk; use fewer decode tokens"
+            )
+        ret_k = torch.cat([self.keys, key_states], dim=2)
+        ret_v = torch.cat([self.values, value_states], dim=2)
+        one = torch.ones(
+            self.valid_mask.shape[0], 1, dtype=torch.bool, device=self.valid_mask.device
+        )
+        self.valid_mask = torch.cat([self.valid_mask, one], dim=1)
+        self.keys, self.values = ret_k, ret_v
+        self.cumulative_length += 1
+        self._pending_tail += 1
+        return ret_k, ret_v
+
+    def get_mask_sizes(self, query_length: int):
+        return self.keys.shape[2] + query_length, 0
+
+    def get_seq_length(self) -> int:
+        return self.cumulative_length
+
+    def get_max_cache_shape(self) -> int:
+        return self.keys.shape[2]
+
+    def n_bank_slots(self) -> int:
+        return 0
+
+    def batch_repeat_interleave(self, repeats: int):
+        raise NotImplementedError("already batched")
+
+
+def _pad_and_stack(ts: list[torch.Tensor], max_len: int, what: str) -> tuple[torch.Tensor, torch.Tensor]:
+    if any(t is None for t in ts):
+        raise DistinctCacheMergeError(f"{what}: missing tensor")
+    B = len(ts)
+    H, D = ts[0].shape[1], ts[0].shape[3]
+    dtype, device = ts[0].dtype, ts[0].device
+    out = torch.zeros(B, H, max_len, D, dtype=dtype, device=device)
+    mask = torch.zeros(B, max_len, dtype=torch.bool, device=device)
+    for i, t in enumerate(ts):
+        if t.shape[0] != 1 or t.shape[1] != H or t.shape[3] != D:
+            raise DistinctCacheMergeError(
+                f"{what}: incompatible shapes {[tuple(x.shape) for x in ts[:4]]}"
+            )
+        L = t.shape[2]
+        out[i, :, :L].copy_(t[0])
+        mask[i, :L] = True
+    return out.contiguous(), mask.contiguous()
+
+
+def _merge_routed_span_layer_padded(
+    layers: list[RoutedSpanLayer],
+    decode_steps: int,
+    layer_idx: int,
+) -> tuple[PaddedRoutedSpanDecodeLayer, dict]:
+    base = layers[0]
+    cum = base.cumulative_length
+    route_chunk = base.route_chunk
+    pending_tail = base._pend_k.shape[2]
+    if any(l.cumulative_length != cum for l in layers):
+        raise DistinctCacheMergeError(f"layer {layer_idx}: cumulative lengths differ")
+    if any(l.route_chunk != route_chunk for l in layers):
+        raise DistinctCacheMergeError(f"layer {layer_idx}: route_chunk differs")
+    if any(l._pend_k.shape[2] != pending_tail for l in layers):
+        raise DistinctCacheMergeError(f"layer {layer_idx}: pending tails differ")
+    if pending_tail + decode_steps >= route_chunk:
+        raise DistinctCacheMergeError(
+            f"layer {layer_idx}: pending tail {pending_tail} + decode {decode_steps} "
+            f"reaches route_chunk {route_chunk}; batched decode would route"
+        )
+    lengths = [l.keys.shape[2] for l in layers]
+    max_len = max(lengths)
+    keys, valid = _pad_and_stack([l.keys for l in layers], max_len, f"layer{layer_idx}.keys")
+    values, valid_v = _pad_and_stack([l.values for l in layers], max_len, f"layer{layer_idx}.values")
+    if not torch.equal(valid, valid_v):
+        raise DistinctCacheMergeError(f"layer {layer_idx}: key/value valid masks differ")
+    merged = PaddedRoutedSpanDecodeLayer(
+        keys, values, valid, cum, route_chunk, pending_tail, base)
+    return merged, {
+        "merge": "padded_valid_mask_concat",
+        "materialized_slots_max": int(max_len),
+        "materialized_slots_min": int(min(lengths)),
+        "pad_slots_total": int(sum(max_len - x for x in lengths)),
+        "pending_tail": int(pending_tail),
+    }
+
+
+def _merge_routed_span_layer_exact(layers: list[RoutedSpanLayer], decode_steps: int) -> dict:
+    base = layers[0]
+    sig0 = _routed_span_signature(base)
+    for j, layer in enumerate(layers[1:], start=1):
+        if _routed_span_signature(layer) != sig0:
+            raise DistinctCacheMergeError(
+                f"routed-span layer layout differs at request {j}; "
+                "native paged/per-row span metadata is required for exact batching"
+            )
+    if base._pend_k.shape[2] + decode_steps >= base.route_chunk:
+        raise DistinctCacheMergeError(
+            f"pending tail {base._pend_k.shape[2]} + decode {decode_steps} reaches "
+            f"route_chunk {base.route_chunk}; batched routed-span decode would route"
+        )
+
+    base.keys = base.values = None
+    for attr in ("_sink_k", "_sink_v", "_ring_k", "_ring_v", "_pend_k", "_pend_v",
+                 "_slot_mk", "_slot_mv"):
+        setattr(base, attr, _cat_batch([getattr(l, attr) for l in layers], attr))
+    for s, spans in enumerate(base._slot_spans):
+        for j, sp in enumerate(spans):
+            sp["k"] = _cat_batch([l._slot_spans[s][j]["k"] for l in layers],
+                                 f"slot{s}.span{j}.k")
+            sp["v"] = _cat_batch([l._slot_spans[s][j]["v"] for l in layers],
+                                 f"slot{s}.span{j}.v")
+    base._materialize()
+    return {
+        "merge": "exact_structural_concat",
+        "materialized_slots": int(base.keys.shape[2]),
+        "pending_tail": int(base._pend_k.shape[2]),
+        "bank_slots": int(base.n_bank_slots()),
+    }
+
+
+def _merge_simple_layer(layers: list[DynamicLayer]) -> dict:
+    base = layers[0]
+    if any(l.cumulative_length != base.cumulative_length for l in layers):
+        raise DistinctCacheMergeError("simple layer cumulative lengths differ")
+    base.keys = _cat_batch([l.keys for l in layers], "simple.keys")
+    base.values = _cat_batch([l.values for l in layers], "simple.values")
+    return {"merge": "tensor_concat", "materialized_slots": int(base.keys.shape[2])}
+
+
+def merge_distinct_caches(caches: list[DynamicCache], decode_steps: int) -> tuple[DynamicCache, dict]:
+    if not caches:
+        raise ValueError("no caches to merge")
+    base = caches[0]
+    layer_infos = []
+    for i, base_layer in enumerate(base.layers):
+        layers = [c.layers[i] for c in caches]
+        if isinstance(base_layer, RoutedSpanLayer):
+            try:
+                info = _merge_routed_span_layer_exact(layers, decode_steps)
+                info["layer"] = i
+                info["type"] = type(base_layer).__name__
+            except DistinctCacheMergeError:
+                merged_layer, info = _merge_routed_span_layer_padded(layers, decode_steps, i)
+                base.layers[i] = merged_layer
+                info["layer"] = i
+                info["type"] = type(merged_layer).__name__
+        elif isinstance(base_layer, (RoutedBankLayer, BankedRingLayer, SinkRingLayer)):
+            raise DistinctCacheMergeError(
+                f"layer {i}: {type(base_layer).__name__} has no exact distinct merge path"
+            )
+        elif getattr(base_layer, "is_initialized", False):
+            info = _merge_simple_layer(layers)
+            info["layer"] = i
+            info["type"] = type(base_layer).__name__
+        else:
+            info = {"merge": "uninitialized_skip"}
+            info["layer"] = i
+            info["type"] = type(base_layer).__name__
+        layer_infos.append(info)
+        for extra in caches[1:]:
+            clear_layer_tensors(extra.layers[i])
+    return base, {"layers": layer_infos}
+
+
 # --------------------------------------------------------------------------- #
 # Model / tokenizer loading
 # --------------------------------------------------------------------------- #
@@ -897,6 +1178,58 @@ def build_plain_prompt(tok, ctx: int) -> torch.Tensor:
     """Synthetic long prompt of exactly `ctx` tokens (BOS + filler)."""
     ids = [tok.bos_token_id] + filler_ids(tok, ctx - 1)
     return torch.tensor([ids], dtype=torch.long)
+
+
+def sha_ids(ids: list[int]) -> str:
+    h = hashlib.sha256()
+    for tid in ids:
+        h.update(int(tid).to_bytes(4, "little", signed=False))
+    return h.hexdigest()
+
+
+def _variant_token_pool(tok) -> list[int]:
+    words = (
+        " red blue green gold silver copper iron north south east west alpha beta "
+        "gamma delta harbor lantern archive ledger signal meadow stone river cloud"
+    )
+    out, seen = [], set()
+    for tid in tok(words, add_special_tokens=False).input_ids:
+        if tid in seen:
+            continue
+        seen.add(tid)
+        if not any(c in tok.decode([tid]) for c in ".!?\n"):
+            out.append(tid)
+    if len(out) < 8:
+        raise ValueError("not enough non-break variant tokens")
+    return out
+
+
+def build_distinct_plain_prompt_ids(tok, ctx: int, idx: int) -> list[int]:
+    """Exact-length prompt variants with identical punctuation boundaries.
+
+    This gives independently-prefilled, content-distinct long prompts while
+    preserving the routed-span structural layout needed for exact cache merging.
+    """
+    ids = build_plain_prompt(tok, ctx)[0].tolist()
+    pool = _variant_token_pool(tok)
+    base_breaks = break_mask_for(tok, ids)
+    raw_positions = [
+        max(1, ctx // 9),
+        max(1, ctx // 4),
+        max(1, ctx // 2),
+        max(1, (3 * ctx) // 4),
+        max(1, ctx - 96),
+    ]
+    positions = []
+    for p in raw_positions:
+        while p < ctx - 1 and base_breaks[p]:
+            p += 1
+        if 0 < p < ctx:
+            positions.append(p)
+    for j, p in enumerate(positions):
+        ids[p] = pool[(idx * 7 + j * 3) % len(pool)]
+    assert len(ids) == ctx
+    return ids
 
 
 _BREAK_CACHE: dict[int, bool] = {}
@@ -974,13 +1307,18 @@ def chunked_prefill(model, cache, input_ids, chunk: int, keep_last_logits: int =
 # is two batched GEMMs on the grouped-query layout: q [B,H,1,D] -> [B,G,H/G,D]
 # (query head h uses kv head h//(H/G) — the repeat_kv/enable_gqa mapping),
 # scores fp32-softmaxed like the eager path. No KV copy, no fallback.
-def _grouped_gemm_decode_attention(module, query, key, value, scaling):
+def _grouped_gemm_decode_attention(module, query, key, value, attention_mask, scaling):
     B, H, _, D = query.shape
     G = key.shape[1]
     qg = query.reshape(B, G, H // G, D)
     scores = torch.matmul(qg, key.transpose(-1, -2))  # [B, G, H/G, S]
     if scaling is not None:
         scores = scores * scaling
+    if attention_mask is not None:
+        if attention_mask.dtype == torch.bool:
+            scores = scores.masked_fill(~attention_mask, torch.finfo(scores.dtype).min)
+        else:
+            scores = scores + attention_mask.to(dtype=scores.dtype, device=scores.device)
     probs = torch.softmax(scores.float(), dim=-1).to(query.dtype)
     out = torch.matmul(probs, value)  # [B, G, H/G, D]
     return out.reshape(B, H, D).unsqueeze(1), None  # [B, q=1, H, D]
@@ -995,8 +1333,9 @@ def install_sdpa_decode_patch():
 
     def sdpa_with_wide_head_decode(module, query, key, value, attention_mask,
                                    scaling=None, **kwargs):
-        if attention_mask is None and query.shape[2] == 1 and query.shape[3] > 256:
-            return _grouped_gemm_decode_attention(module, query, key, value, scaling)
+        if query.shape[2] == 1 and query.shape[3] > 256:
+            return _grouped_gemm_decode_attention(
+                module, query, key, value, attention_mask, scaling)
         return orig(module, query, key, value, attention_mask, scaling=scaling, **kwargs)
 
     sdpa_with_wide_head_decode._wkvm_patched = True
@@ -1018,6 +1357,34 @@ def _decode_mask_kwargs() -> dict:
     return {}
 
 
+def _padded_decode_mask_kwargs(cache) -> dict | None:
+    masks = [
+        layer.valid_mask for layer in cache.layers
+        if isinstance(layer, PaddedRoutedSpanDecodeLayer)
+    ]
+    if not masks:
+        return None
+    first = masks[0]
+    for m in masks[1:]:
+        if m.shape != first.shape or not torch.equal(m, first):
+            raise DistinctCacheMergeError(
+                "padded routed-span layers need per-layer masks; current Gemma HF "
+                "path accepts one full_attention mask"
+            )
+    cur = torch.ones(first.shape[0], 1, dtype=torch.bool, device=first.device)
+    visible = torch.cat([first, cur], dim=1)[:, None, None, :]
+    dtype = next(
+        layer.keys.dtype for layer in cache.layers
+        if isinstance(layer, PaddedRoutedSpanDecodeLayer)
+    )
+    mask = torch.where(
+        visible,
+        torch.tensor(0.0, device=first.device, dtype=dtype),
+        torch.tensor(torch.finfo(dtype).min, device=first.device, dtype=dtype),
+    )
+    return {"attention_mask": {"full_attention": mask, "sliding_attention": None}}
+
+
 @torch.inference_mode()
 def greedy_decode(model, cache, first_token, steps, attention_mask=None):
     """Batched greedy decode. Returns (tokens [B, steps], elapsed_seconds)."""
@@ -1035,7 +1402,8 @@ def greedy_decode(model, cache, first_token, steps, attention_mask=None):
             kwargs["attention_mask"] = attention_mask
             kwargs["position_ids"] = (attention_mask.cumsum(-1) - 1)[:, -1:]
         else:
-            kwargs.update(_decode_mask_kwargs())
+            padded_kwargs = _padded_decode_mask_kwargs(cache)
+            kwargs.update(padded_kwargs if padded_kwargs is not None else _decode_mask_kwargs())
         out = model(
             input_ids=cur,
             past_key_values=cache,
@@ -1643,7 +2011,194 @@ def run_concurrency(model, tok, args):
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(payload, indent=2, allow_nan=False) + "\n")
         print(f"WROTE_JSON {out}")
-    return tables
+
+
+def run_distinct_concurrency(model, tok, args):
+    """Distinct long-prompt routed-span concurrency.
+
+    Each row independently prefills B content-distinct long prompts, merges only
+    exact-compatible resident caches into one batch, then times batched decode.
+    This is intentionally stricter than the replicated-session ladder.
+    """
+    if args.mode != "routed" or not getattr(args, "span", False):
+        raise ValueError("distinct-concurrency currently supports --mode routed --span")
+
+    steps = args.decode_tokens
+    headroom = 1 << 30
+    avail = torch.cuda.mem_get_info()[0] + torch.cuda.memory_reserved()
+    avail = min(avail, int(args.mem_cap_gib * 2**30))
+    ladder = args.ladder or [8, 16, 32, 48]
+    label = "routed-span-m64" if args.m_slots == 64 else f"routed-span-m{args.m_slots}"
+    print(f"# distinct-concurrency: mode={label} ctx={args.ctx_per_session} "
+          f"decode={steps} cap={args.mem_cap_gib}GiB headroom=1GiB")
+
+    warmup(model, tok, args)
+    variant_ids = _variant_token_pool(tok)
+    rows = []
+    last_failure = None
+    for B in ladder:
+        gc.collect(); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
+        caches, prompt_hashes, first_tokens, prefill_s = [], [], [], []
+        row = {
+            "B": B,
+            "ok": False,
+            "green": False,
+            "distinct_prompts": True,
+            "success_count": 0,
+            "error_count": 0,
+            "agg": float("nan"),
+            "per": float("nan"),
+            "decode_s": float("nan"),
+            "prefill_s_total": float("nan"),
+            "e2e_s_total": float("nan"),
+            "e2e_output_tok_s": float("nan"),
+            "p50_latency_s": float("nan"),
+            "p95_latency_s": float("nan"),
+            "cache_mib": float("nan"),
+            "peak_gib": float("nan"),
+            "resv_gib": float("nan"),
+            "prompt_hashes": [],
+            "error": None,
+        }
+        merged = None
+        try:
+            for i in range(B):
+                ids = build_distinct_plain_prompt_ids(tok, args.ctx_per_session, i)
+                prompt_hashes.append(sha_ids(ids))
+                prompt = torch.tensor([ids], dtype=torch.long)
+                cache = build_cache(model, "routed", args)
+                set_span_break_mask(cache, break_mask_for(tok, ids))
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                logits = chunked_prefill(model, cache, prompt, args.chunk)
+                torch.cuda.synchronize()
+                prefill_s.append(time.perf_counter() - t0)
+                first_tokens.append(logits[:, -1].argmax(dim=-1, keepdim=True).cpu())
+                cache = move_cache_tensors(cache, "cpu")
+                torch.cuda.empty_cache()
+                caches.append(cache)
+
+            torch.cuda.reset_peak_memory_stats()
+            caches = [move_cache_tensors(cache, model.device) for cache in caches]
+            merged, merge_info = merge_distinct_caches(caches, steps)
+            caches = [merged]
+            first = torch.cat(first_tokens, dim=0)
+            _, decode_s = greedy_decode(model, merged, first, steps)
+            resv = torch.cuda.max_memory_reserved()
+            e2e_s = sum(prefill_s) + decode_s
+            row.update(
+                ok=True,
+                green=resv <= avail - headroom,
+                success_count=B,
+                error_count=0,
+                agg=B * steps / decode_s,
+                per=steps / decode_s,
+                decode_s=decode_s,
+                prefill_s_total=sum(prefill_s),
+                e2e_s_total=e2e_s,
+                e2e_output_tok_s=B * steps / e2e_s,
+                p50_latency_s=decode_s,
+                p95_latency_s=decode_s,
+                cache_mib=cache_bytes(merged) / 2**20,
+                peak_gib=torch.cuda.max_memory_allocated() / 2**30,
+                resv_gib=resv / 2**30,
+                prompt_hashes=prompt_hashes,
+                merge_info=merge_info,
+            )
+        except (DistinctCacheMergeError, NotImplementedError, torch.OutOfMemoryError, RuntimeError) as exc:
+            if isinstance(exc, RuntimeError) and not isinstance(exc, torch.OutOfMemoryError) and \
+                    "out of memory" not in str(exc).lower() and \
+                    not isinstance(exc, (DistinctCacheMergeError, NotImplementedError)):
+                raise
+            torch.cuda.empty_cache()
+            last_failure = f"{type(exc).__name__}: {exc}"
+            row.update(
+                success_count=len(caches),
+                error_count=max(1, B - len(caches)),
+                error=last_failure,
+                resv_gib=torch.cuda.max_memory_reserved() / 2**30,
+                prompt_hashes=prompt_hashes,
+            )
+        finally:
+            for cache in caches:
+                free_cache(cache)
+        rows.append(row)
+        print(f"[distinct {label} ctx={args.ctx_per_session:5d} B={B:3d}] "
+              f"ok={row['ok']} green={row['green']} "
+              f"decode_agg={row['agg']:.1f}tok/s e2e={row['e2e_output_tok_s']:.1f}tok/s "
+              f"cache={row['cache_mib']:.1f}MiB reserved={row['resv_gib']:.2f}GiB "
+              f"err={row['error']}")
+        if not row["ok"]:
+            break
+
+    green_rows = [r for r in rows if r["green"]]
+    ok_rows = [r for r in rows if r["ok"]]
+    payload = {
+        "schema": "wkvm.distinct_concurrency.v1",
+        "basis": "distinct_prompt_measured",
+        "mode": label,
+        "engine": "patched_hf_poc",
+        "context_tokens_per_session": args.ctx_per_session,
+        "decode_tokens_per_session": steps,
+        "mem_cap_gib": args.mem_cap_gib,
+        "headroom_gib": headroom / 2**30,
+        "torch_usable_gib": avail / 2**30,
+        "replicated_sessions": False,
+        "distinct_prompts": True,
+        "prompt_family": {
+            "kind": "content_distinct_same_span_layout",
+            "variant_token_ids": variant_ids,
+            "note": "Prompts differ at non-punctuation token positions so routed-span boundaries stay identical.",
+        },
+        "notes": [
+            "Each resident session is independently prefilled before merge.",
+            "B=1 prefills are CPU-staged between requests to remove a HF PoC transient from the resident decode capacity.",
+            "Cache merge uses exact structural concat when layouts match; otherwise it pads KV rows and hides pad slots with an explicit 4D attention mask.",
+            "decode throughput is resident batched decode; e2e_output_tok_s includes this HF PoC's sequential prefills.",
+        ],
+        "config": {
+            "mode": args.mode,
+            "span": bool(args.span),
+            "m_slots": args.m_slots,
+            "route_on": args.route_on,
+            "route_chunk": args.route_chunk,
+            "sink": args.sink,
+            "window": args.window,
+            "reps": args.reps,
+            "attn": args.attn,
+            "graphs": False,
+            "chunk": args.chunk,
+        },
+        "summary": {
+            "bmax_green": max((r["B"] for r in green_rows), default=0),
+            "best_green_decode_agg_tok_s": max((r["agg"] for r in green_rows), default=0.0),
+            "best_green_e2e_output_tok_s": max((r["e2e_output_tok_s"] for r in green_rows), default=0.0),
+            "max_ok_B": max((r["B"] for r in ok_rows), default=0),
+            "last_failure": last_failure,
+        },
+        "rows": [json_row(r) for r in rows],
+    }
+
+    print(f"\n### distinct concurrency {label} @ ctx/session {args.ctx_per_session} — "
+          f"B_max(green) = {payload['summary']['bmax_green']}\n")
+    print("| B | cache MiB total | peak reserved GiB | resident decode tok/s "
+          "| e2e tok/s incl sequential prefill | p50/p95 decode latency s | status |")
+    print("|---|---|---|---|---|---|---|")
+    for r in rows:
+        if not r["ok"]:
+            print(f"| {r['B']} | - | {r['resv_gib']:.2f} | - | - | - | {r['error']} |")
+        else:
+            status = "green" if r["green"] else "over-budget"
+            print(f"| {r['B']} | {r['cache_mib']:.1f} | {r['resv_gib']:.2f} "
+                  f"| {r['agg']:.1f} | {r['e2e_output_tok_s']:.1f} "
+                  f"| {r['p50_latency_s']:.3f}/{r['p95_latency_s']:.3f} | {status} |")
+
+    if getattr(args, "out_json", None):
+        out = Path(args.out_json)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payload, indent=2, allow_nan=False) + "\n")
+        print(f"WROTE_JSON {out}")
+    return payload
 
 
 def _needle_once(model, tok, args, mode, ctx):
@@ -1909,8 +2464,8 @@ def run_batch(model, tok, args):
 # --------------------------------------------------------------------------- #
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("cmd", choices=["bench", "needle", "batch", "concurrency", "bank",
-                                    "profile", "verify"])
+    ap.add_argument("cmd", choices=["bench", "needle", "batch", "concurrency",
+                                    "distinct-concurrency", "bank", "profile", "verify"])
     ap.add_argument("--mode", choices=["full", "ring", "banked", "routed", "both"],
                     default="both")
     ap.add_argument("--attn", choices=["eager", "sdpa"], default="sdpa",
@@ -1989,6 +2544,8 @@ def main():
         run_batch(model, tok, args)
     elif args.cmd == "concurrency":
         run_concurrency(model, tok, args)
+    elif args.cmd == "distinct-concurrency":
+        run_distinct_concurrency(model, tok, args)
     elif args.cmd == "bank":
         run_bank(model, tok, args)
     elif args.cmd == "profile":

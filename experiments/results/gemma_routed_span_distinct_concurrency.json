@@ -1,0 +1,903 @@
+{
+  "schema": "wkvm.distinct_concurrency.v1",
+  "basis": "distinct_prompt_measured",
+  "mode": "routed-span-m64",
+  "engine": "patched_hf_poc",
+  "context_tokens_per_session": 13824,
+  "decode_tokens_per_session": 128,
+  "mem_cap_gib": 19.0,
+  "headroom_gib": 1.0,
+  "torch_usable_gib": 19.0,
+  "replicated_sessions": false,
+  "distinct_prompts": true,
+  "prompt_family": {
+    "kind": "content_distinct_same_span_layout",
+    "variant_token_ids": [
+      2604,
+      3730,
+      3826,
+      5122,
+      10173,
+      14561,
+      8603,
+      8339,
+      8710,
+      13512,
+      11895,
+      14434,
+      17673,
+      24228,
+      19649,
+      45694,
+      41865,
+      33563,
+      85503,
+      6953,
+      35280,
+      10810,
+      8858,
+      6425
+    ],
+    "note": "Prompts differ at non-punctuation token positions so routed-span boundaries stay identical."
+  },
+  "notes": [
+    "Each resident session is independently prefilled before merge.",
+    "B=1 prefills are CPU-staged between requests to remove a HF PoC transient from the resident decode capacity.",
+    "Cache merge uses exact structural concat when layouts match; otherwise it pads KV rows and hides pad slots with an explicit 4D attention mask.",
+    "decode throughput is resident batched decode; e2e_output_tok_s includes this HF PoC's sequential prefills."
+  ],
+  "config": {
+    "mode": "routed",
+    "span": true,
+    "m_slots": 64,
+    "route_on": "value",
+    "route_chunk": 256,
+    "sink": 16,
+    "window": 1024,
+    "reps": 8,
+    "attn": "sdpa",
+    "graphs": false,
+    "chunk": 2048
+  },
+  "summary": {
+    "bmax_green": 16,
+    "best_green_decode_agg_tok_s": 643.8960633606562,
+    "best_green_e2e_output_tok_s": 81.44005176007252,
+    "max_ok_B": 48,
+    "last_failure": null
+  },
+  "rows": [
+    {
+      "B": 8,
+      "ok": true,
+      "green": true,
+      "distinct_prompts": true,
+      "success_count": 8,
+      "error_count": 0,
+      "agg": 346.58755960891745,
+      "per": 43.32344495111468,
+      "decode_s": 2.9545203559973743,
+      "prefill_s_total": 10.969114171995898,
+      "e2e_s_total": 13.923634527993272,
+      "e2e_output_tok_s": 73.54401596373866,
+      "p50_latency_s": 2.9545203559973743,
+      "p95_latency_s": 2.9545203559973743,
+      "cache_mib": 456.6875,
+      "peak_gib": 14.692031860351562,
+      "resv_gib": 14.87109375,
+      "prompt_hashes": [
+        "83281e6caf25edca77e02867f55aa266659091fd0777d386c2567d6b23536f08",
+        "caf55b088e43fe2e77001dc3ec93002688c46e3c5332108820a8cb7e41d5c5cc",
+        "4305766f940afb4af490863bfe26f74e7958b4b33a77d1c7858a59d2d0adff8f",
+        "de5bc903f636fb93dd249a6e2c40c904b9651f008b321d2add4b713005454c36",
+        "00bd70dbcdb3dd537ebe77db8d1276f622e197155478212c55891ea56306bbc1",
+        "c0226fe57a6759a7d4c297016a0ebdb2908d3399163499a5a82f44a00e242413",
+        "c8ec5dd1ff179dd821ab3ca40d6313a2c15206483610d43a3019d11da32e39ed",
+        "05bd7194fa411e79c18cb0186e548fe24ec2495cfea29403f951bdb96c998bd0"
+      ],
+      "error": null,
+      "merge_info": {
+        "layers": [
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 0,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 1,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 2,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 3,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 4,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "padded_valid_mask_concat",
+            "materialized_slots_max": 2248,
+            "materialized_slots_min": 2217,
+            "pad_slots_total": 155,
+            "pending_tail": 6,
+            "layer": 5,
+            "type": "PaddedRoutedSpanDecodeLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 6,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 7,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 8,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 9,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 10,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "padded_valid_mask_concat",
+            "materialized_slots_max": 2248,
+            "materialized_slots_min": 2217,
+            "pad_slots_total": 155,
+            "pending_tail": 6,
+            "layer": 11,
+            "type": "PaddedRoutedSpanDecodeLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 12,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 13,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 14,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 15,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 16,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "padded_valid_mask_concat",
+            "materialized_slots_max": 2248,
+            "materialized_slots_min": 2217,
+            "pad_slots_total": 155,
+            "pending_tail": 6,
+            "layer": 17,
+            "type": "PaddedRoutedSpanDecodeLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 18,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 19,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 20,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 21,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 22,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "padded_valid_mask_concat",
+            "materialized_slots_max": 2248,
+            "materialized_slots_min": 2217,
+            "pad_slots_total": 155,
+            "pending_tail": 6,
+            "layer": 23,
+            "type": "PaddedRoutedSpanDecodeLayer"
+          }
+        ]
+      }
+    },
+    {
+      "B": 16,
+      "ok": true,
+      "green": true,
+      "distinct_prompts": true,
+      "success_count": 16,
+      "error_count": 0,
+      "agg": 643.8960633606562,
+      "per": 40.24350396004101,
+      "decode_s": 3.1806375540036242,
+      "prefill_s_total": 21.966694204005762,
+      "e2e_s_total": 25.147331758009386,
+      "e2e_output_tok_s": 81.44005176007252,
+      "p50_latency_s": 3.1806375540036242,
+      "p95_latency_s": 3.1806375540036242,
+      "cache_mib": 913.375,
+      "peak_gib": 15.470936298370361,
+      "resv_gib": 15.966796875,
+      "prompt_hashes": [
+        "83281e6caf25edca77e02867f55aa266659091fd0777d386c2567d6b23536f08",
+        "caf55b088e43fe2e77001dc3ec93002688c46e3c5332108820a8cb7e41d5c5cc",
+        "4305766f940afb4af490863bfe26f74e7958b4b33a77d1c7858a59d2d0adff8f",
+        "de5bc903f636fb93dd249a6e2c40c904b9651f008b321d2add4b713005454c36",
+        "00bd70dbcdb3dd537ebe77db8d1276f622e197155478212c55891ea56306bbc1",
+        "c0226fe57a6759a7d4c297016a0ebdb2908d3399163499a5a82f44a00e242413",
+        "c8ec5dd1ff179dd821ab3ca40d6313a2c15206483610d43a3019d11da32e39ed",
+        "05bd7194fa411e79c18cb0186e548fe24ec2495cfea29403f951bdb96c998bd0",
+        "89cf277094336088e834cd39c518f0c30eb2ae117d7a4d7d126ccef46b3790fe",
+        "f27226169eff57893c255c2b54e44a77044b0c6cdc54a2b228c053df15e11dc2",
+        "ee3186d2929768f1106ba80fe51834a7b5b04c1229336c371436cc8e72292c0a",
+        "95aee0df92286ccfeac56af276feea05182da22adcca26b7771ebb4269baf950",
+        "00117d58a869ec598716fdbccd35e4de6b3e4e640399ed8f9cb69da5d297fa9a",
+        "50966d595c0aa2c313b2d5f305415e8c12b77f8d9928f06e9aa33c5674fb53b9",
+        "d44dec1a978c1e5b6abfbc02e37d6fb424c5421a9adc0f91652e79e8f427b5f7",
+        "48e91c9d1aeb235fa5c08982ff4b2d7e4ac9bc32af19cb6414f9abc8b071238d"
+      ],
+      "error": null,
+      "merge_info": {
+        "layers": [
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 0,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 1,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 2,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 3,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 4,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "padded_valid_mask_concat",
+            "materialized_slots_max": 2248,
+            "materialized_slots_min": 2186,
+            "pad_slots_total": 434,
+            "pending_tail": 6,
+            "layer": 5,
+            "type": "PaddedRoutedSpanDecodeLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 6,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 7,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 8,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 9,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 10,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "padded_valid_mask_concat",
+            "materialized_slots_max": 2248,
+            "materialized_slots_min": 2186,
+            "pad_slots_total": 434,
+            "pending_tail": 6,
+            "layer": 11,
+            "type": "PaddedRoutedSpanDecodeLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 12,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 13,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 14,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 15,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 16,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "padded_valid_mask_concat",
+            "materialized_slots_max": 2248,
+            "materialized_slots_min": 2186,
+            "pad_slots_total": 434,
+            "pending_tail": 6,
+            "layer": 17,
+            "type": "PaddedRoutedSpanDecodeLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 18,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 19,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 20,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 21,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 22,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "padded_valid_mask_concat",
+            "materialized_slots_max": 2248,
+            "materialized_slots_min": 2186,
+            "pad_slots_total": 434,
+            "pending_tail": 6,
+            "layer": 23,
+            "type": "PaddedRoutedSpanDecodeLayer"
+          }
+        ]
+      }
+    },
+    {
+      "B": 32,
+      "ok": true,
+      "green": false,
+      "distinct_prompts": true,
+      "success_count": 32,
+      "error_count": 0,
+      "agg": 1039.350609577025,
+      "per": 32.47970654928203,
+      "decode_s": 3.9409223050024593,
+      "prefill_s_total": 43.53949235699838,
+      "e2e_s_total": 47.48041466200084,
+      "e2e_output_tok_s": 86.26714886881726,
+      "p50_latency_s": 3.9409223050024593,
+      "p95_latency_s": 3.9409223050024593,
+      "cache_mib": 1826.75,
+      "peak_gib": 17.03247594833374,
+      "resv_gib": 18.181640625,
+      "prompt_hashes": [
+        "83281e6caf25edca77e02867f55aa266659091fd0777d386c2567d6b23536f08",
+        "caf55b088e43fe2e77001dc3ec93002688c46e3c5332108820a8cb7e41d5c5cc",
+        "4305766f940afb4af490863bfe26f74e7958b4b33a77d1c7858a59d2d0adff8f",
+        "de5bc903f636fb93dd249a6e2c40c904b9651f008b321d2add4b713005454c36",
+        "00bd70dbcdb3dd537ebe77db8d1276f622e197155478212c55891ea56306bbc1",
+        "c0226fe57a6759a7d4c297016a0ebdb2908d3399163499a5a82f44a00e242413",
+        "c8ec5dd1ff179dd821ab3ca40d6313a2c15206483610d43a3019d11da32e39ed",
+        "05bd7194fa411e79c18cb0186e548fe24ec2495cfea29403f951bdb96c998bd0",
+        "89cf277094336088e834cd39c518f0c30eb2ae117d7a4d7d126ccef46b3790fe",
+        "f27226169eff57893c255c2b54e44a77044b0c6cdc54a2b228c053df15e11dc2",
+        "ee3186d2929768f1106ba80fe51834a7b5b04c1229336c371436cc8e72292c0a",
+        "95aee0df92286ccfeac56af276feea05182da22adcca26b7771ebb4269baf950",
+        "00117d58a869ec598716fdbccd35e4de6b3e4e640399ed8f9cb69da5d297fa9a",
+        "50966d595c0aa2c313b2d5f305415e8c12b77f8d9928f06e9aa33c5674fb53b9",
+        "d44dec1a978c1e5b6abfbc02e37d6fb424c5421a9adc0f91652e79e8f427b5f7",
+        "48e91c9d1aeb235fa5c08982ff4b2d7e4ac9bc32af19cb6414f9abc8b071238d",
+        "ed0f035d35b64d6b960b18a31b6c71f4cd5e4fdb48cba7b125c3967383c1cf51",
+        "8fed1e1fc085a4680245f3f86b01ea77929473afa3b4400dacc693668692645e",
+        "ac0338e88c92a5495885b2effbb594fa75a97903ec8cf5a697106965d09ad5da",
+        "012ded7fd8c47384514bd22a7aa22f8f76af09d3201e4dec9cd906da808b15b7",
+        "e9fff452a386f3a5327464a6deb6839e2ceef4b793967498c69d9131ac507d3b",
+        "21c552c12da4407ede83591e925d2958cc5f9eb7c37a806336bcd1141c3db7fc",
+        "0ab7e7a857295c3b56ca2afc8d39d72a3a007dfd31a3c0ceb2c54e01044a5c03",
+        "ff3c37b0bd34b0651b29a138c7823be3e9c56e1df23152a18d48e73bcd1dc9e3",
+        "83281e6caf25edca77e02867f55aa266659091fd0777d386c2567d6b23536f08",
+        "caf55b088e43fe2e77001dc3ec93002688c46e3c5332108820a8cb7e41d5c5cc",
+        "4305766f940afb4af490863bfe26f74e7958b4b33a77d1c7858a59d2d0adff8f",
+        "de5bc903f636fb93dd249a6e2c40c904b9651f008b321d2add4b713005454c36",
+        "00bd70dbcdb3dd537ebe77db8d1276f622e197155478212c55891ea56306bbc1",
+        "c0226fe57a6759a7d4c297016a0ebdb2908d3399163499a5a82f44a00e242413",
+        "c8ec5dd1ff179dd821ab3ca40d6313a2c15206483610d43a3019d11da32e39ed",
+        "05bd7194fa411e79c18cb0186e548fe24ec2495cfea29403f951bdb96c998bd0"
+      ],
+      "error": null,
+      "merge_info": {
+        "layers": [
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 0,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 1,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 2,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 3,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 4,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "padded_valid_mask_concat",
+            "materialized_slots_max": 2248,
+            "materialized_slots_min": 2186,
+            "pad_slots_total": 868,
+            "pending_tail": 6,
+            "layer": 5,
+            "type": "PaddedRoutedSpanDecodeLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 6,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 7,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 8,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 9,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 10,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "padded_valid_mask_concat",
+            "materialized_slots_max": 2248,
+            "materialized_slots_min": 2186,
+            "pad_slots_total": 868,
+            "pending_tail": 6,
+            "layer": 11,
+            "type": "PaddedRoutedSpanDecodeLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 12,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 13,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 14,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 15,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 16,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "padded_valid_mask_concat",
+            "materialized_slots_max": 2248,
+            "materialized_slots_min": 2186,
+            "pad_slots_total": 868,
+            "pending_tail": 6,
+            "layer": 17,
+            "type": "PaddedRoutedSpanDecodeLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 18,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 19,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 20,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 21,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 22,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "padded_valid_mask_concat",
+            "materialized_slots_max": 2248,
+            "materialized_slots_min": 2186,
+            "pad_slots_total": 868,
+            "pending_tail": 6,
+            "layer": 23,
+            "type": "PaddedRoutedSpanDecodeLayer"
+          }
+        ]
+      }
+    },
+    {
+      "B": 48,
+      "ok": true,
+      "green": false,
+      "distinct_prompts": true,
+      "success_count": 48,
+      "error_count": 0,
+      "agg": 1292.4711342128703,
+      "per": 26.926481962768133,
+      "decode_s": 4.753684502007673,
+      "prefill_s_total": 64.26584411195654,
+      "e2e_s_total": 69.01952861396421,
+      "e2e_output_tok_s": 89.01828400428874,
+      "p50_latency_s": 4.753684502007673,
+      "p95_latency_s": 4.753684502007673,
+      "cache_mib": 2740.125,
+      "peak_gib": 18.590284824371338,
+      "resv_gib": 19.005859375,
+      "prompt_hashes": [
+        "83281e6caf25edca77e02867f55aa266659091fd0777d386c2567d6b23536f08",
+        "caf55b088e43fe2e77001dc3ec93002688c46e3c5332108820a8cb7e41d5c5cc",
+        "4305766f940afb4af490863bfe26f74e7958b4b33a77d1c7858a59d2d0adff8f",
+        "de5bc903f636fb93dd249a6e2c40c904b9651f008b321d2add4b713005454c36",
+        "00bd70dbcdb3dd537ebe77db8d1276f622e197155478212c55891ea56306bbc1",
+        "c0226fe57a6759a7d4c297016a0ebdb2908d3399163499a5a82f44a00e242413",
+        "c8ec5dd1ff179dd821ab3ca40d6313a2c15206483610d43a3019d11da32e39ed",
+        "05bd7194fa411e79c18cb0186e548fe24ec2495cfea29403f951bdb96c998bd0",
+        "89cf277094336088e834cd39c518f0c30eb2ae117d7a4d7d126ccef46b3790fe",
+        "f27226169eff57893c255c2b54e44a77044b0c6cdc54a2b228c053df15e11dc2",
+        "ee3186d2929768f1106ba80fe51834a7b5b04c1229336c371436cc8e72292c0a",
+        "95aee0df92286ccfeac56af276feea05182da22adcca26b7771ebb4269baf950",
+        "00117d58a869ec598716fdbccd35e4de6b3e4e640399ed8f9cb69da5d297fa9a",
+        "50966d595c0aa2c313b2d5f305415e8c12b77f8d9928f06e9aa33c5674fb53b9",
+        "d44dec1a978c1e5b6abfbc02e37d6fb424c5421a9adc0f91652e79e8f427b5f7",
+        "48e91c9d1aeb235fa5c08982ff4b2d7e4ac9bc32af19cb6414f9abc8b071238d",
+        "ed0f035d35b64d6b960b18a31b6c71f4cd5e4fdb48cba7b125c3967383c1cf51",
+        "8fed1e1fc085a4680245f3f86b01ea77929473afa3b4400dacc693668692645e",
+        "ac0338e88c92a5495885b2effbb594fa75a97903ec8cf5a697106965d09ad5da",
+        "012ded7fd8c47384514bd22a7aa22f8f76af09d3201e4dec9cd906da808b15b7",
+        "e9fff452a386f3a5327464a6deb6839e2ceef4b793967498c69d9131ac507d3b",
+        "21c552c12da4407ede83591e925d2958cc5f9eb7c37a806336bcd1141c3db7fc",
+        "0ab7e7a857295c3b56ca2afc8d39d72a3a007dfd31a3c0ceb2c54e01044a5c03",
+        "ff3c37b0bd34b0651b29a138c7823be3e9c56e1df23152a18d48e73bcd1dc9e3",
+        "83281e6caf25edca77e02867f55aa266659091fd0777d386c2567d6b23536f08",
+        "caf55b088e43fe2e77001dc3ec93002688c46e3c5332108820a8cb7e41d5c5cc",
+        "4305766f940afb4af490863bfe26f74e7958b4b33a77d1c7858a59d2d0adff8f",
+        "de5bc903f636fb93dd249a6e2c40c904b9651f008b321d2add4b713005454c36",
+        "00bd70dbcdb3dd537ebe77db8d1276f622e197155478212c55891ea56306bbc1",
+        "c0226fe57a6759a7d4c297016a0ebdb2908d3399163499a5a82f44a00e242413",
+        "c8ec5dd1ff179dd821ab3ca40d6313a2c15206483610d43a3019d11da32e39ed",
+        "05bd7194fa411e79c18cb0186e548fe24ec2495cfea29403f951bdb96c998bd0",
+        "89cf277094336088e834cd39c518f0c30eb2ae117d7a4d7d126ccef46b3790fe",
+        "f27226169eff57893c255c2b54e44a77044b0c6cdc54a2b228c053df15e11dc2",
+        "ee3186d2929768f1106ba80fe51834a7b5b04c1229336c371436cc8e72292c0a",
+        "95aee0df92286ccfeac56af276feea05182da22adcca26b7771ebb4269baf950",
+        "00117d58a869ec598716fdbccd35e4de6b3e4e640399ed8f9cb69da5d297fa9a",
+        "50966d595c0aa2c313b2d5f305415e8c12b77f8d9928f06e9aa33c5674fb53b9",
+        "d44dec1a978c1e5b6abfbc02e37d6fb424c5421a9adc0f91652e79e8f427b5f7",
+        "48e91c9d1aeb235fa5c08982ff4b2d7e4ac9bc32af19cb6414f9abc8b071238d",
+        "ed0f035d35b64d6b960b18a31b6c71f4cd5e4fdb48cba7b125c3967383c1cf51",
+        "8fed1e1fc085a4680245f3f86b01ea77929473afa3b4400dacc693668692645e",
+        "ac0338e88c92a5495885b2effbb594fa75a97903ec8cf5a697106965d09ad5da",
+        "012ded7fd8c47384514bd22a7aa22f8f76af09d3201e4dec9cd906da808b15b7",
+        "e9fff452a386f3a5327464a6deb6839e2ceef4b793967498c69d9131ac507d3b",
+        "21c552c12da4407ede83591e925d2958cc5f9eb7c37a806336bcd1141c3db7fc",
+        "0ab7e7a857295c3b56ca2afc8d39d72a3a007dfd31a3c0ceb2c54e01044a5c03",
+        "ff3c37b0bd34b0651b29a138c7823be3e9c56e1df23152a18d48e73bcd1dc9e3"
+      ],
+      "error": null,
+      "merge_info": {
+        "layers": [
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 0,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 1,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 2,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 3,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 4,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "padded_valid_mask_concat",
+            "materialized_slots_max": 2248,
+            "materialized_slots_min": 2186,
+            "pad_slots_total": 1426,
+            "pending_tail": 6,
+            "layer": 5,
+            "type": "PaddedRoutedSpanDecodeLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 6,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 7,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 8,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 9,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 10,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "padded_valid_mask_concat",
+            "materialized_slots_max": 2248,
+            "materialized_slots_min": 2186,
+            "pad_slots_total": 1426,
+            "pending_tail": 6,
+            "layer": 11,
+            "type": "PaddedRoutedSpanDecodeLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 12,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 13,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 14,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 15,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 16,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "padded_valid_mask_concat",
+            "materialized_slots_max": 2248,
+            "materialized_slots_min": 2186,
+            "pad_slots_total": 1426,
+            "pending_tail": 6,
+            "layer": 17,
+            "type": "PaddedRoutedSpanDecodeLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 18,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 19,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 20,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 21,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "tensor_concat",
+            "materialized_slots": 511,
+            "layer": 22,
+            "type": "DynamicSlidingWindowLayer"
+          },
+          {
+            "merge": "padded_valid_mask_concat",
+            "materialized_slots_max": 2248,
+            "materialized_slots_min": 2186,
+            "pad_slots_total": 1426,
+            "pending_tail": 6,
+            "layer": 23,
+            "type": "PaddedRoutedSpanDecodeLayer"
+          }
+        ]
+      }
+    }
+  ]
+}
