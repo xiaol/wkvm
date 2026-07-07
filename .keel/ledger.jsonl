@@ -140,3 +140,7 @@
 {"type": "check_result", "pid": "p20", "ok": false, "code": 1, "tail": "", "ts": "2026-07-07T20:03:29"}
 {"type": "phase_status", "pid": "p20", "status": "done", "ts": "2026-07-07T20:03:54"}
 {"type": "check_result", "pid": "p20", "ok": true, "code": 0, "tail": "", "ts": "2026-07-07T20:03:54"}
+{"type": "phase", "pid": "p21", "title": "Write native wkvm engine implementation plan", "check": "cd /home/xiaol/X/wkvm && test -f docs/NATIVE_ENGINE_PLAN.md && grep -q 'Do not fork vLLM or SGLang' docs/NATIVE_ENGINE_PLAN.md && grep -q 'GemmaRoutedSpanRunner' docs/NATIVE_ENGINE_PLAN.md && grep -q '13,824' docs/NATIVE_ENGINE_PLAN.md && grep -q 'p50/p95' docs/NATIVE_ENGINE_PLAN.md", "ts": "2026-07-07T21:46:36"}
+{"type": "phase_status", "pid": "p21", "status": "in_progress", "ts": "2026-07-07T21:46:36"}
+{"type": "phase_status", "pid": "p21", "status": "done", "ts": "2026-07-07T21:47:48"}
+{"type": "check_result", "pid": "p21", "ok": true, "code": 0, "tail": "", "ts": "2026-07-07T21:47:48"}
