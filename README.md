@@ -6,9 +6,9 @@
 
 ## Demo
 
-<video src="experiments/results/gemma_wkvm_style_demo.mp4" controls width="100%"></video>
+[![Gemma recurrent-mode serving demo](experiments/results/gemma_wkvm_style_demo.gif)](experiments/results/gemma_wkvm_style_demo.mp4)
 
-Local artifact: [`experiments/results/gemma_wkvm_style_demo.mp4`](experiments/results/gemma_wkvm_style_demo.mp4)
+Full-quality MP4: [`experiments/results/gemma_wkvm_style_demo.mp4`](experiments/results/gemma_wkvm_style_demo.mp4)
 
 ## Why
 
