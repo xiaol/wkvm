@@ -144,3 +144,8 @@
 {"type": "phase_status", "pid": "p21", "status": "in_progress", "ts": "2026-07-07T21:46:36"}
 {"type": "phase_status", "pid": "p21", "status": "done", "ts": "2026-07-07T21:47:48"}
 {"type": "check_result", "pid": "p21", "ok": true, "code": 0, "tail": "", "ts": "2026-07-07T21:47:48"}
+{"type": "phase", "pid": "p22", "title": "Update native engine plan from vLLM/SGLang component audit", "check": "cd /home/xiaol/X/wkvm && grep -q 'vLLM/SGLang Component Audit' docs/NATIVE_ENGINE_PLAN.md && grep -q 'Python orchestration' docs/NATIVE_ENGINE_PLAN.md && grep -q 'Benchmark-grade native engine' docs/NATIVE_ENGINE_PLAN.md && grep -q '6-10 weeks' docs/NATIVE_ENGINE_PLAN.md && grep -q 'Req-to-state indirection' docs/NATIVE_ENGINE_PLAN.md", "ts": "2026-07-07T22:12:36"}
+{"type": "phase_status", "pid": "p22", "status": "in_progress", "ts": "2026-07-07T22:12:47"}
+{"type": "finding", "text": "vLLM/SGLang audit changes wkvm-native estimate: single-model proof remains narrow, but benchmark-grade engine needs graph buckets, serving boundary, metrics, process/ops floor, and state-slot arena instead of token-prefix cache.", "refs": ["docs/NATIVE_ENGINE_PLAN.md"], "ts": "2026-07-07T22:15:43"}
+{"type": "phase_status", "pid": "p22", "status": "done", "ts": "2026-07-07T22:15:57"}
+{"type": "check_result", "pid": "p22", "ok": true, "code": 0, "tail": "", "ts": "2026-07-07T22:15:57"}

@@ -13,6 +13,35 @@ Use wkvm-native scheduler, arena, runner, and durable-state boundaries. Borrow n
 
 Reason: vLLM and SGLang both index reusable cache by token prefix. wkvm's differentiator is state as a first-class mutable object: fork, hibernate, resume, decay, merge, consolidate. Building inside either incumbent means fighting their primary cache invariant.
 
+## Audit Basis
+
+This plan is based on a local source audit of:
+
+- vLLM `ec0ffaa`: scheduler, KV cache/block pool, GPU runner, CUDA graph dispatcher, engine core, OpenAI API server, and metrics stats.
+- SGLang `9588cac`: scheduler and schedule batches, radix cache, memory pools, model runner, CUDA graph backend interface, HTTP server, tokenizer manager, and metrics reporter.
+
+The audit does not treat either project as a single "Python script". Both production engines are Python orchestration around optimized CUDA/Triton/C++ kernels, static buffers, graph capture, worker processes, HTTP frontends, and metrics. wkvm-native should use the same implementation model: Python orchestration for admission/control flow, with GPU kernels and static CUDA buffers for the hot path. A C++ rewrite is not the next step.
+
+## vLLM/SGLang Component Audit
+
+| Component | vLLM component shape | SGLang component shape | wkvm-native implication |
+|---|---|---|---|
+| Frontend and tokenizer boundary | OpenAI API server plus engine client/process boundary. | FastAPI/uvloop HTTP server, tokenizer manager, OpenAI/Anthropic/Ollama-style surfaces, health and metrics wiring. | Keep tokenizer outside the GPU loop. Start with a documented token-id or narrow OpenAI-compatible endpoint, then harden health/auth/streaming. |
+| Scheduler/admission | `v1/core/sched/scheduler.py` is a no-phase token-budget scheduler: running requests first, chunked prefill, prefix cache, speculative decode, connectors, Mamba alignment. | `srt/managers/scheduler.py` plus `ScheduleBatch` handles overlap, prefill/decode scheduling, retraction, disaggregation, policy controls, and watchdog behavior. | Borrow the no-phase token-budget shape and SGLang-style retraction/admission controls. Do not import their feature cross-product. |
+| Cache/memory object | `KVCacheBlock`, `FreeKVCacheBlockQueue`, and `BlockPool` manage ref-counted token-prefix blocks and prefix-hash lookup. | `RadixCache` handles prefix reuse; `ReqToTokenPool` and token-to-KV pools provide request-row to physical-KV indirection and graph padding rows. | Build a wkvm `StateSlotArena`, not a token-prefix block cache. Steal the allocator discipline, refcounts, dummy rows, and Req-to-state indirection, but make the identity a mutable state slot/span bank/ring lineage. |
+| Runner hot path | `GPUModelRunner` is a large production runner with model loading, attention backends, LoRA, KV connectors, speculative decode, CUDA graphs, pooling, distributed handling, and sampling. | `ModelRunner` owns model loading, attention backend selection, memory pool config, graph runners, quantization, distributed modes, sampling, canary/update hooks. | First runner should be narrow: `GemmaRoutedSpanRunner` only, bf16, one GPU, greedy first. General model breadth is a later product, not part of the proof. |
+| CUDA graph execution | `CudagraphDispatcher` enumerates valid graph keys and pads batch sizes before capture/replay. | `BaseCudaGraphBackend` gives a clean `capture_session`, `capture_one`, `can_run`, `replay_session`, `replay`, `cleanup` contract. | Copy the shape-key discipline: explicit graph buckets, static addresses, masked dummy rows, eager-vs-graph token parity tests. |
+| Metrics and observability | `SchedulerStats`, `RequestStateStats`, prefix-cache stats, KV eviction events, graph stats, performance stats. | Prometheus middleware, scheduler metrics reporter, forward-pass metrics, cache/event metrics, idle logging. | Benchmark-grade wkvm needs first-class p50/p95, queue time, prefill/decode throughput, state-slot occupancy, graph hit rate, errors, and GPU memory. README/video numbers should come only from these artifacts. |
+| Process and resilience | Engine core process, executor abstraction, ready handshake, failure callback, IPC, batch queue. | Multi-process scheduler/server layout, watchdog paths, warmup, health checks, metrics endpoint, request receiver/output streamer. | Minimal proof can be single process; production subset needs separate frontend/engine process, health checks, watchdog, backpressure, graceful cancellation, and soak tests. |
+| Model breadth | Many model families and feature modes. | Many model families and serving modes. | Explicitly out of scope. Supporting Gemma routed-span well is the proof; becoming a vLLM/SGLang-class general engine is a separate multi-quarter project. |
+
+## Component Decisions
+
+- Do not build wkvm-native by forking vLLM or SGLang. Their reusable-cache identity is token-prefix based; wkvm's useful identity is durable mutable state.
+- Borrow architecture, not code bulk: vLLM's no-phase scheduler and graph dispatcher shape; SGLang's graph backend interface, request-to-token indirection, dummy padding row, retraction/backpressure ideas, and Prometheus-style metrics.
+- Make the core object a state slot: request row -> state slot -> ring/span-bank/pending-span buffers -> lineage/hibernation metadata. Prefix tokens are inputs to state construction, not the durable cache key.
+- Keep the first native runner narrow enough to finish: Gemma-4-E4B-it routed-span on one CUDA GPU. Add OpenAI-compatible polish only after the engine boundary is stable.
+
 ## Target Artifact
 
 A native single-model Gemma routed-span runner and minimal serving path:
@@ -76,6 +105,7 @@ Deliverable: wkvm-owned cache/state classes for Gemma routed-span:
 - Pending span buffer and span-boundary bookkeeping.
 - Padded valid-mask representation for distinct-cache batching.
 - Memory accounting hooks.
+- Req-to-state indirection and dummy/padded rows for graph-safe batching.
 
 Acceptance:
 
@@ -124,6 +154,7 @@ Requirements:
 - Distinct prompts are first-class requests.
 - Running decode batches can contain requests with different prompt histories.
 - Report success/error counts.
+- Admission must expose queue depth, runnable rows, resident state slots, and retraction/backpressure decisions.
 
 ### N4. CUDA Graph Decode Path
 
@@ -141,6 +172,7 @@ Requirements:
 - Graph bucket keys are explicit and enumerable.
 - Padded rows write into safe sink rows or masked slots.
 - No per-token CPU sync on the greedy path except benchmark timing boundaries.
+- Graph backend API follows the SGLang-style capture/replay interface, while graph bucket dispatch follows vLLM-style explicit valid keys.
 
 ### N5. Minimal Serving Endpoint
 
@@ -158,8 +190,26 @@ Requirements:
 - Tokenizer/detokenizer is outside the GPU busy loop.
 - Streaming or stepwise token output is supported.
 - Per-request metrics are surfaced: latency, output tokens, finish reason, errors.
+- Endpoint can be narrow, but must have health, cancellation, and bounded queue behavior.
 
-### N6. Head-to-Head Benchmark
+### N6. Observability and Ops Floor
+
+Deliverable: metrics and failure handling sufficient to trust head-to-head benchmark output.
+
+Acceptance:
+
+```bash
+python experiments/native_gemma_metrics_smoke.py --ctx 2048 --out 32 --concurrency 4 | grep -q NATIVE_METRICS_OK
+```
+
+Requirements:
+
+- Per-request: enqueue time, prefill time, decode time, first-token latency, total latency, output tokens, finish reason, error.
+- Per-step: scheduled rows, token budget used, runnable/waiting counts, graph bucket, graph hit/miss, GPU memory allocated/reserved/device-used.
+- Per-state: resident slots, ring tokens, span-bank occupancy, pending-span occupancy, evictions/retractions.
+- Process/server: health endpoint, startup readiness, controlled shutdown, exception reporting.
+
+### N7. Head-to-Head Benchmark
 
 Deliverable: native result artifacts for the README comparison.
 
@@ -197,7 +247,7 @@ Benchmark report must include:
 - Whether each row is under the 19 GiB cap with 1 GiB headroom.
 - Comparison rows for vLLM and SGLang must state when they are nearest existing full-KV runs rather than identical semantics.
 
-### N7. README and Demo Update
+### N8. README and Demo Update
 
 Deliverable: README table and video labels use native wkvm numbers.
 
@@ -220,15 +270,25 @@ Requirements:
 | Work package | Estimate |
 |---|---:|
 | N0 contract | 0.5-1 day |
-| N1 cache structures | 3-5 days |
-| N2 offline runner | 4-7 days |
-| N3 scheduler integration | 3-5 days |
-| N4 CUDA graph decode | 4-8 days |
-| N5 serving endpoint | 2-4 days |
-| N6 benchmark and comparison | 2-4 days |
-| N7 README/video update | 1-2 days |
+| N1 cache/state arena | 4-7 days |
+| N2 offline runner | 5-9 days |
+| N3 scheduler integration | 4-7 days |
+| N4 CUDA graph decode | 5-10 days |
+| N5 serving endpoint | 3-6 days |
+| N6 observability/ops floor | 2-4 days |
+| N7 benchmark and comparison | 2-4 days |
+| N8 README/video update | 1-2 days |
 
-Total: about 3-5 focused weeks for a credible native single-model proof. The low end assumes reuse of HF module math for weights/layers while wkvm owns cache/state. The high end assumes replacing more of the model-forward path and fixing graph-capture edge cases.
+Updated estimate:
+
+| Target | Estimate | What it proves |
+|---|---:|---|
+| Native single-model proof | 4-6 focused weeks | Gemma routed-span runs without HF `DynamicCache` patching, uses wkvm-owned state/cache, and can complete offline plus scheduler smoke tests. |
+| Benchmark-grade native engine | 6-10 weeks | Adds graph buckets, serving boundary, metrics, p50/p95, memory accounting, and head-to-head artifacts that can be honestly compared with vLLM/SGLang. |
+| Production-grade wkvm subset | 3-5 months | Adds process split, health/auth/cancellation, watchdog/restart behavior, soak tests, backpressure, operational metrics, packaging, and enough failure handling for real users. |
+| vLLM/SGLang-class general engine | 9-18+ months | Broad model support, distributed modes, LoRA/spec decode/grammar/multimodal/quantization breadth, compatibility surfaces, and production operations. This is not the goal. |
+
+The previous 3-5 week estimate was reasonable only for a narrow proof that reuses HF module math while wkvm owns cache/state. After auditing vLLM and SGLang, the credible benchmark-grade target is 6-10 weeks because graph capture, metrics, server/process edges, and honest comparison artifacts are real work.
 
 ## Risks
 
