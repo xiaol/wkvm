@@ -4,6 +4,12 @@
 
 > WKV + KVM: states are the VMs — create, snapshot, fork, hibernate, resume, live-migrate. The engine is the hypervisor.
 
+## Demo
+
+<video src="experiments/results/gemma_wkvm_style_demo.mp4" controls width="100%"></video>
+
+Local artifact: [`experiments/results/gemma_wkvm_style_demo.mp4`](experiments/results/gemma_wkvm_style_demo.mp4)
+
 ## Why
 
 For linear/hybrid models, per-request memory is **constant and tiny** (an RWKV-7 7B state is ~20MB — ~1000× smaller than long-context KV). Built around that physics instead of paged KV, an engine gets:
