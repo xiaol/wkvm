@@ -1,0 +1,77 @@
+{
+  "schema": "wkvm.concurrency_ladder.v1",
+  "basis": "replicated_session_measured",
+  "mode": "routed-span-m64",
+  "engine": "patched_hf_poc",
+  "context_tokens_per_session": 13824,
+  "decode_tokens_per_session": 128,
+  "mem_cap_gib": 19.0,
+  "headroom_gib": 1.0,
+  "torch_usable_gib": 19.0,
+  "replicated_sessions": true,
+  "distinct_prompts": false,
+  "notes": [
+    "One real B=1 prefill, then real tensor copies across batch dimension.",
+    "This measures replicated resident sessions and batched decode, not distinct routed-span concurrent prefills."
+  ],
+  "config": {
+    "mode": "routed",
+    "span": true,
+    "m_slots": 64,
+    "route_on": "value",
+    "route_chunk": 256,
+    "sink": 16,
+    "window": 1024,
+    "reps": 8,
+    "attn": "sdpa",
+    "graphs": false,
+    "chunk": 2048
+  },
+  "summary": {
+    "bmax_green": 16,
+    "best_green_agg_tok_s": 562.5330928001588,
+    "max_ok_B": 32
+  },
+  "rows": [
+    {
+      "B": 8,
+      "ok": true,
+      "green": true,
+      "agg": 328.62460845895225,
+      "per": 41.07807605736903,
+      "cache_mib": 434.9375,
+      "peak_gib": 14.720718383789062,
+      "resv_gib": 14.90625
+    },
+    {
+      "B": 16,
+      "ok": true,
+      "green": true,
+      "agg": 562.5330928001588,
+      "per": 35.158318300009924,
+      "cache_mib": 869.875,
+      "peak_gib": 15.532081604003906,
+      "resv_gib": 15.96484375
+    },
+    {
+      "B": 32,
+      "ok": true,
+      "green": false,
+      "agg": 944.7635210249421,
+      "per": 29.52386003202944,
+      "cache_mib": 1739.75,
+      "peak_gib": 17.154800415039062,
+      "resv_gib": 18.1796875
+    },
+    {
+      "B": 48,
+      "ok": false,
+      "green": false,
+      "agg": null,
+      "per": null,
+      "cache_mib": null,
+      "peak_gib": null,
+      "resv_gib": 18.9296875
+    }
+  ]
+}

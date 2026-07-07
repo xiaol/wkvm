@@ -5,7 +5,7 @@ experiments/results. It intentionally separates:
 
   * measured ring concurrency,
   * measured B=1 routed-span long-output behavior,
-  * derived routed-span resident-session capacity.
+  * measured routed-span replicated-session decode capacity.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ import wkvm_demo_video as R
 
 EVENTS_DEFAULT = RESULTS / "gemma_demo_events.json"
 OUT_DEFAULT = RESULTS / "gemma_routed_span_demo.mp4"
+ROUTED_LADDER = RESULTS / "gemma_routed_span_ladder.json"
 
 LONG_RUNS = {
     "wkvm:ring": RESULTS / "long_gen_13824_512_wkvm_ring.json",
@@ -40,12 +41,23 @@ def load_json(path: Path) -> dict:
     return json.loads(path.read_text())
 
 
-def title_card(emit, blank, P, ev: dict, runs: dict, duration: float, fps: int) -> None:
+def _green_best(ladder: dict) -> dict:
+    green = [r for r in ladder["rows"] if r.get("green")]
+    return max(green, key=lambda r: r["B"]) if green else {}
+
+
+def _best_ok(ladder: dict) -> dict:
+    ok = [r for r in ladder["rows"] if r.get("ok")]
+    return max(ok, key=lambda r: r["B"]) if ok else {}
+
+
+def title_card(emit, blank, P, ev: dict, runs: dict, ladder: dict, duration: float, fps: int) -> None:
     from PIL import ImageDraw
 
     meta = ev["meta"]
     routed = runs["wkvm:routed-span-m64"]
     ring = runs["wkvm:ring"]
+    best_green = _green_best(ladder)
     for _ in range(int(duration * fps)):
         img = blank()
         d = ImageDraw.Draw(img)
@@ -70,8 +82,9 @@ def title_card(emit, blank, P, ev: dict, runs: dict, duration: float, fps: int) 
                 R.CYAN,
             ),
             (
-                "derived routed-span capacity: about 43 resident long sessions; native runner pending",
-                R.AMBER,
+                f"measured routed-span replicated ladder: B={best_green['B']} green, "
+                f"{best_green['agg']:.0f} aggregate tok/s",
+                R.GREEN,
             ),
         ]
         for text, color in rows:
@@ -87,8 +100,105 @@ def title_card(emit, blank, P, ev: dict, runs: dict, duration: float, fps: int) 
         emit(img)
 
 
+def act_routed_span_ladder(
+    emit, blank, P, ev: dict, ladder: dict, duration: float, fps: int
+) -> None:
+    from PIL import ImageDraw
+
+    meta = ev["meta"]
+    rows = ladder["rows"]
+    summary = ladder["summary"]
+    ctx = ladder["context_tokens_per_session"]
+    steps = ladder["decode_tokens_per_session"]
+    best_green = _green_best(ladder)
+    best_ok = _best_ok(ladder)
+    max_agg = max([r.get("agg") or 0 for r in rows] + [1])
+    reveal = max(1, len(rows))
+
+    for f_i in range(int(duration * fps)):
+        T = (f_i + 1) / fps
+        img = blank()
+        d = ImageDraw.Draw(img)
+        G.draw_header(
+            d,
+            P,
+            meta,
+            "measured routed-span replicated-session ladder",
+            f"{ctx:,} ctx/session -> {steps} decode tokens",
+        )
+
+        left = (18, 66, 790, 676)
+        right = (810, 66, 1262, 676)
+        G.draw_box(d, left, R.PANE_BG, R.BORDER)
+        G.draw_box(d, right, R.PANE_BG, R.BORDER)
+        G.draw_panel_title(d, P, left, "routed-span-m64 measured rows", "19 GiB cap")
+        G.draw_panel_title(d, P, right, "what the measurement means", None)
+
+        visible = min(len(rows), int(T * reveal / max(1.0, duration - 1.0)) + 1)
+        y = 114
+        headers = [("B", 42), ("cache", 130), ("reserved", 238), ("aggregate decode", 358), ("status", 650)]
+        for text, x in headers:
+            d.text((x, y - 28), text, font=P.font(11, bold=True), fill=R.DIM)
+        for r in rows[:visible]:
+            b = r["B"]
+            ok = bool(r.get("ok"))
+            green = bool(r.get("green"))
+            color = R.GREEN if green else (R.AMBER if ok else R.RED)
+            d.text((42, y), f"{b:>2}", font=P.font(14, bold=True), fill=R.FG)
+            if ok:
+                cache = float(r["cache_mib"])
+                resv = float(r["resv_gib"])
+                agg = float(r["agg"])
+                status = "green" if green else "over budget"
+                d.text((130, y), f"{cache:,.0f} MiB", font=P.font(12), fill=R.CYAN)
+                d.text((238, y), f"{resv:.2f} GiB", font=P.font(12), fill=color)
+                G.draw_bar(d, P, 358, y + 1, 235, 16, agg, max_agg, color, f"{agg:,.0f}/s", R.BORDER)
+                d.text((650, y), status, font=P.font(12, bold=True), fill=color)
+            else:
+                resv = r.get("resv_gib")
+                d.rectangle([358, y + 1, 438, y + 17], fill=(60, 24, 24), outline=R.RED)
+                d.text((456, y), f"OOM at {float(resv):.2f} GiB reserved",
+                       font=P.font(12, bold=True), fill=R.RED)
+            y += 58
+
+        notes = [
+            f"green max: B={summary['bmax_green']} at {summary['best_green_agg_tok_s']:.0f} aggregate tok/s",
+            f"largest completed row: B={summary['max_ok_B']} at {best_ok.get('agg', 0):.0f} tok/s, but over the green memory line",
+            "basis: one real B=1 routed-span prefill, then real cache tensor copies across batch",
+            "not measured here: distinct routed-span prompts doing concurrent prefill/routing",
+        ]
+        y = 112
+        for note in notes:
+            fill = R.GREEN if note.startswith("green max") else (R.AMBER if note.startswith("not measured") else R.FG)
+            y = G.draw_wrapped(d, P, (834, y), note, 48, 14, fill,
+                               bold=note.startswith(("green max", "not measured")), max_lines=3)
+            y += 18
+
+        cfg = ladder["config"]
+        y += 8
+        config_rows = [
+            ("mode", ladder["mode"]),
+            ("m_slots", str(cfg["m_slots"])),
+            ("route_on", cfg["route_on"]),
+            ("decode", f"{steps} tokens/session"),
+            ("cap", f"{ladder['mem_cap_gib']:.0f} GiB with {ladder['headroom_gib']:.0f} GiB headroom"),
+        ]
+        for k, v in config_rows:
+            d.text((834, y), k, font=P.font(12, bold=True), fill=R.DIM)
+            d.text((960, y), v, font=P.font(12), fill=R.CYAN if k == "mode" else R.FG)
+            y += 34
+
+        G.draw_footer(
+            d,
+            P,
+            "ACT 2 / ROUTED-SPAN CONCURRENCY",
+            "replicated-session decode measured; distinct prompt serving remains separate",
+        )
+        emit(img)
+
+
 def act_routed_span_mechanics(
-    emit, blank, P, ev: dict, runs: dict, duration: float, fps: int
+    emit, blank, P, ev: dict, runs: dict, ladder: dict, duration: float, fps: int
 ) -> None:
     from PIL import ImageDraw
 
@@ -97,6 +207,7 @@ def act_routed_span_mechanics(
     cfg = routed["engine_config"]
     mem = routed["memory"]["full_pass"]
     facts = G.facts_found(routed["output_text"])
+    best_green = _green_best(ladder)
 
     for f_i in range(int(duration * fps)):
         T = (f_i + 1) / fps
@@ -112,7 +223,7 @@ def act_routed_span_mechanics(
             G.draw_box(d, rect, R.PANE_BG, R.BORDER)
 
         G.draw_panel_title(d, P, left, "span-routing path", "explicit mask")
-        G.draw_panel_title(d, P, right, "measured B=1 run", "PoC quality path")
+        G.draw_panel_title(d, P, right, "measured runs", "quality + ladder")
         G.draw_panel_title(d, P, bottom, "why ring loses this prompt", None)
 
         steps = [
@@ -138,6 +249,7 @@ def act_routed_span_mechanics(
             ("span_break_mask", cfg["span_break_mask"]),
             ("cache", f"{mem['cache_mib']:.1f} MiB @ 13,824 ctx"),
             ("throughput", f"{routed['timing']['decode_tok_s']:.1f} decode tok/s"),
+            ("ladder", f"B={best_green['B']} green, {best_green['agg']:.0f} aggregate tok/s"),
             ("facts", ", ".join(facts) if facts else "-"),
         ]
         y = 112
@@ -149,7 +261,7 @@ def act_routed_span_mechanics(
             d,
             P,
             (790, 430),
-            "RoutedSpanLayer asserts B=1 today, so routed-span serving concurrency is not measured yet.",
+            "Concurrency shown here is replicated-session decode after one real routed-span prefill; distinct prompt serving is not measured in this artifact.",
             47,
             12,
             R.AMBER,
@@ -276,7 +388,7 @@ def act_long_output(emit, blank, P, ev: dict, runs: dict, duration: float, fps: 
         emit(img)
 
 
-def end_card(emit, blank, P, ev: dict, runs: dict, duration: float, fps: int) -> None:
+def end_card(emit, blank, P, ev: dict, runs: dict, ladder: dict, duration: float, fps: int) -> None:
     from PIL import ImageDraw
 
     meta = ev["meta"]
@@ -285,6 +397,8 @@ def end_card(emit, blank, P, ev: dict, runs: dict, duration: float, fps: int) ->
     ring = runs["wkvm:ring"]
     vllm = runs["vLLM"]
     sglang = runs["SGLang"]
+    best_green = _green_best(ladder)
+    best_ok = _best_ok(ladder)
     rows = [
         ("routed-span Gemma demo", 32, R.WHITE, True),
         ("what is justified by the current artifacts", 16, R.DIM, False),
@@ -317,14 +431,15 @@ def end_card(emit, blank, P, ev: dict, runs: dict, duration: float, fps: int) ->
             True,
         ),
         (
-            "routed-span capacity: about 43 long sessions is derived, not measured serving",
+            f"routed-span replicated ladder: B={best_green['B']} green, "
+            f"{best_green['agg']:.0f} tok/s; B={best_ok['B']} ran but over budget",
             14,
-            R.AMBER,
+            R.GREEN,
             True,
         ),
         ("", 8, R.DIM, False),
         (
-            "next acceptance gate: native wkvm Gemma routed-span runner with real concurrent serving",
+            "remaining gap: distinct routed-span prompts and native serving are not measured in this artifact",
             14,
             R.FG,
             False,
@@ -355,6 +470,7 @@ def cmd_render(args) -> None:
 
     ev = load_json(Path(args.events))
     runs = {name: load_json(path) for name, path in LONG_RUNS.items()}
+    ladder = load_json(Path(args.ladder))
 
     W, H = 1280, 720
     fps = args.fps
@@ -404,13 +520,13 @@ def cmd_render(args) -> None:
         proc.stdin.write(img.tobytes())
         nframes += 1
 
-    title_card(emit, blank, P, ev, runs, 4.0, fps)
+    title_card(emit, blank, P, ev, runs, ladder, 4.0, fps)
     G.act_real_concurrency(emit, blank, P, ev, 8.0, fps)
-    G.act_concurrency_ladder(emit, blank, P, ev, 12.0, fps)
-    act_routed_span_mechanics(emit, blank, P, ev, runs, 8.0, fps)
+    act_routed_span_ladder(emit, blank, P, ev, ladder, 12.0, fps)
+    act_routed_span_mechanics(emit, blank, P, ev, runs, ladder, 8.0, fps)
     act_long_output(emit, blank, P, ev, runs, 16.0, fps)
     G.act_quality_target(emit, blank, P, ev, 10.0, fps)
-    end_card(emit, blank, P, ev, runs, 5.0, fps)
+    end_card(emit, blank, P, ev, runs, ladder, 5.0, fps)
 
     assert proc.stdin is not None
     proc.stdin.close()
@@ -424,6 +540,7 @@ def cmd_render(args) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--events", default=str(EVENTS_DEFAULT))
+    ap.add_argument("--ladder", default=str(ROUTED_LADDER))
     ap.add_argument("--out", default=str(OUT_DEFAULT))
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--crf", type=int, default=22)

@@ -36,9 +36,11 @@ Run (offline, no HF_HOME override):
 
 import argparse
 import gc
+import json
 import math
 import os
 import time
+from pathlib import Path
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -130,6 +132,15 @@ class SinkRingLayer(DynamicLayer):
 
     def get_max_cache_shape(self) -> int:
         return self.sink + self.window
+
+
+def _repeat_batch(t: torch.Tensor | None, repeats: int) -> torch.Tensor | None:
+    if t is None:
+        return None
+    if repeats == 1:
+        return t.contiguous()
+    assert t.shape[0] == 1, "cache batch replication expects a B=1 prefill"
+    return t.repeat_interleave(repeats, dim=0).contiguous()
 
 
 class BankedRingLayer(SinkRingLayer):
@@ -463,7 +474,9 @@ class RoutedBankLayer(SinkRingLayer):
     def update(self, key_states, value_states, *args, **kwargs):
         if not self.is_initialized:
             self.lazy_initialization(key_states, value_states)
-        assert key_states.shape[0] == 1, "RoutedBankLayer is B=1 (PoC quality path)"
+        batched_decode = key_states.shape[0] > 1
+        if batched_decode:
+            assert key_states.shape[-2] == 1, "RoutedBankLayer batched path is decode-only"
         ret_k = torch.cat([self.keys, key_states], dim=-2) if self.keys.numel() else key_states
         ret_v = torch.cat([self.values, value_states], dim=-2) if self.values.numel() else value_states
         self.cumulative_length += key_states.shape[-2]
@@ -483,6 +496,11 @@ class RoutedBankLayer(SinkRingLayer):
             rk, rv = rk[:, :, cut:], rv[:, :, cut:]
         self._ring_k, self._ring_v = rk, rv
         if self._pend_k.shape[2] >= self.route_chunk:
+            if batched_decode:
+                raise NotImplementedError(
+                    "batched routed decode cannot route new overflow chunks; "
+                    "lower --decode-tokens or increase --route-chunk"
+                )
             pk, pv = self._pend_k, self._pend_v
             self._pend_k, self._pend_v = pk[:, :, :0], pv[:, :, :0]
             self._route_fold(pk, pv)
@@ -490,7 +508,16 @@ class RoutedBankLayer(SinkRingLayer):
         return ret_k, ret_v
 
     def batch_repeat_interleave(self, repeats: int):
-        raise NotImplementedError("RoutedBankLayer does not support batch replication")
+        if repeats < 1:
+            raise ValueError("repeats must be >= 1")
+        self.keys = None
+        self.values = None
+        for attr in ("_sink_k", "_sink_v", "_ring_k", "_ring_v", "_pend_k",
+                     "_pend_v", "_slot_mk", "_slot_mv"):
+            setattr(self, attr, _repeat_batch(getattr(self, attr), repeats))
+        self._slot_rk = [_repeat_batch(t, repeats) for t in self._slot_rk]
+        self._slot_rv = [_repeat_batch(t, repeats) for t in self._slot_rv]
+        self._materialize()
 
 
 class RoutedSpanLayer(RoutedBankLayer):
@@ -703,7 +730,9 @@ class RoutedSpanLayer(RoutedBankLayer):
     def update(self, key_states, value_states, *args, **kwargs):
         if not self.is_initialized:
             self.lazy_initialization(key_states, value_states)
-        assert key_states.shape[0] == 1, "RoutedSpanLayer is B=1 (PoC quality path)"
+        batched_decode = key_states.shape[0] > 1
+        if batched_decode:
+            assert key_states.shape[-2] == 1, "RoutedSpanLayer batched path is decode-only"
         ret_k = torch.cat([self.keys, key_states], dim=-2) if self.keys.numel() else key_states
         ret_v = torch.cat([self.values, value_states], dim=-2) if self.values.numel() else value_states
         self.cumulative_length += key_states.shape[-2]
@@ -723,11 +752,30 @@ class RoutedSpanLayer(RoutedBankLayer):
             rk, rv = rk[:, :, cut:], rv[:, :, cut:]
         self._ring_k, self._ring_v = rk, rv
         if self._pend_k.shape[2] >= self.route_chunk:
+            if batched_decode:
+                raise NotImplementedError(
+                    "batched routed-span decode cannot route new overflow spans; "
+                    "lower --decode-tokens or increase --route-chunk"
+                )
             n = self._route_fold(self._pend_k, self._pend_v)
             self._pend_k = self._pend_k[:, :, n:]
             self._pend_v = self._pend_v[:, :, n:]
         self._materialize()
         return ret_k, ret_v
+
+    def batch_repeat_interleave(self, repeats: int):
+        if repeats < 1:
+            raise ValueError("repeats must be >= 1")
+        self.keys = None
+        self.values = None
+        for attr in ("_sink_k", "_sink_v", "_ring_k", "_ring_v", "_pend_k",
+                     "_pend_v", "_slot_mk", "_slot_mv"):
+            setattr(self, attr, _repeat_batch(getattr(self, attr), repeats))
+        for spans in self._slot_spans:
+            for sp in spans:
+                sp["k"] = _repeat_batch(sp["k"], repeats)
+                sp["v"] = _repeat_batch(sp["v"], repeats)
+        self._materialize()
 
 
 def set_span_break_mask(cache, mask):
@@ -759,6 +807,7 @@ def build_cache(model, mode: str, args) -> DynamicCache:
                 cache.layers[i] = cls(
                     sink=args.sink, window=args.window,
                     m_slots=getattr(args, "m_slots", 16), reps=args.reps,
+                    route_chunk=getattr(args, "route_chunk", 256),
                     route_on=getattr(args, "route_on", "resid"),
                     coord=coord, is_leader=(j == 0),
                     trace=getattr(args, "trace", False))
@@ -848,6 +897,31 @@ def build_plain_prompt(tok, ctx: int) -> torch.Tensor:
     """Synthetic long prompt of exactly `ctx` tokens (BOS + filler)."""
     ids = [tok.bos_token_id] + filler_ids(tok, ctx - 1)
     return torch.tensor([ids], dtype=torch.long)
+
+
+_BREAK_CACHE: dict[int, bool] = {}
+
+
+def break_mask_for(tok, ids: list[int]) -> list[bool]:
+    """Sentence-break mask per token position for RoutedSpanLayer."""
+    mask: list[bool] = []
+    for tid in ids:
+        b = _BREAK_CACHE.get(tid)
+        if b is None:
+            b = any(c in tok.decode([tid]) for c in ".!?\n")
+            _BREAK_CACHE[tid] = b
+        mask.append(b)
+    return mask
+
+
+def json_number(x):
+    if isinstance(x, float) and not math.isfinite(x):
+        return None
+    return x
+
+
+def json_row(row: dict) -> dict:
+    return {k: json_number(v) for k, v in row.items()}
 
 
 def build_needle_prompt(tok, ctx: int) -> torch.Tensor:
@@ -1457,10 +1531,13 @@ def run_concurrency(model, tok, args):
     tables = []
     for mode, ctx, ladder_b in plans:
         prompt = build_plain_prompt(tok, ctx)
+        prompt_ids = prompt[0].tolist()
         rows = []
         for B in ladder_b:
             gc.collect(); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
             cache = build_cache(model, mode, args)
+            if mode == "routed" and getattr(args, "span", False):
+                set_span_break_mask(cache, break_mask_for(tok, prompt_ids))
             row = dict(B=B, ok=False, green=False, agg=float("nan"),
                        per=float("nan"), cache_mib=float("nan"),
                        peak_gib=float("nan"), resv_gib=float("nan"))
@@ -1519,6 +1596,53 @@ def run_concurrency(model, tok, args):
                 print(f"| {r['B']} | {r['cache_mib']:.0f} | {r['cache_mib']/r['B']:.1f} "
                       f"| {r['peak_gib']:.2f} | {r['resv_gib']:.2f} "
                       f"| {r['agg']:.1f} | {r['per']:.2f} | {status} |")
+    if getattr(args, "out_json", None):
+        if len(tables) != 1:
+            raise ValueError("--out-json expects a single concurrency plan")
+        mode, ctx, rows = tables[0]
+        label = "routed-span-m64" if mode == "routed" and getattr(args, "span", False) else mode
+        green_rows = [r for r in rows if r["green"]]
+        ok_rows = [r for r in rows if r["ok"]]
+        payload = {
+            "schema": "wkvm.concurrency_ladder.v1",
+            "basis": "replicated_session_measured",
+            "mode": label,
+            "engine": "patched_hf_poc",
+            "context_tokens_per_session": ctx,
+            "decode_tokens_per_session": steps,
+            "mem_cap_gib": args.mem_cap_gib,
+            "headroom_gib": headroom / 2**30,
+            "torch_usable_gib": avail / 2**30,
+            "replicated_sessions": True,
+            "distinct_prompts": False,
+            "notes": [
+                "One real B=1 prefill, then real tensor copies across batch dimension.",
+                "This measures replicated resident sessions and batched decode, not distinct routed-span concurrent prefills.",
+            ],
+            "config": {
+                "mode": mode,
+                "span": bool(getattr(args, "span", False)),
+                "m_slots": getattr(args, "m_slots", None),
+                "route_on": getattr(args, "route_on", None),
+                "route_chunk": getattr(args, "route_chunk", None),
+                "sink": args.sink,
+                "window": args.window,
+                "reps": args.reps,
+                "attn": args.attn,
+                "graphs": args.graphs,
+                "chunk": args.chunk,
+            },
+            "summary": {
+                "bmax_green": max((r["B"] for r in green_rows), default=0),
+                "best_green_agg_tok_s": max((r["agg"] for r in green_rows), default=0.0),
+                "max_ok_B": max((r["B"] for r in ok_rows), default=0),
+            },
+            "rows": [json_row(r) for r in rows],
+        }
+        out = Path(args.out_json)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payload, indent=2, allow_nan=False) + "\n")
+        print(f"WROTE_JSON {out}")
     return tables
 
 
@@ -1822,6 +1946,12 @@ def main():
                     help="routed mode: number of persistent bank slots")
     ap.add_argument("--route-on", choices=["key", "resid", "value"], default="resid",
                     help="routed mode: routing feature")
+    ap.add_argument("--route-chunk", type=int, default=256,
+                    help="routed mode: evicted tokens per routing chunk")
+    ap.add_argument("--span", action="store_true",
+                    help="routed mode: use span-atomic routing")
+    ap.add_argument("--out-json", default=None,
+                    help="write concurrency results as JSON")
     ap.add_argument("--ctxs", type=int, nargs="*", default=None,
                     help="override bench context lengths")
     ap.add_argument("--model-path", default=None)
