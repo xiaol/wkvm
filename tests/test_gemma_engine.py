@@ -865,6 +865,7 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         req_id: str = "full",
         prompt_token_ids: list[int] | None = None,
         token_pool_capacity: int = 64,
+        token_pool_paged_block_size: int | None = None,
     ):
         import torch
         from wkvm.gemma_engine import GemmaNativeEngine
@@ -930,6 +931,7 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
             enable_token_pool_attention=True,
             token_pool_max_context_len=8,
             token_pool_capacity=token_pool_capacity,
+            token_pool_paged_block_size=token_pool_paged_block_size,
         )
         tokens = list(prompt_token_ids or [1, 2, 3])
         req = Request(prompt_token_ids=tokens, max_new_tokens=4, req_id=req_id)
@@ -2021,6 +2023,189 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         self.assertEqual(engine.metrics.token_pool_full_attention_row_rebuilds, 1)
         self.assertEqual(engine.metrics.token_pool_full_attention_row_reuses, 1)
         self.assertEqual(engine.metrics.token_pool_full_attention_row_appends, 1)
+
+        engine._token_pool_discard_decode_reservations(reused_reservations)
+        engine._token_pool_release_request(req.req_id)
+        self.assertEqual(engine.stats()["token_pool"]["allocated_token_slots"], 0)
+
+    def test_paged_triton_env_does_not_page_align_full_attention_rows(self) -> None:
+        engine, req, cache = self._make_full_attention_token_pool_fixture(
+            req_id="paged-triton-flat",
+            token_pool_capacity=128,
+            token_pool_paged_block_size=4,
+        )
+        materialized_width = cache.layers[1].materialized_tokens()
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {
+                "WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON": "1",
+                "WKVM_ENABLE_TOKEN_POOL_PAGED_SPLIT_TRITON": "1",
+                "WKVM_TOKEN_POOL_BUILD_PAGED_METADATA": "0",
+            },
+        ):
+            reservations = engine._token_pool_prepare_decode_batch(
+                [req],
+                persistent_full_attention_rows=True,
+            )
+        context = engine._token_pool_decode_context(reservations)
+        self.assertIsNotNone(context)
+        full_metadata = context.metadata_by_layer_type["full_attention"]  # type: ignore[union-attr]
+        self.assertEqual(full_metadata.seq_lens.tolist(), [materialized_width + 1])
+        self.assertIsNone(context.paged_metadata_for_layer(1, "full_attention"))  # type: ignore[union-attr]
+        self.assertNotIn(
+            "full_attention",
+            context.paged_metadata_by_layer_type or {},  # type: ignore[union-attr]
+        )
+        row = engine._token_pool_full_attention_rows["paged-triton-flat"]
+        self.assertFalse(row.page_aligned)
+
+        engine._token_pool_discard_decode_reservations(reservations)
+        engine._token_pool_release_request(req.req_id)
+        self.assertEqual(engine.stats()["token_pool"]["allocated_token_slots"], 0)
+
+    def test_persistent_full_attention_rows_build_paged_metadata(self) -> None:
+        import torch
+
+        engine, req, cache = self._make_full_attention_token_pool_fixture(
+            req_id="paged",
+            token_pool_capacity=128,
+            token_pool_paged_block_size=4,
+        )
+        full_layer = cache.layers[1]
+        materialized_width = full_layer.materialized_tokens()
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"WKVM_TOKEN_POOL_BUILD_PAGED_METADATA": "1"},
+        ):
+            reservations = engine._token_pool_prepare_decode_batch(
+                [req],
+                persistent_full_attention_rows=True,
+            )
+        context = engine._token_pool_decode_context(reservations)
+        self.assertIsNotNone(context)
+        full_metadata = context.metadata_by_layer_type["full_attention"]  # type: ignore[union-attr]
+        paged = context.paged_metadata_for_layer(1, "full_attention")  # type: ignore[union-attr]
+        self.assertIsNotNone(paged)
+        self.assertIs(paged, context.paged_metadata_by_layer_type["full_attention"])  # type: ignore[index,union-attr]
+        self.assertEqual(paged.block_size, 4)
+        self.assertEqual(paged.seq_lens.tolist(), full_metadata.seq_lens.tolist())
+        self.assertEqual(
+            paged.logical_seq_lens.tolist(),
+            full_metadata.logical_seq_lens.tolist(),
+        )
+        self.assertEqual(paged.selected_start_positions.tolist(), [0])
+        self.assertEqual(paged.out_cache_loc.tolist(), full_metadata.out_cache_loc.tolist())
+        self.assertEqual(full_metadata.seq_lens.tolist(), [materialized_width + 1])
+
+        flat_slots = full_metadata.kv_indices[: materialized_width + 1].tolist()
+        reconstructed = []
+        for offset in range(materialized_width + 1):
+            block = int(paged.block_tables[0, offset // 4].item())
+            reconstructed.append(block * 4 + (offset % 4))
+        self.assertEqual(reconstructed, flat_slots)
+        self.assertEqual(flat_slots[-1], reservations[0].full_attention_token_slot)
+
+        decode_key = torch.tensor([[[301.0, 302.0]]])
+        engine._token_kv_pool.set_kv(  # type: ignore[union-attr]
+            1,
+            [reservations[0].full_attention_token_slot],
+            decode_key,
+            decode_key + 100,
+        )
+        engine._token_pool_commit_decode_reservations(reservations)
+        req.num_computed_tokens += 1
+        req.output_token_ids.append(88)
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"WKVM_TOKEN_POOL_BUILD_PAGED_METADATA": "1"},
+        ):
+            reused_reservations = engine._token_pool_prepare_decode_batch(
+                [req],
+                persistent_full_attention_rows=True,
+            )
+        reused_context = engine._token_pool_decode_context(reused_reservations)
+        self.assertIsNotNone(reused_context)
+        reused_full = reused_context.metadata_by_layer_type["full_attention"]  # type: ignore[union-attr]
+        reused_paged = reused_context.paged_metadata_for_layer(1, "full_attention")  # type: ignore[union-attr]
+        self.assertIsNotNone(reused_paged)
+        self.assertEqual(reused_paged.seq_lens.tolist(), reused_full.seq_lens.tolist())
+        reused_slots = reused_full.kv_indices[: materialized_width + 2].tolist()
+        reconstructed = []
+        for offset in range(materialized_width + 2):
+            block = int(reused_paged.block_tables[0, offset // 4].item())
+            reconstructed.append(block * 4 + (offset % 4))
+        self.assertEqual(reconstructed, reused_slots)
+
+        engine._token_pool_discard_decode_reservations(reused_reservations)
+        engine._token_pool_release_request(req.req_id)
+        self.assertEqual(engine.stats()["token_pool"]["allocated_token_slots"], 0)
+
+    def test_persistent_full_attention_paged_metadata_pads_block_table_width(self) -> None:
+        import torch
+
+        engine, req, cache = self._make_full_attention_token_pool_fixture(
+            req_id="paged-padding",
+            token_pool_capacity=128,
+            token_pool_paged_block_size=4,
+        )
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"WKVM_TOKEN_POOL_BUILD_PAGED_METADATA": "1"},
+        ):
+            reservations = engine._token_pool_prepare_decode_batch(
+                [req],
+                full_attention_kv_indices_padding_steps=2,
+                persistent_full_attention_rows=True,
+            )
+        context = engine._token_pool_decode_context(reservations)
+        self.assertIsNotNone(context)
+        full_metadata = context.metadata_by_layer_type["full_attention"]  # type: ignore[union-attr]
+        paged = context.paged_metadata_for_layer(1, "full_attention")  # type: ignore[union-attr]
+        self.assertIsNotNone(paged)
+        expected_width = (int(full_metadata.max_seq_len) + paged.block_size - 1) // paged.block_size
+        self.assertEqual(tuple(paged.block_tables.shape), (1, expected_width))
+        first_signature = engine._token_pool_decode_shape_signature(context)[
+            "paged_metadata_by_layer_type"
+        ]["full_attention"]
+
+        decode_key = torch.tensor([[[401.0, 402.0]]])
+        engine._token_kv_pool.set_kv(  # type: ignore[union-attr]
+            1,
+            [reservations[0].full_attention_token_slot],
+            decode_key,
+            decode_key + 100,
+        )
+        engine._token_pool_commit_decode_reservations(reservations)
+        req.num_computed_tokens += 1
+        req.output_token_ids.append(88)
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"WKVM_TOKEN_POOL_BUILD_PAGED_METADATA": "1"},
+        ):
+            reused_reservations = engine._token_pool_prepare_decode_batch(
+                [req],
+                full_attention_kv_indices_padding_steps=1,
+                persistent_full_attention_rows=True,
+            )
+        reused_context = engine._token_pool_decode_context(reused_reservations)
+        self.assertIsNotNone(reused_context)
+        reused_full = reused_context.metadata_by_layer_type["full_attention"]  # type: ignore[union-attr]
+        reused_paged = reused_context.paged_metadata_for_layer(1, "full_attention")  # type: ignore[union-attr]
+        self.assertIsNotNone(reused_paged)
+        self.assertEqual(reused_full.max_seq_len, full_metadata.max_seq_len)
+        self.assertEqual(reused_paged.max_seq_len, paged.max_seq_len)
+        self.assertEqual(tuple(reused_paged.block_tables.shape), tuple(paged.block_tables.shape))
+        self.assertEqual(
+            engine._token_pool_decode_shape_signature(reused_context)[
+                "paged_metadata_by_layer_type"
+            ]["full_attention"],
+            first_signature,
+        )
 
         engine._token_pool_discard_decode_reservations(reused_reservations)
         engine._token_pool_release_request(req.req_id)

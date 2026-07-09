@@ -969,6 +969,8 @@ def build_paged_decode_metadata_from_token_slot_rows(
     dtype: Any | None = None,
     token_pool_capacity: int | None = None,
     padding_block: int = -1,
+    allow_selected_len_gt_logical_len: bool = False,
+    max_seq_len: int | None = None,
 ) -> PagedDecodeBatchMetadata:
     """Build selected-window-relative block tables from page-aligned token rows.
 
@@ -1103,13 +1105,19 @@ def build_paged_decode_metadata_from_token_slot_rows(
         selected_len = int(selected_lens[row_idx])
         logical_len = int(logical_lens[row_idx].item())
         start = int(start_positions[row_idx])
-        if start + selected_len > logical_len:
+        if (
+            start + selected_len > logical_len
+            and not bool(allow_selected_len_gt_logical_len)
+        ):
             raise ValueError("selected_start_positions plus row length exceeds logical length")
         if out is not None:
             out_slot = int(out[row_idx].item())
             if values.count(out_slot) != 1:
                 raise ValueError("each out_cache_loc slot must appear exactly once in its row")
-            decode_offset = logical_len - 1 - start
+            if allow_selected_len_gt_logical_len and start + selected_len > logical_len:
+                decode_offset = selected_len - 1
+            else:
+                decode_offset = logical_len - 1 - start
             if decode_offset < 0 or decode_offset >= selected_len:
                 raise ValueError("out_cache_loc must be inside the selected decode row")
             if int(values[decode_offset]) != out_slot:
@@ -1136,6 +1144,12 @@ def build_paged_decode_metadata_from_token_slot_rows(
         if max_blocks > block_table_width:
             raise ValueError("block_table_width is smaller than the live block table")
         max_blocks = block_table_width
+    metadata_max_seq_len = max(selected_lens)
+    if max_seq_len is not None:
+        max_seq_len = int(max_seq_len)
+        if max_seq_len < metadata_max_seq_len:
+            raise ValueError("max_seq_len is smaller than the live selected length")
+        metadata_max_seq_len = max_seq_len
     block_tables = torch.full(
         (row_count, max_blocks),
         int(padding_block),
@@ -1168,7 +1182,7 @@ def build_paged_decode_metadata_from_token_slot_rows(
         block_size=block_size,
         slot_mapping=out_long,
         out_cache_loc_long=out_long,
-        max_seq_len=max(selected_lens),
+        max_seq_len=metadata_max_seq_len,
     )
 
 

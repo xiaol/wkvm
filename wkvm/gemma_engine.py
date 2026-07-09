@@ -37,6 +37,7 @@ from wkvm.runner.gemma_token_pool import (
     TokenSlotRowChunks,
     TokenSlotAllocator,
     build_decode_metadata_from_token_slot_rows,
+    build_paged_decode_metadata_from_token_slot_rows,
 )
 
 
@@ -74,6 +75,10 @@ def _token_pool_paged_metadata_requested() -> bool:
             "WKVM_TOKEN_POOL_BUILD_PAGED_METADATA",
         )
     )
+
+
+def _token_pool_full_attention_paged_metadata_requested() -> bool:
+    return _env_flag("WKVM_TOKEN_POOL_BUILD_PAGED_METADATA")
 
 
 def _token_pool_graph_signature_recording_requested() -> bool:
@@ -435,6 +440,7 @@ class _TokenPoolFullAttentionRow:
     row_slots: list[int]
     owned_slots: list[int]
     append_slots: list[int] = field(default_factory=list)
+    page_aligned: bool = False
 
 
 class GemmaNativeEngine:
@@ -2165,6 +2171,48 @@ class GemmaNativeEngine:
             slots.append(slot)
         return torch.as_tensor(slots, dtype=torch.int32, device=allocator.device), slots
 
+    def _token_pool_alloc_page_aligned_full_attention_row_slots(
+        self,
+        start_position: int,
+        min_slots: int,
+    ):
+        allocator = self._token_slot_allocator
+        if allocator is None:
+            raise RuntimeError("token-pool allocator is not initialized")
+        alloc_page = getattr(allocator, "alloc_page_block_with_ids", None)
+        if alloc_page is None:
+            slots_tensor, slot_ids = allocator.alloc_slots_with_ids(min_slots)
+            return slots_tensor, slot_ids, list(slot_ids)
+        import torch
+
+        block_size = max(1, int(self.token_pool_paged_block_size))
+        start_position = int(start_position)
+        min_slots = int(min_slots)
+        if start_position < 0:
+            raise ValueError("start_position must be non-negative")
+        if min_slots < 1:
+            raise ValueError("min_slots must be >= 1")
+        if start_position % block_size:
+            raise RuntimeError("page-aligned full-attention row append must start at a page boundary")
+        end_position = start_position + min_slots
+        rounded_end = ((end_position + block_size - 1) // block_size) * block_size
+        slots: list[int] = []
+        owned_slots: list[int] = []
+        first_block = start_position // block_size
+        last_block = (rounded_end - 1) // block_size
+        for logical_block in range(first_block, last_block + 1):
+            _physical_block, block_slots = alloc_page(block_size)
+            owned_slots.extend(int(slot) for slot in block_slots)
+            block_start = max(start_position, logical_block * block_size)
+            block_end = min(rounded_end, (logical_block + 1) * block_size)
+            for logical_pos in range(block_start, block_end):
+                slots.append(int(block_slots[logical_pos % block_size]))
+        return (
+            torch.as_tensor(slots, dtype=torch.int32, device=allocator.device),
+            slots,
+            owned_slots,
+        )
+
     def _token_pool_release_prefill_sliding_storage(self, cache) -> None:
         if self._token_kv_pool is None or cache is None:
             return
@@ -2349,7 +2397,12 @@ class GemmaNativeEngine:
                         for reservation in reservations
                     ],
                 )
-                layer_metadata, full_metadata = self._token_pool_prepare_layer_decode_metadata(
+                (
+                    layer_metadata,
+                    full_metadata,
+                    paged_layer_metadata,
+                    full_paged_metadata,
+                ) = self._token_pool_prepare_layer_decode_metadata(
                     reqs,
                     reservations,
                     sliding_metadata,
@@ -2369,6 +2422,12 @@ class GemmaNativeEngine:
                     }
                 if full_metadata is not None:
                     self.last_token_pool_decode_metadata["full_attention"] = full_metadata
+                if full_paged_metadata is not None:
+                    if self.last_token_pool_paged_decode_metadata is None:
+                        self.last_token_pool_paged_decode_metadata = {}
+                    self.last_token_pool_paged_decode_metadata[
+                        "full_attention"
+                    ] = full_paged_metadata
                 covered_layer_types = {"sliding_attention"}
                 if full_metadata is not None:
                     covered_layer_types.add("full_attention")
@@ -2378,15 +2437,21 @@ class GemmaNativeEngine:
                 self.last_token_pool_decode_metadata_by_layer_id = (
                     layer_metadata if layer_metadata else None
                 )
-                if sliding_paged_metadata is not None:
-                    self.last_token_pool_paged_decode_metadata_by_layer_id = {
-                        int(layer_id): sliding_paged_metadata
-                        for layer_id in sorted(self._token_kv_pool.layer_specs)
-                        if self._token_pool_layer_type(int(layer_id))
-                        == "sliding_attention"
-                    }
-                    if not self.last_token_pool_paged_decode_metadata_by_layer_id:
-                        self.last_token_pool_paged_decode_metadata_by_layer_id = None
+                if sliding_paged_metadata is not None or paged_layer_metadata:
+                    paged_by_layer_id = {}
+                    if sliding_paged_metadata is not None:
+                        paged_by_layer_id.update(
+                            {
+                                int(layer_id): sliding_paged_metadata
+                                for layer_id in sorted(self._token_kv_pool.layer_specs)
+                                if self._token_pool_layer_type(int(layer_id))
+                                == "sliding_attention"
+                            }
+                        )
+                    paged_by_layer_id.update(paged_layer_metadata)
+                    self.last_token_pool_paged_decode_metadata_by_layer_id = (
+                        paged_by_layer_id if paged_by_layer_id else None
+                    )
             self.metrics.token_pool_decode_metadata_batches += 1
             self.metrics.token_pool_decode_metadata_rows += len(reqs)
             for layer_type in self.last_token_pool_decode_covered_layer_types:
@@ -2875,16 +2940,25 @@ class GemmaNativeEngine:
         *,
         full_attention_kv_indices_padding_steps: int = 0,
         persistent_full_attention_rows: bool = False,
-    ) -> tuple[dict[int, DecodeBatchMetadata], DecodeBatchMetadata | None]:
+    ) -> tuple[
+        dict[int, DecodeBatchMetadata],
+        DecodeBatchMetadata | None,
+        dict[int, PagedDecodeBatchMetadata],
+        PagedDecodeBatchMetadata | None,
+    ]:
         pool = self._token_kv_pool
         if pool is None:
-            return {}, None
+            return {}, None, {}, None
         metadata_by_layer_id: dict[int, DecodeBatchMetadata] = {}
+        paged_metadata_by_layer_id: dict[int, PagedDecodeBatchMetadata] = {}
         for layer_id in sorted(pool.layer_specs):
             if self._token_pool_layer_type(layer_id) == "sliding_attention":
                 metadata_by_layer_id[int(layer_id)] = sliding_metadata
 
-        full_metadata = self._token_pool_prepare_full_attention_decode_metadata(
+        (
+            full_metadata,
+            full_paged_metadata,
+        ) = self._token_pool_prepare_full_attention_decode_metadata(
             reqs,
             reservations,
             kv_indices_padding_steps=full_attention_kv_indices_padding_steps,
@@ -2894,7 +2968,14 @@ class GemmaNativeEngine:
             for layer_id in sorted(pool.layer_specs):
                 if self._token_pool_layer_type(layer_id) == "full_attention":
                     metadata_by_layer_id[int(layer_id)] = full_metadata
-        return metadata_by_layer_id, full_metadata
+                    if full_paged_metadata is not None:
+                        paged_metadata_by_layer_id[int(layer_id)] = full_paged_metadata
+        return (
+            metadata_by_layer_id,
+            full_metadata,
+            paged_metadata_by_layer_id,
+            full_paged_metadata,
+        )
 
     def _token_pool_prepare_full_attention_decode_metadata(
         self,
@@ -2903,16 +2984,16 @@ class GemmaNativeEngine:
         *,
         kv_indices_padding_steps: int = 0,
         persistent_rows: bool = False,
-    ) -> DecodeBatchMetadata | None:
+    ) -> tuple[DecodeBatchMetadata | None, PagedDecodeBatchMetadata | None]:
         pool = self._token_kv_pool
         allocator = self._token_slot_allocator
         if pool is None or allocator is None:
-            return None
+            return None, None
         import torch
 
         owner_layer_ids = self._token_pool_full_attention_owner_layer_ids()
         if not owner_layer_ids:
-            return None
+            return None, None
         full_layer_ids = set(self._token_pool_full_attention_layer_ids())
         pool_full_layer_ids = {
             int(layer_id)
@@ -2920,14 +3001,18 @@ class GemmaNativeEngine:
             if self._token_pool_layer_type(int(layer_id)) == "full_attention"
         }
         if not full_layer_ids or not full_layer_ids.issubset(pool_full_layer_ids):
-            return None
+            return None, None
         expected_owner_layer_ids = set(self.config.full_kv_layers)
         if not expected_owner_layer_ids.issubset(set(owner_layer_ids)):
-            return None
+            return None, None
         req_ids = [req.req_id for req in reqs]
         if not persistent_rows:
             self._token_pool_clear_full_attention_rows(req_ids)
+        build_paged_rows = bool(
+            persistent_rows and _token_pool_full_attention_paged_metadata_requested()
+        )
         rows = []
+        paged_rows: list[list[int]] = []
         logical_lens: list[int] = []
         req_slots: list[int] = []
         out_cache_loc: list[int] = []
@@ -2970,11 +3055,30 @@ class GemmaNativeEngine:
                     if persistent_rows
                     else None
                 )
+                if (
+                    existing_row is not None
+                    and build_paged_rows
+                    and not existing_row.page_aligned
+                ):
+                    self._token_pool_invalidate_full_attention_rows([req.req_id])
+                    existing_row = None
                 append_reserve_slots = max(1, int(kv_indices_padding_steps) + 1)
                 if existing_row is not None:
                     if len(existing_row.row_slots) == materialized_width:
                         if existing_row.append_slots:
                             full_token_slot = int(existing_row.append_slots.pop(0))
+                        elif existing_row.page_aligned:
+                            (
+                                append_slots_tensor,
+                                append_slot_list,
+                                append_owned_slots,
+                            ) = self._token_pool_alloc_page_aligned_full_attention_row_slots(
+                                len(existing_row.row_slots),
+                                append_reserve_slots,
+                            )
+                            full_token_slot = int(append_slot_list[0])
+                            existing_row.owned_slots.extend(append_owned_slots)
+                            existing_row.append_slots.extend(append_slot_list[1:])
                         else:
                             _, append_slot_list = allocator.alloc_slots_with_ids(
                                 append_reserve_slots
@@ -3001,62 +3105,90 @@ class GemmaNativeEngine:
                         out_cache_loc.append(full_token_slot)
                         first_layer = routed_layers[0][1]
                         logical_lens.append(int(first_layer.cumulative_length) + 1)
+                        if build_paged_rows and existing_row.page_aligned:
+                            paged_rows.append(list(existing_row.row_slots))
                         self.metrics.token_pool_full_attention_row_reuses += 1
                         self.metrics.token_pool_full_attention_row_appends += 1
                         continue
                     self._token_pool_invalidate_full_attention_rows([req.req_id])
-                if materialized_width:
-                    (
-                        materialized_slots,
-                        materialized_slot_list,
-                    ) = allocator.alloc_slots_with_ids(materialized_width)
-                    materialized_slots_long = materialized_slots.to(dtype=torch.long)
-                else:
-                    materialized_slots = torch.empty(
-                        0,
-                        dtype=torch.int32,
-                        device=pool.device,
-                    )
-                    materialized_slot_list = []
-                    materialized_slots_long = materialized_slots.to(dtype=torch.long)
                 persistent_row: _TokenPoolFullAttentionRow | None = None
-                if persistent_rows:
+                if persistent_rows and build_paged_rows:
+                    (
+                        row_slots_tensor,
+                        row_slot_list,
+                        row_owned_slots,
+                    ) = self._token_pool_alloc_page_aligned_full_attention_row_slots(
+                        0,
+                        materialized_width + append_reserve_slots,
+                    )
+                    materialized_slots = row_slots_tensor[:materialized_width]
+                    materialized_slot_list = row_slot_list[:materialized_width]
+                    materialized_slots_long = materialized_slots.to(dtype=torch.long)
                     persistent_row = _TokenPoolFullAttentionRow(
                         row_slots=list(materialized_slot_list),
-                        owned_slots=list(materialized_slot_list),
+                        owned_slots=list(row_owned_slots),
+                        page_aligned=True,
                     )
                     self._token_pool_full_attention_rows[req.req_id] = persistent_row
-                    append_slots_tensor, append_slot_list = allocator.alloc_slots_with_ids(
-                        append_reserve_slots
-                    )
-                    full_token_slot = int(append_slot_list[0])
+                    full_token_slot = int(row_slot_list[materialized_width])
                     reservation.full_attention_token_slot = full_token_slot
                     persistent_row.row_slots.append(full_token_slot)
-                    persistent_row.owned_slots.extend(append_slot_list)
-                    persistent_row.append_slots.extend(append_slot_list[1:])
-                    decode_slot = append_slots_tensor[:1]
+                    persistent_row.append_slots.extend(row_slot_list[materialized_width + 1:])
+                    decode_slot = row_slots_tensor[
+                        materialized_width : materialized_width + 1
+                    ]
                 else:
-                    self._token_pool_full_attention_slots[req.req_id] = list(
-                        materialized_slot_list
-                    )
-                    full_token_slot = reservation.token_slot
-                    decode_slot = reservation.token_slot_tensor
-                    decode_device = getattr(decode_slot, "device", None)
-                    decode_device_matches = (
-                        decode_device is not None
-                        and torch.device(decode_device) == torch.device(pool.device)
-                    )
-                    if (
-                        not hasattr(decode_slot, "numel")
-                        or int(decode_slot.numel()) != 1
-                        or getattr(decode_slot, "dtype", None) != torch.int32
-                        or not decode_device_matches
-                    ):
-                        decode_slot = torch.as_tensor(
-                            [full_token_slot],
+                    if materialized_width:
+                        (
+                            materialized_slots,
+                            materialized_slot_list,
+                        ) = allocator.alloc_slots_with_ids(materialized_width)
+                        materialized_slots_long = materialized_slots.to(dtype=torch.long)
+                    else:
+                        materialized_slots = torch.empty(
+                            0,
                             dtype=torch.int32,
                             device=pool.device,
                         )
+                        materialized_slot_list = []
+                        materialized_slots_long = materialized_slots.to(dtype=torch.long)
+                    if persistent_rows:
+                        persistent_row = _TokenPoolFullAttentionRow(
+                            row_slots=list(materialized_slot_list),
+                            owned_slots=list(materialized_slot_list),
+                        )
+                        self._token_pool_full_attention_rows[req.req_id] = persistent_row
+                        append_slots_tensor, append_slot_list = allocator.alloc_slots_with_ids(
+                            append_reserve_slots
+                        )
+                        full_token_slot = int(append_slot_list[0])
+                        reservation.full_attention_token_slot = full_token_slot
+                        persistent_row.row_slots.append(full_token_slot)
+                        persistent_row.owned_slots.extend(append_slot_list)
+                        persistent_row.append_slots.extend(append_slot_list[1:])
+                        decode_slot = append_slots_tensor[:1]
+                    else:
+                        self._token_pool_full_attention_slots[req.req_id] = list(
+                            materialized_slot_list
+                        )
+                        full_token_slot = reservation.token_slot
+                        decode_slot = reservation.token_slot_tensor
+                        decode_device = getattr(decode_slot, "device", None)
+                        decode_device_matches = (
+                            decode_device is not None
+                            and torch.device(decode_device) == torch.device(pool.device)
+                        )
+                        if (
+                            not hasattr(decode_slot, "numel")
+                            or int(decode_slot.numel()) != 1
+                            or getattr(decode_slot, "dtype", None) != torch.int32
+                            or not decode_device_matches
+                        ):
+                            decode_slot = torch.as_tensor(
+                                [full_token_slot],
+                                dtype=torch.int32,
+                                device=pool.device,
+                            )
                 if materialized_width:
                     for layer_id, _layer, writer in routed_layers:
                         writer(
@@ -3076,6 +3208,12 @@ class GemmaNativeEngine:
                 out_cache_loc.append(full_token_slot)
                 first_layer = routed_layers[0][1]
                 logical_lens.append(int(first_layer.cumulative_length) + 1)
+                if (
+                    build_paged_rows
+                    and persistent_row is not None
+                    and persistent_row.page_aligned
+                ):
+                    paged_rows.append(list(persistent_row.row_slots))
                 if persistent_rows:
                     self.metrics.token_pool_full_attention_row_rebuilds += 1
             metadata = build_decode_metadata_from_token_slot_rows(
@@ -3089,10 +3227,39 @@ class GemmaNativeEngine:
                 kv_indices_padding_slots=int(kv_indices_padding_steps) * len(rows),
                 trusted_aux_metadata=True,
             )
-            return metadata
+            paged_metadata = None
+            if build_paged_rows and paged_rows:
+                try:
+                    paged_block_size = max(1, int(self.token_pool_paged_block_size))
+                    max_paged_row_len = max(len(row) for row in paged_rows)
+                    padded_paged_row_len = max_paged_row_len + max(
+                        0,
+                        int(kv_indices_padding_steps),
+                    )
+                    block_table_width = max(
+                        1,
+                        (padded_paged_row_len + paged_block_size - 1)
+                        // paged_block_size,
+                    )
+                    paged_metadata = build_paged_decode_metadata_from_token_slot_rows(
+                        paged_rows,
+                        block_size=paged_block_size,
+                        block_table_width=block_table_width,
+                        req_slots=req_slots,
+                        logical_seq_lens=logical_lens,
+                        out_cache_loc=out_cache_loc,
+                        selected_start_positions=[0 for _ in paged_rows],
+                        device=pool.device,
+                        token_pool_capacity=pool.capacity,
+                        allow_selected_len_gt_logical_len=True,
+                        max_seq_len=padded_paged_row_len,
+                    )
+                except (RuntimeError, ValueError, KeyError):
+                    paged_metadata = None
+            return metadata, paged_metadata
         except (DistinctCacheBatchError, RuntimeError, ValueError, KeyError):
             self._token_pool_clear_full_attention_rows(req_ids)
-            return None
+            return None, None
 
     @staticmethod
     def _pad_decode_metadata_kv_indices(

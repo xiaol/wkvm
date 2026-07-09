@@ -1215,6 +1215,60 @@ class TestGemmaTokenPool(unittest.TestCase):
                 token_pool_capacity=1,
             )
 
+    def test_paged_token_slot_rows_can_allow_materialized_rows_past_logical_len(self) -> None:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            build_paged_decode_metadata_from_token_slot_rows,
+        )
+
+        with self.assertRaisesRegex(ValueError, "exceeds logical length"):
+            build_paged_decode_metadata_from_token_slot_rows(
+                [[0, 1, 2, 3]],
+                block_size=2,
+                logical_seq_lens=[2],
+                selected_start_positions=[0],
+            )
+
+        metadata = build_paged_decode_metadata_from_token_slot_rows(
+            [[0, 1, 2, 3]],
+            block_size=2,
+            logical_seq_lens=[2],
+            out_cache_loc=[3],
+            selected_start_positions=[0],
+            allow_selected_len_gt_logical_len=True,
+            max_seq_len=6,
+        )
+
+        self.assertEqual(metadata.seq_lens.tolist(), [4])
+        self.assertEqual(metadata.logical_seq_lens.tolist(), [2])
+        self.assertEqual(metadata.block_tables.tolist(), [[0, 1]])
+        self.assertEqual(metadata.block_table_lens.tolist(), [2])
+        self.assertEqual(metadata.slot_mapping.tolist(), [3])
+        self.assertEqual(metadata.max_seq_len, 6)
+
+        with self.assertRaisesRegex(ValueError, "final logical token"):
+            build_paged_decode_metadata_from_token_slot_rows(
+                [[0, 1, 2, 3]],
+                block_size=2,
+                logical_seq_lens=[2],
+                out_cache_loc=[1],
+                selected_start_positions=[0],
+                allow_selected_len_gt_logical_len=True,
+            )
+        with self.assertRaisesRegex(ValueError, "max_seq_len"):
+            build_paged_decode_metadata_from_token_slot_rows(
+                [[0, 1, 2, 3]],
+                block_size=2,
+                logical_seq_lens=[2],
+                selected_start_positions=[0],
+                allow_selected_len_gt_logical_len=True,
+                max_seq_len=3,
+            )
+
     def test_paged_triton_decode_matches_manual_grouped_attention(self) -> None:
         try:
             import torch
