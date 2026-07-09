@@ -2355,13 +2355,8 @@ class TestGemmaTokenPool(unittest.TestCase):
             layer_specs = {7: object()}
 
             def __init__(self) -> None:
-                self.kv_calls = []
                 self.output_calls = []
                 self.split_calls = []
-
-            def get_kv_buffer(self, layer_idx):
-                self.kv_calls.append(layer_idx)
-                return ("pool_key", "pool_value")
 
             def attention_output_buffer(self, **kwargs):
                 self.output_calls.append(kwargs)
@@ -2388,7 +2383,6 @@ class TestGemmaTokenPool(unittest.TestCase):
             query_seq_len=1,
         )
 
-        kv_buffers = plan.kv_buffer_for_attention()
         output = plan.attention_output_buffer(
             batch=2,
             query_heads=4,
@@ -2405,10 +2399,8 @@ class TestGemmaTokenPool(unittest.TestCase):
             device="cpu",
         )
 
-        self.assertEqual(kv_buffers, ("pool_key", "pool_value"))
         self.assertEqual(output[0], "pool_output")
         self.assertEqual(split[0], "pool_split")
-        self.assertEqual(pool.kv_calls, [7])
         self.assertEqual(
             pool.output_calls,
             [
@@ -2444,9 +2436,6 @@ class TestGemmaTokenPool(unittest.TestCase):
                 self.output_calls = []
                 self.split_calls = []
 
-            def kv_buffer_for_attention(self):
-                return ("owned_key", "owned_value")
-
             def attention_output_buffer(self, **kwargs):
                 self.output_calls.append(kwargs)
                 return "owned_output"
@@ -2460,10 +2449,6 @@ class TestGemmaTokenPool(unittest.TestCase):
             owned_binding,
             layer_idx=7,
             query_seq_len=1,
-        )
-        self.assertEqual(
-            owned_plan.kv_buffer_for_attention(),
-            ("owned_key", "owned_value"),
         )
         self.assertEqual(
             owned_plan.attention_output_buffer(
@@ -2488,7 +2473,6 @@ class TestGemmaTokenPool(unittest.TestCase):
         )
         self.assertEqual(len(pool.output_calls), 1)
         self.assertEqual(len(pool.split_calls), 1)
-        self.assertEqual(pool.kv_calls, [7])
         self.assertEqual(len(owned_binding.output_calls), 1)
         self.assertEqual(len(owned_binding.split_calls), 1)
 

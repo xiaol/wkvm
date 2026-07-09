@@ -110,14 +110,6 @@ class TokenPoolAttentionBinding:
         )
         return out_cache_loc
 
-    def kv_buffer_for_attention(self) -> Any | None:
-        if self.layer_idx is None or self.kv_pool is None:
-            return None
-        get_kv_buffer = getattr(self.kv_pool, "get_kv_buffer", None)
-        if get_kv_buffer is None:
-            return None
-        return get_kv_buffer(int(self.layer_idx))
-
     def attention_output_buffer(
         self,
         *,
@@ -236,21 +228,6 @@ class TokenPoolAttentionPlan:
             value_states,
         )
         return out_cache_loc
-
-    def kv_buffer_for_attention(self) -> Any | None:
-        kv_buffer_for_attention = getattr(
-            self.binding,
-            "kv_buffer_for_attention",
-            None,
-        )
-        if kv_buffer_for_attention is not None:
-            return kv_buffer_for_attention()
-        if self.layer_idx is None or self.kv_pool is None:
-            return None
-        get_kv_buffer = getattr(self.kv_pool, "get_kv_buffer", None)
-        if get_kv_buffer is None:
-            return None
-        return get_kv_buffer(int(self.layer_idx))
 
     def attention_output_buffer(
         self,
