@@ -2457,6 +2457,7 @@ class TestGemmaTokenPool(unittest.TestCase):
         except ImportError:
             self.skipTest("torch unavailable")
 
+        from types import SimpleNamespace
         from wkvm.runner.gemma_token_pool import (
             DecodeBatchMetadata,
             TokenPoolAttentionBinding,
@@ -2510,6 +2511,9 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertFalse(binding.should_use_decode_attention(query_seq_len=2))
         self.assertIs(binding.kv_buffers_for_attention(), pool.buffers)
         self.assertEqual(pool.buffer_calls, [7])
+        flat_metadata, paged_metadata = binding.attention_metadata_for_dispatch()
+        self.assertIs(flat_metadata, metadata)
+        self.assertIsNone(paged_metadata)
         self.assertIs(out_cache_loc, metadata.out_cache_loc_long)
         self.assertEqual(len(pool.calls), 1)
         layer_idx, written_slots, written_keys, written_values = pool.calls[0]
@@ -2539,6 +2543,19 @@ class TestGemmaTokenPool(unittest.TestCase):
             fallback_metadata.out_cache_loc,
         )
         self.assertTrue(fallback_binding.has_write_location())
+        paged_like_metadata = SimpleNamespace(
+            block_tables=object(),
+            out_cache_loc=fallback_metadata.out_cache_loc,
+        )
+        paged_binding = TokenPoolAttentionBinding(
+            layer_idx=7,
+            metadata=paged_like_metadata,
+            paged_metadata=None,
+            kv_pool=pool,
+        )
+        flat_metadata, paged_metadata = paged_binding.attention_metadata_for_dispatch()
+        self.assertIsNone(flat_metadata)
+        self.assertIs(paged_metadata, paged_like_metadata)
         null_binding = TokenPoolAttentionBinding(
             layer_idx=None,
             metadata=None,
@@ -2556,6 +2573,7 @@ class TestGemmaTokenPool(unittest.TestCase):
         except ImportError:
             self.skipTest("torch unavailable")
 
+        from types import SimpleNamespace
         from wkvm.runner.gemma_token_pool import (
             DecodeBatchMetadata,
             TokenPoolAttentionBinding,
@@ -2603,6 +2621,9 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertIs(plan.kv_pool, pool)
         self.assertIs(plan.kv_buffers_for_attention(), pool.buffers)
         self.assertEqual(pool.buffer_calls, [7])
+        flat_metadata, paged_metadata = plan.attention_metadata_for_dispatch()
+        self.assertIs(flat_metadata, metadata)
+        self.assertIsNone(paged_metadata)
         self.assertEqual(
             plan.attention_kwargs(),
             {
@@ -2677,6 +2698,23 @@ class TestGemmaTokenPool(unittest.TestCase):
             query_seq_len=1,
         )
         self.assertTrue(long_only_plan.use_decode_attention)
+        paged_like_metadata = SimpleNamespace(
+            block_tables=object(),
+            out_cache_loc=metadata.out_cache_loc,
+        )
+        paged_plan = TokenPoolAttentionPlan.from_binding(
+            TokenPoolAttentionBinding(
+                layer_idx=7,
+                metadata=paged_like_metadata,
+                paged_metadata=None,
+                kv_pool=pool,
+            ),
+            layer_idx=7,
+            query_seq_len=1,
+        )
+        flat_metadata, paged_metadata = paged_plan.attention_metadata_for_dispatch()
+        self.assertIsNone(flat_metadata)
+        self.assertIs(paged_metadata, paged_like_metadata)
 
         legacy_context = type(
             "LegacyContext",

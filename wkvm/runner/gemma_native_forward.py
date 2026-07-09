@@ -1521,14 +1521,29 @@ def _attention_forward_token_pool_gqa(
         _TOKEN_POOL_TRITON_STATS["effective_disabled_calls"] += 1
     if dispatch_plan.auto_default_enabled:
         _TOKEN_POOL_TRITON_STATS["auto_enabled_calls"] += 1
-    paged_metadata = paged_decode_metadata
-    if paged_metadata is None and getattr(decode_metadata, "block_tables", None) is not None:
-        paged_metadata = decode_metadata
-    flat_metadata = (
-        None
-        if getattr(decode_metadata, "block_tables", None) is not None
-        else decode_metadata
-    )
+    if token_pool_plan is not None:
+        metadata_for_dispatch = getattr(
+            token_pool_plan,
+            "attention_metadata_for_dispatch",
+            None,
+        )
+        if metadata_for_dispatch is not None:
+            flat_metadata, paged_metadata = metadata_for_dispatch()
+        else:
+            flat_metadata = token_pool_plan.metadata
+            paged_metadata = token_pool_plan.paged_metadata
+    else:
+        paged_metadata = paged_decode_metadata
+        if (
+            paged_metadata is None
+            and getattr(decode_metadata, "block_tables", None) is not None
+        ):
+            paged_metadata = decode_metadata
+        flat_metadata = (
+            None
+            if getattr(decode_metadata, "block_tables", None) is not None
+            else decode_metadata
+        )
     paged_triton_enabled = dispatch_plan.paged_enabled
     split_triton_enabled = dispatch_plan.split_enabled
     paged_split_triton_enabled = dispatch_plan.paged_split_enabled

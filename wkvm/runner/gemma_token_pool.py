@@ -588,6 +588,23 @@ class TokenPoolAttentionBinding:
     def has_write_location(self) -> bool:
         return self.out_cache_loc_for_write() is not None
 
+    def flat_metadata_for_attention(self) -> DecodeBatchMetadata | None:
+        if getattr(self.metadata, "block_tables", None) is not None:
+            return None
+        return self.metadata
+
+    def paged_metadata_for_attention(self) -> Any | None:
+        if self.paged_metadata is not None:
+            return self.paged_metadata
+        if getattr(self.metadata, "block_tables", None) is not None:
+            return self.metadata
+        return None
+
+    def attention_metadata_for_dispatch(
+        self,
+    ) -> tuple[DecodeBatchMetadata | None, Any | None]:
+        return self.flat_metadata_for_attention(), self.paged_metadata_for_attention()
+
     def should_use_decode_attention(
         self,
         *,
@@ -818,6 +835,44 @@ class TokenPoolAttentionPlan:
         if get_kv_buffer is None:
             return None
         return get_kv_buffer(int(self.layer_idx))
+
+    def flat_metadata_for_attention(self) -> DecodeBatchMetadata | None:
+        flat_metadata_for_attention = getattr(
+            self.binding,
+            "flat_metadata_for_attention",
+            None,
+        )
+        if flat_metadata_for_attention is not None:
+            return flat_metadata_for_attention()
+        if getattr(self.metadata, "block_tables", None) is not None:
+            return None
+        return self.metadata
+
+    def paged_metadata_for_attention(self) -> Any | None:
+        paged_metadata_for_attention = getattr(
+            self.binding,
+            "paged_metadata_for_attention",
+            None,
+        )
+        if paged_metadata_for_attention is not None:
+            return paged_metadata_for_attention()
+        if self.paged_metadata is not None:
+            return self.paged_metadata
+        if getattr(self.metadata, "block_tables", None) is not None:
+            return self.metadata
+        return None
+
+    def attention_metadata_for_dispatch(
+        self,
+    ) -> tuple[DecodeBatchMetadata | None, Any | None]:
+        metadata_for_dispatch = getattr(
+            self.binding,
+            "attention_metadata_for_dispatch",
+            None,
+        )
+        if metadata_for_dispatch is not None:
+            return metadata_for_dispatch()
+        return self.flat_metadata_for_attention(), self.paged_metadata_for_attention()
 
     def attention_split_workspace(
         self,
