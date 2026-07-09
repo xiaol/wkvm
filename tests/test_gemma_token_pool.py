@@ -3035,6 +3035,49 @@ class TestGemmaTokenPool(unittest.TestCase):
             dispatch.triton_split_plan_for_metadata(metadata),
             (True, 2, 2, 2),
         )
+        flat_split_dispatch = dispatch.select_triton_dispatch(
+            paged_enabled=False,
+            split_enabled=True,
+            paged_split_enabled=False,
+        )
+        self.assertEqual(flat_split_dispatch.kind, "flat_split")
+        self.assertFalse(flat_split_dispatch.is_paged)
+        self.assertTrue(flat_split_dispatch.is_split)
+        self.assertIs(flat_split_dispatch.metadata, metadata)
+        self.assertEqual(flat_split_dispatch.split_size, 2)
+        self.assertEqual(flat_split_dispatch.min_splits, 2)
+        self.assertEqual(flat_split_dispatch.max_splits, 2)
+
+        no_split_metadata = DecodeBatchMetadata(
+            req_pool_indices=base_metadata.req_pool_indices,
+            seq_lens=base_metadata.seq_lens,
+            logical_seq_lens=base_metadata.logical_seq_lens,
+            out_cache_loc=base_metadata.out_cache_loc,
+            kv_indptr=base_metadata.kv_indptr,
+            kv_indices=base_metadata.kv_indices,
+            out_cache_loc_long=base_metadata.out_cache_loc_long,
+            max_seq_len=base_metadata.max_seq_len,
+            triton_decode_plan=TokenPoolTritonDecodePlan(
+                should_split=False,
+                split_size=2,
+                min_splits=2,
+                max_splits=None,
+            ),
+        )
+        no_split_dispatch = TokenPoolAttentionDispatchContext(
+            layer_idx=7,
+            flat_metadata=no_split_metadata,
+            paged_metadata=None,
+            token_kv_pool=pool,
+        ).select_triton_dispatch(
+            paged_enabled=False,
+            split_enabled=True,
+            paged_split_enabled=False,
+        )
+        self.assertEqual(no_split_dispatch.kind, "flat")
+        self.assertFalse(no_split_dispatch.is_split)
+        self.assertTrue(no_split_dispatch.split_skipped_by_min_splits)
+
         reference_metadata, reference_pool, reference_layer_idx = (
             dispatch.reference_decode_inputs()
         )
@@ -3068,6 +3111,21 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertTrue(legacy_dispatch.has_paged_metadata)
         self.assertIs(legacy_dispatch.kv_buffers_for_attention(), pool.buffers)
         self.assertEqual(pool.buffer_calls, [7, 7])
+        paged_dispatch = legacy_dispatch.select_triton_dispatch(
+            paged_enabled=True,
+            split_enabled=False,
+            paged_split_enabled=False,
+        )
+        self.assertEqual(paged_dispatch.kind, "paged")
+        self.assertTrue(paged_dispatch.is_paged)
+        self.assertFalse(paged_dispatch.is_split)
+        self.assertIs(paged_dispatch.metadata, paged_like_metadata)
+        with self.assertRaisesRegex(RuntimeError, "flat decode metadata"):
+            legacy_dispatch.select_triton_dispatch(
+                paged_enabled=False,
+                split_enabled=False,
+                paged_split_enabled=False,
+            )
         with self.assertRaisesRegex(RuntimeError, "reference fallback"):
             legacy_dispatch.reference_decode_inputs()
 

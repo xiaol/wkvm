@@ -160,6 +160,25 @@ class TokenPoolAttentionWorkspace:
 
 
 @dataclass(frozen=True)
+class TokenPoolAttentionKernelDispatch:
+    kind: str
+    metadata: Any
+    max_seq_len: Any | None = None
+    split_size: int | None = None
+    min_splits: int | None = None
+    max_splits: int | None = None
+    split_skipped_by_min_splits: bool = False
+
+    @property
+    def is_paged(self) -> bool:
+        return self.kind.startswith("paged")
+
+    @property
+    def is_split(self) -> bool:
+        return self.kind.endswith("split")
+
+
+@dataclass(frozen=True)
 class TokenPoolAttentionDispatchContext:
     layer_idx: int | None
     flat_metadata: DecodeBatchMetadata | None
@@ -282,6 +301,64 @@ class TokenPoolAttentionDispatchContext:
             int(plan.min_splits),
             None if plan.max_splits is None else int(plan.max_splits),
         )
+
+    def select_triton_dispatch(
+        self,
+        *,
+        paged_enabled: bool,
+        split_enabled: bool,
+        paged_split_enabled: bool,
+    ) -> TokenPoolAttentionKernelDispatch:
+        if paged_enabled and self.has_paged_metadata:
+            metadata = self.paged_metadata
+            max_seq_len = getattr(metadata, "max_seq_len", None)
+            if paged_split_enabled:
+                should_split, split_size, min_splits, max_splits = (
+                    self.triton_split_plan_for_metadata(metadata, max_seq_len)
+                )
+                if should_split:
+                    return TokenPoolAttentionKernelDispatch(
+                        kind="paged_split",
+                        metadata=metadata,
+                        max_seq_len=max_seq_len,
+                        split_size=split_size,
+                        min_splits=min_splits,
+                        max_splits=max_splits,
+                    )
+                return TokenPoolAttentionKernelDispatch(
+                    kind="paged",
+                    metadata=metadata,
+                    split_skipped_by_min_splits=True,
+                )
+            return TokenPoolAttentionKernelDispatch(kind="paged", metadata=metadata)
+
+        if not self.has_flat_metadata:
+            raise RuntimeError(
+                "token-pool flat decode metadata is required when paged "
+                "Triton decode is unavailable"
+            )
+
+        metadata = self.flat_metadata
+        max_seq_len = getattr(metadata, "max_seq_len", None)
+        if split_enabled:
+            should_split, split_size, min_splits, max_splits = (
+                self.triton_split_plan_for_metadata(metadata, max_seq_len)
+            )
+            if should_split:
+                return TokenPoolAttentionKernelDispatch(
+                    kind="flat_split",
+                    metadata=metadata,
+                    max_seq_len=max_seq_len,
+                    split_size=split_size,
+                    min_splits=min_splits,
+                    max_splits=max_splits,
+                )
+            return TokenPoolAttentionKernelDispatch(
+                kind="flat",
+                metadata=metadata,
+                split_skipped_by_min_splits=True,
+            )
+        return TokenPoolAttentionKernelDispatch(kind="flat", metadata=metadata)
 
 
 @dataclass

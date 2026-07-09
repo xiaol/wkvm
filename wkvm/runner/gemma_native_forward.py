@@ -1530,12 +1530,9 @@ def _attention_forward_token_pool_gqa(
         _TOKEN_POOL_TRITON_STATS["effective_disabled_calls"] += 1
     if dispatch_plan.auto_default_enabled:
         _TOKEN_POOL_TRITON_STATS["auto_enabled_calls"] += 1
-    flat_metadata = dispatch_context.flat_metadata
-    paged_metadata = dispatch_context.paged_metadata
     paged_triton_enabled = dispatch_plan.paged_enabled
     split_triton_enabled = dispatch_plan.split_enabled
     paged_split_triton_enabled = dispatch_plan.paged_split_enabled
-    has_paged_metadata = dispatch_context.has_paged_metadata
     has_flat_metadata = dispatch_context.has_flat_metadata
     if paged_triton_enabled:
         _TOKEN_POOL_TRITON_STATS["paged_enabled_calls"] += 1
@@ -1573,7 +1570,9 @@ def _attention_forward_token_pool_gqa(
             try:
                 kv_buffers = dispatch_context.kv_buffers_for_attention()
                 if kv_buffers is None:
-                    raise RuntimeError("token-pool KV buffers are required for Triton attention")
+                    raise RuntimeError(
+                        "token-pool KV buffers are required for Triton attention"
+                    )
                 key_buffer, value_buffer = kv_buffers
                 output_buffer = dispatch_context.attention_output_buffer(
                     batch=int(query_states.shape[0]),
@@ -1582,148 +1581,110 @@ def _attention_forward_token_pool_gqa(
                     dtype=query_states.dtype,
                     device=query_states.device,
                 )
-                if paged_triton_enabled and has_paged_metadata:
+                kernel_dispatch = dispatch_context.select_triton_dispatch(
+                    paged_enabled=paged_triton_enabled,
+                    split_enabled=split_triton_enabled,
+                    paged_split_enabled=paged_split_triton_enabled,
+                )
+                metadata = kernel_dispatch.metadata
+                if kernel_dispatch.is_paged:
                     _TOKEN_POOL_TRITON_STATS["paged_attempts"] += 1
-                    if paged_split_triton_enabled:
+                    if kernel_dispatch.is_split:
                         split_workspace = None
-                        max_seq_len = getattr(paged_metadata, "max_seq_len", None)
-                        should_split, split_size, min_splits, max_splits = (
-                            dispatch_context.triton_split_plan_for_metadata(
-                                paged_metadata,
-                                max_seq_len,
+                        _TOKEN_POOL_TRITON_STATS["paged_split_attempts"] += 1
+                        _TOKEN_POOL_TRITON_STATS["split_attempts"] += 1
+                        if kernel_dispatch.max_splits is not None:
+                            split_workspace = dispatch_context.attention_split_workspace(
+                                batch=int(query_states.shape[0]),
+                                kv_heads=int(key_buffer.shape[1]),
+                                max_splits=kernel_dispatch.max_splits,
+                                block_groups=_token_pool_triton_block_groups(
+                                    int(attn.num_key_value_groups),
+                                    query_states.dtype,
+                                ),
+                                head_dim=int(query_states.shape[3]),
+                                device=query_states.device,
                             )
+                        output = _token_pool_triton_paged_split_decode_fn()(
+                            query_states,
+                            key_buffer,
+                            value_buffer,
+                            metadata.block_tables,
+                            metadata.block_table_lens,
+                            metadata.selected_start_positions,
+                            metadata.seq_lens,
+                            block_size=metadata.block_size,
+                            num_key_value_groups=attn.num_key_value_groups,
+                            scaling=attn.scaling,
+                            max_seq_len=kernel_dispatch.max_seq_len,
+                            split_size=kernel_dispatch.split_size,
+                            min_splits=kernel_dispatch.min_splits,
+                            workspace=split_workspace,
+                            output=output_buffer,
                         )
-                        if should_split:
-                            _TOKEN_POOL_TRITON_STATS["paged_split_attempts"] += 1
-                            _TOKEN_POOL_TRITON_STATS["split_attempts"] += 1
-                            if max_splits is not None:
-                                split_workspace = dispatch_context.attention_split_workspace(
-                                    batch=int(query_states.shape[0]),
-                                    kv_heads=int(key_buffer.shape[1]),
-                                    max_splits=max_splits,
-                                    block_groups=_token_pool_triton_block_groups(
-                                        int(attn.num_key_value_groups),
-                                        query_states.dtype,
-                                    ),
-                                    head_dim=int(query_states.shape[3]),
-                                    device=query_states.device,
-                                )
-                            output = _token_pool_triton_paged_split_decode_fn()(
-                                query_states,
-                                key_buffer,
-                                value_buffer,
-                                paged_metadata.block_tables,
-                                paged_metadata.block_table_lens,
-                                paged_metadata.selected_start_positions,
-                                paged_metadata.seq_lens,
-                                block_size=paged_metadata.block_size,
-                                num_key_value_groups=attn.num_key_value_groups,
-                                scaling=attn.scaling,
-                                max_seq_len=max_seq_len,
-                                split_size=split_size,
-                                min_splits=min_splits,
-                                workspace=split_workspace,
-                                output=output_buffer,
-                            )
-                            _TOKEN_POOL_TRITON_STATS["paged_split_successes"] += 1
-                            _TOKEN_POOL_TRITON_STATS["split_successes"] += 1
-                        else:
+                        _TOKEN_POOL_TRITON_STATS["paged_split_successes"] += 1
+                        _TOKEN_POOL_TRITON_STATS["split_successes"] += 1
+                    else:
+                        if kernel_dispatch.split_skipped_by_min_splits:
                             _TOKEN_POOL_TRITON_STATS[
                                 "paged_split_skips_by_min_splits"
                             ] += 1
                             _TOKEN_POOL_TRITON_STATS["split_skips_by_min_splits"] += 1
-                            output = _token_pool_triton_paged_decode_fn()(
-                                query_states,
-                                key_buffer,
-                                value_buffer,
-                                paged_metadata.block_tables,
-                                paged_metadata.block_table_lens,
-                                paged_metadata.selected_start_positions,
-                                paged_metadata.seq_lens,
-                                block_size=paged_metadata.block_size,
-                                num_key_value_groups=attn.num_key_value_groups,
-                                scaling=attn.scaling,
-                                output=output_buffer,
-                            )
-                    else:
                         output = _token_pool_triton_paged_decode_fn()(
                             query_states,
                             key_buffer,
                             value_buffer,
-                            paged_metadata.block_tables,
-                            paged_metadata.block_table_lens,
-                            paged_metadata.selected_start_positions,
-                            paged_metadata.seq_lens,
-                            block_size=paged_metadata.block_size,
+                            metadata.block_tables,
+                            metadata.block_table_lens,
+                            metadata.selected_start_positions,
+                            metadata.seq_lens,
+                            block_size=metadata.block_size,
                             num_key_value_groups=attn.num_key_value_groups,
                             scaling=attn.scaling,
                             output=output_buffer,
                         )
                     _TOKEN_POOL_TRITON_STATS["paged_successes"] += 1
                 else:
-                    if not has_flat_metadata:
-                        raise RuntimeError(
-                            "token-pool flat decode metadata is required when paged "
-                            "Triton decode is unavailable"
-                        )
-                    if split_triton_enabled:
+                    if kernel_dispatch.is_split:
                         split_workspace = None
-                        max_seq_len = getattr(flat_metadata, "max_seq_len", None)
-                        should_split, split_size, min_splits, max_splits = (
-                            dispatch_context.triton_split_plan_for_metadata(
-                                flat_metadata,
-                                max_seq_len,
+                        _TOKEN_POOL_TRITON_STATS["split_attempts"] += 1
+                        if kernel_dispatch.max_splits is not None:
+                            split_workspace = dispatch_context.attention_split_workspace(
+                                batch=int(query_states.shape[0]),
+                                kv_heads=int(key_buffer.shape[1]),
+                                max_splits=kernel_dispatch.max_splits,
+                                block_groups=_token_pool_triton_block_groups(
+                                    int(attn.num_key_value_groups),
+                                    query_states.dtype,
+                                ),
+                                head_dim=int(query_states.shape[3]),
+                                device=query_states.device,
                             )
+                        output = _token_pool_triton_split_decode_fn()(
+                            query_states,
+                            key_buffer,
+                            value_buffer,
+                            metadata.kv_indptr,
+                            metadata.kv_indices,
+                            num_key_value_groups=attn.num_key_value_groups,
+                            scaling=attn.scaling,
+                            max_seq_len=kernel_dispatch.max_seq_len,
+                            split_size=kernel_dispatch.split_size,
+                            min_splits=kernel_dispatch.min_splits,
+                            seq_lens=metadata.seq_lens,
+                            workspace=split_workspace,
+                            output=output_buffer,
                         )
-                        if should_split:
-                            _TOKEN_POOL_TRITON_STATS["split_attempts"] += 1
-                            if max_splits is not None:
-                                split_workspace = dispatch_context.attention_split_workspace(
-                                    batch=int(query_states.shape[0]),
-                                    kv_heads=int(key_buffer.shape[1]),
-                                    max_splits=max_splits,
-                                    block_groups=_token_pool_triton_block_groups(
-                                        int(attn.num_key_value_groups),
-                                        query_states.dtype,
-                                    ),
-                                    head_dim=int(query_states.shape[3]),
-                                    device=query_states.device,
-                                )
-                            output = _token_pool_triton_split_decode_fn()(
-                                query_states,
-                                key_buffer,
-                                value_buffer,
-                                flat_metadata.kv_indptr,
-                                flat_metadata.kv_indices,
-                                num_key_value_groups=attn.num_key_value_groups,
-                                scaling=attn.scaling,
-                                max_seq_len=max_seq_len,
-                                split_size=split_size,
-                                min_splits=min_splits,
-                                seq_lens=flat_metadata.seq_lens,
-                                workspace=split_workspace,
-                                output=output_buffer,
-                            )
-                            _TOKEN_POOL_TRITON_STATS["split_successes"] += 1
-                        else:
-                            _TOKEN_POOL_TRITON_STATS["split_skips_by_min_splits"] += 1
-                            output = _token_pool_triton_decode_fn()(
-                                query_states,
-                                key_buffer,
-                                value_buffer,
-                                flat_metadata.kv_indptr,
-                                flat_metadata.kv_indices,
-                                num_key_value_groups=attn.num_key_value_groups,
-                                scaling=attn.scaling,
-                                output=output_buffer,
-                            )
+                        _TOKEN_POOL_TRITON_STATS["split_successes"] += 1
                     else:
+                        if kernel_dispatch.split_skipped_by_min_splits:
+                            _TOKEN_POOL_TRITON_STATS["split_skips_by_min_splits"] += 1
                         output = _token_pool_triton_decode_fn()(
                             query_states,
                             key_buffer,
                             value_buffer,
-                            flat_metadata.kv_indptr,
-                            flat_metadata.kv_indices,
+                            metadata.kv_indptr,
+                            metadata.kv_indices,
                             num_key_value_groups=attn.num_key_value_groups,
                             scaling=attn.scaling,
                             output=output_buffer,
