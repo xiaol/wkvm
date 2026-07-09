@@ -1941,79 +1941,8 @@ class _GraphedPaddedDecodeStep:
             raise AssertionError("graph logits buffer was not initialized")
         return self.logits
 
-    @classmethod
-    def _clone_token_pool_decode_context(cls, token_pool_decode):
-        from wkvm.runner.gemma_token_pool import TokenPoolDecodeBackendState
-
-        return TokenPoolDecodeBackendState.clone_graph_decode_context(token_pool_decode)
-
-    @staticmethod
-    def _clone_decode_metadata(metadata):
-        from wkvm.runner.gemma_token_pool import TokenPoolDecodeBackendState
-
-        return TokenPoolDecodeBackendState.clone_graph_decode_metadata(metadata)
-
     def _copy_token_pool_decode_context(self, token_pool_decode) -> dict[str, int]:
         return self._token_pool_metadata.copy_from(token_pool_decode)
-
-    @classmethod
-    def _copy_decode_metadata_group(
-        cls,
-        dst_group: dict[Any, Any],
-        src_group: dict[Any, Any],
-        name: str,
-        *,
-        copied: set[tuple[int, int]] | None = None,
-        stats: dict[str, int] | None = None,
-    ) -> None:
-        from wkvm.runner.gemma_token_pool import TokenPoolDecodeBackendState
-
-        TokenPoolDecodeBackendState.copy_graph_decode_metadata_group(
-            dst_group,
-            src_group,
-            name,
-            copied=copied,
-            stats=stats,
-        )
-
-    @classmethod
-    def _copy_decode_metadata(
-        cls,
-        dst,
-        src,
-        prefix: str,
-        *,
-        copied: set[tuple[int, int]] | None = None,
-        stats: dict[str, int] | None = None,
-    ) -> None:
-        from wkvm.runner.gemma_token_pool import TokenPoolDecodeBackendState
-
-        TokenPoolDecodeBackendState.copy_graph_decode_metadata(
-            dst,
-            src,
-            prefix,
-            copied=copied,
-            stats=stats,
-        )
-
-    @staticmethod
-    def _copy_decode_metadata_tensor(
-        dst,
-        src,
-        name: str,
-        *,
-        copied: set[tuple[int, int]] | None = None,
-        stats: dict[str, int] | None = None,
-    ) -> None:
-        from wkvm.runner.gemma_token_pool import TokenPoolDecodeBackendState
-
-        TokenPoolDecodeBackendState.copy_graph_decode_metadata_tensor(
-            dst,
-            src,
-            name,
-            copied=copied,
-            stats=stats,
-        )
 
 
 def config_from_hf(hf_config) -> GemmaRoutedSpanConfig:

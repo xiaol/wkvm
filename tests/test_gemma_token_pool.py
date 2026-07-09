@@ -2911,16 +2911,16 @@ class TestGemmaTokenPool(unittest.TestCase):
         )
         self.assertIs(planned, direct)
 
-    def test_graph_clone_and_copy_handles_paged_metadata(self) -> None:
+    def test_backend_graph_metadata_copy_handles_paged_metadata(self) -> None:
         try:
             import torch  # noqa: F401
         except ImportError:
             self.skipTest("torch unavailable")
 
-        from wkvm.runner.gemma_runner import _GraphedPaddedDecodeStep
         from wkvm.runner.gemma_token_pool import (
             build_decode_metadata_from_token_slot_rows,
             build_paged_decode_metadata_from_token_slot_rows,
+            TokenPoolDecodeBackendState,
             TokenPoolDecodeContext,
         )
 
@@ -2939,7 +2939,11 @@ class TestGemmaTokenPool(unittest.TestCase):
             covered_layer_types=frozenset({"sliding_attention"}),
         )
 
-        cloned = _GraphedPaddedDecodeStep._clone_token_pool_decode_context(context)
+        graph_metadata = TokenPoolDecodeBackendState.capture_graph_decode_metadata(
+            context,
+            clone_tensors=True,
+        )
+        cloned = graph_metadata.context
         self.assertIsNotNone(cloned)
         self.assertIs(
             cloned.metadata_by_layer_id[0],
@@ -2975,38 +2979,15 @@ class TestGemmaTokenPool(unittest.TestCase):
             selected_start_positions=[4],
             out_cache_loc=[5],
         )
-        copy_stats: dict[str, int] = {}
-        copied_pairs: set[tuple[int, int]] = set()
-        _GraphedPaddedDecodeStep._copy_decode_metadata_group(
-            {
-                "by_type": cloned.metadata_by_layer_type["sliding_attention"],
-                "layer_0": cloned.metadata_by_layer_id[0],
-                "layer_1": cloned.metadata_by_layer_id[1],
-            },
-            {
-                "by_type": updated_flat,
-                "layer_0": updated_flat,
-                "layer_1": updated_flat,
-            },
-            "metadata",
-            copied=copied_pairs,
-            stats=copy_stats,
+        updated_context = TokenPoolDecodeContext(
+            metadata_by_layer_type={"sliding_attention": updated_flat},
+            metadata_by_layer_id={0: updated_flat, 1: updated_flat},
+            paged_metadata_by_layer_type={"sliding_attention": updated},
+            paged_metadata_by_layer_id={0: updated, 1: updated},
+            kv_pool=context.kv_pool,
+            covered_layer_types=context.covered_layer_types,
         )
-        _GraphedPaddedDecodeStep._copy_decode_metadata_group(
-            {
-                "by_type": cloned.paged_metadata_by_layer_type["sliding_attention"],
-                "layer_0": cloned.paged_metadata_by_layer_id[0],
-                "layer_1": cloned.paged_metadata_by_layer_id[1],
-            },
-            {
-                "by_type": updated,
-                "layer_0": updated,
-                "layer_1": updated,
-            },
-            "paged_metadata",
-            copied=copied_pairs,
-            stats=copy_stats,
-        )
+        copy_stats = graph_metadata.copy_from(updated_context)
         self.assertGreater(copy_stats["cuda_graph_metadata_tensor_copies"], 0)
         self.assertGreater(copy_stats["cuda_graph_metadata_tensor_copy_skips"], 0)
         copied = cloned.paged_metadata_by_layer_type["sliding_attention"]
@@ -3021,12 +3002,21 @@ class TestGemmaTokenPool(unittest.TestCase):
             selected_start_positions=[8],
             out_cache_loc=[9],
         )
+        mismatched_context = TokenPoolDecodeContext(
+            metadata_by_layer_type={"sliding_attention": updated_flat},
+            metadata_by_layer_id={0: updated_flat, 1: updated_flat},
+            paged_metadata_by_layer_type={
+                "sliding_attention": mismatched_block_size,
+            },
+            paged_metadata_by_layer_id={
+                0: mismatched_block_size,
+                1: mismatched_block_size,
+            },
+            kv_pool=context.kv_pool,
+            covered_layer_types=context.covered_layer_types,
+        )
         with self.assertRaisesRegex(ValueError, "block_size changed"):
-            _GraphedPaddedDecodeStep._copy_decode_metadata(
-                copied,
-                mismatched_block_size,
-                "paged_metadata_by_layer_type.sliding_attention",
-            )
+            graph_metadata.copy_from(mismatched_context)
 
     def test_graph_metadata_facade_aliases_workspace_metadata_and_skips_copies(self) -> None:
         try:
