@@ -1,0 +1,2889 @@
+"""Native Gemma4 text layer math used to retire HF forward calls incrementally."""
+
+from __future__ import annotations
+
+from collections import UserDict
+from dataclasses import dataclass
+import json
+import os
+from pathlib import Path
+import time
+from typing import Any
+
+
+_TOKEN_POOL_TRITON_DISABLED_SHAPES: set[tuple[Any, ...]] = set()
+_TOKEN_POOL_TRITON_DECODE_FN = None
+_TOKEN_POOL_TRITON_SPLIT_DECODE_FN = None
+_TOKEN_POOL_TRITON_PAGED_DECODE_FN = None
+_TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN = None
+_TOKEN_POOL_TRITON_DISPATCH_ENV_NAMES = (
+    "WKVM_ENABLE_TOKEN_POOL_TRITON",
+    "WKVM_DISABLE_TOKEN_POOL_TRITON",
+    "WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON",
+    "WKVM_ENABLE_TOKEN_POOL_SPLIT_TRITON",
+    "WKVM_TOKEN_POOL_TRITON_SPLIT_KV",
+    "WKVM_ENABLE_TOKEN_POOL_PAGED_SPLIT_TRITON",
+    "WKVM_TOKEN_POOL_TRITON_PAGED_SPLIT_KV",
+    "WKVM_TOKEN_POOL_TRITON_INPUT_PRECISION",
+    "WKVM_TOKEN_POOL_TRITON_DOT_DTYPE",
+    "WKVM_TOKEN_POOL_TRITON_STRICT",
+)
+_TOKEN_POOL_TRITON_DISPATCH_ENV_KEY = None
+_TOKEN_POOL_TRITON_DISPATCH_PLAN = None
+_TOKEN_POOL_TRITON_STATS: dict[str, int] = {
+    "calls": 0,
+    "env_enabled_calls": 0,
+    "env_disabled_calls": 0,
+    "effective_enabled_calls": 0,
+    "effective_disabled_calls": 0,
+    "auto_enabled_calls": 0,
+    "disabled_shape_skips": 0,
+    "attempts": 0,
+    "successes": 0,
+    "import_error_fallbacks": 0,
+    "runtime_errors": 0,
+    "recoverable_runtime_fallbacks": 0,
+    "nonrecoverable_runtime_errors": 0,
+    "paged_enabled_calls": 0,
+    "paged_attempts": 0,
+    "paged_successes": 0,
+    "paged_split_enabled_calls": 0,
+    "paged_split_attempts": 0,
+    "paged_split_successes": 0,
+    "paged_split_skips_by_min_splits": 0,
+    "split_enabled_calls": 0,
+    "split_attempts": 0,
+    "split_successes": 0,
+    "split_skips_by_min_splits": 0,
+}
+_TOKEN_POOL_TRITON_FALLBACK_REASONS: dict[str, int] = {}
+
+
+@dataclass(frozen=True)
+class TokenPoolTritonDispatchPlan:
+    env_enabled: bool
+    env_forced_off: bool
+    env_disabled: bool
+    effective_enabled: bool
+    auto_default_enabled: bool
+    paged_enabled: bool
+    split_enabled: bool
+    paged_split_enabled: bool
+    input_precision_policy: str
+    dot_dtype_policy: str
+    strict: bool
+
+
+_NATIVE_FORWARD_TIMING_STATS: dict[str, float | int] = {
+    "layer_forward_calls": 0,
+    "layer_forward_wall_s": 0.0,
+    "layer_input_norm_wall_s": 0.0,
+    "layer_self_attention_wall_s": 0.0,
+    "layer_post_attention_norm_wall_s": 0.0,
+    "layer_pre_feedforward_norm_wall_s": 0.0,
+    "layer_mlp_wall_s": 0.0,
+    "layer_post_feedforward_norm_wall_s": 0.0,
+    "layer_ple_wall_s": 0.0,
+    "self_attention_qkv_proj_wall_s": 0.0,
+    "self_attention_q_norm_rope_wall_s": 0.0,
+    "self_attention_kv_norm_rope_wall_s": 0.0,
+    "self_attention_shared_kv_wall_s": 0.0,
+    "self_attention_metadata_wall_s": 0.0,
+    "self_attention_cache_update_wall_s": 0.0,
+    "self_attention_attention_wall_s": 0.0,
+    "self_attention_output_proj_wall_s": 0.0,
+    "mlp_gate_up_proj_wall_s": 0.0,
+    "mlp_activation_down_proj_wall_s": 0.0,
+    "text_embedding_wall_s": 0.0,
+    "text_per_layer_input_wall_s": 0.0,
+    "text_mask_wall_s": 0.0,
+    "text_rotary_wall_s": 0.0,
+    "text_layers_wall_s": 0.0,
+    "text_final_norm_wall_s": 0.0,
+    "lm_head_wall_s": 0.0,
+    "lm_head_softcap_wall_s": 0.0,
+    "token_pool_attention_calls": 0,
+    "token_pool_attention_rows": 0,
+    "token_pool_attention_wall_s": 0.0,
+    "token_pool_attention_triton_calls": 0,
+    "token_pool_attention_triton_wall_s": 0.0,
+    "token_pool_attention_reference_calls": 0,
+    "token_pool_attention_reference_wall_s": 0.0,
+    "token_pool_attention_triton_attempts": 0,
+    "token_pool_attention_triton_attempt_wall_s": 0.0,
+    "token_pool_kv_write_calls": 0,
+    "token_pool_kv_write_tokens": 0,
+    "token_pool_kv_write_wall_s": 0.0,
+}
+
+
+def _coerce_env_bool(raw: str | None) -> bool | None:
+    if raw is None:
+        return None
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return False
+
+
+def _env_bool(name: str) -> bool | None:
+    return _coerce_env_bool(os.environ.get(name))
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return int(default)
+    return int(raw.strip())
+
+
+def _native_forward_timing_enabled() -> bool:
+    return _env_bool("WKVM_NATIVE_FORWARD_TIMING") is True
+
+
+def _slot_count(slot_ids: Any) -> int:
+    shape = getattr(slot_ids, "shape", None)
+    if shape is not None:
+        numel = getattr(slot_ids, "numel", None)
+        if numel is not None:
+            return int(numel())
+        count = 1
+        for dim in shape:
+            count *= int(dim)
+        return int(count)
+    if isinstance(slot_ids, (list, tuple)):
+        return len(slot_ids)
+    return 1
+
+
+def native_forward_timing_stats() -> dict[str, Any]:
+    stats = dict(_NATIVE_FORWARD_TIMING_STATS)
+    stats["enabled"] = _native_forward_timing_enabled()
+    return stats
+
+
+def reset_native_forward_timing_stats() -> None:
+    for key, value in list(_NATIVE_FORWARD_TIMING_STATS.items()):
+        _NATIVE_FORWARD_TIMING_STATS[key] = 0.0 if isinstance(value, float) else 0
+
+
+def _record_native_timing(name: str, elapsed: float) -> None:
+    _NATIVE_FORWARD_TIMING_STATS[name] = (
+        float(_NATIVE_FORWARD_TIMING_STATS.get(name, 0.0)) + float(elapsed)
+    )
+
+
+def _record_native_count(name: str, value: int = 1) -> None:
+    _NATIVE_FORWARD_TIMING_STATS[name] = int(
+        _NATIVE_FORWARD_TIMING_STATS.get(name, 0)
+    ) + int(value)
+
+
+def _record_token_pool_attention_timing(
+    kind: str,
+    *,
+    rows: int,
+    elapsed: float,
+) -> None:
+    _record_native_count("token_pool_attention_calls")
+    _record_native_count("token_pool_attention_rows", rows)
+    _record_native_timing("token_pool_attention_wall_s", elapsed)
+    if kind == "triton":
+        _record_native_count("token_pool_attention_triton_calls")
+        _record_native_timing("token_pool_attention_triton_wall_s", elapsed)
+    elif kind == "reference":
+        _record_native_count("token_pool_attention_reference_calls")
+        _record_native_timing("token_pool_attention_reference_wall_s", elapsed)
+
+
+def _record_token_pool_kv_write_timing(*, tokens: int, elapsed: float) -> None:
+    _record_native_count("token_pool_kv_write_calls")
+    _record_native_count("token_pool_kv_write_tokens", tokens)
+    _record_native_timing("token_pool_kv_write_wall_s", elapsed)
+
+
+def _token_pool_triton_split_size() -> int:
+    split_size = _env_int("WKVM_TOKEN_POOL_TRITON_SPLIT_SIZE", 512)
+    if split_size < 1:
+        raise ValueError("WKVM_TOKEN_POOL_TRITON_SPLIT_SIZE must be >= 1")
+    return split_size
+
+
+def _token_pool_triton_min_splits() -> int:
+    min_splits = _env_int("WKVM_TOKEN_POOL_TRITON_MIN_SPLITS", 4)
+    if min_splits < 2:
+        raise ValueError("WKVM_TOKEN_POOL_TRITON_MIN_SPLITS must be >= 2")
+    return min_splits
+
+
+def _token_pool_triton_input_precision_policy() -> str:
+    return _token_pool_triton_input_precision_policy_from_raw(
+        os.environ.get("WKVM_TOKEN_POOL_TRITON_INPUT_PRECISION")
+    )
+
+
+def _token_pool_triton_dot_dtype_policy() -> str:
+    return _token_pool_triton_dot_dtype_policy_from_raw(
+        os.environ.get("WKVM_TOKEN_POOL_TRITON_DOT_DTYPE")
+    )
+
+
+def _token_pool_triton_input_precision_policy_from_raw(raw: str | None) -> str:
+    return raw if raw is not None else "auto_float32_ieee_low_precision_tf32"
+
+
+def _token_pool_triton_dot_dtype_policy_from_raw(raw: str | None) -> str:
+    return raw if raw is not None else "auto_float32_fp32_low_precision_native"
+
+
+def _token_pool_triton_dispatch_plan() -> TokenPoolTritonDispatchPlan:
+    global _TOKEN_POOL_TRITON_DISPATCH_ENV_KEY, _TOKEN_POOL_TRITON_DISPATCH_PLAN
+
+    env_key = tuple(
+        os.environ.get(name) for name in _TOKEN_POOL_TRITON_DISPATCH_ENV_NAMES
+    )
+    if (
+        _TOKEN_POOL_TRITON_DISPATCH_PLAN is not None
+        and env_key == _TOKEN_POOL_TRITON_DISPATCH_ENV_KEY
+    ):
+        return _TOKEN_POOL_TRITON_DISPATCH_PLAN
+
+    enabled = _coerce_env_bool(env_key[0])
+    disabled = _coerce_env_bool(env_key[1])
+    effective_enabled, auto_default_enabled = (
+        _token_pool_triton_effective_enabled_from_values(enabled, disabled)
+    )
+    plan = TokenPoolTritonDispatchPlan(
+        env_enabled=enabled is True,
+        env_forced_off=enabled is False,
+        env_disabled=disabled is True,
+        effective_enabled=effective_enabled,
+        auto_default_enabled=auto_default_enabled,
+        paged_enabled=_coerce_env_bool(env_key[2]) is True,
+        split_enabled=(
+            _coerce_env_bool(env_key[3]) is True
+            or _coerce_env_bool(env_key[4]) is True
+        ),
+        paged_split_enabled=(
+            _coerce_env_bool(env_key[5]) is True
+            or _coerce_env_bool(env_key[6]) is True
+        ),
+        input_precision_policy=_token_pool_triton_input_precision_policy_from_raw(
+            env_key[7]
+        ),
+        dot_dtype_policy=_token_pool_triton_dot_dtype_policy_from_raw(env_key[8]),
+        strict=str(env_key[9] or "").lower() in {"1", "true", "yes"},
+    )
+    _TOKEN_POOL_TRITON_DISPATCH_ENV_KEY = env_key
+    _TOKEN_POOL_TRITON_DISPATCH_PLAN = plan
+    return plan
+
+
+def _token_pool_triton_block_groups(groups: int, dtype: Any) -> int:
+    groups = int(groups)
+    fallback = 1 << (groups - 1).bit_length()
+    try:
+        from wkvm.runner.gemma_token_pool_triton import _block_g, _resolve_native_dot
+
+        return int(_block_g(groups, _resolve_native_dot(dtype)))
+    except Exception:
+        return fallback
+
+
+def _token_pool_triton_split_plan(max_seq_len: Any) -> tuple[bool, int, int, int | None]:
+    from wkvm.runner.gemma_token_pool import build_token_pool_triton_decode_plan
+
+    plan = build_token_pool_triton_decode_plan(max_seq_len)
+    return (
+        bool(plan.should_split),
+        int(plan.split_size),
+        int(plan.min_splits),
+        None if plan.max_splits is None else int(plan.max_splits),
+    )
+
+
+def _token_pool_triton_metadata_split_plan(
+    metadata,
+    max_seq_len: Any,
+) -> tuple[bool, int, int, int | None]:
+    plan = getattr(metadata, "triton_decode_plan", None)
+    if plan is None:
+        return _token_pool_triton_split_plan(max_seq_len)
+    return (
+        bool(plan.should_split),
+        int(plan.split_size),
+        int(plan.min_splits),
+        None if plan.max_splits is None else int(plan.max_splits),
+    )
+
+
+def _token_pool_triton_effective_enabled() -> tuple[bool, bool]:
+    plan = _token_pool_triton_dispatch_plan()
+    return plan.effective_enabled, plan.auto_default_enabled
+
+
+def _token_pool_triton_effective_enabled_from_values(
+    enabled: bool | None,
+    disabled: bool | None,
+) -> tuple[bool, bool]:
+    if disabled is True or enabled is False:
+        return False, False
+    if enabled is True:
+        return True, False
+    return True, True
+
+
+def _token_pool_triton_decode_fn():
+    global _TOKEN_POOL_TRITON_DECODE_FN
+    if _TOKEN_POOL_TRITON_DECODE_FN is None:
+        from wkvm.runner.gemma_token_pool_triton import token_pool_gqa_decode
+
+        _TOKEN_POOL_TRITON_DECODE_FN = token_pool_gqa_decode
+    return _TOKEN_POOL_TRITON_DECODE_FN
+
+
+def _token_pool_triton_split_decode_fn():
+    global _TOKEN_POOL_TRITON_SPLIT_DECODE_FN
+    if _TOKEN_POOL_TRITON_SPLIT_DECODE_FN is None:
+        from wkvm.runner.gemma_token_pool_triton import token_pool_gqa_decode_split_kv
+
+        _TOKEN_POOL_TRITON_SPLIT_DECODE_FN = token_pool_gqa_decode_split_kv
+    return _TOKEN_POOL_TRITON_SPLIT_DECODE_FN
+
+
+def _token_pool_triton_paged_decode_fn():
+    global _TOKEN_POOL_TRITON_PAGED_DECODE_FN
+    if _TOKEN_POOL_TRITON_PAGED_DECODE_FN is None:
+        from wkvm.runner.gemma_token_pool_triton import token_pool_paged_gqa_decode
+
+        _TOKEN_POOL_TRITON_PAGED_DECODE_FN = token_pool_paged_gqa_decode
+    return _TOKEN_POOL_TRITON_PAGED_DECODE_FN
+
+
+def _token_pool_triton_paged_split_decode_fn():
+    global _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN
+    if _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN is None:
+        from wkvm.runner.gemma_token_pool_triton import (
+            token_pool_paged_gqa_decode_split_kv,
+        )
+
+        _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN = token_pool_paged_gqa_decode_split_kv
+    return _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN
+
+
+def token_pool_triton_stats() -> dict[str, Any]:
+    stats = dict(_TOKEN_POOL_TRITON_STATS)
+    plan = _token_pool_triton_dispatch_plan()
+    stats["fallback_reasons"] = dict(_TOKEN_POOL_TRITON_FALLBACK_REASONS)
+    stats["disabled_shape_count"] = len(_TOKEN_POOL_TRITON_DISABLED_SHAPES)
+    stats["env_enabled"] = plan.env_enabled
+    stats["env_disabled"] = plan.env_disabled
+    stats["split_enabled"] = plan.split_enabled
+    stats["paged_split_enabled"] = plan.paged_split_enabled
+    stats["split_size"] = _token_pool_triton_split_size()
+    stats["split_min_splits"] = _token_pool_triton_min_splits()
+    stats["input_precision_policy"] = plan.input_precision_policy
+    stats["dot_dtype_policy"] = plan.dot_dtype_policy
+    stats["effective_enabled"] = plan.effective_enabled
+    stats["auto_default_enabled"] = plan.auto_default_enabled
+    return stats
+
+
+def reset_token_pool_triton_stats(*, clear_disabled_shapes: bool = False) -> None:
+    global _TOKEN_POOL_TRITON_DECODE_FN, _TOKEN_POOL_TRITON_SPLIT_DECODE_FN
+    global _TOKEN_POOL_TRITON_PAGED_DECODE_FN, _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN
+    global _TOKEN_POOL_TRITON_DISPATCH_ENV_KEY, _TOKEN_POOL_TRITON_DISPATCH_PLAN
+    for key in _TOKEN_POOL_TRITON_STATS:
+        _TOKEN_POOL_TRITON_STATS[key] = 0
+    _TOKEN_POOL_TRITON_FALLBACK_REASONS.clear()
+    _TOKEN_POOL_TRITON_DECODE_FN = None
+    _TOKEN_POOL_TRITON_SPLIT_DECODE_FN = None
+    _TOKEN_POOL_TRITON_PAGED_DECODE_FN = None
+    _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN = None
+    _TOKEN_POOL_TRITON_DISPATCH_ENV_KEY = None
+    _TOKEN_POOL_TRITON_DISPATCH_PLAN = None
+    if clear_disabled_shapes:
+        _TOKEN_POOL_TRITON_DISABLED_SHAPES.clear()
+
+
+def _record_token_pool_triton_fallback(reason: str) -> None:
+    _TOKEN_POOL_TRITON_FALLBACK_REASONS[reason] = (
+        _TOKEN_POOL_TRITON_FALLBACK_REASONS.get(reason, 0) + 1
+    )
+
+
+def _torch():
+    import torch
+
+    return torch
+
+
+def _rms_norm(hidden_states, norm) -> Any:
+    import torch.nn.functional as F
+
+    weight = getattr(norm, "weight", None)
+    if weight is not None:
+        weight = _tensor_on_device(weight, hidden_states)
+    return F.rms_norm(hidden_states, (hidden_states.shape[-1],), weight, norm.eps)
+
+
+def _linear(x, linear) -> Any:
+    import torch.nn.functional as F
+
+    weight = _tensor_on_device(linear.weight, x)
+    bias = _tensor_on_device(getattr(linear, "bias", None), x)
+    return F.linear(x, weight, bias)
+
+
+def _normalize_weight_backend(backend: str) -> str:
+    backend = str(backend).strip().lower()
+    if backend in {"hf", "live", "hf_live"}:
+        backend = "hf_live"
+    if backend in {"cpu", "owned-cpu", "owned_cpu"}:
+        backend = "owned_cpu"
+    if backend not in {"hf_live", "owned", "owned_cpu"}:
+        raise ValueError(
+            "native Gemma weight backend must be 'hf_live', 'owned', or 'owned_cpu'"
+        )
+    return backend
+
+
+def _normalize_projection_backend(backend: str) -> str:
+    backend = str(backend).strip().lower()
+    if backend == "packed":
+        backend = "qkv_gate_up_packed"
+    if backend not in {
+        "separate",
+        "qkv_packed",
+        "gate_up_packed",
+        "qkv_gate_up_packed",
+    }:
+        raise ValueError(
+            "native Gemma projection backend must be 'separate', 'qkv_packed', "
+            "'gate_up_packed', or 'qkv_gate_up_packed'"
+        )
+    return backend
+
+
+def _packs_qkv(backend: str) -> bool:
+    return _normalize_projection_backend(backend) in {"qkv_packed", "qkv_gate_up_packed"}
+
+
+def _packs_gate_up(backend: str) -> bool:
+    return _normalize_projection_backend(backend) in {
+        "gate_up_packed",
+        "qkv_gate_up_packed",
+    }
+
+
+def _linear_signature(linear) -> tuple[Any, ...]:
+    bias = getattr(linear, "bias", None)
+    bias_sig = None
+    if bias is not None:
+        bias_sig = (
+            bias.data_ptr(),
+            str(bias.device),
+            bias.dtype,
+            tuple(bias.shape),
+            getattr(bias, "_version", 0),
+        )
+    return (
+        linear.weight.data_ptr(),
+        str(linear.weight.device),
+        linear.weight.dtype,
+        tuple(linear.weight.shape),
+        getattr(linear.weight, "_version", 0),
+        bias_sig,
+    )
+
+
+def _tensor_on_device(tensor, reference):
+    if tensor is None:
+        return None
+    if tensor.device == reference.device:
+        return tensor
+    return tensor.to(device=reference.device, non_blocking=True)
+
+
+def _clone_weight(tensor, *, device=None, clone: bool = True):
+    if tensor is None:
+        return None
+    tensor = tensor.detach()
+    if device is not None:
+        return tensor.to(device=device, copy=True).contiguous()
+    if clone:
+        return tensor.clone().contiguous()
+    return tensor.contiguous()
+
+
+def _cat_detached_tensors(tensors, *, dim: int = 0, device=None):
+    torch = _torch()
+
+    pieces = []
+    for tensor in tensors:
+        tensor = tensor.detach()
+        if device is not None:
+            tensor = tensor.to(device=device, copy=True)
+        pieces.append(tensor)
+    return torch.cat(pieces, dim=dim).contiguous()
+
+
+class _TensorLinear:
+    """Inference linear that owns a detached checkpoint tensor snapshot."""
+
+    def __init__(
+        self,
+        linear=None,
+        *,
+        weight=None,
+        bias=None,
+        device=None,
+        clone: bool = True,
+    ) -> None:
+        if linear is None and weight is None:
+            raise ValueError("_TensorLinear requires a source linear or weight tensor")
+        if weight is None:
+            weight = linear.weight
+        if bias is None and linear is not None:
+            bias = getattr(linear, "bias", None)
+        self.weight = _clone_weight(weight, device=device, clone=clone)
+        self.bias = _clone_weight(bias, device=device, clone=clone)
+        self.snapshot_device = device
+
+    def __call__(self, x):
+        return _linear(x, self)
+
+    def to(self, *args, **kwargs):
+        self.weight = self.weight.to(*args, **kwargs)
+        if self.bias is not None:
+            self.bias = self.bias.to(*args, **kwargs)
+        if self.snapshot_device is not None:
+            self.weight = self.weight.to(device=self.snapshot_device)
+            if self.bias is not None:
+                self.bias = self.bias.to(device=self.snapshot_device)
+        return self
+
+
+class _TensorRMSNorm:
+    """Inference RMSNorm state detached from the source HF module."""
+
+    def __init__(
+        self,
+        norm=None,
+        *,
+        weight=None,
+        eps=None,
+        device=None,
+        clone: bool = True,
+    ) -> None:
+        if norm is None and eps is None:
+            raise ValueError("_TensorRMSNorm requires a source norm or eps")
+        self.eps = norm.eps if norm is not None else eps
+        if weight is None and norm is not None:
+            weight = getattr(norm, "weight", None)
+        self.weight = _clone_weight(weight, device=device, clone=clone)
+        self.snapshot_device = device
+
+    def __call__(self, hidden_states):
+        return _rms_norm(hidden_states, self)
+
+    def to(self, *args, **kwargs):
+        if self.weight is not None:
+            self.weight = self.weight.to(*args, **kwargs)
+            if self.snapshot_device is not None:
+                self.weight = self.weight.to(device=self.snapshot_device)
+        return self
+
+
+def _snapshot_linear(linear, *, owned: bool, device=None):
+    if linear is None or not owned:
+        return linear
+    return _TensorLinear(linear, device=device)
+
+
+def _snapshot_norm(norm, *, owned: bool, device=None):
+    if norm is None or not owned:
+        return norm
+    return _TensorRMSNorm(norm, device=device)
+
+
+class _TensorEmbedding:
+    """Scaled embedding backed by checkpoint tensors, without an HF module."""
+
+    def __init__(self, weight, *, padding_idx: int | None = None, embed_scale: float = 1.0) -> None:
+        self.weight = weight.detach()
+        self.padding_idx = padding_idx
+        self.scalar_embed_scale = float(embed_scale)
+        self.embed_scale = _torch().tensor(float(embed_scale), device=self.weight.device)
+
+    def __call__(self, input_ids):
+        import torch.nn.functional as F
+
+        return F.embedding(input_ids, self.weight, padding_idx=self.padding_idx) * self.embed_scale.to(
+            self.weight.dtype
+        )
+
+    def to(self, *args, **kwargs):
+        self.weight = self.weight.to(*args, **kwargs)
+        self.embed_scale = self.embed_scale.to(device=self.weight.device)
+        return self
+
+
+def _checkpoint_tensor(state_dict: dict[str, Any], key: str, *, device=None, dtype=None, required: bool = True):
+    tensor = state_dict.get(key)
+    if tensor is None:
+        if required:
+            raise KeyError(f"missing Gemma checkpoint tensor {key!r}")
+        return None
+    tensor = tensor.detach()
+    if dtype is not None and tensor.dtype != dtype:
+        tensor = tensor.to(dtype=dtype)
+    if device is not None and tensor.device != _torch().device(device):
+        tensor = tensor.to(device=device)
+    return tensor.contiguous()
+
+
+def _checkpoint_files(model_path: str | Path) -> list[Path]:
+    model_path = Path(model_path)
+    if model_path.is_file():
+        return [model_path]
+    index_path = model_path / "model.safetensors.index.json"
+    if index_path.exists():
+        with index_path.open("r", encoding="utf-8") as f:
+            index = json.load(f)
+        files = sorted({model_path / name for name in index.get("weight_map", {}).values()})
+        if files:
+            return files
+    single = model_path / "model.safetensors"
+    if single.exists():
+        return [single]
+    files = sorted(model_path.glob("*.safetensors"))
+    if files:
+        return files
+    raise FileNotFoundError(f"no safetensors checkpoint files found under {model_path}")
+
+
+def _load_checkpoint_state_dict(
+    model_path: str | Path,
+    *,
+    prefix: str = "model.language_model",
+    device=None,
+    dtype=None,
+) -> dict[str, Any]:
+    from safetensors.torch import safe_open
+
+    torch = _torch()
+    if dtype is not None and isinstance(dtype, str):
+        dtype = getattr(torch, dtype)
+    device_arg = "cpu" if device is None else str(torch.device(device))
+    prefix_dot = f"{prefix}."
+    state_dict: dict[str, Any] = {}
+    for checkpoint_file in _checkpoint_files(model_path):
+        with safe_open(str(checkpoint_file), framework="pt", device=device_arg) as f:
+            for key in f.keys():
+                if not (key.startswith(prefix_dot) or key == "lm_head.weight"):
+                    continue
+                tensor = f.get_tensor(key)
+                if dtype is not None and tensor.dtype != dtype:
+                    tensor = tensor.to(dtype=dtype)
+                state_dict[key] = tensor.contiguous()
+    if f"{prefix}.embed_tokens.weight" not in state_dict:
+        raise KeyError(
+            f"checkpoint under {model_path!s} does not contain {prefix}.embed_tokens.weight"
+        )
+    return state_dict
+
+
+def _linear_from_checkpoint(state_dict: dict[str, Any], key: str, *, device=None, dtype=None, bias_key: str | None = None):
+    return _TensorLinear(
+        weight=_checkpoint_tensor(state_dict, key, device=device, dtype=dtype),
+        bias=(
+            _checkpoint_tensor(state_dict, bias_key, device=device, dtype=dtype, required=False)
+            if bias_key is not None
+            else None
+        ),
+        clone=False,
+    )
+
+
+def _norm_from_checkpoint(state_dict: dict[str, Any], key: str, *, eps: float, device=None, dtype=None, required: bool = True):
+    weight = _checkpoint_tensor(
+        state_dict,
+        key,
+        device=device,
+        dtype=dtype,
+        required=required,
+    )
+    return _TensorRMSNorm(weight=weight, eps=eps, clone=False)
+
+
+class _CheckpointGemma4MLP:
+    def __init__(self, config, state_dict: dict[str, Any], prefix: str, *, device=None, dtype=None) -> None:
+        self.config = config
+        self.gate_proj = _linear_from_checkpoint(
+            state_dict,
+            f"{prefix}.gate_proj.weight",
+            device=device,
+            dtype=dtype,
+        )
+        self.up_proj = _linear_from_checkpoint(
+            state_dict,
+            f"{prefix}.up_proj.weight",
+            device=device,
+            dtype=dtype,
+        )
+        self.down_proj = _linear_from_checkpoint(
+            state_dict,
+            f"{prefix}.down_proj.weight",
+            device=device,
+            dtype=dtype,
+        )
+
+    def to(self, *args, **kwargs):
+        self.gate_proj.to(*args, **kwargs)
+        self.up_proj.to(*args, **kwargs)
+        self.down_proj.to(*args, **kwargs)
+        return self
+
+
+class _CheckpointGemma4Attention:
+    def __init__(
+        self,
+        config,
+        layer_idx: int,
+        state_dict: dict[str, Any],
+        prefix: str,
+        *,
+        device=None,
+        dtype=None,
+    ) -> None:
+        self.config = config
+        self.layer_idx = int(layer_idx)
+        self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
+        self.is_sliding = self.layer_type == "sliding_attention"
+        self.sliding_window = config.sliding_window if self.is_sliding else None
+        global_head_dim = getattr(config, "global_head_dim", None)
+        self.head_dim = global_head_dim if not self.is_sliding and global_head_dim else config.head_dim
+        self.use_alternative_attention = bool(getattr(config, "attention_k_eq_v", False) and not self.is_sliding)
+        num_key_value_heads = (
+            getattr(config, "num_global_key_value_heads", None)
+            if self.use_alternative_attention
+            else config.num_key_value_heads
+        )
+        num_key_value_heads = num_key_value_heads or config.num_key_value_heads
+        self.num_key_value_groups = config.num_attention_heads // num_key_value_heads
+        self.scaling = 1.0
+        self.attention_dropout = config.attention_dropout
+        self.training = False
+        self.is_causal = getattr(config, "use_bidirectional_attention", None) != "all"
+
+        first_kv_shared_layer_idx = config.num_hidden_layers - getattr(config, "num_kv_shared_layers", 0)
+        self.is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx >= 0
+        prev_layers = config.layer_types[:first_kv_shared_layer_idx]
+        self.store_full_length_kv = (
+            not self.is_kv_shared_layer
+            and layer_idx == len(prev_layers) - 1 - prev_layers[::-1].index(config.layer_types[layer_idx])
+        )
+
+        self.q_proj = _linear_from_checkpoint(
+            state_dict,
+            f"{prefix}.q_proj.weight",
+            device=device,
+            dtype=dtype,
+            bias_key=f"{prefix}.q_proj.bias" if getattr(config, "attention_bias", False) else None,
+        )
+        self.q_norm = _norm_from_checkpoint(
+            state_dict,
+            f"{prefix}.q_norm.weight",
+            eps=config.rms_norm_eps,
+            device=device,
+            dtype=dtype,
+        )
+        self.k_norm = _norm_from_checkpoint(
+            state_dict,
+            f"{prefix}.k_norm.weight",
+            eps=config.rms_norm_eps,
+            device=device,
+            dtype=dtype,
+            required=False,
+        )
+        self.v_norm = _norm_from_checkpoint(
+            state_dict,
+            f"{prefix}.v_norm.weight",
+            eps=config.rms_norm_eps,
+            device=device,
+            dtype=dtype,
+            required=False,
+        )
+        if self.is_kv_shared_layer:
+            self.k_proj = None
+            self.v_proj = None
+        else:
+            self.k_proj = _linear_from_checkpoint(
+                state_dict,
+                f"{prefix}.k_proj.weight",
+                device=device,
+                dtype=dtype,
+                bias_key=f"{prefix}.k_proj.bias" if getattr(config, "attention_bias", False) else None,
+            )
+            v_weight_key = f"{prefix}.v_proj.weight"
+            self.v_proj = (
+                None
+                if self.use_alternative_attention and v_weight_key not in state_dict
+                else _linear_from_checkpoint(
+                    state_dict,
+                    v_weight_key,
+                    device=device,
+                    dtype=dtype,
+                    bias_key=f"{prefix}.v_proj.bias" if getattr(config, "attention_bias", False) else None,
+                )
+            )
+        self.o_proj = _linear_from_checkpoint(
+            state_dict,
+            f"{prefix}.o_proj.weight",
+            device=device,
+            dtype=dtype,
+            bias_key=f"{prefix}.o_proj.bias" if getattr(config, "attention_bias", False) else None,
+        )
+
+    def to(self, *args, **kwargs):
+        for obj in (
+            self.q_proj,
+            self.q_norm,
+            self.k_norm,
+            self.v_norm,
+            self.k_proj,
+            self.v_proj,
+            self.o_proj,
+        ):
+            to = getattr(obj, "to", None)
+            if to is not None:
+                to(*args, **kwargs)
+        return self
+
+
+class _CheckpointGemma4TextDecoderLayer:
+    def __init__(
+        self,
+        config,
+        layer_idx: int,
+        state_dict: dict[str, Any],
+        prefix: str,
+        *,
+        device=None,
+        dtype=None,
+    ) -> None:
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.layer_idx = int(layer_idx)
+        self.self_attn = _CheckpointGemma4Attention(
+            config,
+            layer_idx,
+            state_dict,
+            f"{prefix}.self_attn",
+            device=device,
+            dtype=dtype,
+        )
+        self.mlp = _CheckpointGemma4MLP(
+            config,
+            state_dict,
+            f"{prefix}.mlp",
+            device=device,
+            dtype=dtype,
+        )
+        self.input_layernorm = _norm_from_checkpoint(
+            state_dict,
+            f"{prefix}.input_layernorm.weight",
+            eps=config.rms_norm_eps,
+            device=device,
+            dtype=dtype,
+        )
+        self.post_attention_layernorm = _norm_from_checkpoint(
+            state_dict,
+            f"{prefix}.post_attention_layernorm.weight",
+            eps=config.rms_norm_eps,
+            device=device,
+            dtype=dtype,
+        )
+        self.pre_feedforward_layernorm = _norm_from_checkpoint(
+            state_dict,
+            f"{prefix}.pre_feedforward_layernorm.weight",
+            eps=config.rms_norm_eps,
+            device=device,
+            dtype=dtype,
+        )
+        self.post_feedforward_layernorm = _norm_from_checkpoint(
+            state_dict,
+            f"{prefix}.post_feedforward_layernorm.weight",
+            eps=config.rms_norm_eps,
+            device=device,
+            dtype=dtype,
+        )
+        self.layer_scalar = _checkpoint_tensor(
+            state_dict,
+            f"{prefix}.layer_scalar",
+            device=device,
+            dtype=dtype,
+        )
+        self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
+        if self.hidden_size_per_layer_input:
+            self.per_layer_input_gate = _linear_from_checkpoint(
+                state_dict,
+                f"{prefix}.per_layer_input_gate.weight",
+                device=device,
+                dtype=dtype,
+            )
+            self.per_layer_projection = _linear_from_checkpoint(
+                state_dict,
+                f"{prefix}.per_layer_projection.weight",
+                device=device,
+                dtype=dtype,
+            )
+            self.post_per_layer_input_norm = _norm_from_checkpoint(
+                state_dict,
+                f"{prefix}.post_per_layer_input_norm.weight",
+                eps=config.rms_norm_eps,
+                device=device,
+                dtype=dtype,
+            )
+        else:
+            self.per_layer_input_gate = None
+            self.per_layer_projection = None
+            self.post_per_layer_input_norm = None
+        self.enable_moe_block = bool(getattr(config, "enable_moe_block", False))
+
+    def to(self, *args, **kwargs):
+        for obj in (
+            self.self_attn,
+            self.mlp,
+            self.input_layernorm,
+            self.post_attention_layernorm,
+            self.pre_feedforward_layernorm,
+            self.post_feedforward_layernorm,
+            self.per_layer_input_gate,
+            self.per_layer_projection,
+            self.post_per_layer_input_norm,
+        ):
+            to = getattr(obj, "to", None)
+            if to is not None:
+                to(*args, **kwargs)
+        self.layer_scalar = self.layer_scalar.to(*args, **kwargs)
+        return self
+
+
+class _CheckpointGemma4TextModel:
+    def __init__(
+        self,
+        config,
+        state_dict: dict[str, Any],
+        *,
+        prefix: str = "model.language_model",
+        device=None,
+        dtype=None,
+    ) -> None:
+        self.config = config
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+        self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
+        self.training = False
+        self.embed_tokens = _TensorEmbedding(
+            _checkpoint_tensor(
+                state_dict,
+                f"{prefix}.embed_tokens.weight",
+                device=device,
+                dtype=dtype,
+            ),
+            padding_idx=self.padding_idx,
+            embed_scale=config.hidden_size**0.5,
+        )
+        self.layers = [
+            _CheckpointGemma4TextDecoderLayer(
+                config,
+                layer_idx,
+                state_dict,
+                f"{prefix}.layers.{layer_idx}",
+                device=device,
+                dtype=dtype,
+            )
+            for layer_idx in range(config.num_hidden_layers)
+        ]
+        self.norm = _norm_from_checkpoint(
+            state_dict,
+            f"{prefix}.norm.weight",
+            eps=config.rms_norm_eps,
+            device=device,
+            dtype=dtype,
+        )
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4TextRotaryEmbedding
+
+        self.rotary_emb = Gemma4TextRotaryEmbedding(config, device=device)
+        self.unique_layer_types = set(config.layer_types)
+        if self.hidden_size_per_layer_input:
+            self.embed_tokens_per_layer = _TensorEmbedding(
+                _checkpoint_tensor(
+                    state_dict,
+                    f"{prefix}.embed_tokens_per_layer.weight",
+                    device=device,
+                    dtype=dtype,
+                ),
+                padding_idx=self.padding_idx,
+                embed_scale=config.hidden_size_per_layer_input**0.5,
+            )
+            self.per_layer_input_scale = 2.0**-0.5
+            self.per_layer_model_projection = _linear_from_checkpoint(
+                state_dict,
+                f"{prefix}.per_layer_model_projection.weight",
+                device=device,
+                dtype=dtype,
+            )
+            self.per_layer_model_projection_scale = config.hidden_size**-0.5
+            self.per_layer_projection_norm = _norm_from_checkpoint(
+                state_dict,
+                f"{prefix}.per_layer_projection_norm.weight",
+                eps=config.rms_norm_eps,
+                device=device,
+                dtype=dtype,
+            )
+
+    def get_per_layer_inputs(self, input_ids, inputs_embeds):
+        if not self.hidden_size_per_layer_input:
+            raise RuntimeError("Gemma4 config does not support per-layer embeddings")
+        if input_ids is None:
+            raise RuntimeError(
+                "checkpoint-native Gemma4 requires input_ids when per-layer embeddings are enabled"
+            )
+        return self.embed_tokens_per_layer(input_ids).reshape(
+            *input_ids.shape,
+            self.config.num_hidden_layers,
+            self.hidden_size_per_layer_input,
+        )
+
+    def project_per_layer_inputs(self, inputs_embeds, per_layer_inputs=None):
+        if not self.hidden_size_per_layer_input:
+            raise RuntimeError("Gemma4 config does not support per-layer embeddings")
+        per_layer_projection = self.per_layer_model_projection(inputs_embeds) * self.per_layer_model_projection_scale
+        per_layer_projection = per_layer_projection.reshape(
+            *inputs_embeds.shape[:-1],
+            self.config.num_hidden_layers,
+            self.hidden_size_per_layer_input,
+        )
+        per_layer_projection = self.per_layer_projection_norm(per_layer_projection)
+        if per_layer_inputs is None:
+            return per_layer_projection
+        return (per_layer_projection + per_layer_inputs) * self.per_layer_input_scale
+
+    def parameters(self):
+        seen: set[int] = set()
+        for value in self._iter_tensors():
+            ptr = value.data_ptr()
+            if ptr in seen:
+                continue
+            seen.add(ptr)
+            yield value
+
+    def named_parameters(self, prefix: str = "model"):
+        for idx, value in enumerate(self.parameters()):
+            yield f"{prefix}.checkpoint_tensor_{idx}", value
+
+    def buffers(self):
+        return iter(())
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    def eval(self):
+        return self.train(False)
+
+    def train(self, mode: bool = True):
+        self.training = bool(mode)
+        for layer in self.layers:
+            layer.self_attn.training = bool(mode)
+        return self
+
+    def to(self, *args, **kwargs):
+        for obj in (self.embed_tokens, self.norm, self.rotary_emb):
+            obj.to(*args, **kwargs)
+        if self.hidden_size_per_layer_input:
+            for obj in (
+                self.embed_tokens_per_layer,
+                self.per_layer_model_projection,
+                self.per_layer_projection_norm,
+            ):
+                obj.to(*args, **kwargs)
+        for layer in self.layers:
+            layer.to(*args, **kwargs)
+        return self
+
+    def _iter_tensors(self):
+        def visit(obj):
+            if obj is None:
+                return
+            if hasattr(obj, "weight") and getattr(obj, "weight") is not None:
+                yield obj.weight
+            if hasattr(obj, "bias") and getattr(obj, "bias") is not None:
+                yield obj.bias
+            if hasattr(obj, "layer_scalar"):
+                yield obj.layer_scalar
+            if isinstance(obj, (list, tuple)):
+                for item in obj:
+                    yield from visit(item)
+                return
+            for attr in (
+                "embed_tokens",
+                "embed_tokens_per_layer",
+                "per_layer_model_projection",
+                "per_layer_projection_norm",
+                "norm",
+                "self_attn",
+                "mlp",
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "q_norm",
+                "k_norm",
+                "v_norm",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+                "input_layernorm",
+                "post_attention_layernorm",
+                "pre_feedforward_layernorm",
+                "post_feedforward_layernorm",
+                "per_layer_input_gate",
+                "per_layer_projection",
+                "post_per_layer_input_norm",
+            ):
+                if hasattr(obj, attr):
+                    yield from visit(getattr(obj, attr))
+
+        yield from visit(self)
+        yield from visit(self.layers)
+
+
+class _CheckpointGemma4ForCausalLMFacade:
+    def __init__(
+        self,
+        config,
+        state_dict: dict[str, Any],
+        *,
+        prefix: str = "model.language_model",
+        device=None,
+        dtype=None,
+    ) -> None:
+        self.config = config
+        self.model = _CheckpointGemma4TextModel(
+            config,
+            state_dict,
+            prefix=prefix,
+            device=device,
+            dtype=dtype,
+        )
+        lm_head_key = "lm_head.weight"
+        lm_head_weight = _checkpoint_tensor(
+            state_dict,
+            lm_head_key,
+            device=device,
+            dtype=dtype,
+            required=False,
+        )
+        self.tie_word_embeddings = lm_head_weight is None
+        if lm_head_weight is None:
+            lm_head_weight = self.model.embed_tokens.weight
+        self.lm_head = _TensorLinear(weight=lm_head_weight, clone=False)
+        self.training = False
+
+    @property
+    def device(self):
+        return self.model.device
+
+    def parameters(self, *args, **kwargs):
+        seen: set[int] = set()
+        for tensor in self.model.parameters():
+            seen.add(tensor.data_ptr())
+            yield tensor
+        for tensor in (self.lm_head.weight, self.lm_head.bias):
+            if tensor is None or tensor.data_ptr() in seen:
+                continue
+            seen.add(tensor.data_ptr())
+            yield tensor
+
+    def named_parameters(self, *args, **kwargs):
+        seen: set[int] = set()
+        for name, tensor in self.model.named_parameters():
+            seen.add(tensor.data_ptr())
+            yield name, tensor
+        for name, tensor in (("lm_head.weight", self.lm_head.weight), ("lm_head.bias", self.lm_head.bias)):
+            if tensor is None or tensor.data_ptr() in seen:
+                continue
+            seen.add(tensor.data_ptr())
+            yield name, tensor
+
+    def buffers(self, *args, **kwargs):
+        return self.model.buffers()
+
+    def eval(self):
+        return self.train(False)
+
+    def train(self, mode: bool = True):
+        self.training = bool(mode)
+        self.model.train(mode)
+        return self
+
+    def to(self, *args, **kwargs):
+        self.model.to(*args, **kwargs)
+        self.lm_head.to(*args, **kwargs)
+        return self
+
+
+class _PackedLinear:
+    """Concat adjacent HF linear weights for inference-time packed GEMMs."""
+
+    def __init__(self, *linears, cache: bool = True) -> None:
+        if len(linears) < 2:
+            raise ValueError("_PackedLinear requires at least two linears")
+        self.linears = linears
+        self.out_features = [int(linear.weight.shape[0]) for linear in linears]
+        self.cache = bool(cache)
+        self._signature: tuple[Any, ...] | None = None
+        self._weight = None
+        self._bias = None
+
+    def _build(self):
+        torch = _torch()
+
+        weight = torch.cat(
+            [linear.weight.detach() for linear in self.linears],
+            dim=0,
+        ).contiguous()
+        if all(getattr(linear, "bias", None) is None for linear in self.linears):
+            bias = None
+        else:
+            pieces = []
+            for linear in self.linears:
+                bias_piece = getattr(linear, "bias", None)
+                if bias_piece is None:
+                    pieces.append(linear.weight.new_zeros(linear.weight.shape[0]))
+                else:
+                    pieces.append(bias_piece.detach())
+            bias = torch.cat(pieces, dim=0).contiguous()
+        return weight, bias
+
+    def _refresh(self) -> None:
+        signature = tuple(_linear_signature(linear) for linear in self.linears)
+        if signature == self._signature:
+            return
+        with _torch().no_grad():
+            self._weight, self._bias = self._build()
+        self._signature = signature
+
+    def __call__(self, x):
+        import torch.nn.functional as F
+
+        if self.cache:
+            self._refresh()
+            weight, bias = self._weight, self._bias
+        else:
+            weight, bias = self._build()
+        return F.linear(x, weight, bias).split(self.out_features, dim=-1)
+
+
+class _OwnedPackedLinear:
+    """Packed inference linear with copied adjacent projection tensors.
+
+    This mirrors the vLLM/SGLang checkpoint-loaded boundary more closely than
+    `_PackedLinear`: the packed weight is owned by the native bridge and is not
+    rebuilt from live HF modules during forward.
+    """
+
+    def __init__(self, *linears, device=None) -> None:
+        if len(linears) < 2:
+            raise ValueError("_OwnedPackedLinear requires at least two linears")
+        self.out_features = [int(linear.weight.shape[0]) for linear in linears]
+        self.weight = _cat_detached_tensors(
+            [linear.weight for linear in linears],
+            dim=0,
+            device=device,
+        )
+        if all(getattr(linear, "bias", None) is None for linear in linears):
+            self.bias = None
+        else:
+            pieces = []
+            for linear in linears:
+                bias = getattr(linear, "bias", None)
+                if bias is None:
+                    zeros = linear.weight.new_zeros(linear.weight.shape[0])
+                    if device is not None:
+                        zeros = zeros.to(device=device)
+                    pieces.append(zeros)
+                else:
+                    if device is not None:
+                        bias = bias.detach().to(device=device, copy=True)
+                    else:
+                        bias = bias.detach()
+                    pieces.append(bias)
+            self.bias = _torch().cat(pieces, dim=0).contiguous()
+        self.snapshot_device = device
+
+    def __call__(self, x):
+        import torch.nn.functional as F
+
+        weight = _tensor_on_device(self.weight, x)
+        bias = _tensor_on_device(self.bias, x)
+        return F.linear(x, weight, bias).split(self.out_features, dim=-1)
+
+    def to(self, *args, **kwargs):
+        self.weight = self.weight.to(*args, **kwargs)
+        if self.bias is not None:
+            self.bias = self.bias.to(*args, **kwargs)
+        if self.snapshot_device is not None:
+            self.weight = self.weight.to(device=self.snapshot_device)
+            if self.bias is not None:
+                self.bias = self.bias.to(device=self.snapshot_device)
+        return self
+
+
+def _activation(name: str, x) -> Any:
+    import torch.nn.functional as F
+
+    if name == "gelu_pytorch_tanh":
+        return F.gelu(x, approximate="tanh")
+    if name == "gelu":
+        return F.gelu(x)
+    if name in {"silu", "swish"}:
+        return F.silu(x)
+    if name == "relu":
+        return F.relu(x)
+    try:
+        from transformers.activations import ACT2FN
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        raise NotImplementedError(f"unsupported Gemma activation: {name}") from exc
+    return ACT2FN[name](x)
+
+
+def _activation_mul(name: str, gate, up) -> Any:
+    if getattr(gate, "requires_grad", False):
+        return _activation(name, gate) * up
+    if name == "gelu_pytorch_tanh":
+        _torch().ops.aten.gelu_(gate, approximate="tanh")
+        return gate.mul_(up)
+    if name == "gelu":
+        _torch().ops.aten.gelu_(gate, approximate="none")
+        return gate.mul_(up)
+    if name in {"silu", "swish"}:
+        import torch.nn.functional as F
+
+        return F.silu(gate, inplace=True).mul_(up)
+    return _activation(name, gate) * up
+
+
+def _rotate_half(x):
+    torch = _torch()
+
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def _apply_rotary_pos_emb(x, cos, sin, *, unsqueeze_dim: int = 1):
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    return (x * cos) + (_rotate_half(x) * sin)
+
+
+def _repeat_kv(hidden_states, repeats: int):
+    if repeats == 1:
+        return hidden_states
+    batch, num_key_value_heads, seq_len, head_dim = hidden_states.shape
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch,
+        num_key_value_heads,
+        repeats,
+        seq_len,
+        head_dim,
+    )
+    return hidden_states.reshape(batch, num_key_value_heads * repeats, seq_len, head_dim)
+
+
+def _normalize_attention_backend(backend: str) -> str:
+    backend = str(backend).strip().lower()
+    if backend not in {
+        "manual",
+        "manual_gqa",
+        "sdpa",
+        "sdpa_single_gqa",
+        "triton_dense_gqa",
+    }:
+        raise ValueError(
+            "native Gemma attention backend must be 'manual', 'manual_gqa', "
+            "'sdpa', 'sdpa_single_gqa', or 'triton_dense_gqa'"
+        )
+    return backend
+
+
+def _attention_forward_manual_gqa(attn, query_states, key_states, value_states, attention_mask):
+    """Manual attention that keeps grouped-query K/V heads unexpanded."""
+
+    torch = _torch()
+    import torch.nn.functional as F
+
+    batch, query_heads, query_length, head_dim = query_states.shape
+    kv_heads = key_states.shape[1]
+    key_length = key_states.shape[2]
+    if query_heads % kv_heads != 0:
+        raise ValueError("query head count must be divisible by key/value head count")
+    groups = query_heads // kv_heads
+    query = query_states.reshape(batch, kv_heads, groups, query_length, head_dim)
+    key = key_states[:, :, None, :, :]
+    value = value_states[:, :, None, :, :]
+    attn_weights = torch.matmul(query, key.transpose(-2, -1)) * attn.scaling
+    if attention_mask is not None:
+        mask = attention_mask
+        if mask.ndim == 4:
+            mask = mask.unsqueeze(2)
+        else:
+            while mask.ndim < attn_weights.ndim:
+                mask = mask.unsqueeze(1)
+        attn_weights = attn_weights + mask
+    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+    if attn.training and attn.attention_dropout:
+        attn_weights = F.dropout(attn_weights, p=attn.attention_dropout, training=True)
+    attn_output = torch.matmul(attn_weights, value)
+    attn_output = attn_output.reshape(batch, query_heads, query_length, head_dim)
+    attn_weights = attn_weights.reshape(batch, query_heads, query_length, key_length)
+    return attn_output.transpose(1, 2).contiguous(), attn_weights
+
+
+def _attention_forward_token_pool_gqa_reference(
+    attn,
+    query_states,
+    *,
+    decode_metadata,
+    token_kv_pool,
+    layer_idx: int,
+):
+    torch = _torch()
+
+    if query_states.shape[2] != 1:
+        raise ValueError("token-pool attention only supports decode query_len == 1")
+    if query_states.shape[0] != int(decode_metadata.req_pool_indices.numel()):
+        raise ValueError("token-pool metadata row count must match query batch")
+
+    kv_indptr = decode_metadata.kv_indptr.detach().cpu().reshape(-1).tolist()
+    kv_indices = decode_metadata.kv_indices
+    flat_keys, flat_values = token_kv_pool.gather_kv(layer_idx, kv_indices)
+    outputs = []
+    for row in range(query_states.shape[0]):
+        start = int(kv_indptr[row])
+        end = int(kv_indptr[row + 1])
+        if end <= start:
+            raise ValueError("token-pool attention rows must contain at least one KV token")
+        key_states = flat_keys[start:end].permute(1, 0, 2).unsqueeze(0)
+        value_states = flat_values[start:end].permute(1, 0, 2).unsqueeze(0)
+        row_output, _ = _attention_forward_manual_gqa(
+            attn,
+            query_states[row : row + 1],
+            key_states,
+            value_states,
+            None,
+        )
+        outputs.append(row_output)
+    return torch.cat(outputs, dim=0), None
+
+
+def _attention_forward_token_pool_gqa(
+    attn,
+    query_states,
+    *,
+    decode_metadata,
+    paged_decode_metadata=None,
+    token_kv_pool,
+    layer_idx: int,
+):
+    timing_enabled = _native_forward_timing_enabled()
+    attention_start = time.perf_counter() if timing_enabled else 0.0
+    attention_rows = int(query_states.shape[0])
+    _TOKEN_POOL_TRITON_STATS["calls"] += 1
+    dispatch_plan = _token_pool_triton_dispatch_plan()
+    if dispatch_plan.env_enabled:
+        _TOKEN_POOL_TRITON_STATS["env_enabled_calls"] += 1
+    if dispatch_plan.env_forced_off or dispatch_plan.env_disabled:
+        _TOKEN_POOL_TRITON_STATS["env_disabled_calls"] += 1
+    if dispatch_plan.effective_enabled:
+        _TOKEN_POOL_TRITON_STATS["effective_enabled_calls"] += 1
+    else:
+        _TOKEN_POOL_TRITON_STATS["effective_disabled_calls"] += 1
+    if dispatch_plan.auto_default_enabled:
+        _TOKEN_POOL_TRITON_STATS["auto_enabled_calls"] += 1
+    paged_metadata = paged_decode_metadata
+    if paged_metadata is None and getattr(decode_metadata, "block_tables", None) is not None:
+        paged_metadata = decode_metadata
+    flat_metadata = (
+        None
+        if getattr(decode_metadata, "block_tables", None) is not None
+        else decode_metadata
+    )
+    paged_triton_enabled = dispatch_plan.paged_enabled
+    split_triton_enabled = dispatch_plan.split_enabled
+    paged_split_triton_enabled = dispatch_plan.paged_split_enabled
+    has_paged_metadata = getattr(paged_metadata, "block_tables", None) is not None
+    has_flat_metadata = (
+        getattr(flat_metadata, "kv_indptr", None) is not None
+        and getattr(flat_metadata, "kv_indices", None) is not None
+    )
+    if paged_triton_enabled:
+        _TOKEN_POOL_TRITON_STATS["paged_enabled_calls"] += 1
+    if split_triton_enabled:
+        _TOKEN_POOL_TRITON_STATS["split_enabled_calls"] += 1
+    if paged_split_triton_enabled:
+        _TOKEN_POOL_TRITON_STATS["paged_split_enabled_calls"] += 1
+    if query_states.is_cuda and dispatch_plan.effective_enabled:
+        triton_shape_key = (
+            int(query_states.shape[1]),
+            int(query_states.shape[3]),
+            int(attn.num_key_value_groups),
+            query_states.dtype,
+            query_states.device,
+            dispatch_plan.input_precision_policy,
+            dispatch_plan.dot_dtype_policy,
+        )
+        if triton_shape_key in _TOKEN_POOL_TRITON_DISABLED_SHAPES:
+            _TOKEN_POOL_TRITON_STATS["disabled_shape_skips"] += 1
+            _record_token_pool_triton_fallback("disabled_shape")
+        else:
+            _TOKEN_POOL_TRITON_STATS["attempts"] += 1
+            triton_attempt_start = time.perf_counter() if timing_enabled else 0.0
+            try:
+                key_buffer, value_buffer = token_kv_pool.get_kv_buffer(layer_idx)
+                output_buffer = None
+                output_buffer_fn = getattr(token_kv_pool, "attention_output_buffer", None)
+                if output_buffer_fn is not None:
+                    output_buffer = output_buffer_fn(
+                        batch=int(query_states.shape[0]),
+                        query_heads=int(query_states.shape[1]),
+                        head_dim=int(query_states.shape[3]),
+                        dtype=query_states.dtype,
+                        device=query_states.device,
+                    )
+                if paged_triton_enabled and has_paged_metadata:
+                    _TOKEN_POOL_TRITON_STATS["paged_attempts"] += 1
+                    if paged_split_triton_enabled:
+                        split_workspace = None
+                        max_seq_len = getattr(paged_metadata, "max_seq_len", None)
+                        should_split, split_size, min_splits, max_splits = (
+                            _token_pool_triton_metadata_split_plan(
+                                paged_metadata,
+                                max_seq_len,
+                            )
+                        )
+                        if should_split:
+                            _TOKEN_POOL_TRITON_STATS["paged_split_attempts"] += 1
+                            _TOKEN_POOL_TRITON_STATS["split_attempts"] += 1
+                            output_workspace_fn = getattr(
+                                token_kv_pool,
+                                "attention_split_workspace",
+                                None,
+                            )
+                            if output_workspace_fn is not None and max_splits is not None:
+                                split_workspace = output_workspace_fn(
+                                    batch=int(query_states.shape[0]),
+                                    kv_heads=int(key_buffer.shape[1]),
+                                    max_splits=max_splits,
+                                    block_groups=_token_pool_triton_block_groups(
+                                        int(attn.num_key_value_groups),
+                                        query_states.dtype,
+                                    ),
+                                    head_dim=int(query_states.shape[3]),
+                                    device=query_states.device,
+                                )
+                            output = _token_pool_triton_paged_split_decode_fn()(
+                                query_states,
+                                key_buffer,
+                                value_buffer,
+                                paged_metadata.block_tables,
+                                paged_metadata.block_table_lens,
+                                paged_metadata.selected_start_positions,
+                                paged_metadata.seq_lens,
+                                block_size=paged_metadata.block_size,
+                                num_key_value_groups=attn.num_key_value_groups,
+                                scaling=attn.scaling,
+                                max_seq_len=max_seq_len,
+                                split_size=split_size,
+                                min_splits=min_splits,
+                                workspace=split_workspace,
+                                output=output_buffer,
+                            )
+                            _TOKEN_POOL_TRITON_STATS["paged_split_successes"] += 1
+                            _TOKEN_POOL_TRITON_STATS["split_successes"] += 1
+                        else:
+                            _TOKEN_POOL_TRITON_STATS[
+                                "paged_split_skips_by_min_splits"
+                            ] += 1
+                            _TOKEN_POOL_TRITON_STATS["split_skips_by_min_splits"] += 1
+                            output = _token_pool_triton_paged_decode_fn()(
+                                query_states,
+                                key_buffer,
+                                value_buffer,
+                                paged_metadata.block_tables,
+                                paged_metadata.block_table_lens,
+                                paged_metadata.selected_start_positions,
+                                paged_metadata.seq_lens,
+                                block_size=paged_metadata.block_size,
+                                num_key_value_groups=attn.num_key_value_groups,
+                                scaling=attn.scaling,
+                                output=output_buffer,
+                            )
+                    else:
+                        output = _token_pool_triton_paged_decode_fn()(
+                            query_states,
+                            key_buffer,
+                            value_buffer,
+                            paged_metadata.block_tables,
+                            paged_metadata.block_table_lens,
+                            paged_metadata.selected_start_positions,
+                            paged_metadata.seq_lens,
+                            block_size=paged_metadata.block_size,
+                            num_key_value_groups=attn.num_key_value_groups,
+                            scaling=attn.scaling,
+                            output=output_buffer,
+                        )
+                    _TOKEN_POOL_TRITON_STATS["paged_successes"] += 1
+                else:
+                    if not has_flat_metadata:
+                        raise RuntimeError(
+                            "token-pool flat decode metadata is required when paged "
+                            "Triton decode is unavailable"
+                        )
+                    if split_triton_enabled:
+                        split_workspace = None
+                        max_seq_len = getattr(flat_metadata, "max_seq_len", None)
+                        should_split, split_size, min_splits, max_splits = (
+                            _token_pool_triton_metadata_split_plan(
+                                flat_metadata,
+                                max_seq_len,
+                            )
+                        )
+                        if should_split:
+                            _TOKEN_POOL_TRITON_STATS["split_attempts"] += 1
+                            output_workspace_fn = getattr(
+                                token_kv_pool,
+                                "attention_split_workspace",
+                                None,
+                            )
+                            if output_workspace_fn is not None and max_splits is not None:
+                                split_workspace = output_workspace_fn(
+                                    batch=int(query_states.shape[0]),
+                                    kv_heads=int(key_buffer.shape[1]),
+                                    max_splits=max_splits,
+                                    block_groups=_token_pool_triton_block_groups(
+                                        int(attn.num_key_value_groups),
+                                        query_states.dtype,
+                                    ),
+                                    head_dim=int(query_states.shape[3]),
+                                    device=query_states.device,
+                                )
+                            output = _token_pool_triton_split_decode_fn()(
+                                query_states,
+                                key_buffer,
+                                value_buffer,
+                                flat_metadata.kv_indptr,
+                                flat_metadata.kv_indices,
+                                num_key_value_groups=attn.num_key_value_groups,
+                                scaling=attn.scaling,
+                                max_seq_len=max_seq_len,
+                                split_size=split_size,
+                                min_splits=min_splits,
+                                seq_lens=flat_metadata.seq_lens,
+                                workspace=split_workspace,
+                                output=output_buffer,
+                            )
+                            _TOKEN_POOL_TRITON_STATS["split_successes"] += 1
+                        else:
+                            _TOKEN_POOL_TRITON_STATS["split_skips_by_min_splits"] += 1
+                            output = _token_pool_triton_decode_fn()(
+                                query_states,
+                                key_buffer,
+                                value_buffer,
+                                flat_metadata.kv_indptr,
+                                flat_metadata.kv_indices,
+                                num_key_value_groups=attn.num_key_value_groups,
+                                scaling=attn.scaling,
+                                output=output_buffer,
+                            )
+                    else:
+                        output = _token_pool_triton_decode_fn()(
+                            query_states,
+                            key_buffer,
+                            value_buffer,
+                            flat_metadata.kv_indptr,
+                            flat_metadata.kv_indices,
+                            num_key_value_groups=attn.num_key_value_groups,
+                            scaling=attn.scaling,
+                            output=output_buffer,
+                        )
+                _TOKEN_POOL_TRITON_STATS["successes"] += 1
+                if timing_enabled:
+                    _record_native_count("token_pool_attention_triton_attempts")
+                    _record_native_timing(
+                        "token_pool_attention_triton_attempt_wall_s",
+                        time.perf_counter() - triton_attempt_start,
+                    )
+                    _record_token_pool_attention_timing(
+                        "triton",
+                        rows=attention_rows,
+                        elapsed=time.perf_counter() - attention_start,
+                    )
+                return output, None
+            except ImportError:
+                if timing_enabled:
+                    _record_native_count("token_pool_attention_triton_attempts")
+                    _record_native_timing(
+                        "token_pool_attention_triton_attempt_wall_s",
+                        time.perf_counter() - triton_attempt_start,
+                    )
+                _TOKEN_POOL_TRITON_STATS["import_error_fallbacks"] += 1
+                _record_token_pool_triton_fallback("import_error")
+            except RuntimeError as exc:
+                if timing_enabled:
+                    _record_native_count("token_pool_attention_triton_attempts")
+                    _record_native_timing(
+                        "token_pool_attention_triton_attempt_wall_s",
+                        time.perf_counter() - triton_attempt_start,
+                    )
+                _TOKEN_POOL_TRITON_STATS["runtime_errors"] += 1
+                if dispatch_plan.strict:
+                    _TOKEN_POOL_TRITON_STATS["nonrecoverable_runtime_errors"] += 1
+                    raise
+                if not has_flat_metadata:
+                    _TOKEN_POOL_TRITON_STATS["nonrecoverable_runtime_errors"] += 1
+                    raise
+                if not _is_recoverable_token_pool_triton_error(exc):
+                    _TOKEN_POOL_TRITON_STATS["nonrecoverable_runtime_errors"] += 1
+                    raise
+                _TOKEN_POOL_TRITON_STATS["recoverable_runtime_fallbacks"] += 1
+                _record_token_pool_triton_fallback("recoverable_runtime_error")
+                _TOKEN_POOL_TRITON_DISABLED_SHAPES.add(triton_shape_key)
+    if not has_flat_metadata:
+        raise RuntimeError("token-pool flat decode metadata is required for reference fallback")
+    result = _attention_forward_token_pool_gqa_reference(
+        attn,
+        query_states,
+        decode_metadata=flat_metadata,
+        token_kv_pool=token_kv_pool,
+        layer_idx=layer_idx,
+    )
+    if timing_enabled:
+        _record_token_pool_attention_timing(
+            "reference",
+            rows=attention_rows,
+            elapsed=time.perf_counter() - attention_start,
+        )
+    return result
+
+
+def _is_recoverable_token_pool_triton_error(exc: RuntimeError) -> bool:
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "out of resource",
+            "shared memory",
+            "ptxas",
+            "triton",
+            "cuda error",
+            "invalid argument",
+            "illegal memory access",
+            "no kernel image",
+        )
+    )
+
+
+def _attention_forward(
+    attn,
+    query_states,
+    key_states,
+    value_states,
+    attention_mask,
+    *,
+    backend: str,
+    decode_metadata=None,
+    paged_decode_metadata=None,
+    token_kv_pool=None,
+    layer_idx: int | None = None,
+):
+    torch = _torch()
+    import torch.nn.functional as F
+
+    backend = _normalize_attention_backend(backend)
+    if (
+        decode_metadata is not None
+        and token_kv_pool is not None
+        and layer_idx is not None
+        and attention_mask is None
+        and query_states.shape[2] == 1
+    ):
+        return _attention_forward_token_pool_gqa(
+            attn,
+            query_states,
+            decode_metadata=decode_metadata,
+            paged_decode_metadata=paged_decode_metadata,
+            token_kv_pool=token_kv_pool,
+            layer_idx=int(layer_idx),
+        )
+    if backend == "manual_gqa" or (
+        backend == "sdpa_single_gqa"
+        and query_states.shape[0] == 1
+        and query_states.shape[2] == 1
+        and attn.num_key_value_groups > 1
+    ):
+        return _attention_forward_manual_gqa(
+            attn,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+        )
+    if backend == "sdpa_single_gqa":
+        backend = "sdpa"
+    if backend == "triton_dense_gqa":
+        if (
+            query_states.shape[2] == 1
+            and attn.num_key_value_groups > 1
+            and bool(getattr(query_states, "is_cuda", False))
+        ):
+            from wkvm.runner.gemma_token_pool_triton import dense_padded_gqa_decode
+
+            attn_output = dense_padded_gqa_decode(
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                num_key_value_groups=attn.num_key_value_groups,
+                scaling=attn.scaling,
+            )
+            return attn_output, None
+        backend = "sdpa"
+    key_states = _repeat_kv(key_states, attn.num_key_value_groups)
+    value_states = _repeat_kv(value_states, attn.num_key_value_groups)
+    if backend == "sdpa":
+        dropout_p = attn.attention_dropout if attn.training else 0.0
+        attn_output = F.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=attention_mask,
+            dropout_p=dropout_p,
+            is_causal=False,
+            scale=attn.scaling,
+        )
+        return attn_output.transpose(1, 2).contiguous(), None
+
+    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * attn.scaling
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask
+    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+    if attn.training and attn.attention_dropout:
+        attn_weights = F.dropout(attn_weights, p=attn.attention_dropout, training=True)
+    attn_output = torch.matmul(attn_weights, value_states)
+    return attn_output.transpose(1, 2).contiguous(), attn_weights
+
+
+@dataclass
+class NativeGemma4PrefixOutput:
+    hidden_states: Any
+    past_key_values: Any | None
+    shared_kv_states: dict[str, tuple[Any, Any]] | UserDict
+    per_layer_inputs: Any | None
+    position_ids: Any
+    causal_mask_mapping: dict[str, Any]
+
+
+@dataclass
+class _NativeAttentionMeta:
+    head_dim: int
+    num_key_value_groups: int
+    attention_dropout: float
+    training: bool
+    scaling: float
+    is_kv_shared_layer: bool
+    layer_type: str | None
+    store_full_length_kv: bool
+
+
+@dataclass
+class NativeGemma4CausalLMOutput:
+    logits: Any
+    hidden_states: Any
+    past_key_values: Any | None
+    shared_kv_states: dict[str, tuple[Any, Any]] | UserDict
+
+
+class NativeGemma4TextDecoderLayer:
+    """Explicit Gemma4 decoder-layer math backed by an already-loaded HF layer.
+
+    The first production target is KV-owning sliding layers. The implementation is
+    intentionally a parity bridge: it reads checkpoint weights from the HF layer,
+    but does not call `Gemma4TextDecoderLayer.forward` or
+    `Gemma4TextAttention.forward`.
+    """
+
+    def __init__(
+        self,
+        hf_layer,
+        *,
+        native_attention_backend: str = "manual",
+        native_projection_backend: str = "separate",
+        native_weight_backend: str = "hf_live",
+    ) -> None:
+        self.config = hf_layer.config
+        self.layer_idx = int(hf_layer.layer_idx)
+        self.hidden_size = int(hf_layer.hidden_size)
+        self.hidden_size_per_layer_input = bool(hf_layer.hidden_size_per_layer_input)
+        self.native_attention_backend = _normalize_attention_backend(native_attention_backend)
+        self.native_projection_backend = _normalize_projection_backend(native_projection_backend)
+        self.native_weight_backend = _normalize_weight_backend(native_weight_backend)
+        self._owns_weight_tensors = self.native_weight_backend in {"owned", "owned_cpu"}
+        self._weight_snapshot_device = (
+            "cpu" if self.native_weight_backend == "owned_cpu" else None
+        )
+        self._qkv_proj = None
+        self._gate_up_proj = None
+        if getattr(hf_layer, "enable_moe_block", False):
+            raise NotImplementedError("native Gemma4 layer does not support MoE blocks yet")
+        attn = hf_layer.self_attn
+        self.attn_meta = _NativeAttentionMeta(
+            head_dim=int(attn.head_dim),
+            num_key_value_groups=int(attn.num_key_value_groups),
+            attention_dropout=float(attn.attention_dropout),
+            training=bool(attn.training),
+            scaling=float(attn.scaling),
+            is_kv_shared_layer=bool(getattr(attn, "is_kv_shared_layer", False)),
+            layer_type=getattr(attn, "layer_type", None),
+            store_full_length_kv=bool(getattr(attn, "store_full_length_kv", False)),
+        )
+        self.mlp_activation = hf_layer.mlp.config.hidden_activation
+        owned = self._owns_weight_tensors
+        snapshot_device = self._weight_snapshot_device
+        self.input_layernorm = _snapshot_norm(
+            hf_layer.input_layernorm,
+            owned=owned,
+            device=snapshot_device,
+        )
+        self.post_attention_layernorm = _snapshot_norm(
+            hf_layer.post_attention_layernorm,
+            owned=owned,
+            device=snapshot_device,
+        )
+        self.pre_feedforward_layernorm = _snapshot_norm(
+            hf_layer.pre_feedforward_layernorm,
+            owned=owned,
+            device=snapshot_device,
+        )
+        self.post_feedforward_layernorm = _snapshot_norm(
+            hf_layer.post_feedforward_layernorm,
+            owned=owned,
+            device=snapshot_device,
+        )
+        self.q_proj = _snapshot_linear(attn.q_proj, owned=owned, device=snapshot_device)
+        self.k_proj = _snapshot_linear(
+            getattr(attn, "k_proj", None),
+            owned=owned,
+            device=snapshot_device,
+        )
+        self.v_proj = _snapshot_linear(
+            getattr(attn, "v_proj", None),
+            owned=owned,
+            device=snapshot_device,
+        )
+        self.o_proj = _snapshot_linear(attn.o_proj, owned=owned, device=snapshot_device)
+        self.q_norm = _snapshot_norm(attn.q_norm, owned=owned, device=snapshot_device)
+        self.k_norm = _snapshot_norm(
+            getattr(attn, "k_norm", None),
+            owned=owned,
+            device=snapshot_device,
+        )
+        self.v_norm = _snapshot_norm(
+            getattr(attn, "v_norm", None),
+            owned=owned,
+            device=snapshot_device,
+        )
+        self.mlp_gate_proj = _snapshot_linear(
+            hf_layer.mlp.gate_proj,
+            owned=owned,
+            device=snapshot_device,
+        )
+        self.mlp_up_proj = _snapshot_linear(
+            hf_layer.mlp.up_proj,
+            owned=owned,
+            device=snapshot_device,
+        )
+        self.mlp_down_proj = _snapshot_linear(
+            hf_layer.mlp.down_proj,
+            owned=owned,
+            device=snapshot_device,
+        )
+        self.per_layer_input_gate = _snapshot_linear(
+            getattr(hf_layer, "per_layer_input_gate", None),
+            owned=owned,
+            device=snapshot_device,
+        )
+        self.per_layer_projection = _snapshot_linear(
+            getattr(hf_layer, "per_layer_projection", None),
+            owned=owned,
+            device=snapshot_device,
+        )
+        self.post_per_layer_input_norm = _snapshot_norm(
+            getattr(hf_layer, "post_per_layer_input_norm", None),
+            owned=owned,
+            device=snapshot_device,
+        )
+        self.layer_scalar = (
+            _clone_weight(hf_layer.layer_scalar, device=snapshot_device)
+            if owned
+            else hf_layer.layer_scalar
+        )
+        if (
+            _packs_qkv(self.native_projection_backend)
+            and not getattr(attn, "is_kv_shared_layer", False)
+            and getattr(attn, "v_proj", None) is not None
+        ):
+            if owned:
+                self._qkv_proj = _OwnedPackedLinear(
+                    self.q_proj,
+                    self.k_proj,
+                    self.v_proj,
+                    device=snapshot_device,
+                )
+                self.q_proj = None
+                self.k_proj = None
+                self.v_proj = None
+            else:
+                self._qkv_proj = _PackedLinear(attn.q_proj, attn.k_proj, attn.v_proj)
+        if _packs_gate_up(self.native_projection_backend):
+            if owned:
+                self._gate_up_proj = _OwnedPackedLinear(
+                    self.mlp_gate_proj,
+                    self.mlp_up_proj,
+                    device=snapshot_device,
+                )
+                self.mlp_gate_proj = None
+                self.mlp_up_proj = None
+            else:
+                self._gate_up_proj = _PackedLinear(
+                    hf_layer.mlp.gate_proj,
+                    hf_layer.mlp.up_proj,
+                    cache=False,
+                )
+        self.hf_layer = None if owned else hf_layer
+
+    @property
+    def layer_type(self) -> str | None:
+        return self.attn_meta.layer_type
+
+    def __call__(self, *args, **kwargs):
+        return self.forward(*args, **kwargs)
+
+    def forward(
+        self,
+        hidden_states,
+        per_layer_input=None,
+        *,
+        shared_kv_states: dict[str, tuple[Any, Any]] | UserDict | None = None,
+        position_embeddings=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        wkvm_token_pool_decode=None,
+        **_kwargs,
+    ):
+        if position_embeddings is None:
+            raise ValueError("position_embeddings are required for native Gemma4 layer")
+        shared_kv_states = shared_kv_states if shared_kv_states is not None else UserDict()
+
+        timing_enabled = _native_forward_timing_enabled()
+        layer_start = time.perf_counter() if timing_enabled else 0.0
+        if timing_enabled:
+            _record_native_count("layer_forward_calls")
+
+        residual = hidden_states
+        phase_start = time.perf_counter() if timing_enabled else 0.0
+        hidden_states = _rms_norm(hidden_states, self.input_layernorm)
+        if timing_enabled:
+            _record_native_timing(
+                "layer_input_norm_wall_s",
+                time.perf_counter() - phase_start,
+            )
+            phase_start = time.perf_counter()
+        hidden_states, _attn_weights = self._self_attention(
+            hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            shared_kv_states=shared_kv_states,
+            past_key_values=past_key_values,
+            wkvm_token_pool_decode=wkvm_token_pool_decode,
+        )
+        if timing_enabled:
+            _record_native_timing(
+                "layer_self_attention_wall_s",
+                time.perf_counter() - phase_start,
+            )
+            phase_start = time.perf_counter()
+        hidden_states = _rms_norm(hidden_states, self.post_attention_layernorm)
+        if timing_enabled:
+            _record_native_timing(
+                "layer_post_attention_norm_wall_s",
+                time.perf_counter() - phase_start,
+            )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        phase_start = time.perf_counter() if timing_enabled else 0.0
+        hidden_states = _rms_norm(hidden_states, self.pre_feedforward_layernorm)
+        if timing_enabled:
+            _record_native_timing(
+                "layer_pre_feedforward_norm_wall_s",
+                time.perf_counter() - phase_start,
+            )
+            phase_start = time.perf_counter()
+        hidden_states = self._mlp(hidden_states)
+        if timing_enabled:
+            _record_native_timing("layer_mlp_wall_s", time.perf_counter() - phase_start)
+            phase_start = time.perf_counter()
+        hidden_states = _rms_norm(hidden_states, self.post_feedforward_layernorm)
+        if timing_enabled:
+            _record_native_timing(
+                "layer_post_feedforward_norm_wall_s",
+                time.perf_counter() - phase_start,
+            )
+        hidden_states = residual + hidden_states
+
+        if self.hidden_size_per_layer_input:
+            if per_layer_input is None:
+                raise ValueError("per_layer_input is required for Gemma4 PLE layers")
+            phase_start = time.perf_counter() if timing_enabled else 0.0
+            residual = hidden_states
+            hidden_states = _linear(hidden_states, self.per_layer_input_gate)
+            hidden_states = _activation(self.config.hidden_activation, hidden_states)
+            hidden_states = hidden_states * per_layer_input
+            hidden_states = _linear(hidden_states, self.per_layer_projection)
+            hidden_states = _rms_norm(hidden_states, self.post_per_layer_input_norm)
+            hidden_states = residual + hidden_states
+            if timing_enabled:
+                _record_native_timing("layer_ple_wall_s", time.perf_counter() - phase_start)
+
+        result = hidden_states * _tensor_on_device(self.layer_scalar, hidden_states)
+        if timing_enabled:
+            _record_native_timing("layer_forward_wall_s", time.perf_counter() - layer_start)
+        return result
+
+    def _self_attention(
+        self,
+        hidden_states,
+        *,
+        position_embeddings,
+        attention_mask,
+        shared_kv_states,
+        past_key_values,
+        wkvm_token_pool_decode,
+    ):
+        attn = self.attn_meta
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, attn.head_dim)
+        cos, sin = position_embeddings
+        timing_enabled = _native_forward_timing_enabled()
+
+        packed_qkv = self._qkv_proj is not None
+        phase_start = time.perf_counter() if timing_enabled else 0.0
+        if packed_qkv:
+            query_raw, key_raw, value_raw = self._qkv_proj(hidden_states)
+        else:
+            query_raw = _linear(hidden_states, self.q_proj)
+            key_raw = None
+            value_raw = None
+        if timing_enabled:
+            _record_native_timing(
+                "self_attention_qkv_proj_wall_s",
+                time.perf_counter() - phase_start,
+            )
+
+        phase_start = time.perf_counter() if timing_enabled else 0.0
+        query_states = query_raw.view(hidden_shape)
+        query_states = _rms_norm(query_states, self.q_norm)
+        query_states = _apply_rotary_pos_emb(query_states, cos, sin, unsqueeze_dim=2)
+        query_states = query_states.transpose(1, 2)
+        if timing_enabled:
+            _record_native_timing(
+                "self_attention_q_norm_rope_wall_s",
+                time.perf_counter() - phase_start,
+            )
+
+        if attn.is_kv_shared_layer:
+            phase_start = time.perf_counter() if timing_enabled else 0.0
+            if attn.layer_type not in shared_kv_states:
+                raise KeyError(
+                    f"missing shared Gemma4 KV state for layer type {attn.layer_type!r}"
+                )
+            key_states, value_states = shared_kv_states[attn.layer_type]
+            key_states = key_states.to(query_states.device)
+            value_states = value_states.to(query_states.device)
+            if timing_enabled:
+                _record_native_timing(
+                    "self_attention_shared_kv_wall_s",
+                    time.perf_counter() - phase_start,
+                )
+        else:
+            if key_raw is None:
+                phase_start = time.perf_counter() if timing_enabled else 0.0
+                key_raw = _linear(hidden_states, self.k_proj)
+                if timing_enabled:
+                    _record_native_timing(
+                        "self_attention_qkv_proj_wall_s",
+                        time.perf_counter() - phase_start,
+                    )
+            key_states = key_raw.view(hidden_shape)
+            if value_raw is None and self.v_proj is None:
+                value_states = key_states
+            else:
+                if value_raw is None:
+                    phase_start = time.perf_counter() if timing_enabled else 0.0
+                    value_raw = _linear(hidden_states, self.v_proj)
+                    if timing_enabled:
+                        _record_native_timing(
+                            "self_attention_qkv_proj_wall_s",
+                            time.perf_counter() - phase_start,
+                        )
+                value_states = value_raw.view(hidden_shape)
+
+            phase_start = time.perf_counter() if timing_enabled else 0.0
+            key_states = _rms_norm(key_states, self.k_norm)
+            key_states = _apply_rotary_pos_emb(key_states, cos, sin, unsqueeze_dim=2)
+            key_states = key_states.transpose(1, 2)
+
+            value_states = _rms_norm(value_states, self.v_norm)
+            value_states = value_states.transpose(1, 2)
+            if timing_enabled:
+                _record_native_timing(
+                    "self_attention_kv_norm_rope_wall_s",
+                    time.perf_counter() - phase_start,
+                )
+
+        decode_metadata = None
+        paged_decode_metadata = None
+        token_kv_pool = None
+        phase_start = time.perf_counter() if timing_enabled else 0.0
+        if wkvm_token_pool_decode is not None and attn.layer_type is not None:
+            attention_metadata_for_layer = getattr(
+                wkvm_token_pool_decode,
+                "attention_metadata_for_layer",
+                None,
+            )
+            if attention_metadata_for_layer is not None:
+                (
+                    decode_metadata,
+                    paged_decode_metadata,
+                    token_kv_pool,
+                ) = attention_metadata_for_layer(
+                    self.layer_idx,
+                    attn.layer_type,
+                    attention_mask_present=attention_mask is not None,
+                )
+            else:
+                metadata_for_layer = getattr(
+                    wkvm_token_pool_decode,
+                    "metadata_for_layer",
+                    None,
+                )
+                if metadata_for_layer is not None:
+                    decode_metadata = metadata_for_layer(self.layer_idx, attn.layer_type)
+                else:
+                    decode_metadata = wkvm_token_pool_decode.metadata_by_layer_type.get(
+                        attn.layer_type
+                    )
+                paged_metadata_for_layer = getattr(
+                    wkvm_token_pool_decode,
+                    "paged_metadata_for_layer",
+                    None,
+                )
+                if paged_metadata_for_layer is not None:
+                    paged_decode_metadata = paged_metadata_for_layer(
+                        self.layer_idx,
+                        attn.layer_type,
+                    )
+                token_kv_pool = wkvm_token_pool_decode.kv_pool
+                if (
+                    token_kv_pool is not None
+                    and self.layer_idx not in getattr(token_kv_pool, "layer_specs", {})
+                ):
+                    if decode_metadata is not None and attention_mask is None:
+                        raise RuntimeError(
+                            f"token-pool metadata was provided for layer {self.layer_idx}, "
+                            "but the KV pool has no spec for that layer"
+                        )
+                    decode_metadata = None
+                    paged_decode_metadata = None
+                    token_kv_pool = None
+        if timing_enabled:
+            _record_native_timing(
+                "self_attention_metadata_wall_s",
+                time.perf_counter() - phase_start,
+            )
+        token_pool_decode_attention = (
+            decode_metadata is not None
+            and token_kv_pool is not None
+            and decode_metadata.out_cache_loc is not None
+            and self.layer_idx is not None
+            and attention_mask is None
+            and query_states.shape[2] == 1
+        )
+
+        current_key_states = None if attn.is_kv_shared_layer else key_states
+        current_value_states = None if attn.is_kv_shared_layer else value_states
+        if (
+            past_key_values is not None
+            and not attn.is_kv_shared_layer
+            and not token_pool_decode_attention
+        ):
+            phase_start = time.perf_counter() if timing_enabled else 0.0
+            key_states, value_states = past_key_values.update(
+                key_states,
+                value_states,
+                self.layer_idx,
+            )
+            if timing_enabled:
+                _record_native_timing(
+                    "self_attention_cache_update_wall_s",
+                    time.perf_counter() - phase_start,
+                )
+        if attn.store_full_length_kv:
+            shared_kv_states[attn.layer_type] = key_states, value_states
+        if (
+            decode_metadata is not None
+            and token_kv_pool is not None
+            and decode_metadata.out_cache_loc is not None
+            and current_key_states is not None
+            and current_value_states is not None
+        ):
+            out_cache_loc = getattr(
+                decode_metadata,
+                "out_cache_loc_long",
+                None,
+            )
+            if out_cache_loc is None:
+                out_cache_loc = decode_metadata.out_cache_loc
+            kv_write_start = time.perf_counter() if timing_enabled else 0.0
+            token_kv_pool.set_kv(
+                self.layer_idx,
+                out_cache_loc,
+                current_key_states,
+                current_value_states,
+            )
+            if timing_enabled:
+                _record_token_pool_kv_write_timing(
+                    tokens=_slot_count(out_cache_loc),
+                    elapsed=time.perf_counter() - kv_write_start,
+                )
+
+        phase_start = time.perf_counter() if timing_enabled else 0.0
+        attn_output, attn_weights = _attention_forward(
+            attn,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            backend=self.native_attention_backend,
+            decode_metadata=decode_metadata,
+            paged_decode_metadata=paged_decode_metadata,
+            token_kv_pool=token_kv_pool,
+            layer_idx=self.layer_idx,
+        )
+        if timing_enabled:
+            _record_native_timing(
+                "self_attention_attention_wall_s",
+                time.perf_counter() - phase_start,
+            )
+            phase_start = time.perf_counter()
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = _linear(attn_output, self.o_proj)
+        if timing_enabled:
+            _record_native_timing(
+                "self_attention_output_proj_wall_s",
+                time.perf_counter() - phase_start,
+            )
+        return attn_output, attn_weights
+
+    def _mlp(self, x):
+        timing_enabled = _native_forward_timing_enabled()
+        phase_start = time.perf_counter() if timing_enabled else 0.0
+        if self._gate_up_proj is not None:
+            gate, up = self._gate_up_proj(x)
+        else:
+            gate = _linear(x, self.mlp_gate_proj)
+            up = _linear(x, self.mlp_up_proj)
+        if timing_enabled:
+            _record_native_timing(
+                "mlp_gate_up_proj_wall_s",
+                time.perf_counter() - phase_start,
+            )
+            phase_start = time.perf_counter()
+        output = _linear(_activation_mul(self.mlp_activation, gate, up), self.mlp_down_proj)
+        if timing_enabled:
+            _record_native_timing(
+                "mlp_activation_down_proj_wall_s",
+                time.perf_counter() - phase_start,
+            )
+        return output
+
+    def to(self, *args, **kwargs):
+        for obj in (
+            self.input_layernorm,
+            self.post_attention_layernorm,
+            self.pre_feedforward_layernorm,
+            self.post_feedforward_layernorm,
+            self.q_proj,
+            self.k_proj,
+            self.v_proj,
+            self.o_proj,
+            self.q_norm,
+            self.k_norm,
+            self.v_norm,
+            self.mlp_gate_proj,
+            self.mlp_up_proj,
+            self.mlp_down_proj,
+            self.per_layer_input_gate,
+            self.per_layer_projection,
+            self.post_per_layer_input_norm,
+            self._qkv_proj,
+            self._gate_up_proj,
+        ):
+            to = getattr(obj, "to", None)
+            if to is not None:
+                to(*args, **kwargs)
+        if self._owns_weight_tensors and self.layer_scalar is not None:
+            self.layer_scalar = self.layer_scalar.to(*args, **kwargs)
+            if self._weight_snapshot_device is not None:
+                self.layer_scalar = self.layer_scalar.to(device=self._weight_snapshot_device)
+        return self
+
+
+class NativeGemma4TextPrefix:
+    """Run the first N Gemma4 text layers with explicit native layer math.
+
+    This is an integration bridge, not the final production model runner. It
+    keeps embeddings, PLE, rotary embeddings, and checkpoint weights from the
+    already-loaded HF text model, while replacing the selected decoder layer
+    calls with `NativeGemma4TextDecoderLayer`.
+    """
+
+    def __init__(
+        self,
+        hf_text_model,
+        num_layers: int,
+        *,
+        native_attention_backend: str = "manual",
+        native_projection_backend: str = "separate",
+        native_weight_backend: str = "hf_live",
+        release_hf_decoder_layers: bool = False,
+    ) -> None:
+        self.text_model = hf_text_model
+        self.config = hf_text_model.config
+        self.num_layers = int(num_layers)
+        self.native_attention_backend = _normalize_attention_backend(native_attention_backend)
+        self.native_projection_backend = _normalize_projection_backend(native_projection_backend)
+        self.native_weight_backend = _normalize_weight_backend(native_weight_backend)
+        self.release_hf_decoder_layers = bool(release_hf_decoder_layers)
+        if self.release_hf_decoder_layers and self.native_weight_backend not in {
+            "owned",
+            "owned_cpu",
+        }:
+            raise ValueError(
+                "release_hf_decoder_layers requires native_weight_backend='owned' "
+                "or 'owned_cpu'"
+            )
+        if self.num_layers < 1:
+            raise ValueError("num_layers must be >= 1")
+        if self.num_layers > int(self.config.num_hidden_layers):
+            raise ValueError("num_layers exceeds Gemma4 text model depth")
+        self.layers = []
+        for layer_idx in range(self.num_layers):
+            layer = hf_text_model.layers[layer_idx]
+            self.layers.append(
+                NativeGemma4TextDecoderLayer(
+                    layer,
+                    native_attention_backend=self.native_attention_backend,
+                    native_projection_backend=self.native_projection_backend,
+                    native_weight_backend=self.native_weight_backend,
+                )
+            )
+            if self.release_hf_decoder_layers:
+                import torch.nn as nn
+
+                hf_text_model.layers[layer_idx] = nn.Identity()
+                del layer
+        self.released_hf_decoder_layers = (
+            self.num_layers if self.release_hf_decoder_layers else 0
+        )
+        self.unique_layer_types = set(self.config.layer_types[: self.num_layers])
+
+    def __call__(self, *args, **kwargs) -> NativeGemma4PrefixOutput:
+        return self.forward(*args, **kwargs)
+
+    def forward(
+        self,
+        *,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        per_layer_inputs=None,
+        use_cache: bool | None = None,
+        apply_final_norm: bool = False,
+        wkvm_token_pool_decode=None,
+        **kwargs,
+    ) -> NativeGemma4PrefixOutput:
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+        if input_ids is not None and per_layer_inputs is not None:
+            raise ValueError("You cannot specify per_layer_inputs if input_ids is provided")
+
+        timing_enabled = _native_forward_timing_enabled()
+        if input_ids is not None:
+            phase_start = time.perf_counter() if timing_enabled else 0.0
+            inputs_embeds = self.text_model.embed_tokens(input_ids)
+            if timing_enabled:
+                _record_native_timing(
+                    "text_embedding_wall_s",
+                    time.perf_counter() - phase_start,
+                )
+
+        if self.text_model.hidden_size_per_layer_input:
+            phase_start = time.perf_counter() if timing_enabled else 0.0
+            if per_layer_inputs is None:
+                per_layer_inputs = self.text_model.get_per_layer_inputs(input_ids, inputs_embeds)
+            per_layer_inputs = self.text_model.project_per_layer_inputs(
+                inputs_embeds,
+                per_layer_inputs,
+            )
+            if timing_enabled:
+                _record_native_timing(
+                    "text_per_layer_input_wall_s",
+                    time.perf_counter() - phase_start,
+                )
+
+        if use_cache and past_key_values is None:
+            from transformers.cache_utils import DynamicCache
+
+            past_key_values = DynamicCache(config=self.config)
+
+        if position_ids is None:
+            past_seen_tokens = (
+                past_key_values.get_seq_length() if past_key_values is not None else 0
+            )
+            torch = _torch()
+            position_ids = (
+                torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
+                + past_seen_tokens
+            )
+            position_ids = position_ids.unsqueeze(0)
+
+        if isinstance(attention_mask, dict):
+            causal_mask_mapping = attention_mask
+        else:
+            phase_start = time.perf_counter() if timing_enabled else 0.0
+            from transformers.masking_utils import (
+                create_causal_mask,
+                create_sliding_window_causal_mask,
+            )
+
+            mask_kwargs = {
+                "config": self.config,
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "past_key_values": past_key_values,
+                "position_ids": position_ids,
+            }
+            causal_mask_mapping = {
+                "full_attention": create_causal_mask(**mask_kwargs),
+                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+            }
+            if timing_enabled:
+                _record_native_timing("text_mask_wall_s", time.perf_counter() - phase_start)
+
+        hidden_states = inputs_embeds
+        phase_start = time.perf_counter() if timing_enabled else 0.0
+        position_embeddings = {
+            layer_type: self.text_model.rotary_emb(hidden_states, position_ids, layer_type)
+            for layer_type in self.unique_layer_types
+        }
+        if timing_enabled:
+            _record_native_timing("text_rotary_wall_s", time.perf_counter() - phase_start)
+        shared_kv_states = kwargs.pop("shared_kv_states", UserDict())
+
+        phase_start = time.perf_counter() if timing_enabled else 0.0
+        for i, native_layer in enumerate(self.layers):
+            layer_type = self.config.layer_types[i]
+            per_layer_input = (
+                per_layer_inputs[:, :, i, :] if per_layer_inputs is not None else None
+            )
+            hidden_states = native_layer(
+                hidden_states,
+                per_layer_input,
+                shared_kv_states=shared_kv_states,
+                position_embeddings=position_embeddings[layer_type],
+                attention_mask=causal_mask_mapping[layer_type],
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                wkvm_token_pool_decode=wkvm_token_pool_decode,
+                **kwargs,
+            )
+        if timing_enabled:
+            _record_native_timing("text_layers_wall_s", time.perf_counter() - phase_start)
+
+        if apply_final_norm:
+            if self.num_layers != int(self.config.num_hidden_layers):
+                raise ValueError("apply_final_norm requires running the full text stack")
+            phase_start = time.perf_counter() if timing_enabled else 0.0
+            hidden_states = self.text_model.norm(hidden_states)
+            if timing_enabled:
+                _record_native_timing(
+                    "text_final_norm_wall_s",
+                    time.perf_counter() - phase_start,
+                )
+
+        return NativeGemma4PrefixOutput(
+            hidden_states=hidden_states,
+            past_key_values=past_key_values,
+            shared_kv_states=shared_kv_states,
+            per_layer_inputs=per_layer_inputs,
+            position_ids=position_ids,
+            causal_mask_mapping=causal_mask_mapping,
+        )
+
+    def to(self, *args, **kwargs):
+        for layer in self.layers:
+            layer.to(*args, **kwargs)
+        return self
+
+    def train(self, mode: bool = True):
+        for layer in self.layers:
+            layer.attn_meta.training = bool(mode)
+        return self
+
+    def eval(self):
+        return self.train(False)
+
+
+class NativeGemma4ForCausalLM:
+    """Causal-LM bridge using native Gemma4 text layers and loaded HF weights."""
+
+    wkvm_forward_backend = "wkvm_native_gemma_forward_bridge"
+    wkvm_no_hf_transformer_forward = True
+
+    def __init__(
+        self,
+        hf_model,
+        num_layers: int | None = None,
+        *,
+        native_attention_backend: str = "manual",
+        native_projection_backend: str = "separate",
+        native_weight_backend: str = "hf_live",
+        release_hf_decoder_layers: bool = False,
+    ) -> None:
+        self.hf_model = hf_model
+        self.config = hf_model.config
+        self.num_layers = (
+            int(self.config.num_hidden_layers) if num_layers is None else int(num_layers)
+        )
+        self.native_attention_backend = _normalize_attention_backend(native_attention_backend)
+        self.native_projection_backend = _normalize_projection_backend(native_projection_backend)
+        self.native_weight_backend = _normalize_weight_backend(native_weight_backend)
+        self.release_hf_decoder_layers = bool(release_hf_decoder_layers)
+        self.text_prefix = NativeGemma4TextPrefix(
+            hf_model.model,
+            self.num_layers,
+            native_attention_backend=self.native_attention_backend,
+            native_projection_backend=self.native_projection_backend,
+            native_weight_backend=self.native_weight_backend,
+            release_hf_decoder_layers=self.release_hf_decoder_layers,
+        )
+        self.released_hf_decoder_layers = self.text_prefix.released_hf_decoder_layers
+        self.lm_head = hf_model.lm_head
+
+    def __call__(self, *args, **kwargs) -> NativeGemma4CausalLMOutput:
+        return self.forward(*args, **kwargs)
+
+    @property
+    def device(self):
+        try:
+            return self.hf_model.device
+        except AttributeError:
+            return next(self.parameters()).device
+
+    @property
+    def training(self) -> bool:
+        return bool(getattr(self.hf_model, "training", False))
+
+    def parameters(self, *args, **kwargs):
+        return self.hf_model.parameters(*args, **kwargs)
+
+    def named_parameters(self, *args, **kwargs):
+        return self.hf_model.named_parameters(*args, **kwargs)
+
+    def buffers(self, *args, **kwargs):
+        return self.hf_model.buffers(*args, **kwargs)
+
+    def eval(self):
+        self.hf_model.eval()
+        self.text_prefix.eval()
+        return self
+
+    def train(self, mode: bool = True):
+        self.hf_model.train(mode)
+        self.text_prefix.train(mode)
+        return self
+
+    def to(self, *args, **kwargs):
+        self.hf_model.to(*args, **kwargs)
+        self.text_prefix.to(*args, **kwargs)
+        return self
+
+    def forward(
+        self,
+        *,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        per_layer_inputs=None,
+        use_cache: bool | None = None,
+        logits_to_keep: int | Any = 0,
+        **kwargs,
+    ) -> NativeGemma4CausalLMOutput:
+        full_stack = self.num_layers == int(self.config.num_hidden_layers)
+        text_out = self.text_prefix(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            per_layer_inputs=per_layer_inputs,
+            use_cache=use_cache,
+            apply_final_norm=full_stack,
+            **kwargs,
+        )
+        hidden_states = text_out.hidden_states
+        if isinstance(logits_to_keep, int):
+            slice_indices = slice(-logits_to_keep, None)
+        else:
+            slice_indices = logits_to_keep
+        timing_enabled = _native_forward_timing_enabled()
+        phase_start = time.perf_counter() if timing_enabled else 0.0
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        if timing_enabled:
+            _record_native_timing("lm_head_wall_s", time.perf_counter() - phase_start)
+        if self.config.final_logit_softcapping is not None:
+            phase_start = time.perf_counter() if timing_enabled else 0.0
+            logits = logits / self.config.final_logit_softcapping
+            logits = logits.tanh()
+            logits = logits * self.config.final_logit_softcapping
+            if timing_enabled:
+                _record_native_timing(
+                    "lm_head_softcap_wall_s",
+                    time.perf_counter() - phase_start,
+                )
+        return NativeGemma4CausalLMOutput(
+            logits=logits,
+            hidden_states=hidden_states,
+            past_key_values=text_out.past_key_values,
+            shared_kv_states=text_out.shared_kv_states,
+        )
+
+
+def native_gemma4_from_checkpoint_state_dict(
+    config,
+    state_dict: dict[str, Any],
+    *,
+    prefix: str = "model.language_model",
+    device=None,
+    dtype=None,
+    native_attention_backend: str = "manual",
+    native_projection_backend: str = "separate",
+) -> NativeGemma4ForCausalLM:
+    """Build a native Gemma4 CausalLM facade from checkpoint tensors.
+
+    This path does not instantiate `transformers.Gemma4ForCausalLM` or any HF
+    decoder layers. `config` must be the Gemma4 text decoder config, not the
+    outer multimodal config.
+    """
+
+    torch = _torch()
+    if dtype is not None and isinstance(dtype, str):
+        dtype = getattr(torch, dtype)
+    facade = _CheckpointGemma4ForCausalLMFacade(
+        config,
+        state_dict,
+        prefix=prefix,
+        device=device,
+        dtype=dtype,
+    )
+    model = NativeGemma4ForCausalLM(
+        facade,
+        native_attention_backend=native_attention_backend,
+        native_projection_backend=native_projection_backend,
+        native_weight_backend="hf_live",
+        release_hf_decoder_layers=False,
+    )
+    model.wkvm_checkpoint_native_loader = True
+    model.wkvm_uses_hf_model_construction = False
+    model.checkpoint_prefix = prefix
+    return model.eval()
+
+
+def load_native_gemma4_from_checkpoint(
+    model_path: str | Path,
+    *,
+    device=None,
+    dtype=None,
+    prefix: str = "model.language_model",
+    native_attention_backend: str = "manual",
+    native_projection_backend: str = "separate",
+) -> NativeGemma4ForCausalLM:
+    """Load Gemma4 text weights from safetensors into the WKVM native bridge.
+
+    This still uses Transformers for config parsing and tokenizer-compatible
+    metadata, but it bypasses `Gemma4ForCausalLM.from_pretrained` and does not
+    build HF decoder-layer modules.
+    """
+
+    torch = _torch()
+    if dtype is not None and isinstance(dtype, str):
+        dtype = getattr(torch, dtype)
+    from transformers import AutoConfig
+
+    full_cfg = AutoConfig.from_pretrained(model_path)
+    text_cfg = (
+        full_cfg.get_text_config(decoder=True)
+        if hasattr(full_cfg, "get_text_config")
+        else full_cfg
+    )
+    state_dict = _load_checkpoint_state_dict(
+        model_path,
+        prefix=prefix,
+        device=device,
+        dtype=dtype,
+    )
+    model = native_gemma4_from_checkpoint_state_dict(
+        text_cfg,
+        state_dict,
+        prefix=prefix,
+        device=device,
+        dtype=dtype,
+        native_attention_backend=native_attention_backend,
+        native_projection_backend=native_projection_backend,
+    )
+    model.checkpoint_path = str(model_path)
+    return model

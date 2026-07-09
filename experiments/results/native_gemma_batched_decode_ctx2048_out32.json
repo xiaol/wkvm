@@ -1,0 +1,122 @@
+{
+  "attn": "sdpa",
+  "concurrency": [
+    1,
+    4,
+    8
+  ],
+  "config": {
+    "chunk": 1024,
+    "m_slots": 64,
+    "route_chunk": 128,
+    "sink": 16,
+    "slots": null,
+    "token_budget": null,
+    "window": 1024
+  },
+  "context_tokens_per_session": 2048,
+  "decode_tokens_per_session": 32,
+  "device": "cuda",
+  "dtype": "bfloat16",
+  "engine": "wkvm-native",
+  "git_commit": "465a478c0ccfba7699e36ee21aaa2b6c3423be22",
+  "headroom_gib": 1.0,
+  "launch_command": "/home/xiaol/X/causalab/.venv/bin/python experiments/native_gemma_bench.py --ctx 2048 --out 32 --concurrency 1,4,8 --prompt-lengths staggered --json experiments/results/native_gemma_batched_decode_ctx2048_out32.json --chunk 1024 --route-chunk 128 --max-steps 10000",
+  "mem_cap_gib": 19.0,
+  "model_path": "/run/media/xiaol/B214449214445C0B/models/gemma/gemma-4-E4B-it",
+  "prompt_lengths_mode": "staggered",
+  "rows": [
+    {
+      "B": 1,
+      "agg_decode_tok_s": 37.979,
+      "batched_decode_model_calls": 0,
+      "decode_batch_fallback_reasons": {},
+      "decode_model_calls": 31,
+      "e2e_output_tok_s": 26.667,
+      "elapsed_s": 1.2,
+      "error": null,
+      "error_count": 0,
+      "exact_decode_batch_rows": 0,
+      "fallback_decode_model_calls": 31,
+      "green": true,
+      "max_decode_batch_rows": 1,
+      "max_resident_state_slots": 1,
+      "p50_latency_s": 1.186,
+      "p95_latency_s": 1.186,
+      "padded_decode_batch_rows": 0,
+      "peak_reserved_gib": 14.297,
+      "prompt_lengths": [
+        2048
+      ],
+      "steps": 32,
+      "success_count": 1
+    },
+    {
+      "B": 4,
+      "agg_decode_tok_s": 66.524,
+      "batched_decode_model_calls": 31,
+      "decode_batch_fallback_reasons": {},
+      "decode_model_calls": 31,
+      "e2e_output_tok_s": 61.19,
+      "elapsed_s": 2.092,
+      "error": null,
+      "error_count": 0,
+      "exact_decode_batch_rows": 0,
+      "fallback_decode_model_calls": 0,
+      "green": true,
+      "max_decode_batch_rows": 4,
+      "max_resident_state_slots": 4,
+      "p50_latency_s": 2.06,
+      "p95_latency_s": 2.076,
+      "padded_decode_batch_rows": 124,
+      "peak_reserved_gib": 14.891,
+      "prompt_lengths": [
+        2048,
+        2041,
+        2034,
+        2027
+      ],
+      "steps": 32,
+      "success_count": 4
+    },
+    {
+      "B": 8,
+      "agg_decode_tok_s": 79.319,
+      "batched_decode_model_calls": 31,
+      "decode_batch_fallback_reasons": {},
+      "decode_model_calls": 31,
+      "e2e_output_tok_s": 75.241,
+      "elapsed_s": 3.402,
+      "error": null,
+      "error_count": 0,
+      "exact_decode_batch_rows": 0,
+      "fallback_decode_model_calls": 0,
+      "green": true,
+      "max_decode_batch_rows": 8,
+      "max_resident_state_slots": 8,
+      "p50_latency_s": 3.346,
+      "p95_latency_s": 3.383,
+      "padded_decode_batch_rows": 248,
+      "peak_reserved_gib": 15.73,
+      "prompt_lengths": [
+        2048,
+        2041,
+        2034,
+        2027,
+        2020,
+        2013,
+        2006,
+        1999
+      ],
+      "steps": 32,
+      "success_count": 8
+    }
+  ],
+  "schema": "wkvm.native_gemma_bench.v1",
+  "summary": {
+    "best_green_agg_decode_tok_s": 79.319,
+    "bmax_green": 8,
+    "max_success_B": 8
+  },
+  "torch_usable_gib": 19.0
+}

@@ -1,0 +1,49 @@
+{
+  "attn": "sdpa",
+  "concurrency": [
+    1,
+    2,
+    4,
+    8
+  ],
+  "context_tokens_per_session": 13824,
+  "decode_tokens_per_session": 128,
+  "device": "cuda",
+  "dtype": "bfloat16",
+  "engine": "hf-transformers",
+  "git_commit": "465a478c0ccfba7699e36ee21aaa2b6c3423be22",
+  "headroom_gib": 1.0,
+  "launch_command": "/home/xiaol/X/causalab/.venv/bin/python experiments/hf_gemma_bench.py --ctx 13824 --out 128 --concurrency 1,2,4,8 --mode batched --json experiments/results/hf_gemma_batched_ctx13824_out128_ladder.json --stop-on-failure",
+  "mem_cap_gib": 19.0,
+  "mode": "batched",
+  "model_path": "/run/media/xiaol/B214449214445C0B/models/gemma/gemma-4-E4B-it",
+  "notes": [
+    "Uses Hugging Face Gemma4ForCausalLM forward and full HF cache semantics.",
+    "serial mode measures one request at a time through one loaded model.",
+    "batched mode left-pads prompts and runs one HF batch with an attention mask."
+  ],
+  "prompt_lengths_mode": "staggered",
+  "rows": [
+    {
+      "B": 1,
+      "agg_decode_tok_s": null,
+      "e2e_output_tok_s": null,
+      "elapsed_s": 0.424,
+      "error": "CUDA out of memory. Tried to allocate 5.70 GiB. GPU 0 has a total capacity of 23.51 GiB of which 3.59 GiB is free. Process 6502 has 392.70 MiB memory in use. Process 8285 has 346.34 MiB memory in use. Process 9406 has 689.23 MiB memory in use. Process 52102 has 50.34 MiB memory in use. Process 126631 has 42.34 MiB memory in use. Including non-PyTorch memory, this process has 17.57 GiB memory in use. Of the allocated memory 16.77 GiB is allocated by PyTorch, and 356.21 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)",
+      "error_count": 1,
+      "green": false,
+      "mode": "batched",
+      "p50_latency_s": null,
+      "p95_latency_s": null,
+      "peak_reserved_gib": 17.295,
+      "success_count": 0
+    }
+  ],
+  "schema": "wkvm.hf_gemma_bench.v1",
+  "summary": {
+    "best_green_agg_decode_tok_s": 0.0,
+    "bmax_green": 0,
+    "max_success_B": 0
+  },
+  "torch_usable_gib": 19.0
+}

@@ -1,0 +1,2028 @@
+import unittest
+from collections import UserDict
+
+
+def _tiny_config():
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
+
+    return Gemma4TextConfig(
+        vocab_size=64,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        hidden_size_per_layer_input=4,
+        vocab_size_per_layer_input=64,
+        sliding_window=8,
+        layer_types=["sliding_attention", "sliding_attention"],
+        num_kv_shared_layers=0,
+        attention_dropout=0.0,
+        attention_bias=False,
+        global_head_dim=4,
+    )
+
+
+def _tiny_shared_config():
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
+
+    return Gemma4TextConfig(
+        vocab_size=64,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=4,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        hidden_size_per_layer_input=4,
+        vocab_size_per_layer_input=64,
+        sliding_window=8,
+        layer_types=[
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+        ],
+        num_kv_shared_layers=2,
+        attention_dropout=0.0,
+        attention_bias=False,
+        global_head_dim=4,
+    )
+
+
+def _causal_mask(batch: int, seq_len: int, *, dtype, device):
+    import torch
+
+    mask = torch.zeros(batch, 1, seq_len, seq_len, dtype=dtype, device=device)
+    blocked = torch.triu(
+        torch.ones(seq_len, seq_len, dtype=torch.bool, device=device),
+        diagonal=1,
+    )
+    return mask.masked_fill(blocked.view(1, 1, seq_len, seq_len), torch.finfo(dtype).min)
+
+
+def _checkpoint_layout_state_dict(hf_model):
+    state = {}
+    for key, value in hf_model.state_dict().items():
+        if key.startswith("model."):
+            key = "model.language_model" + key[len("model") :]
+        state[key] = value.detach().clone()
+    return state
+
+
+class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
+    def test_prefill_layer_matches_hf_decoder_layer(self) -> None:
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import (
+            Gemma4TextDecoderLayer,
+            Gemma4TextRotaryEmbedding,
+        )
+        from wkvm.runner.gemma_native_forward import NativeGemma4TextDecoderLayer
+
+        torch.manual_seed(7)
+        cfg = _tiny_config()
+        hf_layer = Gemma4TextDecoderLayer(cfg, layer_idx=0).eval()
+        native_layer = NativeGemma4TextDecoderLayer(hf_layer)
+        rotary = Gemma4TextRotaryEmbedding(cfg)
+
+        hidden = torch.randn(2, 5, cfg.hidden_size)
+        per_layer_input = torch.randn(2, 5, cfg.hidden_size_per_layer_input)
+        position_ids = torch.arange(5).unsqueeze(0).expand(2, -1)
+        position_embeddings = rotary(hidden, position_ids, "sliding_attention")
+        mask = _causal_mask(2, 5, dtype=hidden.dtype, device=hidden.device)
+
+        with torch.inference_mode():
+            expected = hf_layer(
+                hidden,
+                per_layer_input,
+                shared_kv_states=UserDict(),
+                position_embeddings=position_embeddings,
+                attention_mask=mask,
+                position_ids=position_ids,
+                past_key_values=None,
+            )
+            actual = native_layer(
+                hidden,
+                per_layer_input,
+                shared_kv_states=UserDict(),
+                position_embeddings=position_embeddings,
+                attention_mask=mask,
+                position_ids=position_ids,
+                past_key_values=None,
+            )
+
+        self.assertLess((expected - actual).abs().max().item(), 2e-6)
+
+    def test_decode_layer_with_wkvm_cache_matches_hf_decoder_layer(self) -> None:
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import (
+            Gemma4TextDecoderLayer,
+            Gemma4TextRotaryEmbedding,
+        )
+        from wkvm.models.gemma import GemmaRoutedSpanConfig
+        from wkvm.runner.gemma_native_forward import NativeGemma4TextDecoderLayer
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+
+        torch.manual_seed(11)
+        cfg = _tiny_config()
+        hf_layer = Gemma4TextDecoderLayer(cfg, layer_idx=0).eval()
+        native_layer = NativeGemma4TextDecoderLayer(hf_layer)
+        rotary = Gemma4TextRotaryEmbedding(cfg)
+        native_cfg = GemmaRoutedSpanConfig(
+            num_hidden_layers=cfg.num_hidden_layers,
+            num_kv_shared_layers=cfg.num_kv_shared_layers,
+            layer_types=tuple(cfg.layer_types),
+            num_kv_heads=cfg.num_key_value_heads,
+            head_dim=cfg.head_dim,
+            sliding_window=cfg.sliding_window,
+        )
+        hf_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+        native_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+
+        prefill_hidden = torch.randn(1, 3, cfg.hidden_size)
+        prefill_ple = torch.randn(1, 3, cfg.hidden_size_per_layer_input)
+        prefill_pos = torch.arange(3).unsqueeze(0)
+        prefill_pos_emb = rotary(prefill_hidden, prefill_pos, "sliding_attention")
+        prefill_mask = _causal_mask(1, 3, dtype=prefill_hidden.dtype, device=prefill_hidden.device)
+
+        decode_hidden = torch.randn(1, 1, cfg.hidden_size)
+        decode_ple = torch.randn(1, 1, cfg.hidden_size_per_layer_input)
+        decode_pos = torch.tensor([[3]])
+        decode_pos_emb = rotary(decode_hidden, decode_pos, "sliding_attention")
+
+        with torch.inference_mode():
+            hf_prefill = hf_layer(
+                prefill_hidden,
+                prefill_ple,
+                shared_kv_states=UserDict(),
+                position_embeddings=prefill_pos_emb,
+                attention_mask=prefill_mask,
+                position_ids=prefill_pos,
+                past_key_values=hf_cache,
+            )
+            native_prefill = native_layer(
+                prefill_hidden,
+                prefill_ple,
+                shared_kv_states=UserDict(),
+                position_embeddings=prefill_pos_emb,
+                attention_mask=prefill_mask,
+                position_ids=prefill_pos,
+                past_key_values=native_cache,
+            )
+            hf_decode = hf_layer(
+                decode_hidden,
+                decode_ple,
+                shared_kv_states=UserDict(),
+                position_embeddings=decode_pos_emb,
+                attention_mask=None,
+                position_ids=decode_pos,
+                past_key_values=hf_cache,
+            )
+            native_decode = native_layer(
+                decode_hidden,
+                decode_ple,
+                shared_kv_states=UserDict(),
+                position_embeddings=decode_pos_emb,
+                attention_mask=None,
+                position_ids=decode_pos,
+                past_key_values=native_cache,
+            )
+
+        self.assertLess((hf_prefill - native_prefill).abs().max().item(), 1e-6)
+        self.assertLess((hf_decode - native_decode).abs().max().item(), 1e-6)
+        self.assertEqual(hf_cache.layers[0].keys.shape, native_cache.layers[0].keys.shape)
+        self.assertLess(
+            (hf_cache.layers[0].keys - native_cache.layers[0].keys).abs().max().item(),
+            1e-6,
+        )
+
+    def test_manual_gqa_backend_matches_hf_decoder_layer(self) -> None:
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import (
+            Gemma4TextDecoderLayer,
+            Gemma4TextRotaryEmbedding,
+        )
+        from wkvm.models.gemma import GemmaRoutedSpanConfig
+        from wkvm.runner.gemma_native_forward import NativeGemma4TextDecoderLayer
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+
+        torch.manual_seed(17)
+        cfg = _tiny_config()
+        hf_layer = Gemma4TextDecoderLayer(cfg, layer_idx=0).eval()
+        native_layer = NativeGemma4TextDecoderLayer(
+            hf_layer,
+            native_attention_backend="manual_gqa",
+        )
+        rotary = Gemma4TextRotaryEmbedding(cfg)
+        native_cfg = GemmaRoutedSpanConfig(
+            num_hidden_layers=cfg.num_hidden_layers,
+            num_kv_shared_layers=cfg.num_kv_shared_layers,
+            layer_types=tuple(cfg.layer_types),
+            num_kv_heads=cfg.num_key_value_heads,
+            head_dim=cfg.head_dim,
+            sliding_window=cfg.sliding_window,
+        )
+        hf_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+        native_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+
+        prefill_hidden = torch.randn(1, 4, cfg.hidden_size)
+        prefill_ple = torch.randn(1, 4, cfg.hidden_size_per_layer_input)
+        prefill_pos = torch.arange(4).unsqueeze(0)
+        prefill_pos_emb = rotary(prefill_hidden, prefill_pos, "sliding_attention")
+        prefill_mask = _causal_mask(1, 4, dtype=prefill_hidden.dtype, device=prefill_hidden.device)
+        decode_hidden = torch.randn(1, 1, cfg.hidden_size)
+        decode_ple = torch.randn(1, 1, cfg.hidden_size_per_layer_input)
+        decode_pos = torch.tensor([[4]])
+        decode_pos_emb = rotary(decode_hidden, decode_pos, "sliding_attention")
+
+        with torch.inference_mode():
+            hf_prefill = hf_layer(
+                prefill_hidden,
+                prefill_ple,
+                shared_kv_states=UserDict(),
+                position_embeddings=prefill_pos_emb,
+                attention_mask=prefill_mask,
+                position_ids=prefill_pos,
+                past_key_values=hf_cache,
+            )
+            native_prefill = native_layer(
+                prefill_hidden,
+                prefill_ple,
+                shared_kv_states=UserDict(),
+                position_embeddings=prefill_pos_emb,
+                attention_mask=prefill_mask,
+                position_ids=prefill_pos,
+                past_key_values=native_cache,
+            )
+            hf_decode = hf_layer(
+                decode_hidden,
+                decode_ple,
+                shared_kv_states=UserDict(),
+                position_embeddings=decode_pos_emb,
+                attention_mask=None,
+                position_ids=decode_pos,
+                past_key_values=hf_cache,
+            )
+            native_decode = native_layer(
+                decode_hidden,
+                decode_ple,
+                shared_kv_states=UserDict(),
+                position_embeddings=decode_pos_emb,
+                attention_mask=None,
+                position_ids=decode_pos,
+                past_key_values=native_cache,
+            )
+
+        self.assertLess((hf_prefill - native_prefill).abs().max().item(), 2e-6)
+        self.assertLess((hf_decode - native_decode).abs().max().item(), 2e-6)
+
+    def test_triton_dense_gqa_backend_matches_hf_decoder_layer_on_cpu_fallback(self) -> None:
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import (
+            Gemma4TextDecoderLayer,
+            Gemma4TextRotaryEmbedding,
+        )
+        from wkvm.models.gemma import GemmaRoutedSpanConfig
+        from wkvm.runner.gemma_native_forward import NativeGemma4TextDecoderLayer
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+
+        torch.manual_seed(23)
+        cfg = _tiny_config()
+        hf_layer = Gemma4TextDecoderLayer(cfg, layer_idx=0).eval()
+        native_layer = NativeGemma4TextDecoderLayer(
+            hf_layer,
+            native_attention_backend="triton_dense_gqa",
+        )
+        rotary = Gemma4TextRotaryEmbedding(cfg)
+        native_cfg = GemmaRoutedSpanConfig(
+            num_hidden_layers=cfg.num_hidden_layers,
+            num_kv_shared_layers=cfg.num_kv_shared_layers,
+            layer_types=tuple(cfg.layer_types),
+            num_kv_heads=cfg.num_key_value_heads,
+            head_dim=cfg.head_dim,
+            sliding_window=cfg.sliding_window,
+        )
+        hf_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+        native_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+
+        prefill_hidden = torch.randn(1, 4, cfg.hidden_size)
+        prefill_ple = torch.randn(1, 4, cfg.hidden_size_per_layer_input)
+        prefill_pos = torch.arange(4).unsqueeze(0)
+        prefill_pos_emb = rotary(prefill_hidden, prefill_pos, "sliding_attention")
+        prefill_mask = _causal_mask(1, 4, dtype=prefill_hidden.dtype, device=prefill_hidden.device)
+        decode_hidden = torch.randn(1, 1, cfg.hidden_size)
+        decode_ple = torch.randn(1, 1, cfg.hidden_size_per_layer_input)
+        decode_pos = torch.tensor([[4]])
+        decode_pos_emb = rotary(decode_hidden, decode_pos, "sliding_attention")
+
+        with torch.inference_mode():
+            hf_layer(
+                prefill_hidden,
+                prefill_ple,
+                shared_kv_states=UserDict(),
+                position_embeddings=prefill_pos_emb,
+                attention_mask=prefill_mask,
+                position_ids=prefill_pos,
+                past_key_values=hf_cache,
+            )
+            native_layer(
+                prefill_hidden,
+                prefill_ple,
+                shared_kv_states=UserDict(),
+                position_embeddings=prefill_pos_emb,
+                attention_mask=prefill_mask,
+                position_ids=prefill_pos,
+                past_key_values=native_cache,
+            )
+            hf_decode = hf_layer(
+                decode_hidden,
+                decode_ple,
+                shared_kv_states=UserDict(),
+                position_embeddings=decode_pos_emb,
+                attention_mask=None,
+                position_ids=decode_pos,
+                past_key_values=hf_cache,
+            )
+            native_decode = native_layer(
+                decode_hidden,
+                decode_ple,
+                shared_kv_states=UserDict(),
+                position_embeddings=decode_pos_emb,
+                attention_mask=None,
+                position_ids=decode_pos,
+                past_key_values=native_cache,
+            )
+
+        self.assertLess((hf_decode - native_decode).abs().max().item(), 2e-6)
+
+    def test_token_pool_attention_matches_ragged_manual_gqa(self) -> None:
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4TextDecoderLayer
+        from wkvm.runner.gemma_native_forward import (
+            NativeGemma4TextDecoderLayer,
+            _attention_forward,
+            _attention_forward_manual_gqa,
+        )
+        from wkvm.runner.gemma_token_pool import (
+            TokenKVLayerSpec,
+            TokenKVPool,
+            build_decode_metadata_from_token_slot_rows,
+        )
+
+        torch.manual_seed(19)
+        cfg = _tiny_config()
+        hf_layer = Gemma4TextDecoderLayer(cfg, layer_idx=0).eval()
+        native_layer = NativeGemma4TextDecoderLayer(
+            hf_layer,
+            native_attention_backend="manual_gqa",
+        )
+        pool = TokenKVPool(
+            capacity=5,
+            layer_specs=[
+                TokenKVLayerSpec(
+                    layer_id=0,
+                    num_kv_heads=cfg.num_key_value_heads,
+                    head_dim=cfg.head_dim,
+                    dtype=torch.float32,
+                )
+            ],
+            dtype=torch.float32,
+        )
+        slots = pool.alloc_slots(5)
+        keys = torch.randn(5, cfg.num_key_value_heads, cfg.head_dim)
+        values = torch.randn(5, cfg.num_key_value_heads, cfg.head_dim)
+        pool.set_kv(0, slots, keys, values)
+        query = torch.randn(2, cfg.num_attention_heads, 1, cfg.head_dim)
+        metadata = build_decode_metadata_from_token_slot_rows(
+            [[2, 0, 1], [4, 3]],
+            req_slots=[0, 1],
+            out_cache_loc=[2, 4],
+        )
+
+        with torch.inference_mode():
+            actual, actual_weights = _attention_forward(
+                native_layer.attn_meta,
+                query,
+                keys[:1].permute(1, 0, 2).unsqueeze(0),
+                values[:1].permute(1, 0, 2).unsqueeze(0),
+                None,
+                backend="manual_gqa",
+                decode_metadata=metadata,
+                token_kv_pool=pool,
+                layer_idx=0,
+            )
+            expected_rows = []
+            for row_indices, row in (([2, 0, 1], 0), ([4, 3], 1)):
+                row_keys = keys[row_indices].permute(1, 0, 2).unsqueeze(0)
+                row_values = values[row_indices].permute(1, 0, 2).unsqueeze(0)
+                expected, _ = _attention_forward_manual_gqa(
+                    native_layer.attn_meta,
+                    query[row : row + 1],
+                    row_keys,
+                    row_values,
+                    None,
+                )
+                expected_rows.append(expected)
+            expected = torch.cat(expected_rows, dim=0)
+
+        self.assertIsNone(actual_weights)
+        self.assertLess((expected - actual).abs().max().item(), 1e-6)
+
+    def test_token_pool_triton_stats_account_recoverable_fallback(self) -> None:
+        import os
+        import sys
+        from types import ModuleType, SimpleNamespace
+        import wkvm.runner.gemma_native_forward as native_forward
+
+        native_forward.reset_token_pool_triton_stats(clear_disabled_shapes=True)
+        module_name = "wkvm.runner.gemma_token_pool_triton"
+        old_module = sys.modules.get(module_name)
+        old_flag = os.environ.get("WKVM_ENABLE_TOKEN_POOL_TRITON")
+        old_disable = os.environ.get("WKVM_DISABLE_TOKEN_POOL_TRITON")
+        old_reference = native_forward._attention_forward_token_pool_gqa_reference
+        fake_module = ModuleType(module_name)
+
+        def fail_decode(*args, **kwargs):
+            raise RuntimeError("out of resource: shared memory")
+
+        fake_module.token_pool_gqa_decode = fail_decode
+        sys.modules[module_name] = fake_module
+        os.environ["WKVM_ENABLE_TOKEN_POOL_TRITON"] = "1"
+        os.environ.pop("WKVM_DISABLE_TOKEN_POOL_TRITON", None)
+        native_forward._attention_forward_token_pool_gqa_reference = (
+            lambda *args, **kwargs: ("reference", None)
+        )
+
+        class FakeQuery:
+            shape = (1, 8, 1, 512)
+            dtype = "bfloat16"
+            device = "cuda:0"
+            is_cuda = True
+
+        class FakePool:
+            def get_kv_buffer(self, layer_idx):
+                return "key_buffer", "value_buffer"
+
+        try:
+            actual = native_forward._attention_forward_token_pool_gqa(
+                SimpleNamespace(num_key_value_groups=4, scaling=1.0),
+                FakeQuery(),
+                decode_metadata=SimpleNamespace(kv_indptr="indptr", kv_indices="indices"),
+                token_kv_pool=FakePool(),
+                layer_idx=0,
+            )
+            self.assertEqual(actual, ("reference", None))
+            second = native_forward._attention_forward_token_pool_gqa(
+                SimpleNamespace(num_key_value_groups=4, scaling=1.0),
+                FakeQuery(),
+                decode_metadata=SimpleNamespace(kv_indptr="indptr", kv_indices="indices"),
+                token_kv_pool=FakePool(),
+                layer_idx=0,
+            )
+            self.assertEqual(second, ("reference", None))
+            stats = native_forward.token_pool_triton_stats()
+        finally:
+            native_forward._attention_forward_token_pool_gqa_reference = old_reference
+            if old_module is None:
+                sys.modules.pop(module_name, None)
+            else:
+                sys.modules[module_name] = old_module
+            if old_flag is None:
+                os.environ.pop("WKVM_ENABLE_TOKEN_POOL_TRITON", None)
+            else:
+                os.environ["WKVM_ENABLE_TOKEN_POOL_TRITON"] = old_flag
+            if old_disable is None:
+                os.environ.pop("WKVM_DISABLE_TOKEN_POOL_TRITON", None)
+            else:
+                os.environ["WKVM_DISABLE_TOKEN_POOL_TRITON"] = old_disable
+            native_forward.reset_token_pool_triton_stats(clear_disabled_shapes=True)
+
+        self.assertEqual(stats["calls"], 2)
+        self.assertEqual(stats["env_enabled_calls"], 2)
+        self.assertEqual(stats["attempts"], 1)
+        self.assertEqual(stats["successes"], 0)
+        self.assertEqual(stats["runtime_errors"], 1)
+        self.assertEqual(stats["recoverable_runtime_fallbacks"], 1)
+        self.assertEqual(stats["disabled_shape_skips"], 1)
+        self.assertEqual(stats["disabled_shape_count"], 1)
+        self.assertEqual(
+            stats["fallback_reasons"],
+            {"recoverable_runtime_error": 1, "disabled_shape": 1},
+        )
+
+    def test_token_pool_triton_auto_default_and_explicit_disable(self) -> None:
+        import os
+        import sys
+        from types import ModuleType, SimpleNamespace
+        import wkvm.runner.gemma_native_forward as native_forward
+
+        native_forward.reset_token_pool_triton_stats(clear_disabled_shapes=True)
+        module_name = "wkvm.runner.gemma_token_pool_triton"
+        old_module = sys.modules.get(module_name)
+        old_enable = os.environ.get("WKVM_ENABLE_TOKEN_POOL_TRITON")
+        old_disable = os.environ.get("WKVM_DISABLE_TOKEN_POOL_TRITON")
+        old_reference = native_forward._attention_forward_token_pool_gqa_reference
+        fake_module = ModuleType(module_name)
+        calls = {"triton": 0, "reference": 0}
+
+        def decode(*args, **kwargs):
+            calls["triton"] += 1
+            return "triton"
+
+        def reference(*args, **kwargs):
+            calls["reference"] += 1
+            return "reference", None
+
+        fake_module.token_pool_gqa_decode = decode
+        sys.modules[module_name] = fake_module
+        os.environ.pop("WKVM_ENABLE_TOKEN_POOL_TRITON", None)
+        os.environ.pop("WKVM_DISABLE_TOKEN_POOL_TRITON", None)
+        native_forward._attention_forward_token_pool_gqa_reference = reference
+
+        class FakeQuery:
+            shape = (1, 8, 1, 512)
+            dtype = "bfloat16"
+            device = "cuda:0"
+            is_cuda = True
+
+        class FakePool:
+            def get_kv_buffer(self, layer_idx):
+                return "key_buffer", "value_buffer"
+
+        try:
+            auto = native_forward._attention_forward_token_pool_gqa(
+                SimpleNamespace(num_key_value_groups=4, scaling=1.0),
+                FakeQuery(),
+                decode_metadata=SimpleNamespace(kv_indptr="indptr", kv_indices="indices"),
+                token_kv_pool=FakePool(),
+                layer_idx=0,
+            )
+            os.environ["WKVM_DISABLE_TOKEN_POOL_TRITON"] = "1"
+            disabled = native_forward._attention_forward_token_pool_gqa(
+                SimpleNamespace(num_key_value_groups=4, scaling=1.0),
+                FakeQuery(),
+                decode_metadata=SimpleNamespace(kv_indptr="indptr", kv_indices="indices"),
+                token_kv_pool=FakePool(),
+                layer_idx=0,
+            )
+            stats = native_forward.token_pool_triton_stats()
+        finally:
+            native_forward._attention_forward_token_pool_gqa_reference = old_reference
+            if old_module is None:
+                sys.modules.pop(module_name, None)
+            else:
+                sys.modules[module_name] = old_module
+            if old_enable is None:
+                os.environ.pop("WKVM_ENABLE_TOKEN_POOL_TRITON", None)
+            else:
+                os.environ["WKVM_ENABLE_TOKEN_POOL_TRITON"] = old_enable
+            if old_disable is None:
+                os.environ.pop("WKVM_DISABLE_TOKEN_POOL_TRITON", None)
+            else:
+                os.environ["WKVM_DISABLE_TOKEN_POOL_TRITON"] = old_disable
+            native_forward.reset_token_pool_triton_stats(clear_disabled_shapes=True)
+
+        self.assertEqual(auto, ("triton", None))
+        self.assertEqual(disabled, ("reference", None))
+        self.assertEqual(calls, {"triton": 1, "reference": 1})
+        self.assertEqual(stats["calls"], 2)
+        self.assertEqual(stats["attempts"], 1)
+        self.assertEqual(stats["successes"], 1)
+        self.assertEqual(stats["auto_enabled_calls"], 1)
+        self.assertEqual(stats["effective_enabled_calls"], 1)
+        self.assertEqual(stats["effective_disabled_calls"], 1)
+        self.assertEqual(stats["env_enabled_calls"], 0)
+        self.assertEqual(stats["env_disabled_calls"], 1)
+        self.assertTrue(stats["env_disabled"])
+        self.assertFalse(stats["effective_enabled"])
+
+    def test_token_pool_triton_dispatch_plan_tracks_env_changes(self) -> None:
+        import os
+        import wkvm.runner.gemma_native_forward as native_forward
+
+        names = (
+            "WKVM_ENABLE_TOKEN_POOL_TRITON",
+            "WKVM_DISABLE_TOKEN_POOL_TRITON",
+            "WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON",
+            "WKVM_ENABLE_TOKEN_POOL_SPLIT_TRITON",
+            "WKVM_TOKEN_POOL_TRITON_SPLIT_KV",
+            "WKVM_ENABLE_TOKEN_POOL_PAGED_SPLIT_TRITON",
+            "WKVM_TOKEN_POOL_TRITON_PAGED_SPLIT_KV",
+            "WKVM_TOKEN_POOL_TRITON_INPUT_PRECISION",
+            "WKVM_TOKEN_POOL_TRITON_DOT_DTYPE",
+            "WKVM_TOKEN_POOL_TRITON_STRICT",
+        )
+        old_env = {name: os.environ.get(name) for name in names}
+        try:
+            for name in names:
+                os.environ.pop(name, None)
+            native_forward.reset_token_pool_triton_stats(clear_disabled_shapes=True)
+            auto = native_forward._token_pool_triton_dispatch_plan()
+            self.assertTrue(auto.effective_enabled)
+            self.assertTrue(auto.auto_default_enabled)
+            self.assertFalse(auto.paged_enabled)
+
+            os.environ["WKVM_DISABLE_TOKEN_POOL_TRITON"] = "1"
+            disabled = native_forward._token_pool_triton_dispatch_plan()
+            self.assertFalse(disabled.effective_enabled)
+            self.assertFalse(disabled.auto_default_enabled)
+            self.assertTrue(disabled.env_disabled)
+
+            os.environ.pop("WKVM_DISABLE_TOKEN_POOL_TRITON", None)
+            os.environ["WKVM_ENABLE_TOKEN_POOL_TRITON"] = "1"
+            os.environ["WKVM_ENABLE_TOKEN_POOL_SPLIT_TRITON"] = "1"
+            os.environ["WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON"] = "1"
+            os.environ["WKVM_ENABLE_TOKEN_POOL_PAGED_SPLIT_TRITON"] = "1"
+            os.environ["WKVM_TOKEN_POOL_TRITON_INPUT_PRECISION"] = "ieee"
+            os.environ["WKVM_TOKEN_POOL_TRITON_DOT_DTYPE"] = "native"
+            os.environ["WKVM_TOKEN_POOL_TRITON_STRICT"] = "yes"
+            explicit = native_forward._token_pool_triton_dispatch_plan()
+            self.assertTrue(explicit.env_enabled)
+            self.assertTrue(explicit.effective_enabled)
+            self.assertFalse(explicit.auto_default_enabled)
+            self.assertTrue(explicit.paged_enabled)
+            self.assertTrue(explicit.split_enabled)
+            self.assertTrue(explicit.paged_split_enabled)
+            self.assertEqual(explicit.input_precision_policy, "ieee")
+            self.assertEqual(explicit.dot_dtype_policy, "native")
+            self.assertTrue(explicit.strict)
+        finally:
+            for name, value in old_env.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+            native_forward.reset_token_pool_triton_stats(clear_disabled_shapes=True)
+
+    def test_token_pool_paged_triton_dispatch_is_explicit(self) -> None:
+        import os
+        import sys
+        from types import ModuleType, SimpleNamespace
+        import wkvm.runner.gemma_native_forward as native_forward
+
+        native_forward.reset_token_pool_triton_stats(clear_disabled_shapes=True)
+        module_name = "wkvm.runner.gemma_token_pool_triton"
+        old_module = sys.modules.get(module_name)
+        old_enable = os.environ.get("WKVM_ENABLE_TOKEN_POOL_TRITON")
+        old_paged = os.environ.get("WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON")
+        old_disable = os.environ.get("WKVM_DISABLE_TOKEN_POOL_TRITON")
+        fake_module = ModuleType(module_name)
+        calls = {"flat": 0, "paged": 0, "paged_block_size": None}
+
+        def flat_decode(*args, **kwargs):
+            calls["flat"] += 1
+            return "flat"
+
+        def paged_decode(*args, **kwargs):
+            calls["paged"] += 1
+            calls["paged_block_size"] = kwargs.get("block_size")
+            return "paged"
+
+        fake_module.token_pool_gqa_decode = flat_decode
+        fake_module.token_pool_paged_gqa_decode = paged_decode
+        sys.modules[module_name] = fake_module
+        os.environ["WKVM_ENABLE_TOKEN_POOL_TRITON"] = "1"
+        os.environ["WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON"] = "1"
+        os.environ.pop("WKVM_DISABLE_TOKEN_POOL_TRITON", None)
+
+        class FakeQuery:
+            shape = (1, 8, 1, 512)
+            dtype = "bfloat16"
+            device = "cuda:0"
+            is_cuda = True
+
+        class FakePool:
+            def get_kv_buffer(self, layer_idx):
+                return "key_buffer", "value_buffer"
+
+        metadata = SimpleNamespace(
+            req_pool_indices="reqs",
+            seq_lens="seq_lens",
+            logical_seq_lens="logical_seq_lens",
+            out_cache_loc="out_cache_loc",
+            block_tables="block_tables",
+            block_table_lens="block_table_lens",
+            selected_start_positions="selected_start_positions",
+            block_size=32,
+        )
+        try:
+            actual = native_forward._attention_forward_token_pool_gqa(
+                SimpleNamespace(num_key_value_groups=4, scaling=1.0),
+                FakeQuery(),
+                decode_metadata=metadata,
+                token_kv_pool=FakePool(),
+                layer_idx=0,
+            )
+            stats = native_forward.token_pool_triton_stats()
+        finally:
+            if old_module is None:
+                sys.modules.pop(module_name, None)
+            else:
+                sys.modules[module_name] = old_module
+            if old_enable is None:
+                os.environ.pop("WKVM_ENABLE_TOKEN_POOL_TRITON", None)
+            else:
+                os.environ["WKVM_ENABLE_TOKEN_POOL_TRITON"] = old_enable
+            if old_paged is None:
+                os.environ.pop("WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON", None)
+            else:
+                os.environ["WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON"] = old_paged
+            if old_disable is None:
+                os.environ.pop("WKVM_DISABLE_TOKEN_POOL_TRITON", None)
+            else:
+                os.environ["WKVM_DISABLE_TOKEN_POOL_TRITON"] = old_disable
+            native_forward.reset_token_pool_triton_stats(clear_disabled_shapes=True)
+
+        self.assertEqual(actual, ("paged", None))
+        self.assertEqual(calls, {"flat": 0, "paged": 1, "paged_block_size": 32})
+        self.assertEqual(stats["calls"], 1)
+        self.assertEqual(stats["attempts"], 1)
+        self.assertEqual(stats["successes"], 1)
+        self.assertEqual(stats["paged_enabled_calls"], 1)
+        self.assertEqual(stats["paged_attempts"], 1)
+        self.assertEqual(stats["paged_successes"], 1)
+
+    def test_token_pool_triton_attention_matches_ragged_manual_gqa_on_cuda(self) -> None:
+        import os
+        import torch
+        from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4TextDecoderLayer
+        from wkvm.runner.gemma_native_forward import (
+            NativeGemma4TextDecoderLayer,
+            _attention_forward,
+            _attention_forward_manual_gqa,
+        )
+        from wkvm.runner.gemma_token_pool import (
+            DecodeBatchMetadata,
+            TokenKVLayerSpec,
+            TokenKVPool,
+        )
+
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for Triton token-pool attention")
+        from wkvm.runner.gemma_token_pool_triton import token_pool_gqa_decode
+
+        torch.manual_seed(20)
+        cfg = Gemma4TextConfig(
+            vocab_size=64,
+            hidden_size=128,
+            intermediate_size=256,
+            num_hidden_layers=2,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            head_dim=16,
+            hidden_size_per_layer_input=4,
+            vocab_size_per_layer_input=64,
+            sliding_window=16,
+            layer_types=["sliding_attention", "sliding_attention"],
+            num_kv_shared_layers=0,
+            attention_dropout=0.0,
+            attention_bias=False,
+            global_head_dim=16,
+        )
+        hf_layer = Gemma4TextDecoderLayer(cfg, layer_idx=0).eval().cuda()
+        native_layer = NativeGemma4TextDecoderLayer(
+            hf_layer,
+            native_attention_backend="manual_gqa",
+        )
+        pool = TokenKVPool(
+            capacity=12,
+            layer_specs=[
+                TokenKVLayerSpec(
+                    layer_id=0,
+                    num_kv_heads=cfg.num_key_value_heads,
+                    head_dim=cfg.head_dim,
+                    dtype=torch.float32,
+                )
+            ],
+            dtype=torch.float32,
+            device="cuda",
+        )
+        slots = pool.alloc_slots(12)
+        keys = torch.randn(12, cfg.num_key_value_heads, cfg.head_dim, device="cuda")
+        values = torch.randn(12, cfg.num_key_value_heads, cfg.head_dim, device="cuda")
+        pool.set_kv(0, slots, keys, values)
+        query = torch.randn(
+            3,
+            cfg.num_attention_heads,
+            1,
+            cfg.head_dim,
+            device="cuda",
+        )
+        metadata = DecodeBatchMetadata(
+            req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int32, device="cuda"),
+            seq_lens=torch.tensor([4, 3, 5], dtype=torch.int32, device="cuda"),
+            logical_seq_lens=torch.tensor([4, 3, 5], dtype=torch.int32, device="cuda"),
+            out_cache_loc=torch.tensor([3, 6, 11], dtype=torch.int32, device="cuda"),
+            kv_indptr=torch.tensor([0, 4, 7, 12], dtype=torch.int32, device="cuda"),
+            kv_indices=torch.arange(12, dtype=torch.int32, device="cuda"),
+        )
+
+        with torch.inference_mode():
+            direct = token_pool_gqa_decode(
+                query,
+                pool.get_kv_buffer(0)[0],
+                pool.get_kv_buffer(0)[1],
+                metadata.kv_indptr,
+                metadata.kv_indices,
+                num_key_value_groups=native_layer.attn_meta.num_key_value_groups,
+                scaling=native_layer.attn_meta.scaling,
+            )
+            old_flag = os.environ.get("WKVM_ENABLE_TOKEN_POOL_TRITON")
+            os.environ["WKVM_ENABLE_TOKEN_POOL_TRITON"] = "1"
+            try:
+                actual, actual_weights = _attention_forward(
+                    native_layer.attn_meta,
+                    query,
+                    keys[:1].permute(1, 0, 2).unsqueeze(0),
+                    values[:1].permute(1, 0, 2).unsqueeze(0),
+                    None,
+                    backend="manual_gqa",
+                    decode_metadata=metadata,
+                    token_kv_pool=pool,
+                    layer_idx=0,
+                )
+            finally:
+                if old_flag is None:
+                    os.environ.pop("WKVM_ENABLE_TOKEN_POOL_TRITON", None)
+                else:
+                    os.environ["WKVM_ENABLE_TOKEN_POOL_TRITON"] = old_flag
+            expected_rows = []
+            for start, end, row in ((0, 4, 0), (4, 7, 1), (7, 12, 2)):
+                expected, _ = _attention_forward_manual_gqa(
+                    native_layer.attn_meta,
+                    query[row : row + 1],
+                    keys[start:end].permute(1, 0, 2).unsqueeze(0),
+                    values[start:end].permute(1, 0, 2).unsqueeze(0),
+                    None,
+                )
+                expected_rows.append(expected)
+            expected = torch.cat(expected_rows, dim=0)
+        torch.cuda.synchronize()
+
+        self.assertIsNone(actual_weights)
+        self.assertLess((expected - direct).abs().max().item(), 1e-5)
+        self.assertLess((expected - actual).abs().max().item(), 1e-5)
+
+    def test_decode_layer_token_pool_context_matches_dense_cache(self) -> None:
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import (
+            Gemma4TextDecoderLayer,
+            Gemma4TextRotaryEmbedding,
+        )
+        from wkvm.models.gemma import GemmaRoutedSpanConfig
+        from wkvm.runner.gemma_native_forward import NativeGemma4TextDecoderLayer
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenKVLayerSpec,
+            TokenKVPool,
+            TokenPoolDecodeContext,
+            build_decode_metadata_from_token_slot_rows,
+        )
+
+        torch.manual_seed(21)
+        cfg = _tiny_config()
+        hf_layer = Gemma4TextDecoderLayer(cfg, layer_idx=0).eval()
+        dense_layer = NativeGemma4TextDecoderLayer(
+            hf_layer,
+            native_attention_backend="manual_gqa",
+        )
+        token_pool_layer = NativeGemma4TextDecoderLayer(
+            hf_layer,
+            native_attention_backend="manual_gqa",
+        )
+        rotary = Gemma4TextRotaryEmbedding(cfg)
+        native_cfg = GemmaRoutedSpanConfig(
+            num_hidden_layers=cfg.num_hidden_layers,
+            num_kv_shared_layers=cfg.num_kv_shared_layers,
+            layer_types=tuple(cfg.layer_types),
+            num_kv_heads=cfg.num_key_value_heads,
+            head_dim=cfg.head_dim,
+            sliding_window=cfg.sliding_window,
+        )
+        dense_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+        token_pool_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+
+        prefill_hidden = torch.randn(1, 3, cfg.hidden_size)
+        prefill_ple = torch.randn(1, 3, cfg.hidden_size_per_layer_input)
+        prefill_pos = torch.arange(3).unsqueeze(0)
+        prefill_pos_emb = rotary(prefill_hidden, prefill_pos, "sliding_attention")
+        prefill_mask = _causal_mask(1, 3, dtype=prefill_hidden.dtype, device=prefill_hidden.device)
+
+        decode_hidden = torch.randn(1, 1, cfg.hidden_size)
+        decode_ple = torch.randn(1, 1, cfg.hidden_size_per_layer_input)
+        decode_pos = torch.tensor([[3]])
+        decode_pos_emb = rotary(decode_hidden, decode_pos, "sliding_attention")
+
+        pool = TokenKVPool(
+            capacity=4,
+            layer_specs=[
+                TokenKVLayerSpec(
+                    layer_id=0,
+                    num_kv_heads=cfg.num_key_value_heads,
+                    head_dim=cfg.head_dim,
+                    dtype=torch.float32,
+                )
+            ],
+            dtype=torch.float32,
+        )
+        table = ReqToTokenTable(max_requests=1, max_context_len=4)
+        req_slot = table.allocate("r0")
+        token_slots = pool.alloc_slots(4)
+        prefill_slots = token_slots[:3]
+        decode_slot = token_slots[3:4]
+        table.append_slots(req_slot, prefill_slots)
+
+        with torch.inference_mode():
+            dense_layer(
+                prefill_hidden,
+                prefill_ple,
+                shared_kv_states=UserDict(),
+                position_embeddings=prefill_pos_emb,
+                attention_mask=prefill_mask,
+                position_ids=prefill_pos,
+                past_key_values=dense_cache,
+            )
+            token_pool_layer(
+                prefill_hidden,
+                prefill_ple,
+                shared_kv_states=UserDict(),
+                position_embeddings=prefill_pos_emb,
+                attention_mask=prefill_mask,
+                position_ids=prefill_pos,
+                past_key_values=token_pool_cache,
+            )
+
+        prefill_keys = token_pool_cache.layers[0].keys[0].permute(1, 0, 2).contiguous()
+        prefill_values = token_pool_cache.layers[0].values[0].permute(1, 0, 2).contiguous()
+        pool.set_kv(0, prefill_slots, prefill_keys, prefill_values)
+        table.append_slots(req_slot, decode_slot)
+        metadata = table.build_decode_metadata(
+            [req_slot],
+            out_cache_loc=decode_slot,
+        )
+        wrong_type_metadata = build_decode_metadata_from_token_slot_rows(
+            [[int(decode_slot.reshape(-1)[0].item())]],
+            out_cache_loc=decode_slot,
+        )
+        context = TokenPoolDecodeContext(
+            metadata_by_layer_type={"sliding_attention": wrong_type_metadata},
+            metadata_by_layer_id={0: metadata},
+            kv_pool=pool,
+        )
+
+        with torch.inference_mode():
+            expected = dense_layer(
+                decode_hidden,
+                decode_ple,
+                shared_kv_states=UserDict(),
+                position_embeddings=decode_pos_emb,
+                attention_mask=None,
+                position_ids=decode_pos,
+                past_key_values=dense_cache,
+            )
+            actual = token_pool_layer(
+                decode_hidden,
+                decode_ple,
+                shared_kv_states=UserDict(),
+                position_embeddings=decode_pos_emb,
+                attention_mask=None,
+                position_ids=decode_pos,
+                past_key_values=token_pool_cache,
+                wkvm_token_pool_decode=context,
+            )
+
+        pooled_key, pooled_value = pool.gather_kv(0, decode_slot)
+        dense_decode_key = dense_cache.layers[0].keys[0, :, -1:, :].permute(1, 0, 2)
+        dense_decode_value = dense_cache.layers[0].values[0, :, -1:, :].permute(1, 0, 2)
+        self.assertLess((expected - actual).abs().max().item(), 1e-6)
+        self.assertLess((pooled_key - dense_decode_key).abs().max().item(), 1e-6)
+        self.assertLess((pooled_value - dense_decode_value).abs().max().item(), 1e-6)
+
+    def test_token_pool_decode_skips_dense_cache_update_when_covered(self) -> None:
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import (
+            Gemma4TextDecoderLayer,
+            Gemma4TextRotaryEmbedding,
+        )
+        from wkvm.models.gemma import GemmaRoutedSpanConfig
+        from wkvm.runner.gemma_native_forward import NativeGemma4TextDecoderLayer
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenKVLayerSpec,
+            TokenKVPool,
+            TokenPoolDecodeContext,
+        )
+
+        class RaisingDecodeCache:
+            def update(self, *_args, **_kwargs):
+                raise AssertionError("dense cache update should be skipped")
+
+        torch.manual_seed(22)
+        cfg = _tiny_config()
+        hf_layer = Gemma4TextDecoderLayer(cfg, layer_idx=0).eval()
+        dense_layer = NativeGemma4TextDecoderLayer(
+            hf_layer,
+            native_attention_backend="manual_gqa",
+        )
+        token_pool_layer = NativeGemma4TextDecoderLayer(
+            hf_layer,
+            native_attention_backend="manual_gqa",
+        )
+        rotary = Gemma4TextRotaryEmbedding(cfg)
+        native_cfg = GemmaRoutedSpanConfig(
+            num_hidden_layers=cfg.num_hidden_layers,
+            num_kv_shared_layers=cfg.num_kv_shared_layers,
+            layer_types=tuple(cfg.layer_types),
+            num_kv_heads=cfg.num_key_value_heads,
+            head_dim=cfg.head_dim,
+            sliding_window=cfg.sliding_window,
+        )
+        dense_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+        prefill_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+
+        prefill_hidden = torch.randn(1, 3, cfg.hidden_size)
+        prefill_ple = torch.randn(1, 3, cfg.hidden_size_per_layer_input)
+        prefill_pos = torch.arange(3).unsqueeze(0)
+        prefill_pos_emb = rotary(prefill_hidden, prefill_pos, "sliding_attention")
+        prefill_mask = _causal_mask(1, 3, dtype=prefill_hidden.dtype, device=prefill_hidden.device)
+
+        decode_hidden = torch.randn(1, 1, cfg.hidden_size)
+        decode_ple = torch.randn(1, 1, cfg.hidden_size_per_layer_input)
+        decode_pos = torch.tensor([[3]])
+        decode_pos_emb = rotary(decode_hidden, decode_pos, "sliding_attention")
+
+        pool = TokenKVPool(
+            capacity=4,
+            layer_specs=[
+                TokenKVLayerSpec(
+                    layer_id=0,
+                    num_kv_heads=cfg.num_key_value_heads,
+                    head_dim=cfg.head_dim,
+                    dtype=torch.float32,
+                )
+            ],
+            dtype=torch.float32,
+        )
+        table = ReqToTokenTable(max_requests=1, max_context_len=4)
+        req_slot = table.allocate("r0")
+        token_slots = pool.alloc_slots(4)
+        prefill_slots = token_slots[:3]
+        decode_slot = token_slots[3:4]
+        table.append_slots(req_slot, prefill_slots)
+
+        with torch.inference_mode():
+            dense_layer(
+                prefill_hidden,
+                prefill_ple,
+                shared_kv_states=UserDict(),
+                position_embeddings=prefill_pos_emb,
+                attention_mask=prefill_mask,
+                position_ids=prefill_pos,
+                past_key_values=dense_cache,
+            )
+            token_pool_layer(
+                prefill_hidden,
+                prefill_ple,
+                shared_kv_states=UserDict(),
+                position_embeddings=prefill_pos_emb,
+                attention_mask=prefill_mask,
+                position_ids=prefill_pos,
+                past_key_values=prefill_cache,
+            )
+
+        prefill_keys = prefill_cache.layers[0].keys[0].permute(1, 0, 2).contiguous()
+        prefill_values = prefill_cache.layers[0].values[0].permute(1, 0, 2).contiguous()
+        pool.set_kv(0, prefill_slots, prefill_keys, prefill_values)
+        table.append_slots(req_slot, decode_slot)
+        metadata = table.build_decode_metadata(
+            [req_slot],
+            out_cache_loc=decode_slot,
+        )
+        context = TokenPoolDecodeContext(
+            metadata_by_layer_type={"sliding_attention": metadata},
+            kv_pool=pool,
+        )
+
+        with torch.inference_mode():
+            expected = dense_layer(
+                decode_hidden,
+                decode_ple,
+                shared_kv_states=UserDict(),
+                position_embeddings=decode_pos_emb,
+                attention_mask=None,
+                position_ids=decode_pos,
+                past_key_values=dense_cache,
+            )
+            actual = token_pool_layer(
+                decode_hidden,
+                decode_ple,
+                shared_kv_states=UserDict(),
+                position_embeddings=decode_pos_emb,
+                attention_mask=None,
+                position_ids=decode_pos,
+                past_key_values=RaisingDecodeCache(),
+                wkvm_token_pool_decode=context,
+            )
+
+        self.assertLess((expected - actual).abs().max().item(), 1e-6)
+
+    def test_full_attention_token_pool_context_matches_routed_dense_cache(self) -> None:
+        import torch
+        from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
+        from transformers.models.gemma4.modeling_gemma4 import (
+            Gemma4TextDecoderLayer,
+            Gemma4TextRotaryEmbedding,
+        )
+        from wkvm.models.gemma import GemmaRoutedSpanConfig
+        from wkvm.runner.gemma_native_forward import NativeGemma4TextDecoderLayer
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+        from wkvm.runner.gemma_token_pool import (
+            TokenKVLayerSpec,
+            TokenKVPool,
+            TokenPoolDecodeContext,
+            build_decode_metadata_from_token_slot_rows,
+        )
+
+        torch.manual_seed(23)
+        cfg = Gemma4TextConfig(
+            vocab_size=64,
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=4,
+            hidden_size_per_layer_input=4,
+            vocab_size_per_layer_input=64,
+            sliding_window=8,
+            layer_types=["full_attention"],
+            num_kv_shared_layers=0,
+            attention_dropout=0.0,
+            attention_bias=False,
+            global_head_dim=4,
+        )
+        hf_layer = Gemma4TextDecoderLayer(cfg, layer_idx=0).eval()
+        dense_layer = NativeGemma4TextDecoderLayer(
+            hf_layer,
+            native_attention_backend="manual_gqa",
+        )
+        token_pool_layer = NativeGemma4TextDecoderLayer(
+            hf_layer,
+            native_attention_backend="manual_gqa",
+        )
+        rotary = Gemma4TextRotaryEmbedding(cfg)
+        native_cfg = GemmaRoutedSpanConfig(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=tuple(cfg.layer_types),
+            num_kv_heads=cfg.num_key_value_heads,
+            head_dim=cfg.global_head_dim,
+            sliding_window=cfg.sliding_window,
+            sink_tokens=1,
+            ring_tokens=1,
+            routed_slots=2,
+            reps_per_slot=1,
+            span_budget_tokens=4,
+            pending_tokens=2,
+            max_span_tokens=3,
+        )
+        dense_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+        token_pool_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+
+        prefill_hidden = torch.randn(1, 5, cfg.hidden_size)
+        prefill_ple = torch.randn(1, 5, cfg.hidden_size_per_layer_input)
+        prefill_pos = torch.arange(5).unsqueeze(0)
+        prefill_pos_emb = rotary(prefill_hidden, prefill_pos, "full_attention")
+        prefill_mask = _causal_mask(1, 5, dtype=prefill_hidden.dtype, device=prefill_hidden.device)
+
+        decode_hidden = torch.randn(1, 1, cfg.hidden_size)
+        decode_ple = torch.randn(1, 1, cfg.hidden_size_per_layer_input)
+        decode_pos = torch.tensor([[5]])
+        decode_pos_emb = rotary(decode_hidden, decode_pos, "full_attention")
+
+        with torch.inference_mode():
+            dense_layer(
+                prefill_hidden,
+                prefill_ple,
+                shared_kv_states=UserDict(),
+                position_embeddings=prefill_pos_emb,
+                attention_mask=prefill_mask,
+                position_ids=prefill_pos,
+                past_key_values=dense_cache,
+            )
+            token_pool_layer(
+                prefill_hidden,
+                prefill_ple,
+                shared_kv_states=UserDict(),
+                position_embeddings=prefill_pos_emb,
+                attention_mask=prefill_mask,
+                position_ids=prefill_pos,
+                past_key_values=token_pool_cache,
+            )
+
+        materialized_width = token_pool_cache.layers[0].materialized_tokens()
+        self.assertGreater(materialized_width, 5)
+        pool = TokenKVPool(
+            capacity=materialized_width + 1,
+            layer_specs=[
+                TokenKVLayerSpec(
+                    layer_id=0,
+                    num_kv_heads=cfg.num_key_value_heads,
+                    head_dim=cfg.global_head_dim,
+                    dtype=torch.float32,
+                )
+            ],
+            dtype=torch.float32,
+        )
+        slots = pool.alloc_slots(materialized_width + 1)
+        prefill_slots = slots[:materialized_width].flip(0)
+        decode_slot = slots[materialized_width : materialized_width + 1]
+        token_pool_cache.layers[0].write_materialized_readout_to_token_pool(
+            pool,
+            prefill_slots,
+        )
+        slot_row = torch.cat([prefill_slots, decode_slot])
+        metadata = build_decode_metadata_from_token_slot_rows(
+            [slot_row],
+            logical_seq_lens=[dense_cache.layers[0].cumulative_length + 1],
+            out_cache_loc=decode_slot,
+        )
+        context = TokenPoolDecodeContext(
+            metadata_by_layer_type={"full_attention": metadata},
+            metadata_by_layer_id={0: metadata},
+            kv_pool=pool,
+        )
+
+        with torch.inference_mode():
+            expected = dense_layer(
+                decode_hidden,
+                decode_ple,
+                shared_kv_states=UserDict(),
+                position_embeddings=decode_pos_emb,
+                attention_mask=None,
+                position_ids=decode_pos,
+                past_key_values=dense_cache,
+            )
+            actual = token_pool_layer(
+                decode_hidden,
+                decode_ple,
+                shared_kv_states=UserDict(),
+                position_embeddings=decode_pos_emb,
+                attention_mask=None,
+                position_ids=decode_pos,
+                past_key_values=token_pool_cache,
+                wkvm_token_pool_decode=context,
+            )
+
+        pooled_key, pooled_value = pool.gather_kv(0, decode_slot)
+        dense_decode_key = dense_cache.layers[0].keys[0, :, -1:, :].permute(1, 0, 2)
+        dense_decode_value = dense_cache.layers[0].values[0, :, -1:, :].permute(1, 0, 2)
+        self.assertLess((expected - actual).abs().max().item(), 1e-6)
+        self.assertLess((pooled_key - dense_decode_key).abs().max().item(), 1e-6)
+        self.assertLess((pooled_value - dense_decode_value).abs().max().item(), 1e-6)
+
+    def test_text_prefix_with_wkvm_cache_matches_hf_layers(self) -> None:
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4TextModel
+        from wkvm.models.gemma import GemmaRoutedSpanConfig
+        from wkvm.runner.gemma_native_forward import NativeGemma4TextPrefix
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+
+        torch.manual_seed(23)
+        cfg = _tiny_config()
+        text_model = Gemma4TextModel(cfg).eval()
+        native_prefix = NativeGemma4TextPrefix(text_model, num_layers=2)
+        native_cfg = GemmaRoutedSpanConfig(
+            num_hidden_layers=cfg.num_hidden_layers,
+            num_kv_shared_layers=cfg.num_kv_shared_layers,
+            layer_types=tuple(cfg.layer_types),
+            num_kv_heads=cfg.num_key_value_heads,
+            head_dim=cfg.head_dim,
+            sliding_window=cfg.sliding_window,
+        )
+        hf_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+        native_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+
+        input_ids = torch.tensor([[1, 7, 9, 11, 13]])
+        position_ids = torch.arange(input_ids.shape[1]).unsqueeze(0)
+        mask = _causal_mask(1, input_ids.shape[1], dtype=torch.float32, device=input_ids.device)
+        mask_mapping = {"sliding_attention": mask, "full_attention": mask}
+        decode_ids = torch.tensor([[17]])
+        decode_position_ids = torch.tensor([[input_ids.shape[1]]])
+
+        def hf_prefix(ids, pos, cache, attn_mask):
+            inputs_embeds = text_model.embed_tokens(ids)
+            ple = text_model.get_per_layer_inputs(ids, inputs_embeds)
+            ple = text_model.project_per_layer_inputs(inputs_embeds, ple)
+            position_embeddings = {
+                layer_type: text_model.rotary_emb(inputs_embeds, pos, layer_type)
+                for layer_type in set(cfg.layer_types)
+            }
+            hidden = inputs_embeds
+            shared_kv_states = UserDict()
+            for i, layer in enumerate(text_model.layers[:2]):
+                layer_type = cfg.layer_types[i]
+                hidden = layer(
+                    hidden,
+                    ple[:, :, i, :],
+                    shared_kv_states=shared_kv_states,
+                    position_embeddings=position_embeddings[layer_type],
+                    attention_mask=attn_mask[layer_type],
+                    position_ids=pos,
+                    past_key_values=cache,
+                )
+            return hidden
+
+        with torch.inference_mode():
+            hf_prefill = hf_prefix(input_ids, position_ids, hf_cache, mask_mapping)
+            native_prefill = native_prefix(
+                input_ids=input_ids,
+                attention_mask=mask_mapping,
+                position_ids=position_ids,
+                past_key_values=native_cache,
+            ).hidden_states
+            hf_decode = hf_prefix(
+                decode_ids,
+                decode_position_ids,
+                hf_cache,
+                {"sliding_attention": None, "full_attention": None},
+            )
+            native_decode = native_prefix(
+                input_ids=decode_ids,
+                attention_mask={"sliding_attention": None, "full_attention": None},
+                position_ids=decode_position_ids,
+                past_key_values=native_cache,
+            ).hidden_states
+
+        self.assertLess((hf_prefill - native_prefill).abs().max().item(), 5e-6)
+        self.assertLess((hf_decode - native_decode).abs().max().item(), 5e-6)
+        for layer_idx in range(2):
+            self.assertEqual(
+                hf_cache.layers[layer_idx].keys.shape,
+                native_cache.layers[layer_idx].keys.shape,
+            )
+            self.assertLess(
+                (
+                    hf_cache.layers[layer_idx].keys
+                    - native_cache.layers[layer_idx].keys
+                ).abs().max().item(),
+                1e-6,
+            )
+
+    def test_full_causal_lm_with_shared_tail_matches_hf_logits(self) -> None:
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM
+        from wkvm.models.gemma import GemmaRoutedSpanConfig
+        from wkvm.runner.gemma_native_forward import NativeGemma4ForCausalLM
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+
+        torch.manual_seed(31)
+        cfg = _tiny_shared_config()
+        hf_model = Gemma4ForCausalLM(cfg).eval()
+        native_model = NativeGemma4ForCausalLM(hf_model)
+        native_cfg = GemmaRoutedSpanConfig(
+            num_hidden_layers=cfg.num_hidden_layers,
+            num_kv_shared_layers=cfg.num_kv_shared_layers,
+            layer_types=tuple(cfg.layer_types),
+            num_kv_heads=cfg.num_key_value_heads,
+            head_dim=cfg.head_dim,
+            sliding_window=cfg.sliding_window,
+        )
+        hf_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+        native_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+
+        input_ids = torch.tensor([[1, 7, 9, 11, 13]])
+        position_ids = torch.arange(input_ids.shape[1]).unsqueeze(0)
+        mask = _causal_mask(1, input_ids.shape[1], dtype=torch.float32, device=input_ids.device)
+        mask_mapping = {"sliding_attention": mask, "full_attention": mask}
+        decode_ids = torch.tensor([[17]])
+        decode_position_ids = torch.tensor([[input_ids.shape[1]]])
+
+        with torch.inference_mode():
+            hf_prefill = hf_model(
+                input_ids=input_ids,
+                attention_mask=mask_mapping,
+                position_ids=position_ids,
+                past_key_values=hf_cache,
+                use_cache=True,
+                logits_to_keep=1,
+            )
+            native_prefill = native_model(
+                input_ids=input_ids,
+                attention_mask=mask_mapping,
+                position_ids=position_ids,
+                past_key_values=native_cache,
+                use_cache=True,
+                logits_to_keep=1,
+            )
+            hf_decode = hf_model(
+                input_ids=decode_ids,
+                attention_mask={"sliding_attention": None, "full_attention": None},
+                position_ids=decode_position_ids,
+                past_key_values=hf_cache,
+                use_cache=True,
+                logits_to_keep=1,
+            )
+            native_decode = native_model(
+                input_ids=decode_ids,
+                attention_mask={"sliding_attention": None, "full_attention": None},
+                position_ids=decode_position_ids,
+                past_key_values=native_cache,
+                use_cache=True,
+                logits_to_keep=1,
+            )
+
+        self.assertLess((hf_prefill.logits - native_prefill.logits).abs().max().item(), 5e-6)
+        self.assertLess((hf_decode.logits - native_decode.logits).abs().max().item(), 5e-6)
+        self.assertEqual(len(hf_cache.layers), 2)
+        self.assertEqual(len(native_cache.layers), 2)
+        for layer_idx in range(2):
+            self.assertEqual(
+                hf_cache.layers[layer_idx].keys.shape,
+                native_cache.layers[layer_idx].keys.shape,
+            )
+            self.assertLess(
+                (
+                    hf_cache.layers[layer_idx].values
+                    - native_cache.layers[layer_idx].values
+                ).abs().max().item(),
+                1e-6,
+            )
+
+    def test_causal_lm_bridge_exposes_runner_model_interface(self) -> None:
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM
+        from wkvm.runner.gemma_native_forward import NativeGemma4ForCausalLM
+
+        cfg = _tiny_shared_config()
+        hf_model = Gemma4ForCausalLM(cfg)
+        native_model = NativeGemma4ForCausalLM(hf_model, native_attention_backend="sdpa")
+
+        self.assertEqual(native_model.wkvm_forward_backend, "wkvm_native_gemma_forward_bridge")
+        self.assertTrue(native_model.wkvm_no_hf_transformer_forward)
+        self.assertEqual(native_model.native_attention_backend, "sdpa")
+        self.assertIs(native_model.eval(), native_model)
+        self.assertFalse(native_model.training)
+        self.assertIs(native_model.train(True), native_model)
+        self.assertTrue(native_model.training)
+        self.assertEqual(native_model.device, next(hf_model.parameters()).device)
+        self.assertIs(next(native_model.parameters()), next(hf_model.parameters()))
+        self.assertIs(native_model.to(torch.float32), native_model)
+
+    def test_checkpoint_state_dict_loader_matches_hf_native_bridge(self) -> None:
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import (
+            Gemma4ForCausalLM,
+            Gemma4TextDecoderLayer,
+        )
+        from wkvm.runner.gemma_native_forward import (
+            NativeGemma4ForCausalLM,
+            native_gemma4_from_checkpoint_state_dict,
+        )
+
+        torch.manual_seed(45)
+        cfg = _tiny_shared_config()
+        hf_model = Gemma4ForCausalLM(cfg).eval()
+        live_model = NativeGemma4ForCausalLM(hf_model).eval()
+        checkpoint_model = native_gemma4_from_checkpoint_state_dict(
+            cfg,
+            _checkpoint_layout_state_dict(hf_model),
+            prefix="model.language_model",
+        )
+
+        self.assertTrue(checkpoint_model.wkvm_no_hf_transformer_forward)
+        self.assertTrue(checkpoint_model.wkvm_checkpoint_native_loader)
+        self.assertFalse(checkpoint_model.wkvm_uses_hf_model_construction)
+        self.assertNotIsInstance(checkpoint_model.hf_model, Gemma4ForCausalLM)
+        self.assertFalse(
+            any(
+                isinstance(layer.hf_layer, Gemma4TextDecoderLayer)
+                for layer in checkpoint_model.text_prefix.layers
+            )
+        )
+
+        input_ids = torch.tensor([[1, 7, 9, 11, 13]])
+        position_ids = torch.arange(input_ids.shape[1]).unsqueeze(0)
+        mask = _causal_mask(1, input_ids.shape[1], dtype=torch.float32, device=input_ids.device)
+        mask_mapping = {"sliding_attention": mask, "full_attention": mask}
+
+        with torch.inference_mode():
+            live_out = live_model(
+                input_ids=input_ids,
+                attention_mask=mask_mapping,
+                position_ids=position_ids,
+                use_cache=False,
+                logits_to_keep=1,
+            )
+            checkpoint_out = checkpoint_model(
+                input_ids=input_ids,
+                attention_mask=mask_mapping,
+                position_ids=position_ids,
+                use_cache=False,
+                logits_to_keep=1,
+            )
+
+        self.assertLess((live_out.logits - checkpoint_out.logits).abs().max().item(), 1e-6)
+
+    def test_checkpoint_state_dict_loader_ties_missing_lm_head(self) -> None:
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM
+        from wkvm.runner.gemma_native_forward import native_gemma4_from_checkpoint_state_dict
+
+        cfg = _tiny_shared_config()
+        hf_model = Gemma4ForCausalLM(cfg).eval()
+        state = _checkpoint_layout_state_dict(hf_model)
+        del state["lm_head.weight"]
+        checkpoint_model = native_gemma4_from_checkpoint_state_dict(
+            cfg,
+            state,
+            prefix="model.language_model",
+        )
+
+        self.assertTrue(checkpoint_model.hf_model.tie_word_embeddings)
+        self.assertEqual(
+            checkpoint_model.hf_model.lm_head.weight.data_ptr(),
+            checkpoint_model.hf_model.model.embed_tokens.weight.data_ptr(),
+        )
+        names = [name for name, _tensor in checkpoint_model.hf_model.named_parameters()]
+        self.assertNotIn("lm_head.weight", names)
+
+    def test_owned_weight_backend_copies_decoder_layer_tensors(self) -> None:
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4TextDecoderLayer
+        from wkvm.runner.gemma_native_forward import NativeGemma4TextDecoderLayer
+
+        torch.manual_seed(41)
+        cfg = _tiny_config()
+        hf_layer = Gemma4TextDecoderLayer(cfg, layer_idx=0).eval()
+        native_layer = NativeGemma4TextDecoderLayer(
+            hf_layer,
+            native_weight_backend="owned",
+        )
+
+        self.assertEqual(native_layer.native_weight_backend, "owned")
+        self.assertNotEqual(
+            native_layer.q_proj.weight.data_ptr(),
+            hf_layer.self_attn.q_proj.weight.data_ptr(),
+        )
+        self.assertTrue(torch.equal(native_layer.q_proj.weight, hf_layer.self_attn.q_proj.weight))
+
+        with torch.no_grad():
+            hf_layer.self_attn.q_proj.weight.add_(1.0)
+        self.assertFalse(torch.equal(native_layer.q_proj.weight, hf_layer.self_attn.q_proj.weight))
+
+    def test_owned_cpu_weight_backend_keeps_decoder_layer_tensors_on_cpu(self) -> None:
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4TextDecoderLayer
+        from wkvm.runner.gemma_native_forward import NativeGemma4TextDecoderLayer
+
+        torch.manual_seed(42)
+        cfg = _tiny_config()
+        hf_layer = Gemma4TextDecoderLayer(cfg, layer_idx=0).eval()
+        if torch.cuda.is_available():
+            hf_layer = hf_layer.to("cuda")
+        native_layer = NativeGemma4TextDecoderLayer(
+            hf_layer,
+            native_weight_backend="owned_cpu",
+        )
+
+        self.assertEqual(native_layer.native_weight_backend, "owned_cpu")
+        self.assertEqual(native_layer.q_proj.weight.device.type, "cpu")
+        self.assertNotEqual(
+            native_layer.q_proj.weight.data_ptr(),
+            hf_layer.self_attn.q_proj.weight.data_ptr(),
+        )
+        self.assertTrue(
+            torch.equal(
+                native_layer.q_proj.weight,
+                hf_layer.self_attn.q_proj.weight.detach().cpu(),
+            )
+        )
+
+        with torch.no_grad():
+            hf_layer.self_attn.q_proj.weight.add_(1.0)
+        self.assertFalse(
+            torch.equal(
+                native_layer.q_proj.weight,
+                hf_layer.self_attn.q_proj.weight.detach().cpu(),
+            )
+        )
+
+    def test_owned_weight_backend_matches_hf_live_bridge(self) -> None:
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM
+        from wkvm.models.gemma import GemmaRoutedSpanConfig
+        from wkvm.runner.gemma_native_forward import NativeGemma4ForCausalLM
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+
+        torch.manual_seed(43)
+        cfg = _tiny_shared_config()
+        hf_model = Gemma4ForCausalLM(cfg).eval()
+        live_model = NativeGemma4ForCausalLM(
+            hf_model,
+            native_weight_backend="hf_live",
+        )
+        native_cfg = GemmaRoutedSpanConfig(
+            num_hidden_layers=cfg.num_hidden_layers,
+            num_kv_shared_layers=cfg.num_kv_shared_layers,
+            layer_types=tuple(cfg.layer_types),
+            num_kv_heads=cfg.num_key_value_heads,
+            head_dim=cfg.head_dim,
+            sliding_window=cfg.sliding_window,
+        )
+        live_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+        owned_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+
+        input_ids = torch.tensor([[1, 7, 9, 11, 13]])
+        position_ids = torch.arange(input_ids.shape[1]).unsqueeze(0)
+        mask = _causal_mask(1, input_ids.shape[1], dtype=torch.float32, device=input_ids.device)
+        mask_mapping = {"sliding_attention": mask, "full_attention": mask}
+
+        for backend in ("owned", "owned_cpu"):
+            with self.subTest(backend=backend):
+                owned_model = NativeGemma4ForCausalLM(
+                    hf_model,
+                    native_weight_backend=backend,
+                )
+                live_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+                owned_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+                with torch.inference_mode():
+                    live_out = live_model(
+                        input_ids=input_ids,
+                        attention_mask=mask_mapping,
+                        position_ids=position_ids,
+                        past_key_values=live_cache,
+                        use_cache=True,
+                        logits_to_keep=1,
+                    )
+                    owned_out = owned_model(
+                        input_ids=input_ids,
+                        attention_mask=mask_mapping,
+                        position_ids=position_ids,
+                        past_key_values=owned_cache,
+                        use_cache=True,
+                        logits_to_keep=1,
+                    )
+
+                self.assertLess((live_out.logits - owned_out.logits).abs().max().item(), 1e-6)
+                for layer_idx in range(len(live_cache.layers)):
+                    self.assertLess(
+                        (
+                            live_cache.layers[layer_idx].keys
+                            - owned_cache.layers[layer_idx].keys
+                        ).abs().max().item(),
+                        1e-6,
+                    )
+
+    def test_owned_release_replaces_hf_decoder_layers_and_matches_live_bridge(self) -> None:
+        import torch
+        import torch.nn as nn
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM
+        from wkvm.models.gemma import GemmaRoutedSpanConfig
+        from wkvm.runner.gemma_native_forward import NativeGemma4ForCausalLM
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+
+        torch.manual_seed(44)
+        cfg = _tiny_shared_config()
+        live_hf_model = Gemma4ForCausalLM(cfg).eval()
+        released_hf_model = Gemma4ForCausalLM(cfg).eval()
+        released_hf_model.load_state_dict(live_hf_model.state_dict())
+
+        live_model = NativeGemma4ForCausalLM(
+            live_hf_model,
+            native_weight_backend="hf_live",
+        )
+        released_model = NativeGemma4ForCausalLM(
+            released_hf_model,
+            native_weight_backend="owned",
+            release_hf_decoder_layers=True,
+        )
+        self.assertTrue(released_model.release_hf_decoder_layers)
+        self.assertEqual(released_model.released_hf_decoder_layers, cfg.num_hidden_layers)
+        self.assertTrue(
+            all(isinstance(layer, nn.Identity) for layer in released_hf_model.model.layers)
+        )
+        self.assertTrue(
+            all(layer.hf_layer is None for layer in released_model.text_prefix.layers)
+        )
+
+        native_cfg = GemmaRoutedSpanConfig(
+            num_hidden_layers=cfg.num_hidden_layers,
+            num_kv_shared_layers=cfg.num_kv_shared_layers,
+            layer_types=tuple(cfg.layer_types),
+            num_kv_heads=cfg.num_key_value_heads,
+            head_dim=cfg.head_dim,
+            sliding_window=cfg.sliding_window,
+        )
+        live_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+        released_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+        input_ids = torch.tensor([[1, 7, 9, 11, 13]])
+        position_ids = torch.arange(input_ids.shape[1]).unsqueeze(0)
+        mask = _causal_mask(1, input_ids.shape[1], dtype=torch.float32, device=input_ids.device)
+        mask_mapping = {"sliding_attention": mask, "full_attention": mask}
+
+        with torch.inference_mode():
+            live_out = live_model(
+                input_ids=input_ids,
+                attention_mask=mask_mapping,
+                position_ids=position_ids,
+                past_key_values=live_cache,
+                use_cache=True,
+                logits_to_keep=1,
+            )
+            released_out = released_model(
+                input_ids=input_ids,
+                attention_mask=mask_mapping,
+                position_ids=position_ids,
+                past_key_values=released_cache,
+                use_cache=True,
+                logits_to_keep=1,
+            )
+
+        self.assertLess((live_out.logits - released_out.logits).abs().max().item(), 1e-6)
+        for layer_idx in range(len(live_cache.layers)):
+            self.assertLess(
+                (
+                    live_cache.layers[layer_idx].keys
+                    - released_cache.layers[layer_idx].keys
+                ).abs().max().item(),
+                1e-6,
+            )
+
+    def test_release_hf_decoder_layers_requires_owned_weight_backend(self) -> None:
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM
+        from wkvm.runner.gemma_native_forward import NativeGemma4ForCausalLM
+
+        cfg = _tiny_shared_config()
+        hf_model = Gemma4ForCausalLM(cfg).eval()
+        with self.assertRaisesRegex(ValueError, "requires native_weight_backend"):
+            NativeGemma4ForCausalLM(
+                hf_model,
+                native_weight_backend="hf_live",
+                release_hf_decoder_layers=True,
+            )
+
+    def test_packed_projection_backends_match_separate_layer(self) -> None:
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import (
+            Gemma4TextDecoderLayer,
+            Gemma4TextRotaryEmbedding,
+        )
+        from wkvm.runner.gemma_native_forward import NativeGemma4TextDecoderLayer
+
+        torch.manual_seed(47)
+        cfg = _tiny_config()
+        hf_layer = Gemma4TextDecoderLayer(cfg, layer_idx=0).eval()
+        rotary = Gemma4TextRotaryEmbedding(cfg)
+
+        hidden = torch.randn(2, 5, cfg.hidden_size)
+        per_layer_input = torch.randn(2, 5, cfg.hidden_size_per_layer_input)
+        position_ids = torch.arange(5).unsqueeze(0).expand(2, -1)
+        position_embeddings = rotary(hidden, position_ids, "sliding_attention")
+        mask = _causal_mask(2, 5, dtype=hidden.dtype, device=hidden.device)
+
+        for weight_backend in ("hf_live", "owned", "owned_cpu"):
+            for projection_backend in (
+                "qkv_packed",
+                "gate_up_packed",
+                "qkv_gate_up_packed",
+            ):
+                with self.subTest(
+                    weight_backend=weight_backend,
+                    projection_backend=projection_backend,
+                ):
+                    separate_layer = NativeGemma4TextDecoderLayer(
+                        hf_layer,
+                        native_projection_backend="separate",
+                        native_weight_backend=weight_backend,
+                    )
+                    packed_layer = NativeGemma4TextDecoderLayer(
+                        hf_layer,
+                        native_projection_backend=projection_backend,
+                        native_weight_backend=weight_backend,
+                    )
+
+                    with torch.inference_mode():
+                        expected = separate_layer(
+                            hidden,
+                            per_layer_input,
+                            shared_kv_states=UserDict(),
+                            position_embeddings=position_embeddings,
+                            attention_mask=mask,
+                            position_ids=position_ids,
+                            past_key_values=None,
+                        )
+                        actual = packed_layer(
+                            hidden,
+                            per_layer_input,
+                            shared_kv_states=UserDict(),
+                            position_embeddings=position_embeddings,
+                            attention_mask=mask,
+                            position_ids=position_ids,
+                            past_key_values=None,
+                        )
+
+                    self.assertLess((expected - actual).abs().max().item(), 2e-6)
+
+    def test_projection_backend_alias_packed_uses_qkv_and_gate_up(self) -> None:
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4TextDecoderLayer
+        from wkvm.runner.gemma_native_forward import NativeGemma4TextDecoderLayer
+
+        cfg = _tiny_config()
+        hf_layer = Gemma4TextDecoderLayer(cfg, layer_idx=0).eval()
+        native_layer = NativeGemma4TextDecoderLayer(
+            hf_layer,
+            native_projection_backend="packed",
+        )
+
+        self.assertEqual(native_layer.native_projection_backend, "qkv_gate_up_packed")
+        self.assertIsNotNone(native_layer._qkv_proj)
+        self.assertIsNotNone(native_layer._gate_up_proj)
+
+    def test_owned_packed_projection_drops_replaced_individual_snapshots(self) -> None:
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4TextDecoderLayer
+        from wkvm.runner.gemma_native_forward import NativeGemma4TextDecoderLayer
+
+        cfg = _tiny_config()
+        hf_layer = Gemma4TextDecoderLayer(cfg, layer_idx=0).eval()
+        native_layer = NativeGemma4TextDecoderLayer(
+            hf_layer,
+            native_projection_backend="qkv_gate_up_packed",
+            native_weight_backend="owned",
+        )
+
+        self.assertIsNotNone(native_layer._qkv_proj)
+        self.assertIsNone(native_layer.q_proj)
+        self.assertIsNone(native_layer.k_proj)
+        self.assertIsNone(native_layer.v_proj)
+        self.assertIsNotNone(native_layer._gate_up_proj)
+        self.assertIsNone(native_layer.mlp_gate_proj)
+        self.assertIsNone(native_layer.mlp_up_proj)
+        self.assertIsNotNone(native_layer.o_proj)
+        self.assertIsNotNone(native_layer.mlp_down_proj)
+
+    def test_qkv_and_gate_up_packed_layer_matches_separate_layer(self) -> None:
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import (
+            Gemma4TextDecoderLayer,
+            Gemma4TextRotaryEmbedding,
+        )
+        from wkvm.runner.gemma_native_forward import NativeGemma4TextDecoderLayer
+
+        torch.manual_seed(49)
+        cfg = _tiny_config()
+        hf_layer = Gemma4TextDecoderLayer(cfg, layer_idx=0).eval()
+        rotary = Gemma4TextRotaryEmbedding(cfg)
+
+        hidden = torch.randn(2, 5, cfg.hidden_size)
+        per_layer_input = torch.randn(2, 5, cfg.hidden_size_per_layer_input)
+        position_ids = torch.arange(5).unsqueeze(0).expand(2, -1)
+        position_embeddings = rotary(hidden, position_ids, "sliding_attention")
+        mask = _causal_mask(2, 5, dtype=hidden.dtype, device=hidden.device)
+
+        separate_layer = NativeGemma4TextDecoderLayer(
+            hf_layer,
+            native_projection_backend="separate",
+        )
+        packed_layer = NativeGemma4TextDecoderLayer(
+            hf_layer,
+            native_projection_backend="qkv_gate_up_packed",
+        )
+
+        with torch.inference_mode():
+            expected = separate_layer(
+                hidden,
+                per_layer_input,
+                shared_kv_states=UserDict(),
+                position_embeddings=position_embeddings,
+                attention_mask=mask,
+                position_ids=position_ids,
+                past_key_values=None,
+            )
+            actual = packed_layer(
+                hidden,
+                per_layer_input,
+                shared_kv_states=UserDict(),
+                position_embeddings=position_embeddings,
+                attention_mask=mask,
+                position_ids=position_ids,
+                past_key_values=None,
+            )
+
+        self.assertLess((expected - actual).abs().max().item(), 2e-6)
+
+    def test_owned_qkv_packed_layer_matches_owned_separate_layer(self) -> None:
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import (
+            Gemma4TextDecoderLayer,
+            Gemma4TextRotaryEmbedding,
+        )
+        from wkvm.runner.gemma_native_forward import NativeGemma4TextDecoderLayer
+
+        torch.manual_seed(47)
+        cfg = _tiny_config()
+        hf_layer = Gemma4TextDecoderLayer(cfg, layer_idx=0).eval()
+        rotary = Gemma4TextRotaryEmbedding(cfg)
+
+        hidden = torch.randn(2, 5, cfg.hidden_size)
+        per_layer_input = torch.randn(2, 5, cfg.hidden_size_per_layer_input)
+        position_ids = torch.arange(5).unsqueeze(0).expand(2, -1)
+        position_embeddings = rotary(hidden, position_ids, "sliding_attention")
+        mask = _causal_mask(2, 5, dtype=hidden.dtype, device=hidden.device)
+
+        for backend in ("owned", "owned_cpu"):
+            with self.subTest(backend=backend):
+                separate_layer = NativeGemma4TextDecoderLayer(
+                    hf_layer,
+                    native_projection_backend="separate",
+                    native_weight_backend=backend,
+                )
+                packed_layer = NativeGemma4TextDecoderLayer(
+                    hf_layer,
+                    native_projection_backend="qkv_packed",
+                    native_weight_backend=backend,
+                )
+
+                with torch.inference_mode():
+                    expected = separate_layer(
+                        hidden,
+                        per_layer_input,
+                        shared_kv_states=UserDict(),
+                        position_embeddings=position_embeddings,
+                        attention_mask=mask,
+                        position_ids=position_ids,
+                        past_key_values=None,
+                    )
+                    actual = packed_layer(
+                        hidden,
+                        per_layer_input,
+                        shared_kv_states=UserDict(),
+                        position_embeddings=position_embeddings,
+                        attention_mask=mask,
+                        position_ids=position_ids,
+                        past_key_values=None,
+                    )
+
+                self.assertLess((expected - actual).abs().max().item(), 2e-6)
+
+    def test_causal_lm_sdpa_backend_matches_manual_backend(self) -> None:
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM
+        from wkvm.models.gemma import GemmaRoutedSpanConfig
+        from wkvm.runner.gemma_native_forward import NativeGemma4ForCausalLM
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+
+        torch.manual_seed(37)
+        cfg = _tiny_shared_config()
+        hf_model = Gemma4ForCausalLM(cfg).eval()
+        manual_model = NativeGemma4ForCausalLM(
+            hf_model,
+            native_attention_backend="manual",
+        )
+        sdpa_model = NativeGemma4ForCausalLM(
+            hf_model,
+            native_attention_backend="sdpa",
+        )
+        native_cfg = GemmaRoutedSpanConfig(
+            num_hidden_layers=cfg.num_hidden_layers,
+            num_kv_shared_layers=cfg.num_kv_shared_layers,
+            layer_types=tuple(cfg.layer_types),
+            num_kv_heads=cfg.num_key_value_heads,
+            head_dim=cfg.head_dim,
+            sliding_window=cfg.sliding_window,
+        )
+        manual_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+        sdpa_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+
+        input_ids = torch.tensor([[1, 7, 9, 11, 13]])
+        position_ids = torch.arange(input_ids.shape[1]).unsqueeze(0)
+        mask = _causal_mask(1, input_ids.shape[1], dtype=torch.float32, device=input_ids.device)
+        mask_mapping = {"sliding_attention": mask, "full_attention": mask}
+
+        with torch.inference_mode():
+            manual_out = manual_model(
+                input_ids=input_ids,
+                attention_mask=mask_mapping,
+                position_ids=position_ids,
+                past_key_values=manual_cache,
+                use_cache=True,
+                logits_to_keep=1,
+            )
+            sdpa_out = sdpa_model(
+                input_ids=input_ids,
+                attention_mask=mask_mapping,
+                position_ids=position_ids,
+                past_key_values=sdpa_cache,
+                use_cache=True,
+                logits_to_keep=1,
+            )
+
+        self.assertLess((manual_out.logits - sdpa_out.logits).abs().max().item(), 1e-5)
+
+
+if __name__ == "__main__":
+    unittest.main()

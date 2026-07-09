@@ -1,0 +1,51 @@
+{
+  "attn": "sdpa",
+  "concurrency": [
+    2
+  ],
+  "context_tokens_per_session": 512,
+  "decode_tokens_per_session": 8,
+  "device": "cuda",
+  "dtype": "bfloat16",
+  "engine": "hf-transformers",
+  "git_commit": "465a478c0ccfba7699e36ee21aaa2b6c3423be22",
+  "headroom_gib": 1.0,
+  "launch_command": "/home/xiaol/X/causalab/.venv/bin/python experiments/hf_gemma_bench.py --ctx 512 --out 8 --concurrency 2 --mode batched --json experiments/results/hf_gemma_smoke_batched_ctx512_out8_b2.json --stop-on-failure",
+  "mem_cap_gib": 19.0,
+  "mode": "batched",
+  "model_path": "/run/media/xiaol/B214449214445C0B/models/gemma/gemma-4-E4B-it",
+  "notes": [
+    "Uses Hugging Face Gemma4ForCausalLM forward and full HF cache semantics.",
+    "serial mode measures one request at a time through one loaded model.",
+    "batched mode left-pads prompts and runs one HF batch with an attention mask."
+  ],
+  "prompt_lengths_mode": "staggered",
+  "rows": [
+    {
+      "B": 2,
+      "agg_decode_tok_s": 73.069,
+      "decode_seconds": 0.192,
+      "e2e_output_tok_s": 36.855,
+      "elapsed_s": 0.434,
+      "error": null,
+      "error_count": 0,
+      "green": true,
+      "mode": "batched",
+      "p50_latency_s": 0.433,
+      "p95_latency_s": 0.433,
+      "peak_reserved_gib": 14.115,
+      "prompt_lengths": [
+        512,
+        505
+      ],
+      "success_count": 2
+    }
+  ],
+  "schema": "wkvm.hf_gemma_bench.v1",
+  "summary": {
+    "best_green_agg_decode_tok_s": 73.069,
+    "bmax_green": 2,
+    "max_success_B": 2
+  },
+  "torch_usable_gib": 19.0
+}

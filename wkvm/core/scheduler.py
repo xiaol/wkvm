@@ -76,6 +76,26 @@ class Scheduler:
                 pass
         req.status = RequestStatus.FINISHED_ABORTED
 
+    def fail_request(self, req_id: str) -> Request | None:
+        """Finish a request as errored and release any owned state slot.
+
+        The runner calls this when a model execution step fails after scheduling
+        work. Keeping error completion in the scheduler prevents live requests
+        from becoming permanently stuck in RUNNING/WAITING after an exception.
+        """
+        req = self.requests.get(req_id)
+        if req is None or req.status.is_finished:
+            return None
+        if req.status is RequestStatus.RUNNING:
+            self._release(req)
+        else:
+            try:
+                self.waiting.remove(req)
+            except ValueError:
+                pass
+        req.status = RequestStatus.FINISHED_ERROR
+        return req
+
     # -- the loop ----------------------------------------------------------
 
     def schedule(self) -> SchedulerOutput:

@@ -129,6 +129,27 @@ class TestExactAdmission(unittest.TestCase):
         self.assertEqual(finished, [])
         self.assertEqual(a.output_token_ids, [])  # nothing committed post-abort
 
+    def test_fail_request_marks_error_and_frees_slot(self) -> None:
+        sched = make_scheduler(num_slots=1)
+        a = Request(prompt_token_ids=[1, 2, 3], max_new_tokens=8, req_id="a")
+        b = Request(prompt_token_ids=[4, 5, 6], max_new_tokens=8, req_id="b")
+        sched.add_request(a)
+        sched.add_request(b)
+
+        sched.schedule()
+        self.assertFalse(sched.arena.can_admit())
+
+        failed = sched.fail_request("a")
+        self.assertIs(failed, a)
+        self.assertIs(a.status, RequestStatus.FINISHED_ERROR)
+        self.assertTrue(sched.arena.can_admit())
+        self.assertEqual(list(sched.waiting), [b])
+
+        failed_waiting = sched.fail_request("b")
+        self.assertIs(failed_waiting, b)
+        self.assertIs(b.status, RequestStatus.FINISHED_ERROR)
+        self.assertEqual(list(sched.waiting), [])
+
 
 class TestStopConditions(unittest.TestCase):
     def test_stop_token_finishes_request(self) -> None:

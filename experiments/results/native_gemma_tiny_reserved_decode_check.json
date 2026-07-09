@@ -1,0 +1,67 @@
+{
+  "attn": "sdpa",
+  "concurrency": [
+    2
+  ],
+  "config": {
+    "chunk": 256,
+    "decode_microbatch_bytes": null,
+    "decode_microbatch_rows": 16,
+    "m_slots": 64,
+    "route_chunk": 128,
+    "sink": 16,
+    "slots": null,
+    "token_budget": null,
+    "window": 1024
+  },
+  "context_tokens_per_session": 512,
+  "decode_tokens_per_session": 4,
+  "device": "cuda",
+  "dtype": "bfloat16",
+  "engine": "wkvm-native",
+  "git_commit": "465a478c0ccfba7699e36ee21aaa2b6c3423be22",
+  "headroom_gib": 1.0,
+  "launch_command": "/home/xiaol/X/causalab/.venv/bin/python experiments/native_gemma_bench.py --ctx 512 --out 4 --concurrency 2 --prompt-lengths staggered --json experiments/results/native_gemma_tiny_reserved_decode_check.json --chunk 256 --route-chunk 128 --max-steps 1000 --decode-microbatch-rows 16",
+  "mem_cap_gib": 19.0,
+  "model_path": "/run/media/xiaol/B214449214445C0B/models/gemma/gemma-4-E4B-it",
+  "prompt_lengths_mode": "staggered",
+  "rows": [
+    {
+      "B": 2,
+      "agg_decode_tok_s": 34.606,
+      "batched_decode_model_calls": 3,
+      "decode_batch_fallback_reasons": {},
+      "decode_microbatch_byte_splits": 0,
+      "decode_microbatch_splits": 0,
+      "decode_model_calls": 3,
+      "e2e_output_tok_s": 20.335,
+      "elapsed_s": 0.393,
+      "error": null,
+      "error_count": 0,
+      "exact_decode_batch_rows": 0,
+      "fallback_decode_model_calls": 0,
+      "green": true,
+      "max_decode_batch_rows": 2,
+      "max_decode_model_batch_bytes": 58818560,
+      "max_decode_model_batch_rows": 2,
+      "max_resident_state_slots": 2,
+      "p50_latency_s": 0.388,
+      "p95_latency_s": 0.389,
+      "padded_decode_batch_rows": 6,
+      "peak_reserved_gib": 14.094,
+      "prompt_lengths": [
+        512,
+        505
+      ],
+      "steps": 4,
+      "success_count": 2
+    }
+  ],
+  "schema": "wkvm.native_gemma_bench.v1",
+  "summary": {
+    "best_green_agg_decode_tok_s": 34.606,
+    "bmax_green": 2,
+    "max_success_B": 2
+  },
+  "torch_usable_gib": 19.0
+}

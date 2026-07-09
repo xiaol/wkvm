@@ -1,0 +1,63 @@
+{
+  "concurrency": [
+    1
+  ],
+  "context_tokens_per_session": 512,
+  "decode_tokens_per_session": 8,
+  "dtype": "bfloat16",
+  "engine": "vllm",
+  "engine_config": {
+    "enforce_eager": false,
+    "gpu_memory_utilization": 0.82,
+    "max_model_len": 640,
+    "mm_note": "limit_mm_per_prompt={image:0,audio:0}",
+    "prefix_caching": false,
+    "vllm_version": "0.24.0"
+  },
+  "git_commit": "465a478c0ccfba7699e36ee21aaa2b6c3423be22",
+  "headroom_gib": 1.0,
+  "launch_command": "/run/media/xiaol/B214449214445C0B/wkvm_bench/venvs/vllm/bin/python experiments/incumbent_gemma_bench.py --engine vllm --ctx 512 --out 8 --concurrency 1 --json experiments/results/vllm_gemma_smoke_ctx512_out8_b1.json --max-model-len 640 --vllm-gpu-mem-util 0.82 --stop-on-failure",
+  "mem_cap_gib": 19.0,
+  "memory": {
+    "baseline_gpu_mib": 2152,
+    "green_note": "green uses peak_engine_delta_gib when available; this is whole-GPU peak minus whole-GPU baseline sampled before engine load",
+    "peak_engine_delta_gib": 20.124,
+    "peak_gpu_mib": 22759
+  },
+  "model_path": "/run/media/xiaol/B214449214445C0B/models/gemma/gemma-4-E4B-it",
+  "prompt_lengths_mode": "staggered",
+  "rows": [
+    {
+      "B": 1,
+      "agg_decode_tok_s": 88.939,
+      "baseline_gpu_mib": 2152,
+      "decode_seconds": 0.079,
+      "e2e_output_tok_s": 68.54,
+      "elapsed_s": 0.117,
+      "error": null,
+      "error_count": 0,
+      "green": false,
+      "output_token_counts": [
+        8
+      ],
+      "p50_latency_s": 0.117,
+      "p95_latency_s": 0.117,
+      "peak_alloc_gib": 0.0,
+      "peak_engine_delta_gib": 20.124,
+      "peak_gpu_mib": 22759,
+      "peak_reserved_gib": 0.0,
+      "prefill_plus_first_s": 0.038,
+      "prompt_lengths": [
+        512
+      ],
+      "success_count": 1
+    }
+  ],
+  "schema": "wkvm.incumbent_gemma_bench.v1",
+  "summary": {
+    "best_green_agg_decode_tok_s": 0.0,
+    "bmax_green": 0,
+    "max_success_B": 1
+  },
+  "warmup": true
+}

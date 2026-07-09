@@ -20,6 +20,7 @@ class RequestStatus(enum.Enum):
     FINISHED_STOPPED = enum.auto()  # stop token / stop condition
     FINISHED_LENGTH = enum.auto()  # max_new_tokens reached
     FINISHED_ABORTED = enum.auto()
+    FINISHED_ERROR = enum.auto()
 
     @property
     def is_finished(self) -> bool:
@@ -27,6 +28,7 @@ class RequestStatus(enum.Enum):
             RequestStatus.FINISHED_STOPPED,
             RequestStatus.FINISHED_LENGTH,
             RequestStatus.FINISHED_ABORTED,
+            RequestStatus.FINISHED_ERROR,
         )
 
 
