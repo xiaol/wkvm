@@ -2400,6 +2400,57 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertIsNone(resolved_paged)
         self.assertIsNone(resolved_pool)
 
+    def test_decode_context_owns_mask_and_covered_layer_policy(self) -> None:
+        from types import SimpleNamespace
+
+        from wkvm.runner.gemma_token_pool import (
+            TokenPoolDecodeBackendState,
+            TokenPoolDecodeContext,
+        )
+
+        full_mask = object()
+        sliding_mask = object()
+        mask = {"full_attention": full_mask, "sliding_attention": sliding_mask}
+        context = TokenPoolDecodeContext(
+            metadata_by_layer_type={
+                "sliding_attention": SimpleNamespace(out_cache_loc=object())
+            },
+            kv_pool=object(),
+        )
+
+        self.assertEqual(
+            context.covered_decode_layer_types(),
+            frozenset({"sliding_attention"}),
+        )
+        self.assertEqual(
+            TokenPoolDecodeBackendState.covered_decode_layer_types(context),
+            frozenset({"sliding_attention"}),
+        )
+        adjusted = context.attention_mask_for_decode(mask)
+        self.assertIsNot(adjusted, mask)
+        self.assertIs(adjusted["full_attention"], full_mask)
+        self.assertIsNone(adjusted["sliding_attention"])
+        self.assertIs(mask["sliding_attention"], sliding_mask)
+
+        explicit = TokenPoolDecodeContext(
+            metadata_by_layer_type={
+                "sliding_attention": SimpleNamespace(out_cache_loc=object()),
+                "full_attention": SimpleNamespace(out_cache_loc=None),
+            },
+            kv_pool=object(),
+            covered_layer_types=frozenset({"full_attention"}),
+        )
+        self.assertEqual(
+            explicit.covered_decode_layer_types(),
+            frozenset({"full_attention"}),
+        )
+        explicit_adjusted = TokenPoolDecodeBackendState.attention_mask_for_decode(
+            mask,
+            explicit,
+        )
+        self.assertIsNone(explicit_adjusted["full_attention"])
+        self.assertIs(explicit_adjusted["sliding_attention"], sliding_mask)
+
     def test_attention_binding_owns_current_kv_write(self) -> None:
         try:
             import torch  # noqa: F401

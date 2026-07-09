@@ -996,6 +996,12 @@ class TokenPoolDecodeContext:
                 )
         object.__setattr__(self, "_layer_bindings_by_id", bindings)
 
+    def covered_decode_layer_types(self) -> frozenset[str]:
+        return token_pool_decode_covered_layer_types(self)
+
+    def attention_mask_for_decode(self, attention_mask: Any) -> Any:
+        return token_pool_attention_mask_for_decode(attention_mask, self)
+
     def metadata_for_layer(
         self,
         layer_idx: int | None,
@@ -1122,6 +1128,63 @@ class TokenPoolDecodeContext:
             kv_pool=token_kv_pool,
             attention_workspace=self.attention_workspace,
         )
+
+
+def token_pool_decode_covered_layer_types(
+    token_pool_decode: Any | None,
+) -> frozenset[str]:
+    if token_pool_decode is None:
+        return frozenset()
+    if getattr(token_pool_decode, "kv_pool", None) is None:
+        return frozenset()
+    explicit_covered = getattr(token_pool_decode, "covered_layer_types", None)
+    if explicit_covered is not None:
+        return frozenset(str(layer_type) for layer_type in explicit_covered)
+    metadata_by_layer_type = getattr(token_pool_decode, "metadata_by_layer_type", None)
+    if not metadata_by_layer_type:
+        return frozenset()
+    covered = {
+        str(layer_type)
+        for layer_type, metadata in metadata_by_layer_type.items()
+        if metadata is not None and getattr(metadata, "out_cache_loc", None) is not None
+    }
+    return frozenset(covered)
+
+
+def token_pool_attention_mask_for_decode(
+    attention_mask: Any,
+    token_pool_decode: Any | None,
+) -> Any:
+    if token_pool_decode is None or not isinstance(attention_mask, dict):
+        return attention_mask
+    explicit_covered = getattr(token_pool_decode, "covered_layer_types", None)
+    if explicit_covered is not None:
+        covered = {str(layer_type) for layer_type in explicit_covered}
+        adjusted = dict(attention_mask)
+        changed = False
+        for layer_type in ("full_attention", "sliding_attention"):
+            if layer_type not in covered:
+                continue
+            if layer_type in adjusted:
+                adjusted[layer_type] = None
+                changed = True
+        return adjusted if changed else attention_mask
+    metadata_by_layer_type = getattr(token_pool_decode, "metadata_by_layer_type", None)
+    if not metadata_by_layer_type:
+        return attention_mask
+    adjusted = None
+    for layer_type in ("full_attention", "sliding_attention"):
+        metadata = metadata_by_layer_type.get(layer_type)
+        if metadata is None or getattr(metadata, "out_cache_loc", None) is None:
+            continue
+        if attention_mask.get(layer_type) is None:
+            continue
+        if adjusted is None:
+            adjusted = dict(attention_mask)
+        adjusted[layer_type] = None
+    if adjusted is None:
+        return attention_mask
+    return adjusted
 
 
 def _env_flag(name: str) -> bool:
@@ -4281,6 +4344,19 @@ class TokenPoolDecodeBackendState:
                     if tensor is not None and not bool(getattr(tensor, "is_cuda", False)):
                         return False
         return True
+
+    @staticmethod
+    def covered_decode_layer_types(
+        token_pool_decode: Any | None,
+    ) -> frozenset[str]:
+        return token_pool_decode_covered_layer_types(token_pool_decode)
+
+    @staticmethod
+    def attention_mask_for_decode(
+        attention_mask: Any,
+        token_pool_decode: Any | None,
+    ) -> Any:
+        return token_pool_attention_mask_for_decode(attention_mask, token_pool_decode)
 
     @property
     def page_table_tensor(self):

@@ -1751,55 +1751,18 @@ class GemmaRoutedSpanRunner:
 
 
 def _attention_mask_for_token_pool_decode(attention_mask, token_pool_decode):
-    if token_pool_decode is None or not isinstance(attention_mask, dict):
-        return attention_mask
-    explicit_covered = getattr(token_pool_decode, "covered_layer_types", None)
-    if explicit_covered is not None:
-        covered = {str(layer_type) for layer_type in explicit_covered}
-        adjusted = dict(attention_mask)
-        changed = False
-        for layer_type in ("full_attention", "sliding_attention"):
-            if layer_type not in covered:
-                continue
-            if layer_type in adjusted:
-                adjusted[layer_type] = None
-                changed = True
-        return adjusted if changed else attention_mask
-    metadata_by_layer_type = getattr(token_pool_decode, "metadata_by_layer_type", None)
-    if not metadata_by_layer_type:
-        return attention_mask
-    adjusted = None
-    for layer_type in ("full_attention", "sliding_attention"):
-        metadata = metadata_by_layer_type.get(layer_type)
-        if metadata is None or getattr(metadata, "out_cache_loc", None) is None:
-            continue
-        if attention_mask.get(layer_type) is None:
-            continue
-        if adjusted is None:
-            adjusted = dict(attention_mask)
-        adjusted[layer_type] = None
-    if adjusted is None:
-        return attention_mask
-    return adjusted
+    from wkvm.runner.gemma_token_pool import TokenPoolDecodeBackendState
+
+    return TokenPoolDecodeBackendState.attention_mask_for_decode(
+        attention_mask,
+        token_pool_decode,
+    )
 
 
 def _token_pool_covered_layer_types(token_pool_decode) -> frozenset[str]:
-    if token_pool_decode is None:
-        return frozenset()
-    if getattr(token_pool_decode, "kv_pool", None) is None:
-        return frozenset()
-    explicit_covered = getattr(token_pool_decode, "covered_layer_types", None)
-    if explicit_covered is not None:
-        return frozenset(str(layer_type) for layer_type in explicit_covered)
-    metadata_by_layer_type = getattr(token_pool_decode, "metadata_by_layer_type", None)
-    if not metadata_by_layer_type:
-        return frozenset()
-    covered = {
-        str(layer_type)
-        for layer_type, metadata in metadata_by_layer_type.items()
-        if metadata is not None and getattr(metadata, "out_cache_loc", None) is not None
-    }
-    return frozenset(covered)
+    from wkvm.runner.gemma_token_pool import TokenPoolDecodeBackendState
+
+    return TokenPoolDecodeBackendState.covered_decode_layer_types(token_pool_decode)
 
 
 class _GraphedPaddedDecodeStep:
