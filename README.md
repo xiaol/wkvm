@@ -14,7 +14,7 @@ Previous ring/concurrency demo: [`experiments/results/gemma_wkvm_style_demo.mp4`
 
 ## Routed-span vs vLLM/SGLang
 
-Gemma-4-E4B-it on one RTX 4090. vLLM and SGLang are full-KV transformer engines; wkvm routed-span is approximate recurrent mode (`sink16 + ring1024 + routed span bank m64`), so this is a memory/throughput comparison, not a same-semantics quality claim. Rows labelled `wkvm-native` use the native wkvm scheduler/arena/runner/server boundary, but still call HF Gemma model math; older rows labelled PoC are retained only as historical context.
+Gemma-4-E4B-it on one RTX 4090. vLLM and SGLang are full-KV transformer engines; wkvm routed-span is approximate recurrent mode (`sink16 + ring1024 + routed span bank m64`), so this is a memory/throughput comparison, not a same-semantics quality claim. Rows labelled `wkvm-native` use the native wkvm scheduler/arena/runner/server boundary. Older native rows reused HF Gemma module math; current checkpoint-native rows in [`experiments/results/gemma_native_vllm_sglang_current_compare_20260708.md`](experiments/results/gemma_native_vllm_sglang_current_compare_20260708.md) report `uses_hf_transformer_forward=false` and `uses_hf_model_construction=false`. Older rows labelled PoC are retained only as historical context.
 
 **Single long prompt + long output**: 13,824-token prompt + 512-token output, greedy decode, `ignore_eos=True`.
 
@@ -34,7 +34,7 @@ Gemma-4-E4B-it on one RTX 4090. vLLM and SGLang are full-KV transformer engines;
 | vLLM 0.24.0 | nearest 16,384 ctx full-KV run | 9 cap; N=8 measured | 285.6 tok/s | 21.81 GiB device used; 18.26 GiB alloc | wall 13.42s at N=8; p50/p95 not recorded | [`bench`](experiments/results/bench_vllm_gemma4e4b.md) |
 | SGLang 0.5.14 | nearest 16,384 ctx full-KV run | 1 true concurrent; N=8 queue-limited | 68 tok/s | 25,360-token KV pool on this stack | queue-limited; p50/p95 not recorded | [`bench`](experiments/results/bench_sglang_gemma4e4b.md) |
 
-Readout: routed-span is slower for one exact long generation than vLLM/SGLang full-KV, and the current native engine is only modestly faster than green HF Transformers on aggregate decode (**57.9 vs 52.6 tok/s**) while supporting many more resident long sessions (**32 vs 2**). The measured advantage is bounded-memory long-context concurrency when approximate recurrent semantics are acceptable; it is not a replacement for full-KV serving when exact transformer behavior is required.
+Readout: routed-span is slower for one exact long generation than vLLM/SGLang full-KV, and the shown routed-span native row is only modestly faster than green HF Transformers on aggregate decode (**57.9 vs 52.6 tok/s**) while supporting many more resident long sessions (**32 vs 2**). The measured advantage is bounded-memory long-context concurrency when approximate recurrent semantics are acceptable; it is not a replacement for full-KV serving when exact transformer behavior is required.
 
 ### Serving-path benchmark
 
