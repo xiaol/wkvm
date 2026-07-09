@@ -177,6 +177,33 @@ class TokenPoolFullAttentionPreparedDecodeRow:
     invalidated_existing_rows: int = 0
 
 
+@dataclass(frozen=True)
+class TokenPoolFullAttentionPreparedBatch:
+    metadata: DecodeBatchMetadata
+    paged_metadata: PagedDecodeBatchMetadata | None
+    prepared_rows: tuple[TokenPoolFullAttentionPreparedDecodeRow, ...]
+    req_ids: tuple[str, ...]
+    req_slots: tuple[int, ...]
+    out_cache_loc: tuple[int, ...]
+    logical_seq_lens: tuple[int, ...]
+
+    @property
+    def invalidated_existing_rows(self) -> int:
+        return sum(int(row.invalidated_existing_rows) for row in self.prepared_rows)
+
+    @property
+    def reused_existing_rows(self) -> int:
+        return sum(1 for row in self.prepared_rows if row.reused_existing_row)
+
+    @property
+    def appended_existing_rows(self) -> int:
+        return sum(1 for row in self.prepared_rows if row.appended_existing_row)
+
+    @property
+    def rebuilt_persistent_rows(self) -> int:
+        return sum(1 for row in self.prepared_rows if row.rebuilt_persistent_row)
+
+
 class TokenPoolFullAttentionRowManager:
     """Backend-owned lifecycle for materialized full-attention token rows."""
 
@@ -4021,6 +4048,147 @@ class TokenPoolDecodeBackendState:
             max_seq_len=padded_paged_row_len,
             workspace=self.decode_metadata_workspace,
             workspace_key="full_attention_paged",
+        )
+
+    def prepare_full_attention_decode_batch(
+        self,
+        *,
+        requests: Iterable[Any],
+        reservations: Iterable[Any],
+        caches_by_req_id: Any,
+        owner_layer_ids: Iterable[int],
+        kv_indices_padding_steps: int = 0,
+        persistent_rows: bool = False,
+        build_paged_rows: bool = False,
+    ) -> TokenPoolFullAttentionPreparedBatch:
+        pool = self.kv_pool
+        row_manager = self.full_attention_rows
+        if pool is None or row_manager is None:
+            raise RuntimeError("full-attention token-pool backend is not initialized")
+
+        request_list = list(requests)
+        reservation_list = list(reservations)
+        if len(request_list) != len(reservation_list):
+            raise ValueError("requests length must match reservations")
+        if not request_list:
+            raise ValueError("full-attention decode batch requires requests")
+        owner_layer_id_list = [int(layer_id) for layer_id in owner_layer_ids]
+        if not owner_layer_id_list:
+            raise ValueError("full-attention decode batch requires owner layers")
+
+        rows: list[TokenSlotRowChunks] = []
+        paged_rows: list[list[int]] = []
+        logical_lens: list[int] = []
+        req_slots: list[int] = []
+        out_cache_loc: list[int] = []
+        req_ids: list[str] = []
+        prepared_rows: list[TokenPoolFullAttentionPreparedDecodeRow] = []
+        append_reserve_slots = max(1, int(kv_indices_padding_steps) + 1)
+
+        for request, reservation in zip(request_list, reservation_list):
+            req_id = str(getattr(request, "req_id", request))
+            req_ids.append(req_id)
+            if hasattr(caches_by_req_id, "get"):
+                cache = caches_by_req_id.get(req_id)
+            else:
+                cache = caches_by_req_id[req_id]
+            if cache is None:
+                raise RuntimeError(
+                    f"{req_id}: missing cache for full-attention token-pool metadata"
+                )
+            cache_layers = getattr(cache, "layers", None)
+            if cache_layers is None:
+                raise RuntimeError(f"{req_id}: missing native cache layers")
+
+            materialized_width: int | None = None
+            routed_layers: list[tuple[int, Any, Any]] = []
+            for layer_id in owner_layer_id_list:
+                if layer_id >= len(cache_layers):
+                    raise RuntimeError(
+                        f"{req_id}: missing full-attention layer {layer_id}"
+                    )
+                layer = cache_layers[layer_id]
+                writer = getattr(layer, "write_materialized_readout_to_token_pool", None)
+                if writer is None:
+                    raise RuntimeError(
+                        f"{req_id}: layer {layer_id} cannot backfill materialized KV"
+                    )
+                materialized_tokens = getattr(layer, "materialized_tokens", None)
+                if materialized_tokens is None:
+                    raise RuntimeError(
+                        f"{req_id}: layer {layer_id} has no materialized width"
+                    )
+                width = int(materialized_tokens())
+                if materialized_width is None:
+                    materialized_width = width
+                elif width != materialized_width:
+                    raise RuntimeError(
+                        f"{req_id}: full-attention materialized widths differ"
+                    )
+                routed_layers.append((layer_id, layer, writer))
+            materialized_width = int(materialized_width or 0)
+
+            prepared_row = row_manager.prepare_decode_row(
+                req_id,
+                materialized_width=materialized_width,
+                decode_token_slot=int(getattr(reservation, "token_slot")),
+                decode_token_slot_tensor=getattr(reservation, "token_slot_tensor"),
+                persistent_rows=persistent_rows,
+                build_paged_rows=build_paged_rows,
+                append_reserve_slots=append_reserve_slots,
+                device=pool.device,
+            )
+            full_token_slot = int(prepared_row.full_token_slot)
+            if persistent_rows:
+                setattr(reservation, "full_attention_token_slot", full_token_slot)
+
+            if materialized_width and not prepared_row.reused_existing_row:
+                for layer_id, _layer, writer in routed_layers:
+                    writer(
+                        pool,
+                        prepared_row.materialized_slots,
+                        layer_id=int(layer_id),
+                        token_slots_long=prepared_row.materialized_slots_long,
+                        token_slot_ids=prepared_row.materialized_slot_ids,
+                    )
+
+            rows.append(prepared_row.row_chunks)
+            req_slots.append(int(getattr(reservation, "req_slot")))
+            out_cache_loc.append(full_token_slot)
+            first_layer = routed_layers[0][1]
+            logical_lens.append(int(getattr(first_layer, "cumulative_length")) + 1)
+            if prepared_row.paged_row is not None:
+                paged_rows.append(prepared_row.paged_row)
+            prepared_rows.append(prepared_row)
+
+        metadata = self.build_full_attention_decode_metadata(
+            rows=rows,
+            req_slots=req_slots,
+            logical_seq_lens=logical_lens,
+            out_cache_loc=out_cache_loc,
+            kv_indices_padding_steps=kv_indices_padding_steps,
+            trusted_aux_metadata=True,
+        )
+        paged_metadata = None
+        if build_paged_rows and paged_rows:
+            try:
+                paged_metadata = self.build_full_attention_paged_decode_metadata(
+                    paged_rows=paged_rows,
+                    req_slots=req_slots,
+                    logical_seq_lens=logical_lens,
+                    out_cache_loc=out_cache_loc,
+                    kv_indices_padding_steps=kv_indices_padding_steps,
+                )
+            except (RuntimeError, ValueError, KeyError):
+                paged_metadata = None
+        return TokenPoolFullAttentionPreparedBatch(
+            metadata=metadata,
+            paged_metadata=paged_metadata,
+            prepared_rows=tuple(prepared_rows),
+            req_ids=tuple(req_ids),
+            req_slots=tuple(req_slots),
+            out_cache_loc=tuple(out_cache_loc),
+            logical_seq_lens=tuple(logical_lens),
         )
 
     def build_decode_context(

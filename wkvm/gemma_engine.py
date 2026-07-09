@@ -2864,12 +2864,10 @@ class GemmaNativeEngine:
         persistent_rows: bool = False,
     ) -> tuple[DecodeBatchMetadata | None, PagedDecodeBatchMetadata | None]:
         pool = self._token_kv_pool
-        allocator = self._token_slot_allocator
         backend = self._token_pool_decode_backend
-        if pool is None or allocator is None or backend is None:
+        if pool is None or backend is None:
             return None, None
-        row_manager = backend.full_attention_rows
-        if row_manager is None:
+        if backend.full_attention_rows is None:
             return None, None
         owner_layer_ids = self._token_pool_full_attention_owner_layer_ids()
         if not owner_layer_ids:
@@ -2891,106 +2889,29 @@ class GemmaNativeEngine:
         build_paged_rows = bool(
             persistent_rows and _token_pool_full_attention_paged_metadata_requested()
         )
-        rows = []
-        paged_rows: list[list[int]] = []
-        logical_lens: list[int] = []
-        req_slots: list[int] = []
-        out_cache_loc: list[int] = []
         try:
-            for req, reservation in zip(reqs, reservations):
-                cache = self._caches.get(req.req_id)
-                if cache is None:
-                    raise DistinctCacheBatchError(
-                        f"{req.req_id}: missing cache for full-attention token-pool metadata"
-                    )
-                cache_layers = getattr(cache, "layers", None)
-                if cache_layers is None:
-                    raise DistinctCacheBatchError(
-                        f"{req.req_id}: missing native cache layers"
-                    )
-                materialized_width: int | None = None
-                routed_layers = []
-                for layer_id in owner_layer_ids:
-                    if layer_id >= len(cache_layers):
-                        raise DistinctCacheBatchError(
-                            f"{req.req_id}: missing full-attention layer {layer_id}"
-                        )
-                    layer = cache_layers[layer_id]
-                    writer = getattr(layer, "write_materialized_readout_to_token_pool", None)
-                    if writer is None:
-                        raise DistinctCacheBatchError(
-                            f"{req.req_id}: layer {layer_id} cannot backfill materialized KV"
-                        )
-                    width = int(layer.materialized_tokens())
-                    if materialized_width is None:
-                        materialized_width = width
-                    elif width != materialized_width:
-                        raise DistinctCacheBatchError(
-                            f"{req.req_id}: full-attention materialized widths differ"
-                        )
-                    routed_layers.append((layer_id, layer, writer))
-                materialized_width = int(materialized_width or 0)
-                append_reserve_slots = max(1, int(kv_indices_padding_steps) + 1)
-                prepared_row = row_manager.prepare_decode_row(
-                    req.req_id,
-                    materialized_width=materialized_width,
-                    decode_token_slot=reservation.token_slot,
-                    decode_token_slot_tensor=reservation.token_slot_tensor,
-                    persistent_rows=persistent_rows,
-                    build_paged_rows=build_paged_rows,
-                    append_reserve_slots=append_reserve_slots,
-                    device=pool.device,
-                )
-                if prepared_row.invalidated_existing_rows:
-                    self.metrics.token_pool_full_attention_row_invalidations += (
-                        prepared_row.invalidated_existing_rows
-                    )
-                full_token_slot = prepared_row.full_token_slot
-                if persistent_rows:
-                    reservation.full_attention_token_slot = full_token_slot
-                if materialized_width and not prepared_row.reused_existing_row:
-                    for layer_id, _layer, writer in routed_layers:
-                        writer(
-                            pool,
-                            prepared_row.materialized_slots,
-                            layer_id=int(layer_id),
-                            token_slots_long=prepared_row.materialized_slots_long,
-                            token_slot_ids=prepared_row.materialized_slot_ids,
-                        )
-                rows.append(prepared_row.row_chunks)
-                req_slots.append(reservation.req_slot)
-                out_cache_loc.append(full_token_slot)
-                first_layer = routed_layers[0][1]
-                logical_lens.append(int(first_layer.cumulative_length) + 1)
-                if prepared_row.paged_row is not None:
-                    paged_rows.append(prepared_row.paged_row)
-                if prepared_row.reused_existing_row:
-                    self.metrics.token_pool_full_attention_row_reuses += 1
-                if prepared_row.appended_existing_row:
-                    self.metrics.token_pool_full_attention_row_appends += 1
-                if prepared_row.rebuilt_persistent_row:
-                    self.metrics.token_pool_full_attention_row_rebuilds += 1
-            metadata = backend.build_full_attention_decode_metadata(
-                rows=rows,
-                req_slots=req_slots,
-                logical_seq_lens=logical_lens,
-                out_cache_loc=out_cache_loc,
+            prepared_batch = backend.prepare_full_attention_decode_batch(
+                requests=reqs,
+                reservations=reservations,
+                caches_by_req_id=self._caches,
+                owner_layer_ids=owner_layer_ids,
                 kv_indices_padding_steps=kv_indices_padding_steps,
-                trusted_aux_metadata=True,
+                persistent_rows=persistent_rows,
+                build_paged_rows=build_paged_rows,
             )
-            paged_metadata = None
-            if build_paged_rows and paged_rows:
-                try:
-                    paged_metadata = backend.build_full_attention_paged_decode_metadata(
-                        paged_rows=paged_rows,
-                        req_slots=req_slots,
-                        logical_seq_lens=logical_lens,
-                        out_cache_loc=out_cache_loc,
-                        kv_indices_padding_steps=kv_indices_padding_steps,
-                    )
-                except (RuntimeError, ValueError, KeyError):
-                    paged_metadata = None
-            return metadata, paged_metadata
+            self.metrics.token_pool_full_attention_row_invalidations += (
+                prepared_batch.invalidated_existing_rows
+            )
+            self.metrics.token_pool_full_attention_row_reuses += (
+                prepared_batch.reused_existing_rows
+            )
+            self.metrics.token_pool_full_attention_row_appends += (
+                prepared_batch.appended_existing_rows
+            )
+            self.metrics.token_pool_full_attention_row_rebuilds += (
+                prepared_batch.rebuilt_persistent_rows
+            )
+            return prepared_batch.metadata, prepared_batch.paged_metadata
         except (DistinctCacheBatchError, RuntimeError, ValueError, KeyError):
             self._token_pool_clear_full_attention_rows(req_ids)
             return None, None

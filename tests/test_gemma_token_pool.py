@@ -1005,6 +1005,128 @@ class TestGemmaTokenPool(unittest.TestCase):
             backend.decode_metadata_workspace.paged_workspace("full_attention_paged"),
         )
 
+    def test_decode_backend_prepares_full_attention_batch_and_backfills_kv(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from types import SimpleNamespace
+
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenKVLayerSpec,
+            TokenKVPool,
+            TokenPoolDecodeBackendState,
+        )
+
+        class FullAttentionLayer:
+            def __init__(self) -> None:
+                self.keys = torch.arange(6, dtype=torch.float32).reshape(1, 1, 3, 2)
+                self.values = self.keys + 100
+                self.cumulative_length = 7
+                self.write_calls = []
+
+            def materialized_tokens(self) -> int:
+                return int(self.keys.shape[2])
+
+            def write_materialized_readout_to_token_pool(
+                self,
+                token_kv_pool,
+                token_slots,
+                *,
+                layer_id=None,
+                token_slots_long=None,
+                token_slot_ids=None,
+            ) -> None:
+                self.write_calls.append(
+                    {
+                        "layer_id": int(layer_id),
+                        "token_slot_ids": list(token_slot_ids or []),
+                    }
+                )
+                slots = token_slots_long if token_slots_long is not None else token_slots
+                token_kv_pool.set_kv(
+                    int(layer_id),
+                    slots,
+                    self.keys[0].permute(1, 0, 2).contiguous(),
+                    self.values[0].permute(1, 0, 2).contiguous(),
+                )
+
+        table = ReqToTokenTable(max_requests=1, max_context_len=8)
+        pool = TokenKVPool(
+            capacity=16,
+            layer_specs=[
+                TokenKVLayerSpec(
+                    layer_id=1,
+                    num_kv_heads=1,
+                    head_dim=2,
+                    dtype=torch.float32,
+                )
+            ],
+            dtype=torch.float32,
+            device="cpu",
+        )
+        backend = TokenPoolDecodeBackendState(
+            table=table,
+            allocator=pool,
+            kv_pool=pool,
+            block_size=4,
+            token_pool_capacity=pool.capacity,
+        )
+        layer = FullAttentionLayer()
+        request = SimpleNamespace(req_id="req")
+        reservation = SimpleNamespace(
+            req_slot=0,
+            token_slot=8,
+            token_slot_tensor=torch.tensor([8], dtype=torch.int32),
+            full_attention_token_slot=None,
+        )
+
+        first = backend.prepare_full_attention_decode_batch(
+            requests=[request],
+            reservations=[reservation],
+            caches_by_req_id={"req": SimpleNamespace(layers=[None, layer])},
+            owner_layer_ids=[1],
+            kv_indices_padding_steps=1,
+            persistent_rows=True,
+        )
+
+        self.assertEqual(len(layer.write_calls), 1)
+        self.assertEqual(layer.write_calls[0]["token_slot_ids"], [0, 1, 2])
+        self.assertEqual(reservation.full_attention_token_slot, 3)
+        self.assertEqual(first.out_cache_loc, (3,))
+        self.assertEqual(first.metadata.out_cache_loc.tolist(), [3])
+        self.assertEqual(first.metadata.kv_indices.tolist(), [0, 1, 2, 3, 3])
+        self.assertEqual(first.rebuilt_persistent_rows, 1)
+        gathered_k, gathered_v = pool.gather_kv(1, [0, 1, 2])
+        self.assertTrue(torch.equal(gathered_k, layer.keys[0].permute(1, 0, 2)))
+        self.assertTrue(torch.equal(gathered_v, layer.values[0].permute(1, 0, 2)))
+
+        layer.keys = torch.arange(8, dtype=torch.float32).reshape(1, 1, 4, 2)
+        layer.values = layer.keys + 100
+        layer.cumulative_length = 8
+        reuse_reservation = SimpleNamespace(
+            req_slot=0,
+            token_slot=9,
+            token_slot_tensor=torch.tensor([9], dtype=torch.int32),
+            full_attention_token_slot=None,
+        )
+        second = backend.prepare_full_attention_decode_batch(
+            requests=[request],
+            reservations=[reuse_reservation],
+            caches_by_req_id={"req": SimpleNamespace(layers=[None, layer])},
+            owner_layer_ids=[1],
+            persistent_rows=True,
+        )
+
+        self.assertEqual(len(layer.write_calls), 1)
+        self.assertEqual(reuse_reservation.full_attention_token_slot, 4)
+        self.assertEqual(second.reused_existing_rows, 1)
+        self.assertEqual(second.appended_existing_rows, 1)
+        self.assertEqual(second.rebuilt_persistent_rows, 0)
+        self.assertEqual(second.metadata.kv_indices.tolist(), [0, 1, 2, 3, 4])
+
     def test_req_to_token_table_reuses_decode_metadata_workspace_by_key(self) -> None:
         try:
             import torch
