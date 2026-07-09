@@ -2438,6 +2438,64 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         engine._token_pool_release_request(req.req_id)
         self.assertEqual(engine.stats()["token_pool"]["allocated_token_slots"], 0)
 
+    def test_token_pool_clear_prefix_reclaims_page_blocks_without_dropped_slots(self) -> None:
+        import torch
+        from wkvm.gemma_engine import GemmaNativeEngine
+        from wkvm.models.gemma import gemma4_e4b_routed_span_config
+
+        class FakeNativeTokenPoolModel:
+            wkvm_no_hf_transformer_forward = True
+
+            def __init__(self) -> None:
+                self._param = torch.empty((), dtype=torch.float32)
+                self.config = SimpleNamespace(num_attention_heads=2)
+                attn = SimpleNamespace(
+                    layer_type="sliding_attention",
+                    is_kv_shared_layer=False,
+                    num_key_value_groups=2,
+                    head_dim=4,
+                )
+                self.text_prefix = SimpleNamespace(
+                    layers=[SimpleNamespace(layer_idx=0, attn_meta=attn)]
+                )
+
+            def parameters(self):
+                return iter([self._param])
+
+        cfg = gemma4_e4b_routed_span_config(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("sliding_attention",),
+            sliding_window=4,
+        )
+        engine = GemmaNativeEngine(
+            model=FakeNativeTokenPoolModel(),
+            config=cfg,
+            num_slots=1,
+            enable_token_pool_attention=True,
+            token_pool_max_context_len=8,
+            token_pool_capacity=4,
+            token_pool_paged_block_size=4,
+        )
+        req = Request(prompt_token_ids=[1, 2, 3, 4], max_new_tokens=1, req_id="empty")
+        engine._token_pool_admit_request(req)
+        req_slot = engine._token_pool_req_slots[req.req_id]
+        _, slot_ids = engine._token_pool_alloc_page_aligned_slots(req.req_id, 0, 1)
+        self.assertEqual(slot_ids, [0])
+        engine._token_table.append_slots(req_slot, [engine._token_table.padding_token] * 4)
+
+        page_table_tensor = engine._token_pool_page_table_tensor
+        self.assertIsNotNone(page_table_tensor)
+        self.assertEqual(page_table_tensor[req_slot, :1].tolist(), [0])
+        self.assertEqual(engine.stats()["token_pool"]["allocated_token_slots"], 4)
+
+        engine._token_pool_clear_prefix(req.req_id, req_slot, 4)
+
+        self.assertEqual(page_table_tensor[req_slot, :1].tolist(), [-1])
+        self.assertEqual(engine._token_pool_page_tables[req.req_id], {})
+        self.assertEqual(engine._token_pool_page_owned_slots[req.req_id], set())
+        self.assertEqual(engine.stats()["token_pool"]["allocated_token_slots"], 0)
+
     def test_decode_batch_fallback_discards_token_pool_reservations(self) -> None:
         from wkvm.gemma_engine import GemmaNativeEngine
         from wkvm.models.gemma import gemma4_e4b_routed_span_config

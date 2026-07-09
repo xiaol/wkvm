@@ -486,6 +486,37 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(table.length(c), 0)
         self.assertTrue((table.req_to_token[c] == table.padding_token).all().item())
 
+    def test_req_to_token_table_clear_before_tracks_new_prefix_only(self) -> None:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import ReqToTokenTable
+
+        table = ReqToTokenTable(max_requests=1, max_context_len=8)
+        slot = table.allocate("a")
+        table.append_slots(slot, range(8))
+
+        self.assertEqual(table.clear_before(slot, 4), [0, 1, 2, 3])
+        self.assertEqual(table.clear_before(slot, 6), [4, 5])
+        self.assertEqual(table.clear_before(slot, 6), [])
+        self.assertEqual(
+            table.slots_for(slot).tolist(),
+            [-1, -1, -1, -1, -1, -1, 6, 7],
+        )
+
+        table.truncate(slot, 2)
+        table.append_slots(slot, [8, 9])
+        self.assertEqual(table.slots_for(slot).tolist(), [-1, -1, 8, 9])
+        self.assertEqual(table.clear_before(slot, 4), [8, 9])
+
+        table.free("a")
+        reused = table.allocate("reused")
+        self.assertEqual(reused, slot)
+        table.append_slots(reused, [10, 11])
+        self.assertEqual(table.clear_before("reused", 1), [10])
+
     def test_req_to_token_table_reuses_decode_metadata_workspace_by_key(self) -> None:
         try:
             import torch

@@ -1228,6 +1228,7 @@ class ReqToTokenTable:
         self._free_req_slots = list(range(self.max_requests))
         self._req_to_slot: dict[str, int] = {}
         self._slot_to_req: dict[int, str] = {}
+        self._cleared_prefix_lengths = [0 for _ in range(self.max_requests)]
         self._decode_metadata_workspaces: dict[str, dict[str, Any]] = {}
         self._paged_decode_metadata_workspaces: dict[str, dict[str, Any]] = {}
 
@@ -1242,6 +1243,7 @@ class ReqToTokenTable:
         self._slot_to_req[slot] = req_id
         self.req_to_token[slot].fill_(self.padding_token)
         self._lengths[slot] = 0
+        self._cleared_prefix_lengths[slot] = 0
         return slot
 
     def free(self, req_id_or_slot: str | int) -> None:
@@ -1250,6 +1252,7 @@ class ReqToTokenTable:
         self._req_to_slot.pop(req_id, None)
         self.req_to_token[slot].fill_(self.padding_token)
         self._lengths[slot] = 0
+        self._cleared_prefix_lengths[slot] = 0
         self._free_req_slots.append(slot)
         self._free_req_slots.sort()
 
@@ -1285,6 +1288,10 @@ class ReqToTokenTable:
         if length < current:
             self.req_to_token[slot, length:current].fill_(self.padding_token)
             self._lengths[slot] = length
+            self._cleared_prefix_lengths[slot] = min(
+                self._cleared_prefix_lengths[slot],
+                length,
+            )
 
     def clear_before(self, req_id_or_slot: str | int, length: int) -> list[int]:
         slot = self._resolve_req_slot(req_id_or_slot)
@@ -1292,11 +1299,13 @@ class ReqToTokenTable:
         current = int(self._lengths[slot].item())
         if length < 0 or length > current:
             raise ValueError("clear length must be within the current request length")
-        if length == 0:
+        start = int(self._cleared_prefix_lengths[slot])
+        if length <= start:
             return []
-        prefix = self.req_to_token[slot, :length]
+        prefix = self.req_to_token[slot, start:length]
         active = prefix[prefix != self.padding_token].detach().cpu().reshape(-1).tolist()
         prefix.fill_(self.padding_token)
+        self._cleared_prefix_lengths[slot] = length
         return [int(value) for value in active]
 
     def ensure_context_len(self, min_context_len: int) -> None:

@@ -2811,19 +2811,18 @@ class GemmaNativeEngine:
         if table is None or allocator is None:
             return
         dropped = table.clear_before(req_slot, int(length))
-        if not dropped:
-            return
-        self._token_pool_invalidate_full_attention_rows_containing(dropped)
-        page_owned = self._token_pool_page_owned_slots.get(req_id, set())
-        releasable = [slot for slot in dropped if slot not in page_owned]
-        if releasable:
-            allocator.free_slots(releasable)
-        active = self._token_pool_token_slots.get(req_id)
-        if active is not None:
-            dropped_set = set(dropped)
-            self._token_pool_token_slots[req_id] = [
-                slot for slot in active if slot not in dropped_set
-            ]
+        if dropped:
+            self._token_pool_invalidate_full_attention_rows_containing(dropped)
+            page_owned = self._token_pool_page_owned_slots.get(req_id, set())
+            releasable = [slot for slot in dropped if slot not in page_owned]
+            if releasable:
+                allocator.free_slots(releasable)
+            active = self._token_pool_token_slots.get(req_id)
+            if active is not None:
+                dropped_set = set(dropped)
+                self._token_pool_token_slots[req_id] = [
+                    slot for slot in active if slot not in dropped_set
+                ]
         self._token_pool_release_expired_page_blocks(req_id, req_slot, length)
 
     def _token_pool_release_expired_page_blocks(
