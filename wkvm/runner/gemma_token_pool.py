@@ -1550,6 +1550,303 @@ class TokenPoolDecodeGraphBuffer:
         dst.copy_(src_tensor, non_blocking=True)
 
 
+@dataclass(frozen=True)
+class TokenPoolDecodeGraphSignatureUpdate:
+    candidate_batches: int = 0
+    static_shape_starts: int = 0
+    static_shape_reuses: int = 0
+    shape_mismatches: int = 0
+    shape_mismatch_reasons: dict[str, int] = field(default_factory=dict)
+
+
+class TokenPoolDecodeGraphSignatureTracker:
+    """Backend-owned static-shape signatures for token-pool CUDA graphs."""
+
+    def __init__(self) -> None:
+        self.signatures: dict[tuple[str, ...], dict[str, Any]] = {}
+
+    def clear(self) -> None:
+        self.signatures.clear()
+
+    def discard(self, key: tuple[str, ...]) -> None:
+        self.signatures.pop(tuple(str(part) for part in key), None)
+
+    def discard_touching(self, req_ids: Iterable[Any]) -> int:
+        req_id_set = {str(req_id) for req_id in req_ids}
+        discarded = 0
+        for key in list(self.signatures):
+            if any(req_id in req_id_set for req_id in key):
+                self.signatures.pop(key, None)
+                discarded += 1
+        return discarded
+
+    def record(
+        self,
+        key: tuple[str, ...],
+        token_pool_decode: TokenPoolDecodeContext | None,
+        *,
+        started_new: bool,
+    ) -> TokenPoolDecodeGraphSignatureUpdate:
+        key = tuple(str(part) for part in key)
+        if token_pool_decode is None:
+            self.signatures.pop(key, None)
+            return TokenPoolDecodeGraphSignatureUpdate()
+
+        signature = self.shape_signature(token_pool_decode)
+        previous = self.signatures.get(key)
+        if started_new:
+            self.signatures[key] = signature
+            return TokenPoolDecodeGraphSignatureUpdate(
+                candidate_batches=1,
+                static_shape_starts=1,
+            )
+
+        if previous is None:
+            self.signatures[key] = signature
+            return TokenPoolDecodeGraphSignatureUpdate(
+                candidate_batches=1,
+                shape_mismatches=1,
+                shape_mismatch_reasons={"missing_start_signature": 1},
+            )
+
+        if signature == previous:
+            return TokenPoolDecodeGraphSignatureUpdate(
+                candidate_batches=1,
+                static_shape_reuses=1,
+            )
+
+        reasons: dict[str, int] = {}
+        for reason in self.shape_mismatch_reasons(previous, signature):
+            reasons[reason] = reasons.get(reason, 0) + 1
+        return TokenPoolDecodeGraphSignatureUpdate(
+            candidate_batches=1,
+            shape_mismatches=1,
+            shape_mismatch_reasons=reasons,
+        )
+
+    @classmethod
+    def shape_signature(
+        cls,
+        token_pool_decode: TokenPoolDecodeContext,
+    ) -> dict[str, Any]:
+        return {
+            "kv_pool_present": token_pool_decode.kv_pool is not None,
+            "covered_layer_types": tuple(
+                sorted(str(value) for value in (token_pool_decode.covered_layer_types or ()))
+            ),
+            "layer_id_metadata_only_types": tuple(
+                sorted(str(value) for value in token_pool_decode.layer_id_metadata_only_types)
+            ),
+            "metadata_by_layer_type": {
+                str(layer_type): cls.decode_metadata_shape_signature(metadata)
+                for layer_type, metadata in sorted(
+                    token_pool_decode.metadata_by_layer_type.items(),
+                    key=lambda item: str(item[0]),
+                )
+            },
+            "metadata_by_layer_id": {
+                int(layer_id): cls.decode_metadata_shape_signature(metadata)
+                for layer_id, metadata in sorted(
+                    (token_pool_decode.metadata_by_layer_id or {}).items(),
+                    key=lambda item: int(item[0]),
+                )
+            },
+            "paged_metadata_by_layer_type": {
+                str(layer_type): cls.paged_decode_metadata_shape_signature(metadata)
+                for layer_type, metadata in sorted(
+                    (token_pool_decode.paged_metadata_by_layer_type or {}).items(),
+                    key=lambda item: str(item[0]),
+                )
+            },
+            "paged_metadata_by_layer_id": {
+                int(layer_id): cls.paged_decode_metadata_shape_signature(metadata)
+                for layer_id, metadata in sorted(
+                    (token_pool_decode.paged_metadata_by_layer_id or {}).items(),
+                    key=lambda item: int(item[0]),
+                )
+            },
+        }
+
+    @classmethod
+    def decode_metadata_shape_signature(
+        cls,
+        metadata: DecodeBatchMetadata,
+    ) -> dict[str, Any]:
+        return {
+            "req_pool_indices": cls.tensor_shape_signature(metadata.req_pool_indices),
+            "seq_lens": cls.tensor_shape_signature(metadata.seq_lens),
+            "logical_seq_lens": cls.tensor_shape_signature(metadata.logical_seq_lens),
+            "out_cache_loc": cls.tensor_shape_signature(metadata.out_cache_loc),
+            "kv_indptr": cls.tensor_shape_signature(metadata.kv_indptr),
+            "kv_indices": cls.tensor_shape_signature(metadata.kv_indices),
+            "out_cache_loc_long": cls.tensor_shape_signature(
+                getattr(metadata, "out_cache_loc_long", None)
+            ),
+            "max_seq_len": getattr(metadata, "max_seq_len", None),
+            "triton_decode_plan": cls.triton_decode_plan_signature(
+                getattr(metadata, "triton_decode_plan", None)
+            ),
+        }
+
+    @classmethod
+    def paged_decode_metadata_shape_signature(
+        cls,
+        metadata: PagedDecodeBatchMetadata,
+    ) -> dict[str, Any]:
+        return {
+            "req_pool_indices": cls.tensor_shape_signature(metadata.req_pool_indices),
+            "seq_lens": cls.tensor_shape_signature(metadata.seq_lens),
+            "logical_seq_lens": cls.tensor_shape_signature(metadata.logical_seq_lens),
+            "out_cache_loc": cls.tensor_shape_signature(metadata.out_cache_loc),
+            "block_tables": cls.tensor_shape_signature(metadata.block_tables),
+            "block_table_lens": cls.tensor_shape_signature(metadata.block_table_lens),
+            "selected_start_positions": cls.tensor_shape_signature(
+                metadata.selected_start_positions
+            ),
+            "slot_mapping": cls.tensor_shape_signature(
+                getattr(metadata, "slot_mapping", None)
+            ),
+            "out_cache_loc_long": cls.tensor_shape_signature(
+                getattr(metadata, "out_cache_loc_long", None)
+            ),
+            "block_size": int(metadata.block_size),
+            "max_seq_len": getattr(metadata, "max_seq_len", None),
+            "triton_decode_plan": cls.triton_decode_plan_signature(
+                getattr(metadata, "triton_decode_plan", None)
+            ),
+        }
+
+    @staticmethod
+    def triton_decode_plan_signature(plan: Any) -> dict[str, Any] | None:
+        if plan is None:
+            return None
+        return {
+            "should_split": bool(getattr(plan, "should_split")),
+            "split_size": int(getattr(plan, "split_size")),
+            "min_splits": int(getattr(plan, "min_splits")),
+            "max_splits": (
+                None
+                if getattr(plan, "max_splits", None) is None
+                else int(getattr(plan, "max_splits"))
+            ),
+        }
+
+    @staticmethod
+    def tensor_shape_signature(value: Any) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        shape = getattr(value, "shape", None)
+        if shape is None:
+            size = getattr(value, "size", None)
+            if callable(size):
+                try:
+                    shape = size()
+                except TypeError:
+                    shape = None
+        try:
+            shape_tuple = tuple(int(dim) for dim in (shape or ()))
+        except TypeError:
+            shape_tuple = ()
+
+        numel = None
+        numel_fn = getattr(value, "numel", None)
+        if callable(numel_fn):
+            try:
+                numel = int(numel_fn())
+            except TypeError:
+                numel = None
+        if numel is None:
+            try:
+                numel = int(len(value))
+            except TypeError:
+                numel = None
+
+        return {
+            "shape": shape_tuple,
+            "numel": numel,
+            "dtype": str(getattr(value, "dtype", "")),
+            "device": str(getattr(value, "device", "")),
+        }
+
+    @classmethod
+    def shape_mismatch_reasons(
+        cls,
+        expected: dict[str, Any],
+        actual: dict[str, Any],
+    ) -> list[str]:
+        reasons: list[str] = []
+        for field in (
+            "kv_pool_present",
+            "covered_layer_types",
+            "layer_id_metadata_only_types",
+        ):
+            if expected.get(field) != actual.get(field):
+                reasons.append(field)
+        reasons.extend(
+            cls.metadata_shape_mismatch_reasons(
+                "metadata_by_layer_type",
+                expected.get("metadata_by_layer_type", {}),
+                actual.get("metadata_by_layer_type", {}),
+            )
+        )
+        reasons.extend(
+            cls.metadata_shape_mismatch_reasons(
+                "metadata_by_layer_id",
+                expected.get("metadata_by_layer_id", {}),
+                actual.get("metadata_by_layer_id", {}),
+            )
+        )
+        reasons.extend(
+            cls.metadata_shape_mismatch_reasons(
+                "paged_metadata_by_layer_type",
+                expected.get("paged_metadata_by_layer_type", {}),
+                actual.get("paged_metadata_by_layer_type", {}),
+            )
+        )
+        reasons.extend(
+            cls.metadata_shape_mismatch_reasons(
+                "paged_metadata_by_layer_id",
+                expected.get("paged_metadata_by_layer_id", {}),
+                actual.get("paged_metadata_by_layer_id", {}),
+            )
+        )
+        return reasons or ["unknown"]
+
+    @staticmethod
+    def metadata_shape_mismatch_reasons(
+        prefix: str,
+        expected: dict[Any, Any],
+        actual: dict[Any, Any],
+    ) -> list[str]:
+        reasons: list[str] = []
+        expected_keys = set(expected)
+        actual_keys = set(actual)
+        if expected_keys != actual_keys:
+            reasons.append(f"{prefix}.keys")
+        for key in sorted(expected_keys & actual_keys, key=str):
+            expected_metadata = expected[key]
+            actual_metadata = actual[key]
+            for field in (
+                "req_pool_indices",
+                "seq_lens",
+                "logical_seq_lens",
+                "out_cache_loc",
+                "kv_indptr",
+                "kv_indices",
+                "block_tables",
+                "block_table_lens",
+                "selected_start_positions",
+                "slot_mapping",
+                "out_cache_loc_long",
+                "block_size",
+                "max_seq_len",
+                "triton_decode_plan",
+            ):
+                if expected_metadata.get(field) != actual_metadata.get(field):
+                    reasons.append(f"{prefix}.{key}.{field}")
+        return reasons
+
+
 def _ensure_decode_metadata_workspace(
     workspace: dict[str, Any] | None,
     *,
@@ -3794,6 +4091,7 @@ class TokenPoolDecodeBackendState:
         block_size: int = 16,
         page_table_metadata_max_rows: int = 2,
         token_pool_capacity: int | None = None,
+        graph_signature_tracker: TokenPoolDecodeGraphSignatureTracker | None = None,
     ) -> None:
         block_size = int(block_size)
         if block_size < 1:
@@ -3816,6 +4114,11 @@ class TokenPoolDecodeBackendState:
             self.decode_metadata_workspace.flat_workspace("full_attention")
         )
         self.attention_workspace = TokenPoolAttentionWorkspace()
+        self.graph_signature_tracker = (
+            graph_signature_tracker
+            if graph_signature_tracker is not None
+            else TokenPoolDecodeGraphSignatureTracker()
+        )
         self.full_attention_rows = (
             None
             if self.allocator is None

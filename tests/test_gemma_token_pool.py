@@ -3066,6 +3066,65 @@ class TestGemmaTokenPool(unittest.TestCase):
             [5],
         )
 
+    def test_graph_signature_tracker_records_reuse_and_mismatch(self) -> None:
+        from wkvm.runner.gemma_token_pool import (
+            DecodeBatchMetadata,
+            TokenPoolDecodeContext,
+            TokenPoolDecodeGraphSignatureTracker,
+        )
+
+        class FakeTensorShape:
+            dtype = "torch.int32"
+            device = "cuda:0"
+
+            def __init__(self, shape: tuple[int, ...]) -> None:
+                self.shape = shape
+
+            def numel(self) -> int:
+                total = 1
+                for dim in self.shape:
+                    total *= int(dim)
+                return total
+
+        def context(*, kv_indices: int) -> TokenPoolDecodeContext:
+            metadata = DecodeBatchMetadata(
+                req_pool_indices=FakeTensorShape((2,)),
+                seq_lens=FakeTensorShape((2,)),
+                logical_seq_lens=FakeTensorShape((2,)),
+                out_cache_loc=FakeTensorShape((2,)),
+                kv_indptr=FakeTensorShape((3,)),
+                kv_indices=FakeTensorShape((kv_indices,)),
+            )
+            return TokenPoolDecodeContext(
+                metadata_by_layer_type={"sliding_attention": metadata},
+                kv_pool=object(),
+                metadata_by_layer_id={0: metadata},
+                covered_layer_types=frozenset({"sliding_attention"}),
+            )
+
+        tracker = TokenPoolDecodeGraphSignatureTracker()
+        started = tracker.record(("a", "b"), context(kv_indices=4), started_new=True)
+        reused = tracker.record(("a", "b"), context(kv_indices=4), started_new=False)
+        mismatched = tracker.record(
+            ("a", "b"),
+            context(kv_indices=5),
+            started_new=False,
+        )
+
+        self.assertEqual(started.candidate_batches, 1)
+        self.assertEqual(started.static_shape_starts, 1)
+        self.assertEqual(reused.static_shape_reuses, 1)
+        self.assertEqual(mismatched.shape_mismatches, 1)
+        self.assertEqual(
+            mismatched.shape_mismatch_reasons,
+            {
+                "metadata_by_layer_type.sliding_attention.kv_indices": 1,
+                "metadata_by_layer_id.0.kv_indices": 1,
+            },
+        )
+        self.assertEqual(tracker.discard_touching({"a"}), 1)
+        self.assertFalse(tracker.signatures)
+
     def test_decode_metadata_owns_triton_decode_plan(self) -> None:
         try:
             import torch  # noqa: F401
