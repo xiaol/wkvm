@@ -1413,6 +1413,36 @@ class TokenPoolDecodeGraphBuffer:
         )
         return stats
 
+    def replay_compatibility_error(
+        self,
+        token_pool_decode: TokenPoolDecodeContext | None,
+    ) -> str | None:
+        if self.context is None:
+            if token_pool_decode is not None:
+                return "graph was captured without token-pool metadata"
+            return None
+        if token_pool_decode is None:
+            return "graph token-pool metadata is required for replay"
+        if self.context.kv_pool is not token_pool_decode.kv_pool:
+            return "kv_pool changed"
+        if self.context.covered_layer_types != token_pool_decode.covered_layer_types:
+            return "covered_layer_types changed"
+        if (
+            self.context.layer_id_metadata_only_types
+            != token_pool_decode.layer_id_metadata_only_types
+        ):
+            return "layer_id_metadata_only_types changed"
+
+        expected = TokenPoolDecodeGraphSignatureTracker.shape_signature(self.context)
+        actual = TokenPoolDecodeGraphSignatureTracker.shape_signature(token_pool_decode)
+        if expected == actual:
+            return None
+        reasons = TokenPoolDecodeGraphSignatureTracker.shape_mismatch_reasons(
+            expected,
+            actual,
+        )
+        return ", ".join(str(reason) for reason in reasons)
+
     @staticmethod
     def _clone_decode_metadata(metadata):
         if getattr(metadata, "block_tables", None) is not None:
@@ -1642,6 +1672,12 @@ class TokenPoolDecodeGraphMetadata:
         token_pool_decode: TokenPoolDecodeContext | None,
     ) -> dict[str, int]:
         return self._buffer.copy_from(token_pool_decode)
+
+    def replay_compatibility_error(
+        self,
+        token_pool_decode: TokenPoolDecodeContext | None,
+    ) -> str | None:
+        return self._buffer.replay_compatibility_error(token_pool_decode)
 
 
 @dataclass(frozen=True)

@@ -3018,6 +3018,128 @@ class TestGemmaTokenPool(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "block_size changed"):
             graph_metadata.copy_from(mismatched_context)
 
+    def test_graph_metadata_replay_compatibility_reports_shape_mismatch(self) -> None:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            build_decode_metadata_from_token_slot_rows,
+            TokenPoolDecodeBackendState,
+            TokenPoolDecodeContext,
+        )
+
+        kv_pool = object()
+        captured_metadata = build_decode_metadata_from_token_slot_rows(
+            [[0, 1]],
+            out_cache_loc=[1],
+        )
+        captured_context = TokenPoolDecodeContext(
+            metadata_by_layer_type={"sliding_attention": captured_metadata},
+            metadata_by_layer_id={0: captured_metadata},
+            kv_pool=kv_pool,
+            covered_layer_types=frozenset({"sliding_attention"}),
+        )
+        graph_metadata = TokenPoolDecodeBackendState.capture_graph_decode_metadata(
+            captured_context,
+            clone_tensors=True,
+        )
+
+        compatible_metadata = build_decode_metadata_from_token_slot_rows(
+            [[2, 3]],
+            out_cache_loc=[3],
+        )
+        compatible_context = TokenPoolDecodeContext(
+            metadata_by_layer_type={"sliding_attention": compatible_metadata},
+            metadata_by_layer_id={0: compatible_metadata},
+            kv_pool=kv_pool,
+            covered_layer_types=frozenset({"sliding_attention"}),
+        )
+        self.assertIsNone(
+            graph_metadata.replay_compatibility_error(compatible_context)
+        )
+
+        mismatched_metadata = build_decode_metadata_from_token_slot_rows(
+            [[4, 5, 6]],
+            out_cache_loc=[6],
+        )
+        mismatched_context = TokenPoolDecodeContext(
+            metadata_by_layer_type={"sliding_attention": mismatched_metadata},
+            metadata_by_layer_id={0: mismatched_metadata},
+            kv_pool=kv_pool,
+            covered_layer_types=frozenset({"sliding_attention"}),
+        )
+        error = graph_metadata.replay_compatibility_error(mismatched_context)
+        self.assertIsNotNone(error)
+        self.assertIn("metadata_by_layer_type.sliding_attention.kv_indices", error)
+        self.assertIn("metadata_by_layer_id.0.kv_indices", error)
+
+    def test_graphed_decode_step_rejects_incompatible_token_pool_metadata(self) -> None:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_runner import (
+            DistinctCacheBatchError,
+            _GraphedPaddedDecodeStep,
+        )
+        from wkvm.runner.gemma_token_pool import (
+            build_decode_metadata_from_token_slot_rows,
+            TokenPoolDecodeBackendState,
+            TokenPoolDecodeContext,
+        )
+
+        kv_pool = object()
+        captured_type_metadata = build_decode_metadata_from_token_slot_rows(
+            [[0, 1]],
+            out_cache_loc=[1],
+        )
+        captured_id_metadata = build_decode_metadata_from_token_slot_rows(
+            [[2, 3]],
+            out_cache_loc=[3],
+        )
+        captured_context = TokenPoolDecodeContext(
+            metadata_by_layer_type={"sliding_attention": captured_type_metadata},
+            metadata_by_layer_id={0: captured_id_metadata},
+            kv_pool=kv_pool,
+            covered_layer_types=frozenset({"sliding_attention"}),
+        )
+        graph_metadata = TokenPoolDecodeBackendState.capture_graph_decode_metadata(
+            captured_context,
+            clone_tensors=True,
+        )
+        step = object.__new__(_GraphedPaddedDecodeStep)
+        step._token_pool_metadata = graph_metadata
+
+        compatible_type_metadata = build_decode_metadata_from_token_slot_rows(
+            [[8, 9]],
+            out_cache_loc=[9],
+        )
+        incompatible_id_metadata = build_decode_metadata_from_token_slot_rows(
+            [[10, 11, 12]],
+            out_cache_loc=[12],
+        )
+        incompatible_context = TokenPoolDecodeContext(
+            metadata_by_layer_type={"sliding_attention": compatible_type_metadata},
+            metadata_by_layer_id={0: incompatible_id_metadata},
+            kv_pool=kv_pool,
+            covered_layer_types=frozenset({"sliding_attention"}),
+        )
+
+        with self.assertRaisesRegex(
+            DistinctCacheBatchError,
+            "token-pool cuda graph metadata incompatible: .*metadata_by_layer_id.0.kv_indices",
+        ):
+            step._copy_token_pool_decode_context(incompatible_context)
+        self.assertEqual(
+            graph_metadata.context.metadata_by_layer_type[
+                "sliding_attention"
+            ].kv_indices.tolist(),
+            [0, 1],
+        )
+
     def test_graph_metadata_facade_aliases_workspace_metadata_and_skips_copies(self) -> None:
         try:
             import torch
