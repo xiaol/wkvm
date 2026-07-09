@@ -2924,6 +2924,179 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(len(owned_binding.output_calls), 1)
         self.assertEqual(len(owned_binding.split_calls), 1)
 
+    def test_attention_plan_owns_dispatch_context(self) -> None:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from types import SimpleNamespace
+        from wkvm.runner.gemma_token_pool import (
+            DecodeBatchMetadata,
+            TokenPoolAttentionBinding,
+            TokenPoolAttentionDispatchContext,
+            TokenPoolAttentionPlan,
+            TokenPoolTritonDecodePlan,
+            build_decode_metadata_from_token_slot_rows,
+            build_token_pool_attention_dispatch_context,
+        )
+
+        class DispatchPool:
+            layer_specs = {7: object()}
+
+            def __init__(self) -> None:
+                self.buffer_calls = []
+                self.output_calls = []
+                self.split_calls = []
+                self.set_calls = []
+                self.buffers = ("key_buffer", "value_buffer")
+
+            def get_kv_buffer(self, layer_idx):
+                self.buffer_calls.append(layer_idx)
+                return self.buffers
+
+            def set_kv(self, layer_idx, out_cache_loc, key_states, value_states):
+                self.set_calls.append(
+                    (layer_idx, out_cache_loc, key_states, value_states)
+                )
+
+            def attention_output_buffer(self, **kwargs):
+                self.output_calls.append(kwargs)
+                return ("output", kwargs)
+
+            def attention_split_workspace(self, **kwargs):
+                self.split_calls.append(kwargs)
+                return ("split", kwargs)
+
+        base_metadata = build_decode_metadata_from_token_slot_rows(
+            [[3, 4, 5]],
+            out_cache_loc=[5],
+        )
+        split_plan = TokenPoolTritonDecodePlan(
+            should_split=True,
+            split_size=2,
+            min_splits=2,
+            max_splits=2,
+        )
+        metadata = DecodeBatchMetadata(
+            req_pool_indices=base_metadata.req_pool_indices,
+            seq_lens=base_metadata.seq_lens,
+            logical_seq_lens=base_metadata.logical_seq_lens,
+            out_cache_loc=base_metadata.out_cache_loc,
+            kv_indptr=base_metadata.kv_indptr,
+            kv_indices=base_metadata.kv_indices,
+            out_cache_loc_long=base_metadata.out_cache_loc_long,
+            max_seq_len=base_metadata.max_seq_len,
+            triton_decode_plan=split_plan,
+        )
+        pool = DispatchPool()
+        plan = TokenPoolAttentionPlan.from_binding(
+            TokenPoolAttentionBinding(
+                layer_idx=7,
+                metadata=metadata,
+                paged_metadata=None,
+                kv_pool=pool,
+            ),
+            layer_idx=7,
+            query_seq_len=1,
+        )
+
+        dispatch = plan.attention_dispatch_context()
+
+        self.assertIs(dispatch.flat_metadata, metadata)
+        self.assertIsNone(dispatch.paged_metadata)
+        self.assertTrue(dispatch.has_flat_metadata)
+        self.assertFalse(dispatch.has_paged_metadata)
+        self.assertIs(dispatch.kv_buffers_for_attention(), pool.buffers)
+        self.assertEqual(pool.buffer_calls, [7])
+        self.assertEqual(
+            dispatch.attention_output_buffer(
+                batch=2,
+                query_heads=4,
+                head_dim=8,
+                dtype="float32",
+                device="cpu",
+            )[0],
+            "output",
+        )
+        self.assertEqual(
+            dispatch.attention_split_workspace(
+                batch=2,
+                kv_heads=1,
+                max_splits=2,
+                block_groups=4,
+                head_dim=8,
+                device="cpu",
+            )[0],
+            "split",
+        )
+        self.assertEqual(
+            dispatch.triton_split_plan_for_metadata(metadata),
+            (True, 2, 2, 2),
+        )
+        reference_metadata, reference_pool, reference_layer_idx = (
+            dispatch.reference_decode_inputs()
+        )
+        self.assertIs(reference_metadata, metadata)
+        self.assertIs(reference_pool, pool)
+        self.assertEqual(reference_layer_idx, 7)
+        self.assertIs(
+            dispatch.store_current_kv("key_states", "value_states"),
+            metadata.out_cache_loc_long,
+        )
+        self.assertEqual(
+            pool.set_calls,
+            [(7, metadata.out_cache_loc_long, "key_states", "value_states")],
+        )
+
+        paged_like_metadata = SimpleNamespace(
+            block_tables=object(),
+            block_table_lens=object(),
+            selected_start_positions=object(),
+            seq_lens=object(),
+            block_size=32,
+        )
+        legacy_dispatch = build_token_pool_attention_dispatch_context(
+            decode_metadata=paged_like_metadata,
+            token_kv_pool=pool,
+            layer_idx=7,
+        )
+        self.assertIsNone(legacy_dispatch.flat_metadata)
+        self.assertIs(legacy_dispatch.paged_metadata, paged_like_metadata)
+        self.assertFalse(legacy_dispatch.has_flat_metadata)
+        self.assertTrue(legacy_dispatch.has_paged_metadata)
+        self.assertIs(legacy_dispatch.kv_buffers_for_attention(), pool.buffers)
+        self.assertEqual(pool.buffer_calls, [7, 7])
+        with self.assertRaisesRegex(RuntimeError, "reference fallback"):
+            legacy_dispatch.reference_decode_inputs()
+
+        owned_context = TokenPoolAttentionDispatchContext(
+            layer_idx=11,
+            flat_metadata=metadata,
+            paged_metadata=None,
+            token_kv_pool=pool,
+        )
+
+        class PlanWithOwnDispatch:
+            def attention_dispatch_context(self, **kwargs):
+                self.kwargs = kwargs
+                return owned_context
+
+        owned_plan = PlanWithOwnDispatch()
+        self.assertIs(
+            build_token_pool_attention_dispatch_context(
+                token_pool_plan=owned_plan,
+                decode_metadata=base_metadata,
+                token_kv_pool=pool,
+                layer_idx=7,
+            ),
+            owned_context,
+        )
+        self.assertEqual(
+            owned_plan.kwargs["decode_metadata"],
+            base_metadata,
+        )
+
     def test_decode_backend_owns_attention_workspace(self) -> None:
         try:
             import torch

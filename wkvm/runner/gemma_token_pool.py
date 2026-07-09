@@ -82,6 +82,18 @@ class PagedDecodeBatchMetadata:
             )
 
 
+def token_pool_triton_decode_plan_from_metadata(
+    metadata: Any | None,
+    max_seq_len: Any | None = None,
+) -> TokenPoolTritonDecodePlan:
+    plan = getattr(metadata, "triton_decode_plan", None)
+    if plan is not None:
+        return plan
+    if max_seq_len is None:
+        max_seq_len = getattr(metadata, "max_seq_len", None)
+    return build_token_pool_triton_decode_plan(max_seq_len)
+
+
 @dataclass(frozen=True)
 class TokenPoolLayerDecodeBinding:
     metadata: DecodeBatchMetadata | None
@@ -145,6 +157,131 @@ class TokenPoolAttentionWorkspace:
             )
             self._split_workspaces[key] = workspace
         return workspace
+
+
+@dataclass(frozen=True)
+class TokenPoolAttentionDispatchContext:
+    layer_idx: int | None
+    flat_metadata: DecodeBatchMetadata | None
+    paged_metadata: Any | None
+    token_kv_pool: Any | None
+    kv_buffer_owner: Any | None = None
+    workspace_owner: Any | None = None
+    kv_write_owner: Any | None = None
+
+    @property
+    def has_flat_metadata(self) -> bool:
+        return (
+            getattr(self.flat_metadata, "kv_indptr", None) is not None
+            and getattr(self.flat_metadata, "kv_indices", None) is not None
+        )
+
+    @property
+    def has_paged_metadata(self) -> bool:
+        return getattr(self.paged_metadata, "block_tables", None) is not None
+
+    def kv_buffers_for_attention(self) -> tuple[Any, Any] | None:
+        kv_buffers_for_attention = getattr(
+            self.kv_buffer_owner,
+            "kv_buffers_for_attention",
+            None,
+        )
+        if kv_buffers_for_attention is not None:
+            return kv_buffers_for_attention()
+        if self.layer_idx is None or self.token_kv_pool is None:
+            return None
+        get_kv_buffer = getattr(self.token_kv_pool, "get_kv_buffer", None)
+        if get_kv_buffer is None:
+            return None
+        return get_kv_buffer(int(self.layer_idx))
+
+    def attention_output_buffer(
+        self,
+        *,
+        batch: int,
+        query_heads: int,
+        head_dim: int,
+        dtype: Any,
+        device: Any,
+    ) -> Any | None:
+        output_buffer = getattr(self.workspace_owner, "attention_output_buffer", None)
+        if output_buffer is None:
+            return None
+        return output_buffer(
+            batch=batch,
+            query_heads=query_heads,
+            head_dim=head_dim,
+            dtype=dtype,
+            device=device,
+        )
+
+    def attention_split_workspace(
+        self,
+        *,
+        batch: int,
+        kv_heads: int,
+        max_splits: int,
+        block_groups: int,
+        head_dim: int,
+        device: Any,
+    ) -> Any | None:
+        split_workspace = getattr(self.workspace_owner, "attention_split_workspace", None)
+        if split_workspace is None:
+            return None
+        return split_workspace(
+            batch=batch,
+            kv_heads=kv_heads,
+            max_splits=max_splits,
+            block_groups=block_groups,
+            head_dim=head_dim,
+            device=device,
+        )
+
+    def store_current_kv(self, key_states: Any, value_states: Any) -> Any | None:
+        if key_states is None or value_states is None:
+            return None
+        store_current_kv = getattr(self.kv_write_owner, "store_current_kv", None)
+        if store_current_kv is not None:
+            return store_current_kv(key_states, value_states)
+        out_cache_loc = _metadata_out_cache_loc_for_write(
+            self.flat_metadata if self.flat_metadata is not None else self.paged_metadata
+        )
+        if self.layer_idx is None or self.token_kv_pool is None or out_cache_loc is None:
+            return None
+        set_kv = getattr(self.token_kv_pool, "set_kv", None)
+        if set_kv is None:
+            return None
+        set_kv(
+            int(self.layer_idx),
+            out_cache_loc,
+            key_states,
+            value_states,
+        )
+        return out_cache_loc
+
+    def reference_decode_inputs(self) -> tuple[Any, Any, int]:
+        if not self.has_flat_metadata:
+            raise RuntimeError(
+                "token-pool flat decode metadata is required for reference fallback"
+            )
+        if self.token_kv_pool is None or self.layer_idx is None:
+            raise RuntimeError(
+                "token-pool KV pool and layer index are required for reference fallback"
+            )
+        return self.flat_metadata, self.token_kv_pool, int(self.layer_idx)
+
+    def triton_split_plan_for_metadata(
+        self,
+        metadata: Any | None,
+        max_seq_len: Any | None = None,
+    ) -> tuple[bool, int, int, int | None]:
+        plan = token_pool_triton_decode_plan_from_metadata(metadata, max_seq_len)
+        return (
+            bool(plan.should_split),
+            int(plan.split_size),
+            int(plan.min_splits),
+            None if plan.max_splits is None else int(plan.max_splits),
+        )
 
 
 @dataclass
@@ -874,6 +1011,27 @@ class TokenPoolAttentionPlan:
             return metadata_for_dispatch()
         return self.flat_metadata_for_attention(), self.paged_metadata_for_attention()
 
+    def attention_dispatch_context(
+        self,
+        *,
+        decode_metadata: Any | None = None,
+        paged_decode_metadata: Any | None = None,
+        token_kv_pool: Any | None = None,
+        layer_idx: int | None = None,
+    ) -> TokenPoolAttentionDispatchContext:
+        flat_metadata, paged_metadata = self.attention_metadata_for_dispatch()
+        resolved_layer_idx = self.layer_idx if self.layer_idx is not None else layer_idx
+        resolved_kv_pool = self.kv_pool if self.kv_pool is not None else token_kv_pool
+        return TokenPoolAttentionDispatchContext(
+            layer_idx=resolved_layer_idx,
+            flat_metadata=flat_metadata,
+            paged_metadata=paged_metadata,
+            token_kv_pool=resolved_kv_pool,
+            kv_buffer_owner=self,
+            workspace_owner=self,
+            kv_write_owner=self,
+        )
+
     def attention_split_workspace(
         self,
         *,
@@ -907,6 +1065,84 @@ class TokenPoolAttentionPlan:
             head_dim=head_dim,
             device=device,
         )
+
+
+def build_token_pool_attention_dispatch_context(
+    *,
+    token_pool_plan: Any | None = None,
+    decode_metadata: Any | None = None,
+    paged_decode_metadata: Any | None = None,
+    token_kv_pool: Any | None = None,
+    layer_idx: int | None = None,
+) -> TokenPoolAttentionDispatchContext:
+    attention_dispatch_context = getattr(
+        token_pool_plan,
+        "attention_dispatch_context",
+        None,
+    )
+    if attention_dispatch_context is not None:
+        context = attention_dispatch_context(
+            decode_metadata=decode_metadata,
+            paged_decode_metadata=paged_decode_metadata,
+            token_kv_pool=token_kv_pool,
+            layer_idx=layer_idx,
+        )
+        if context is not None:
+            return context
+
+    if token_pool_plan is not None:
+        metadata_for_dispatch = getattr(
+            token_pool_plan,
+            "attention_metadata_for_dispatch",
+            None,
+        )
+        if metadata_for_dispatch is not None:
+            flat_metadata, paged_metadata = metadata_for_dispatch()
+        else:
+            plan_metadata = getattr(token_pool_plan, "metadata", None)
+            plan_paged_metadata = getattr(token_pool_plan, "paged_metadata", None)
+            flat_metadata, paged_metadata = _normalize_attention_dispatch_metadata(
+                plan_metadata,
+                plan_paged_metadata,
+            )
+        return TokenPoolAttentionDispatchContext(
+            layer_idx=getattr(token_pool_plan, "layer_idx", layer_idx),
+            flat_metadata=flat_metadata,
+            paged_metadata=paged_metadata,
+            token_kv_pool=getattr(token_pool_plan, "kv_pool", token_kv_pool),
+            kv_buffer_owner=token_pool_plan,
+            workspace_owner=token_pool_plan,
+            kv_write_owner=token_pool_plan,
+        )
+
+    flat_metadata, paged_metadata = _normalize_attention_dispatch_metadata(
+        decode_metadata,
+        paged_decode_metadata,
+    )
+    return TokenPoolAttentionDispatchContext(
+        layer_idx=layer_idx,
+        flat_metadata=flat_metadata,
+        paged_metadata=paged_metadata,
+        token_kv_pool=token_kv_pool,
+        kv_buffer_owner=token_kv_pool,
+        workspace_owner=token_kv_pool,
+        kv_write_owner=token_kv_pool,
+    )
+
+
+def _normalize_attention_dispatch_metadata(
+    decode_metadata: Any | None,
+    paged_decode_metadata: Any | None,
+) -> tuple[DecodeBatchMetadata | None, Any | None]:
+    paged_metadata = paged_decode_metadata
+    if paged_metadata is None and getattr(decode_metadata, "block_tables", None) is not None:
+        paged_metadata = decode_metadata
+    flat_metadata = (
+        None
+        if getattr(decode_metadata, "block_tables", None) is not None
+        else decode_metadata
+    )
+    return flat_metadata, paged_metadata
 
 
 def _metadata_out_cache_loc_for_write(metadata: Any | None) -> Any | None:

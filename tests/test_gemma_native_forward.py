@@ -654,6 +654,216 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
         self.assertIs(plan.stored_value, value_states)
         self.assertTrue(torch.equal(output, torch.zeros_like(query_states)))
 
+    def test_token_pool_triton_dispatch_uses_plan_owned_context(self) -> None:
+        import os
+        import sys
+        from types import ModuleType, SimpleNamespace
+        import wkvm.runner.gemma_native_forward as native_forward
+        from wkvm.runner.gemma_token_pool import TokenPoolAttentionDispatchContext
+
+        native_forward.reset_token_pool_triton_stats(clear_disabled_shapes=True)
+        module_name = "wkvm.runner.gemma_token_pool_triton"
+        old_module = sys.modules.get(module_name)
+        old_enable = os.environ.get("WKVM_ENABLE_TOKEN_POOL_TRITON")
+        old_disable = os.environ.get("WKVM_DISABLE_TOKEN_POOL_TRITON")
+        fake_module = ModuleType(module_name)
+        events = []
+        calls = {}
+
+        def decode(query, key_buffer, value_buffer, kv_indptr, kv_indices, **kwargs):
+            events.append("decode")
+            calls.update(
+                {
+                    "key_buffer": key_buffer,
+                    "value_buffer": value_buffer,
+                    "kv_indptr": kv_indptr,
+                    "kv_indices": kv_indices,
+                    "output": kwargs.get("output"),
+                }
+            )
+            return "owned_triton"
+
+        fake_module.token_pool_gqa_decode = decode
+        sys.modules[module_name] = fake_module
+        os.environ["WKVM_ENABLE_TOKEN_POOL_TRITON"] = "1"
+        os.environ.pop("WKVM_DISABLE_TOKEN_POOL_TRITON", None)
+
+        class FakeQuery:
+            shape = (1, 8, 1, 512)
+            dtype = "bfloat16"
+            device = "cuda:0"
+            is_cuda = True
+
+        class FallbackPool:
+            def get_kv_buffer(self, layer_idx):
+                return "fallback_key", "fallback_value"
+
+        class DispatchOwner:
+            def kv_buffers_for_attention(self):
+                events.append("kv_buffers")
+                return "owned_key", "owned_value"
+
+            def attention_output_buffer(self, **kwargs):
+                events.append(("output", kwargs))
+                return "owned_output"
+
+        dispatch_owner = DispatchOwner()
+        dispatch_metadata = SimpleNamespace(
+            kv_indptr="owned_indptr",
+            kv_indices="owned_indices",
+            seq_lens="owned_seq_lens",
+        )
+
+        class Plan:
+            metadata = SimpleNamespace(
+                kv_indptr="plan_indptr",
+                kv_indices="plan_indices",
+            )
+            paged_metadata = None
+            kv_pool = FallbackPool()
+            layer_idx = 0
+            use_decode_attention = True
+
+            def attention_dispatch_context(self, **kwargs):
+                events.append(("context", kwargs))
+                return TokenPoolAttentionDispatchContext(
+                    layer_idx=0,
+                    flat_metadata=dispatch_metadata,
+                    paged_metadata=None,
+                    token_kv_pool=self.kv_pool,
+                    kv_buffer_owner=dispatch_owner,
+                    workspace_owner=dispatch_owner,
+                )
+
+        plan = Plan()
+
+        try:
+            actual = native_forward._attention_forward_token_pool_gqa(
+                SimpleNamespace(num_key_value_groups=4, scaling=1.0),
+                FakeQuery(),
+                decode_metadata=plan.metadata,
+                token_kv_pool=plan.kv_pool,
+                layer_idx=0,
+                token_pool_plan=plan,
+            )
+            stats = native_forward.token_pool_triton_stats()
+        finally:
+            if old_module is None:
+                sys.modules.pop(module_name, None)
+            else:
+                sys.modules[module_name] = old_module
+            if old_enable is None:
+                os.environ.pop("WKVM_ENABLE_TOKEN_POOL_TRITON", None)
+            else:
+                os.environ["WKVM_ENABLE_TOKEN_POOL_TRITON"] = old_enable
+            if old_disable is None:
+                os.environ.pop("WKVM_DISABLE_TOKEN_POOL_TRITON", None)
+            else:
+                os.environ["WKVM_DISABLE_TOKEN_POOL_TRITON"] = old_disable
+            native_forward.reset_token_pool_triton_stats(clear_disabled_shapes=True)
+
+        self.assertEqual(actual, ("owned_triton", None))
+        self.assertEqual(events[0][0], "context")
+        self.assertEqual(events[1], "kv_buffers")
+        self.assertEqual(events[2][0], "output")
+        self.assertEqual(events[3], "decode")
+        self.assertEqual(calls["key_buffer"], "owned_key")
+        self.assertEqual(calls["value_buffer"], "owned_value")
+        self.assertEqual(calls["kv_indptr"], "owned_indptr")
+        self.assertEqual(calls["kv_indices"], "owned_indices")
+        self.assertEqual(calls["output"], "owned_output")
+        self.assertEqual(stats["attempts"], 1)
+        self.assertEqual(stats["successes"], 1)
+
+    def test_token_pool_reference_fallback_uses_plan_owned_context(self) -> None:
+        import os
+        from types import SimpleNamespace
+        import wkvm.runner.gemma_native_forward as native_forward
+        from wkvm.runner.gemma_token_pool import TokenPoolAttentionDispatchContext
+
+        old_disable = os.environ.get("WKVM_DISABLE_TOKEN_POOL_TRITON")
+        old_reference = native_forward._attention_forward_token_pool_gqa_reference
+        native_forward.reset_token_pool_triton_stats(clear_disabled_shapes=True)
+        events = []
+
+        class FakeQuery:
+            shape = (1, 8, 1, 512)
+            dtype = "bfloat16"
+            device = "cpu"
+            is_cuda = False
+
+        class ContextPool:
+            pass
+
+        context_pool = ContextPool()
+        stale_pool = object()
+        context_metadata = SimpleNamespace(
+            kv_indptr="context_indptr",
+            kv_indices="context_indices",
+            out_cache_loc="context_write",
+        )
+
+        class WriteOwner:
+            def store_current_kv(self, key_states, value_states):
+                events.append(("store", key_states, value_states))
+                return "context_write"
+
+        class Plan:
+            metadata = SimpleNamespace(
+                kv_indptr="plan_indptr",
+                kv_indices="plan_indices",
+            )
+            paged_metadata = None
+            kv_pool = stale_pool
+            layer_idx = 3
+            use_decode_attention = True
+
+            def attention_dispatch_context(self, **kwargs):
+                events.append(("context", kwargs))
+                return TokenPoolAttentionDispatchContext(
+                    layer_idx=42,
+                    flat_metadata=context_metadata,
+                    paged_metadata=None,
+                    token_kv_pool=context_pool,
+                    kv_write_owner=WriteOwner(),
+                )
+
+        def reference(*_args, **kwargs):
+            events.append(("reference", kwargs))
+            return "reference", None
+
+        try:
+            os.environ["WKVM_DISABLE_TOKEN_POOL_TRITON"] = "1"
+            native_forward._attention_forward_token_pool_gqa_reference = reference
+            actual = native_forward._attention_forward_token_pool_gqa(
+                SimpleNamespace(num_key_value_groups=4, scaling=1.0),
+                FakeQuery(),
+                decode_metadata=SimpleNamespace(
+                    kv_indptr="stale_indptr",
+                    kv_indices="stale_indices",
+                ),
+                token_kv_pool=stale_pool,
+                layer_idx=3,
+                token_pool_plan=Plan(),
+                current_key_states="current_key",
+                current_value_states="current_value",
+            )
+        finally:
+            native_forward._attention_forward_token_pool_gqa_reference = old_reference
+            if old_disable is None:
+                os.environ.pop("WKVM_DISABLE_TOKEN_POOL_TRITON", None)
+            else:
+                os.environ["WKVM_DISABLE_TOKEN_POOL_TRITON"] = old_disable
+            native_forward.reset_token_pool_triton_stats(clear_disabled_shapes=True)
+
+        self.assertEqual(actual, ("reference", None))
+        self.assertEqual(events[0][0], "context")
+        self.assertEqual(events[1], ("store", "current_key", "current_value"))
+        self.assertEqual(events[2][0], "reference")
+        self.assertIs(events[2][1]["decode_metadata"], context_metadata)
+        self.assertIs(events[2][1]["token_kv_pool"], context_pool)
+        self.assertEqual(events[2][1]["layer_idx"], 42)
+
     def test_token_pool_triton_auto_default_and_explicit_disable(self) -> None:
         import os
         import sys

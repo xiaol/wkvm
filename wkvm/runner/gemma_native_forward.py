@@ -308,9 +308,9 @@ def _token_pool_triton_metadata_split_plan(
     metadata,
     max_seq_len: Any,
 ) -> tuple[bool, int, int, int | None]:
-    plan = getattr(metadata, "triton_decode_plan", None)
-    if plan is None:
-        return _token_pool_triton_split_plan(max_seq_len)
+    from wkvm.runner.gemma_token_pool import token_pool_triton_decode_plan_from_metadata
+
+    plan = token_pool_triton_decode_plan_from_metadata(metadata, max_seq_len)
     return (
         bool(plan.should_split),
         int(plan.split_size),
@@ -1511,6 +1511,15 @@ def _attention_forward_token_pool_gqa(
     attention_rows = int(query_states.shape[0])
     _TOKEN_POOL_TRITON_STATS["calls"] += 1
     dispatch_plan = _token_pool_triton_dispatch_plan()
+    from wkvm.runner.gemma_token_pool import build_token_pool_attention_dispatch_context
+
+    dispatch_context = build_token_pool_attention_dispatch_context(
+        token_pool_plan=token_pool_plan,
+        decode_metadata=decode_metadata,
+        paged_decode_metadata=paged_decode_metadata,
+        token_kv_pool=token_kv_pool,
+        layer_idx=layer_idx,
+    )
     if dispatch_plan.env_enabled:
         _TOKEN_POOL_TRITON_STATS["env_enabled_calls"] += 1
     if dispatch_plan.env_forced_off or dispatch_plan.env_disabled:
@@ -1521,50 +1530,22 @@ def _attention_forward_token_pool_gqa(
         _TOKEN_POOL_TRITON_STATS["effective_disabled_calls"] += 1
     if dispatch_plan.auto_default_enabled:
         _TOKEN_POOL_TRITON_STATS["auto_enabled_calls"] += 1
-    if token_pool_plan is not None:
-        metadata_for_dispatch = getattr(
-            token_pool_plan,
-            "attention_metadata_for_dispatch",
-            None,
-        )
-        if metadata_for_dispatch is not None:
-            flat_metadata, paged_metadata = metadata_for_dispatch()
-        else:
-            flat_metadata = token_pool_plan.metadata
-            paged_metadata = token_pool_plan.paged_metadata
-    else:
-        paged_metadata = paged_decode_metadata
-        if (
-            paged_metadata is None
-            and getattr(decode_metadata, "block_tables", None) is not None
-        ):
-            paged_metadata = decode_metadata
-        flat_metadata = (
-            None
-            if getattr(decode_metadata, "block_tables", None) is not None
-            else decode_metadata
-        )
+    flat_metadata = dispatch_context.flat_metadata
+    paged_metadata = dispatch_context.paged_metadata
     paged_triton_enabled = dispatch_plan.paged_enabled
     split_triton_enabled = dispatch_plan.split_enabled
     paged_split_triton_enabled = dispatch_plan.paged_split_enabled
-    has_paged_metadata = getattr(paged_metadata, "block_tables", None) is not None
-    has_flat_metadata = (
-        getattr(flat_metadata, "kv_indptr", None) is not None
-        and getattr(flat_metadata, "kv_indices", None) is not None
-    )
+    has_paged_metadata = dispatch_context.has_paged_metadata
+    has_flat_metadata = dispatch_context.has_flat_metadata
     if paged_triton_enabled:
         _TOKEN_POOL_TRITON_STATS["paged_enabled_calls"] += 1
     if split_triton_enabled:
         _TOKEN_POOL_TRITON_STATS["split_enabled_calls"] += 1
     if paged_split_triton_enabled:
         _TOKEN_POOL_TRITON_STATS["paged_split_enabled_calls"] += 1
-    if (
-        token_pool_plan is not None
-        and current_key_states is not None
-        and current_value_states is not None
-    ):
+    if current_key_states is not None and current_value_states is not None:
         kv_write_start = time.perf_counter() if timing_enabled else 0.0
-        out_cache_loc = token_pool_plan.store_current_kv(
+        out_cache_loc = dispatch_context.store_current_kv(
             current_key_states,
             current_value_states,
         )
@@ -1590,42 +1571,24 @@ def _attention_forward_token_pool_gqa(
             _TOKEN_POOL_TRITON_STATS["attempts"] += 1
             triton_attempt_start = time.perf_counter() if timing_enabled else 0.0
             try:
-                kv_buffers = None
-                if token_pool_plan is not None:
-                    kv_buffers_for_attention = getattr(
-                        token_pool_plan,
-                        "kv_buffers_for_attention",
-                        None,
-                    )
-                    if kv_buffers_for_attention is not None:
-                        kv_buffers = kv_buffers_for_attention()
+                kv_buffers = dispatch_context.kv_buffers_for_attention()
                 if kv_buffers is None:
-                    kv_buffers = token_kv_pool.get_kv_buffer(layer_idx)
+                    raise RuntimeError("token-pool KV buffers are required for Triton attention")
                 key_buffer, value_buffer = kv_buffers
-                output_buffer = None
-                workspace_owner = (
-                    token_pool_plan if token_pool_plan is not None else token_kv_pool
+                output_buffer = dispatch_context.attention_output_buffer(
+                    batch=int(query_states.shape[0]),
+                    query_heads=int(query_states.shape[1]),
+                    head_dim=int(query_states.shape[3]),
+                    dtype=query_states.dtype,
+                    device=query_states.device,
                 )
-                output_buffer_fn = getattr(
-                    workspace_owner,
-                    "attention_output_buffer",
-                    None,
-                )
-                if output_buffer_fn is not None:
-                    output_buffer = output_buffer_fn(
-                        batch=int(query_states.shape[0]),
-                        query_heads=int(query_states.shape[1]),
-                        head_dim=int(query_states.shape[3]),
-                        dtype=query_states.dtype,
-                        device=query_states.device,
-                    )
                 if paged_triton_enabled and has_paged_metadata:
                     _TOKEN_POOL_TRITON_STATS["paged_attempts"] += 1
                     if paged_split_triton_enabled:
                         split_workspace = None
                         max_seq_len = getattr(paged_metadata, "max_seq_len", None)
                         should_split, split_size, min_splits, max_splits = (
-                            _token_pool_triton_metadata_split_plan(
+                            dispatch_context.triton_split_plan_for_metadata(
                                 paged_metadata,
                                 max_seq_len,
                             )
@@ -1633,13 +1596,8 @@ def _attention_forward_token_pool_gqa(
                         if should_split:
                             _TOKEN_POOL_TRITON_STATS["paged_split_attempts"] += 1
                             _TOKEN_POOL_TRITON_STATS["split_attempts"] += 1
-                            output_workspace_fn = getattr(
-                                workspace_owner,
-                                "attention_split_workspace",
-                                None,
-                            )
-                            if output_workspace_fn is not None and max_splits is not None:
-                                split_workspace = output_workspace_fn(
+                            if max_splits is not None:
+                                split_workspace = dispatch_context.attention_split_workspace(
                                     batch=int(query_states.shape[0]),
                                     kv_heads=int(key_buffer.shape[1]),
                                     max_splits=max_splits,
@@ -1712,20 +1670,15 @@ def _attention_forward_token_pool_gqa(
                         split_workspace = None
                         max_seq_len = getattr(flat_metadata, "max_seq_len", None)
                         should_split, split_size, min_splits, max_splits = (
-                            _token_pool_triton_metadata_split_plan(
+                            dispatch_context.triton_split_plan_for_metadata(
                                 flat_metadata,
                                 max_seq_len,
                             )
                         )
                         if should_split:
                             _TOKEN_POOL_TRITON_STATS["split_attempts"] += 1
-                            output_workspace_fn = getattr(
-                                workspace_owner,
-                                "attention_split_workspace",
-                                None,
-                            )
-                            if output_workspace_fn is not None and max_splits is not None:
-                                split_workspace = output_workspace_fn(
+                            if max_splits is not None:
+                                split_workspace = dispatch_context.attention_split_workspace(
                                     batch=int(query_states.shape[0]),
                                     kv_heads=int(key_buffer.shape[1]),
                                     max_splits=max_splits,
@@ -1817,14 +1770,15 @@ def _attention_forward_token_pool_gqa(
                 _TOKEN_POOL_TRITON_STATS["recoverable_runtime_fallbacks"] += 1
                 _record_token_pool_triton_fallback("recoverable_runtime_error")
                 _TOKEN_POOL_TRITON_DISABLED_SHAPES.add(triton_shape_key)
-    if not has_flat_metadata:
-        raise RuntimeError("token-pool flat decode metadata is required for reference fallback")
+    reference_metadata, reference_kv_pool, reference_layer_idx = (
+        dispatch_context.reference_decode_inputs()
+    )
     result = _attention_forward_token_pool_gqa_reference(
         attn,
         query_states,
-        decode_metadata=flat_metadata,
-        token_kv_pool=token_kv_pool,
-        layer_idx=layer_idx,
+        decode_metadata=reference_metadata,
+        token_kv_pool=reference_kv_pool,
+        layer_idx=reference_layer_idx,
     )
     if timing_enabled:
         _record_token_pool_attention_timing(
