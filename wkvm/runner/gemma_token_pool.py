@@ -1150,6 +1150,313 @@ class TokenPoolDecodeMetadataWorkspace:
         )
 
 
+class TokenPoolBlockTables:
+    """Reusable request-to-physical-block tables for paged token-pool decode."""
+
+    def __init__(
+        self,
+        *,
+        max_requests: int,
+        max_context_len: int,
+        block_size: int,
+        device: Any = "cpu",
+        padding_block: int = -1,
+    ) -> None:
+        import torch
+
+        self.max_requests = int(max_requests)
+        self.block_size = int(block_size)
+        self.padding_block = int(padding_block)
+        if self.max_requests < 1:
+            raise ValueError("max_requests must be >= 1")
+        if int(max_context_len) < 1:
+            raise ValueError("max_context_len must be >= 1")
+        if self.block_size < 1:
+            raise ValueError("block_size must be >= 1")
+        self.device = device
+        self.request_block_tables = torch.full(
+            (self.max_requests, self.width_for_context(max_context_len)),
+            self.padding_block,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._staged_writes: list[tuple[int, int, int]] = []
+        self._gather_workspaces: dict[str, dict[str, Any]] = {}
+        self._slot_mapping_workspaces: dict[str, Any] = {}
+
+    @property
+    def tensor(self):
+        return self.request_block_tables
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return tuple(int(dim) for dim in self.request_block_tables.shape)
+
+    def width_for_context(self, context_len: int) -> int:
+        return max(
+            1,
+            (max(1, int(context_len)) + self.block_size - 1) // self.block_size,
+        )
+
+    def ensure_context_len(self, context_len: int):
+        return self.ensure_width(self.width_for_context(context_len))
+
+    def ensure_width(self, width: int):
+        import torch
+
+        width = int(width)
+        if width < 1:
+            raise ValueError("width must be >= 1")
+        if width <= int(self.request_block_tables.shape[1]):
+            return self.request_block_tables
+        grown = torch.full(
+            (self.max_requests, width),
+            self.padding_block,
+            dtype=self.request_block_tables.dtype,
+            device=self.request_block_tables.device,
+        )
+        grown[:, : int(self.request_block_tables.shape[1])].copy_(
+            self.request_block_tables
+        )
+        self.request_block_tables = grown
+        return self.request_block_tables
+
+    def reset_row(self, req_slot: int) -> None:
+        self._validate_req_slot(req_slot)
+        self.request_block_tables[int(req_slot)].fill_(self.padding_block)
+
+    def snapshot_row(self, req_slot: int):
+        self._validate_req_slot(req_slot)
+        return self.request_block_tables[int(req_slot)].clone()
+
+    def restore_row(self, req_slot: int, snapshot: Any) -> None:
+        self._validate_req_slot(req_slot)
+        if snapshot is None:
+            self.reset_row(req_slot)
+            return
+        self.ensure_width(int(snapshot.numel()))
+        row = self.request_block_tables[int(req_slot)]
+        row.fill_(self.padding_block)
+        width = min(int(row.numel()), int(snapshot.numel()))
+        row[:width].copy_(snapshot[:width].to(device=row.device, dtype=row.dtype))
+
+    def stage_block(self, req_slot: int, logical_block: int, physical_block: int) -> None:
+        req_slot = self._validate_req_slot(req_slot)
+        logical_block = self._validate_logical_block(logical_block)
+        physical_block = self._validate_physical_block(physical_block)
+        self.ensure_width(logical_block + 1)
+        self._staged_writes.append((req_slot, logical_block, physical_block))
+
+    def set_block(
+        self,
+        req_slot: int,
+        logical_block: int,
+        physical_block: int,
+        *,
+        staged: bool = False,
+    ) -> None:
+        if staged:
+            self.stage_block(req_slot, logical_block, physical_block)
+            return
+        req_slot = self._validate_req_slot(req_slot)
+        logical_block = self._validate_logical_block(logical_block)
+        physical_block = self._validate_physical_block(physical_block)
+        self.ensure_width(logical_block + 1)
+        self.request_block_tables[req_slot, logical_block] = physical_block
+
+    def apply_staged_writes(self) -> int:
+        count = len(self._staged_writes)
+        for req_slot, logical_block, physical_block in self._staged_writes:
+            self.request_block_tables[req_slot, logical_block] = physical_block
+        self._staged_writes.clear()
+        return count
+
+    def clear_block(self, req_slot: int, logical_block: int) -> None:
+        req_slot = self._validate_req_slot(req_slot)
+        logical_block = self._validate_logical_block(logical_block)
+        if logical_block < int(self.request_block_tables.shape[1]):
+            self.request_block_tables[req_slot, logical_block] = self.padding_block
+
+    def block_for(self, req_slot: int, logical_block: int) -> int:
+        req_slot = self._validate_req_slot(req_slot)
+        logical_block = self._validate_logical_block(logical_block)
+        if logical_block >= int(self.request_block_tables.shape[1]):
+            return self.padding_block
+        return int(self.request_block_tables[req_slot, logical_block].item())
+
+    def gather_block_tables(
+        self,
+        req_slots: Iterable[int],
+        first_blocks: Iterable[int],
+        block_lens: Iterable[int],
+        *,
+        block_table_width: int | None = None,
+        workspace_key: str | None = None,
+    ):
+        import torch
+
+        req_slots_list = [self._validate_req_slot(slot) for slot in req_slots]
+        first_block_list = [
+            self._validate_logical_block(block) for block in first_blocks
+        ]
+        block_lens_list = [int(length) for length in block_lens]
+        if not req_slots_list:
+            raise ValueError("block-table gather requires at least one request slot")
+        if (
+            len(first_block_list) != len(req_slots_list)
+            or len(block_lens_list) != len(req_slots_list)
+        ):
+            raise ValueError("first_blocks and block_lens must match req_slots")
+        if any(length < 1 for length in block_lens_list):
+            raise ValueError("block_lens must be >= 1")
+
+        max_blocks = max(block_lens_list)
+        if block_table_width is not None:
+            block_table_width = int(block_table_width)
+            if block_table_width < max_blocks:
+                raise ValueError("block_table_width is smaller than live block table")
+            max_blocks = block_table_width
+        max_required = max(
+            first_block + length - 1
+            for first_block, length in zip(first_block_list, block_lens_list)
+        )
+        self.ensure_width(max_required + 1)
+
+        device = self.request_block_tables.device
+        req_slots_tensor = torch.as_tensor(req_slots_list, dtype=torch.long, device=device)
+        first_blocks_tensor = torch.as_tensor(
+            first_block_list,
+            dtype=torch.long,
+            device=device,
+        )
+        offsets = torch.arange(max_blocks, dtype=torch.long, device=device)
+        logical_blocks = first_blocks_tensor[:, None] + offsets[None, :]
+        valid = offsets[None, :] < torch.as_tensor(
+            block_lens_list,
+            dtype=torch.long,
+            device=device,
+        )[:, None]
+        gathered = self.request_block_tables[
+            req_slots_tensor[:, None],
+            logical_blocks.clamp(
+                min=0,
+                max=int(self.request_block_tables.shape[1]) - 1,
+            ),
+        ]
+        filled = torch.where(
+            valid,
+            gathered,
+            torch.full_like(gathered, self.padding_block),
+        )
+        if workspace_key is None:
+            return filled
+        workspace = self._gather_workspaces.setdefault(str(workspace_key), {})
+        block_tables = workspace.get("block_tables")
+        if (
+            block_tables is None
+            or int(block_tables.shape[0]) < len(req_slots_list)
+            or int(block_tables.shape[1]) < max_blocks
+            or block_tables.dtype != filled.dtype
+            or block_tables.device != device
+        ):
+            block_tables = torch.empty(
+                (len(req_slots_list), max_blocks),
+                dtype=filled.dtype,
+                device=device,
+            )
+            workspace["block_tables"] = block_tables
+        block_tables[: len(req_slots_list), :max_blocks].copy_(filled)
+        return block_tables[: len(req_slots_list), :max_blocks]
+
+    def compute_slot_mapping(
+        self,
+        req_slots: Iterable[int],
+        logical_positions: Iterable[int],
+        *,
+        pad_slot_id: int = -1,
+        workspace_key: str | None = None,
+    ):
+        import torch
+
+        req_slots_list = [self._validate_req_slot(slot) for slot in req_slots]
+        logical_positions_list = [int(pos) for pos in logical_positions]
+        if not req_slots_list:
+            raise ValueError("slot mapping requires at least one request slot")
+        if len(logical_positions_list) != len(req_slots_list):
+            raise ValueError("logical_positions must match req_slots")
+        if any(pos < 0 for pos in logical_positions_list):
+            raise ValueError("logical_positions must be non-negative")
+        self.ensure_context_len(max(logical_positions_list) + 1)
+
+        device = self.request_block_tables.device
+        req_slots_tensor = torch.as_tensor(req_slots_list, dtype=torch.long, device=device)
+        logical_positions_tensor = torch.as_tensor(
+            logical_positions_list,
+            dtype=torch.long,
+            device=device,
+        )
+        logical_blocks = logical_positions_tensor // self.block_size
+        physical_blocks = self.request_block_tables[
+            req_slots_tensor,
+            logical_blocks,
+        ].to(dtype=torch.long)
+        slots = physical_blocks * self.block_size + (
+            logical_positions_tensor % self.block_size
+        )
+        slots = torch.where(
+            physical_blocks >= 0,
+            slots,
+            torch.full_like(slots, int(pad_slot_id)),
+        ).to(dtype=torch.long)
+        if workspace_key is None:
+            return slots
+        key = str(workspace_key)
+        out = self._slot_mapping_workspaces.get(key)
+        if (
+            out is None
+            or int(out.numel()) < len(req_slots_list)
+            or out.dtype != slots.dtype
+            or out.device != device
+        ):
+            out = torch.empty(len(req_slots_list), dtype=slots.dtype, device=device)
+            self._slot_mapping_workspaces[key] = out
+        out[: len(req_slots_list)].copy_(slots)
+        return out[: len(req_slots_list)]
+
+    def state_bytes(self) -> int:
+        total = (
+            self.request_block_tables.numel()
+            * self.request_block_tables.element_size()
+        )
+        for workspace in self._gather_workspaces.values():
+            tensor = workspace.get("block_tables")
+            if tensor is not None:
+                total += tensor.numel() * tensor.element_size()
+        for tensor in self._slot_mapping_workspaces.values():
+            total += tensor.numel() * tensor.element_size()
+        return int(total)
+
+    def _validate_req_slot(self, req_slot: int) -> int:
+        req_slot = int(req_slot)
+        if req_slot < 0 or req_slot >= self.max_requests:
+            raise ValueError("req_slot is outside block-table capacity")
+        return req_slot
+
+    @staticmethod
+    def _validate_logical_block(logical_block: int) -> int:
+        logical_block = int(logical_block)
+        if logical_block < 0:
+            raise ValueError("logical_block must be non-negative")
+        return logical_block
+
+    @staticmethod
+    def _validate_physical_block(physical_block: int) -> int:
+        physical_block = int(physical_block)
+        if physical_block < 0:
+            raise ValueError("physical_block must be non-negative")
+        return physical_block
+
+
 def build_decode_metadata_from_token_slot_rows(
     token_slot_rows: Iterable[Iterable[int] | Any],
     *,

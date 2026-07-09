@@ -1385,8 +1385,11 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         self.assertTrue(stats["attention_enabled"])
         self.assertEqual(stats["kv_pool_layers"], 1)
         self.assertEqual(stats["page_table_tensor_shape"], (1, 1))
+        self.assertEqual(stats["block_table_bytes"], 4)
+        self.assertIsNotNone(engine._token_pool_block_tables)
         page_table_tensor = engine._token_pool_page_table_tensor
         self.assertIsNotNone(page_table_tensor)
+        self.assertIs(page_table_tensor, engine._token_pool_block_tables.tensor)
         req_slot = engine._token_pool_req_slots[req.req_id]
         self.assertEqual(page_table_tensor[req_slot, :1].tolist(), [0])
         engine._token_pool_release_request(req.req_id)

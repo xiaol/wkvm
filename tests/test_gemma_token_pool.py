@@ -517,6 +517,90 @@ class TestGemmaTokenPool(unittest.TestCase):
         table.append_slots(reused, [10, 11])
         self.assertEqual(table.clear_before("reused", 1), [10])
 
+    def test_token_pool_block_tables_stage_gather_and_slot_mapping(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import TokenPoolBlockTables
+
+        tables = TokenPoolBlockTables(
+            max_requests=2,
+            max_context_len=4,
+            block_size=4,
+        )
+        self.assertEqual(tables.shape, (2, 1))
+        tables.stage_block(0, 0, 3)
+        self.assertEqual(tables.block_for(0, 0), -1)
+        self.assertEqual(tables.apply_staged_writes(), 1)
+        self.assertEqual(tables.block_for(0, 0), 3)
+
+        tables.set_block(0, 1, 5)
+        tables.set_block(1, 2, 8)
+        self.assertEqual(tables.shape, (2, 3))
+        gathered = tables.gather_block_tables(
+            [0, 1],
+            [0, 2],
+            [2, 1],
+            block_table_width=3,
+            workspace_key="decode",
+        )
+        gathered_ptr = int(gathered.data_ptr())
+        self.assertEqual(gathered.tolist(), [[3, 5, -1], [8, -1, -1]])
+
+        tables.set_block(0, 1, 6)
+        gathered_again = tables.gather_block_tables(
+            [0, 1],
+            [0, 2],
+            [2, 1],
+            block_table_width=3,
+            workspace_key="decode",
+        )
+        self.assertEqual(int(gathered_again.data_ptr()), gathered_ptr)
+        self.assertEqual(gathered_again.tolist(), [[3, 6, -1], [8, -1, -1]])
+
+        slots = tables.compute_slot_mapping(
+            [0, 1],
+            [5, 8],
+            workspace_key="decode",
+        )
+        slots_ptr = int(slots.data_ptr())
+        self.assertEqual(slots.tolist(), [25, 32])
+        tables.clear_block(1, 2)
+        slots_again = tables.compute_slot_mapping(
+            [0, 1],
+            [5, 8],
+            pad_slot_id=-99,
+            workspace_key="decode",
+        )
+        self.assertEqual(int(slots_again.data_ptr()), slots_ptr)
+        self.assertEqual(slots_again.tolist(), [25, -99])
+        self.assertEqual(slots_again.dtype, torch.long)
+        self.assertGreater(tables.state_bytes(), tables.tensor.numel() * 4)
+
+    def test_token_pool_block_tables_snapshot_restore_row(self) -> None:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import TokenPoolBlockTables
+
+        tables = TokenPoolBlockTables(
+            max_requests=1,
+            max_context_len=4,
+            block_size=4,
+        )
+        tables.set_block(0, 0, 2)
+        snapshot = tables.snapshot_row(0)
+        tables.set_block(0, 2, 7)
+        self.assertEqual(tables.tensor.tolist(), [[2, -1, 7]])
+        tables.restore_row(0, snapshot)
+        self.assertEqual(tables.tensor.tolist(), [[2, -1, -1]])
+        tables.reset_row(0)
+        self.assertEqual(tables.tensor.tolist(), [[-1, -1, -1]])
+
     def test_req_to_token_table_reuses_decode_metadata_workspace_by_key(self) -> None:
         try:
             import torch

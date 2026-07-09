@@ -33,6 +33,7 @@ from wkvm.runner.gemma_token_pool import (
     ReqToTokenTable,
     TokenKVLayerSpec,
     TokenKVPool,
+    TokenPoolBlockTables,
     TokenPoolDecodeContext,
     TokenSlotRowChunks,
     TokenSlotAllocator,
@@ -689,7 +690,7 @@ class GemmaNativeEngine:
         self._token_pool_token_slots: dict[str, list[int]] = {}
         self._token_pool_page_tables: dict[str, dict[int, int]] = {}
         self._token_pool_page_owned_slots: dict[str, set[int]] = {}
-        self._token_pool_page_table_tensor: Any | None = None
+        self._token_pool_block_tables: TokenPoolBlockTables | None = None
         self._token_pool_full_attention_slots: dict[str, list[int]] = {}
         self._token_pool_full_attention_rows: dict[str, _TokenPoolFullAttentionRow] = {}
         self._token_pool_full_attention_decode_metadata_workspace: dict[str, Any] = {}
@@ -726,9 +727,7 @@ class GemmaNativeEngine:
                     defer_buffer_allocation=True,
                 )
                 self._token_slot_allocator = self._token_kv_pool
-                self._token_pool_page_table_tensor = (
-                    self._new_token_pool_page_table_tensor()
-                )
+                self._token_pool_block_tables = self._new_token_pool_block_tables()
             else:
                 self._token_slot_allocator = TokenSlotAllocator(capacity=token_pool_capacity)
         self._record_cuda_memory_phase("engine_init")
@@ -1802,43 +1801,33 @@ class GemmaNativeEngine:
         block_size = max(1, int(self.token_pool_paged_block_size))
         return max(1, (max(1, int(context_len)) + block_size - 1) // block_size)
 
-    def _new_token_pool_page_table_tensor(self):
+    @property
+    def _token_pool_page_table_tensor(self):
+        block_tables = self._token_pool_block_tables
+        return None if block_tables is None else block_tables.tensor
+
+    def _new_token_pool_block_tables(self) -> TokenPoolBlockTables | None:
         table = self._token_table
         if table is None:
             return None
-        import torch
-
-        width = self._token_pool_page_table_width_for_context(table.max_context_len)
-        return torch.full(
-            (table.max_requests, width),
-            -1,
-            dtype=torch.int32,
+        return TokenPoolBlockTables(
+            max_requests=table.max_requests,
+            max_context_len=table.max_context_len,
+            block_size=self.token_pool_paged_block_size,
             device=table.req_to_token.device,
         )
 
     def _token_pool_ensure_page_table_width(self, context_len: int) -> None:
-        page_table = self._token_pool_page_table_tensor
-        if page_table is None:
+        block_tables = self._token_pool_block_tables
+        if block_tables is None:
             return
-        width = self._token_pool_page_table_width_for_context(context_len)
-        if width <= int(page_table.shape[1]):
-            return
-        import torch
-
-        grown = torch.full(
-            (int(page_table.shape[0]), width),
-            -1,
-            dtype=page_table.dtype,
-            device=page_table.device,
-        )
-        grown[:, : int(page_table.shape[1])].copy_(page_table)
-        self._token_pool_page_table_tensor = grown
+        block_tables.ensure_context_len(context_len)
 
     def _token_pool_reset_page_table_row(self, req_slot: int) -> None:
-        page_table = self._token_pool_page_table_tensor
-        if page_table is None:
+        block_tables = self._token_pool_block_tables
+        if block_tables is None:
             return
-        page_table[int(req_slot)].fill_(-1)
+        block_tables.reset_row(req_slot)
 
     def _build_token_kv_pool(
         self,
@@ -1973,6 +1962,9 @@ class GemmaNativeEngine:
             stats["page_table_tensor_shape"] = tuple(
                 int(dim) for dim in page_table.shape
             )
+        block_tables = self._token_pool_block_tables
+        if block_tables is not None:
+            stats["block_table_bytes"] = int(block_tables.state_bytes())
         return stats
 
     def _token_pool_admit_request(self, req: Request) -> None:
@@ -2043,11 +2035,9 @@ class GemmaNativeEngine:
         token_slots = None
         page_table_snapshot = dict(self._token_pool_page_tables.get(req.req_id, {}))
         page_owned_snapshot = set(self._token_pool_page_owned_slots.get(req.req_id, set()))
-        page_table_tensor_snapshot = None
-        if self._token_pool_page_table_tensor is not None:
-            page_table_tensor_snapshot = (
-                self._token_pool_page_table_tensor[req_slot].clone()
-            )
+        block_table_snapshot = None
+        if self._token_pool_block_tables is not None:
+            block_table_snapshot = self._token_pool_block_tables.snapshot_row(req_slot)
         self._token_pool_clear_prefix(
             req.req_id,
             req_slot,
@@ -2102,18 +2092,10 @@ class GemmaNativeEngine:
                         allocator.free_slots(added)
                     self._token_pool_page_tables[req.req_id] = page_table_snapshot
                     self._token_pool_page_owned_slots[req.req_id] = page_owned_snapshot
-                    page_table_tensor = self._token_pool_page_table_tensor
-                    if (
-                        page_table_tensor is not None
-                        and page_table_tensor_snapshot is not None
-                    ):
-                        page_table_tensor[req_slot].fill_(-1)
-                        width = min(
-                            int(page_table_tensor.shape[1]),
-                            int(page_table_tensor_snapshot.numel()),
-                        )
-                        page_table_tensor[req_slot, :width].copy_(
-                            page_table_tensor_snapshot[:width]
+                    if self._token_pool_block_tables is not None:
+                        self._token_pool_block_tables.restore_row(
+                            req_slot,
+                            block_table_snapshot,
                         )
             raise
         if token_slots is not None:
@@ -2152,7 +2134,7 @@ class GemmaNativeEngine:
         owned_slots = self._token_pool_page_owned_slots.setdefault(req_id, set())
         req_slot = self._token_pool_req_slots.get(req_id)
         self._token_pool_ensure_page_table_width(start_position + n)
-        page_table_tensor = self._token_pool_page_table_tensor
+        block_tables = self._token_pool_block_tables
         slots: list[int] = []
         for logical_pos in range(start_position, start_position + n):
             logical_block = logical_pos // block_size
@@ -2161,10 +2143,8 @@ class GemmaNativeEngine:
                 physical_block, block_slots = alloc_page(block_size)
                 page_table[logical_block] = int(physical_block)
                 owned_slots.update(int(slot) for slot in block_slots)
-            if page_table_tensor is not None and req_slot is not None:
-                page_table_tensor[int(req_slot), int(logical_block)] = int(
-                    physical_block
-                )
+            if block_tables is not None and req_slot is not None:
+                block_tables.set_block(req_slot, logical_block, physical_block)
             slot = int(physical_block) * block_size + (logical_pos % block_size)
             if slot not in owned_slots:
                 raise RuntimeError("page-aligned token slot is not owned by request")
@@ -2912,18 +2892,14 @@ class GemmaNativeEngine:
         ]
         if not expired_logical_blocks:
             return
-        page_table_tensor = self._token_pool_page_table_tensor
+        block_tables = self._token_pool_block_tables
         slots_to_free: list[int] = []
         for logical_block in sorted(expired_logical_blocks):
             physical_block = page_table.pop(logical_block, None)
             if physical_block is None:
                 continue
-            if (
-                page_table_tensor is not None
-                and 0 <= int(req_slot) < int(page_table_tensor.shape[0])
-                and 0 <= logical_block < int(page_table_tensor.shape[1])
-            ):
-                page_table_tensor[int(req_slot), logical_block] = -1
+            if block_tables is not None:
+                block_tables.clear_block(req_slot, logical_block)
             start_slot = int(physical_block) * block_size
             for slot in range(start_slot, start_slot + block_size):
                 if slot in owned_slots:
