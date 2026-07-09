@@ -1862,11 +1862,13 @@ class _GraphedPaddedDecodeStep:
         self._position_ids_flat = self.position_ids.reshape(self.batch_size)
         self._ids_cpu, self._ids_cpu_np = self._new_decode_staging_buffer(torch)
         self._position_ids_cpu, self._position_ids_cpu_np = self._new_decode_staging_buffer(torch)
-        from wkvm.runner.gemma_token_pool import TokenPoolDecodeGraphBuffer
+        from wkvm.runner.gemma_token_pool import TokenPoolDecodeBackendState
 
-        self._token_pool_metadata = TokenPoolDecodeGraphBuffer.capture(
-            token_pool_decode,
-            clone_tensors=False,
+        self._token_pool_metadata = (
+            TokenPoolDecodeBackendState.capture_graph_decode_metadata(
+                token_pool_decode,
+                clone_tensors=False,
+            )
         )
         self.token_pool_decode = self._token_pool_metadata.context
         self._records_token_pool_decode_steps = bool(
@@ -2010,18 +2012,15 @@ class _GraphedPaddedDecodeStep:
 
     @classmethod
     def _clone_token_pool_decode_context(cls, token_pool_decode):
-        from wkvm.runner.gemma_token_pool import TokenPoolDecodeGraphBuffer
+        from wkvm.runner.gemma_token_pool import TokenPoolDecodeBackendState
 
-        return TokenPoolDecodeGraphBuffer.capture(
-            token_pool_decode,
-            clone_tensors=True,
-        ).context
+        return TokenPoolDecodeBackendState.clone_graph_decode_context(token_pool_decode)
 
     @staticmethod
     def _clone_decode_metadata(metadata):
-        from wkvm.runner.gemma_token_pool import TokenPoolDecodeGraphBuffer
+        from wkvm.runner.gemma_token_pool import TokenPoolDecodeBackendState
 
-        return TokenPoolDecodeGraphBuffer._clone_decode_metadata(metadata)
+        return TokenPoolDecodeBackendState.clone_graph_decode_metadata(metadata)
 
     def _copy_token_pool_decode_context(self, token_pool_decode) -> dict[str, int]:
         return self._token_pool_metadata.copy_from(token_pool_decode)
@@ -2036,9 +2035,9 @@ class _GraphedPaddedDecodeStep:
         copied: set[tuple[int, int]] | None = None,
         stats: dict[str, int] | None = None,
     ) -> None:
-        from wkvm.runner.gemma_token_pool import TokenPoolDecodeGraphBuffer
+        from wkvm.runner.gemma_token_pool import TokenPoolDecodeBackendState
 
-        TokenPoolDecodeGraphBuffer._copy_decode_metadata_group(
+        TokenPoolDecodeBackendState.copy_graph_decode_metadata_group(
             dst_group,
             src_group,
             name,
@@ -2056,9 +2055,9 @@ class _GraphedPaddedDecodeStep:
         copied: set[tuple[int, int]] | None = None,
         stats: dict[str, int] | None = None,
     ) -> None:
-        from wkvm.runner.gemma_token_pool import TokenPoolDecodeGraphBuffer
+        from wkvm.runner.gemma_token_pool import TokenPoolDecodeBackendState
 
-        TokenPoolDecodeGraphBuffer._copy_decode_metadata(
+        TokenPoolDecodeBackendState.copy_graph_decode_metadata(
             dst,
             src,
             prefix,
@@ -2075,9 +2074,9 @@ class _GraphedPaddedDecodeStep:
         copied: set[tuple[int, int]] | None = None,
         stats: dict[str, int] | None = None,
     ) -> None:
-        from wkvm.runner.gemma_token_pool import TokenPoolDecodeGraphBuffer
+        from wkvm.runner.gemma_token_pool import TokenPoolDecodeBackendState
 
-        TokenPoolDecodeGraphBuffer._copy_decode_metadata_tensor(
+        TokenPoolDecodeBackendState.copy_graph_decode_metadata_tensor(
             dst,
             src,
             name,

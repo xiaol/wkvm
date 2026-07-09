@@ -1550,6 +1550,37 @@ class TokenPoolDecodeGraphBuffer:
         dst.copy_(src_tensor, non_blocking=True)
 
 
+class TokenPoolDecodeGraphMetadata:
+    """Backend-facing handle for graph-stable token-pool decode metadata."""
+
+    def __init__(self, buffer: TokenPoolDecodeGraphBuffer) -> None:
+        self._buffer = buffer
+
+    @classmethod
+    def capture(
+        cls,
+        token_pool_decode: TokenPoolDecodeContext | None,
+        *,
+        clone_tensors: bool = False,
+    ) -> "TokenPoolDecodeGraphMetadata":
+        return cls(
+            TokenPoolDecodeGraphBuffer.capture(
+                token_pool_decode,
+                clone_tensors=clone_tensors,
+            )
+        )
+
+    @property
+    def context(self) -> TokenPoolDecodeContext | None:
+        return self._buffer.context
+
+    def copy_from(
+        self,
+        token_pool_decode: TokenPoolDecodeContext | None,
+    ) -> dict[str, int]:
+        return self._buffer.copy_from(token_pool_decode)
+
+
 @dataclass(frozen=True)
 class TokenPoolDecodeGraphSignatureUpdate:
     candidate_batches: int = 0
@@ -4126,6 +4157,92 @@ class TokenPoolDecodeBackendState:
                 allocator=self.allocator,
                 block_size=block_size,
             )
+        )
+
+    def capture_graph_metadata(
+        self,
+        token_pool_decode: TokenPoolDecodeContext | None,
+        *,
+        clone_tensors: bool = False,
+    ) -> TokenPoolDecodeGraphMetadata:
+        return self.capture_graph_decode_metadata(
+            token_pool_decode,
+            clone_tensors=clone_tensors,
+        )
+
+    @staticmethod
+    def capture_graph_decode_metadata(
+        token_pool_decode: TokenPoolDecodeContext | None,
+        *,
+        clone_tensors: bool = False,
+    ) -> TokenPoolDecodeGraphMetadata:
+        return TokenPoolDecodeGraphMetadata.capture(
+            token_pool_decode,
+            clone_tensors=clone_tensors,
+        )
+
+    @staticmethod
+    def clone_graph_decode_context(
+        token_pool_decode: TokenPoolDecodeContext | None,
+    ) -> TokenPoolDecodeContext | None:
+        return TokenPoolDecodeGraphMetadata.capture(
+            token_pool_decode,
+            clone_tensors=True,
+        ).context
+
+    @staticmethod
+    def clone_graph_decode_metadata(metadata: Any) -> Any:
+        return TokenPoolDecodeGraphBuffer._clone_decode_metadata(metadata)
+
+    @staticmethod
+    def copy_graph_decode_metadata_group(
+        dst_group: dict[Any, Any],
+        src_group: dict[Any, Any],
+        name: str,
+        *,
+        copied: set[tuple[int, int]] | None = None,
+        stats: dict[str, int] | None = None,
+    ) -> None:
+        TokenPoolDecodeGraphBuffer._copy_decode_metadata_group(
+            dst_group,
+            src_group,
+            name,
+            copied=copied,
+            stats=stats,
+        )
+
+    @staticmethod
+    def copy_graph_decode_metadata(
+        dst: Any,
+        src: Any,
+        prefix: str,
+        *,
+        copied: set[tuple[int, int]] | None = None,
+        stats: dict[str, int] | None = None,
+    ) -> None:
+        TokenPoolDecodeGraphBuffer._copy_decode_metadata(
+            dst,
+            src,
+            prefix,
+            copied=copied,
+            stats=stats,
+        )
+
+    @staticmethod
+    def copy_graph_decode_metadata_tensor(
+        dst: Any,
+        src: Any,
+        name: str,
+        *,
+        copied: set[tuple[int, int]] | None = None,
+        stats: dict[str, int] | None = None,
+    ) -> None:
+        TokenPoolDecodeGraphBuffer._copy_decode_metadata_tensor(
+            dst,
+            src,
+            name,
+            copied=copied,
+            stats=stats,
         )
 
     @property

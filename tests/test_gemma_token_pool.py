@@ -2977,7 +2977,7 @@ class TestGemmaTokenPool(unittest.TestCase):
                 "paged_metadata_by_layer_type.sliding_attention",
             )
 
-    def test_graph_buffer_aliases_workspace_metadata_and_skips_copies(self) -> None:
+    def test_graph_metadata_facade_aliases_workspace_metadata_and_skips_copies(self) -> None:
         try:
             import torch
         except ImportError:
@@ -2985,8 +2985,8 @@ class TestGemmaTokenPool(unittest.TestCase):
 
         from wkvm.runner.gemma_token_pool import (
             ReqToTokenTable,
+            TokenPoolDecodeBackendState,
             TokenPoolDecodeContext,
-            TokenPoolDecodeGraphBuffer,
         )
 
         table = ReqToTokenTable(max_requests=1, max_context_len=8)
@@ -3016,7 +3016,10 @@ class TestGemmaTokenPool(unittest.TestCase):
             covered_layer_types=frozenset({"sliding_attention"}),
         )
 
-        buffer = TokenPoolDecodeGraphBuffer.capture(context, clone_tensors=False)
+        buffer = TokenPoolDecodeBackendState.capture_graph_decode_metadata(
+            context,
+            clone_tensors=False,
+        )
         self.assertIs(buffer.context.metadata_by_layer_id[0], flat)
         self.assertIs(
             buffer.context.paged_metadata_by_layer_id[0],
