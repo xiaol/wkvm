@@ -423,6 +423,9 @@ class _TokenPoolDecodeReservation:
     previous_length: int
     full_attention_token_slot: int | None = None
     persistent_full_attention_row: bool = False
+    page_table_snapshot: dict[int, int] | None = None
+    page_owned_snapshot: set[int] | None = None
+    block_table_snapshot: Any | None = None
 
 
 class GemmaNativeEngine:
@@ -2319,7 +2322,24 @@ class GemmaNativeEngine:
                     )
                 table.ensure_context_len(previous_length + 1)
                 self._token_pool_ensure_page_table_width(previous_length + 1)
+                page_table_snapshot = None
+                page_owned_snapshot = None
+                block_table_snapshot = None
                 if self._token_kv_pool is not None:
+                    if (
+                        getattr(allocator, "alloc_page_block_with_ids", None)
+                        is not None
+                    ):
+                        page_table_snapshot = dict(
+                            self._token_pool_page_tables.get(req.req_id, {})
+                        )
+                        page_owned_snapshot = set(
+                            self._token_pool_page_owned_slots.get(req.req_id, set())
+                        )
+                        if self._token_pool_block_tables is not None:
+                            block_table_snapshot = (
+                                self._token_pool_block_tables.snapshot_row(req_slot)
+                            )
                     token_slot_tensor, token_slot_ids = (
                         self._token_pool_alloc_page_aligned_slots(
                             req.req_id,
@@ -2339,6 +2359,9 @@ class GemmaNativeEngine:
                     persistent_full_attention_row=bool(
                         persistent_full_attention_rows
                     ),
+                    page_table_snapshot=page_table_snapshot,
+                    page_owned_snapshot=page_owned_snapshot,
+                    block_table_snapshot=block_table_snapshot,
                 )
                 reservations.append(reservation)
                 table.append_slots(req_slot, token_slot_tensor)
@@ -2889,6 +2912,29 @@ class GemmaNativeEngine:
             token_slots = self._token_pool_token_slots.get(reservation.req_id)
             if token_slots is not None and reservation.token_slot in token_slots:
                 token_slots.remove(reservation.token_slot)
+            if (
+                reservation.page_table_snapshot is not None
+                and reservation.page_owned_snapshot is not None
+            ):
+                current_owned = self._token_pool_page_owned_slots.get(
+                    reservation.req_id,
+                    set(),
+                )
+                added = sorted(current_owned - reservation.page_owned_snapshot)
+                if added:
+                    allocator.free_slots(added)
+                self._token_pool_page_tables[reservation.req_id] = dict(
+                    reservation.page_table_snapshot
+                )
+                self._token_pool_page_owned_slots[reservation.req_id] = set(
+                    reservation.page_owned_snapshot
+                )
+                if self._token_pool_block_tables is not None:
+                    self._token_pool_block_tables.restore_row(
+                        reservation.req_slot,
+                        reservation.block_table_snapshot,
+                    )
+                continue
             page_owned = self._token_pool_page_owned_slots.get(reservation.req_id, set())
             if reservation.token_slot not in page_owned:
                 allocator.free_slots([reservation.token_slot])

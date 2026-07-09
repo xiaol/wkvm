@@ -2671,6 +2671,102 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         engine._token_pool_release_request(req.req_id)
         self.assertEqual(engine.stats()["token_pool"]["allocated_token_slots"], 0)
 
+    def test_decode_prepare_failure_rolls_back_page_owned_decode_block(self) -> None:
+        import torch
+        from wkvm.gemma_engine import GemmaNativeEngine
+        from wkvm.models.gemma import gemma4_e4b_routed_span_config
+
+        class FakeNativeTokenPoolModel:
+            wkvm_no_hf_transformer_forward = True
+
+            def __init__(self) -> None:
+                self._param = torch.empty((), dtype=torch.float32)
+                self.config = SimpleNamespace(num_attention_heads=2)
+                attn = SimpleNamespace(
+                    layer_type="sliding_attention",
+                    is_kv_shared_layer=False,
+                    num_key_value_groups=2,
+                    head_dim=4,
+                )
+                self.text_prefix = SimpleNamespace(
+                    layers=[SimpleNamespace(layer_idx=0, attn_meta=attn)]
+                )
+
+            def parameters(self):
+                return iter([self._param])
+
+        cfg = gemma4_e4b_routed_span_config(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("sliding_attention",),
+            sliding_window=4,
+        )
+        engine = GemmaNativeEngine(
+            model=FakeNativeTokenPoolModel(),
+            config=cfg,
+            num_slots=1,
+            enable_token_pool_attention=True,
+            token_pool_max_context_len=8,
+            token_pool_capacity=8,
+            token_pool_paged_block_size=4,
+        )
+        req = Request(prompt_token_ids=[1, 2, 3, 4], max_new_tokens=1, req_id="fail")
+        keys = torch.arange(16, dtype=torch.float32).reshape(1, 1, 4, 4)
+        cache = SimpleNamespace(
+            layers=[
+                SimpleNamespace(
+                    is_sliding=True,
+                    keys=keys,
+                    values=keys + 100,
+                )
+            ]
+        )
+
+        engine._token_pool_commit_prefill_tokens(req, 4, cache=cache)
+        req.num_computed_tokens = 4
+        req.output_token_ids.append(99)
+        req_slot = engine._token_pool_req_slots[req.req_id]
+        page_table_tensor = engine._token_pool_page_table_tensor
+        self.assertIsNotNone(page_table_tensor)
+        self.assertEqual(engine.stats()["token_pool"]["allocated_token_slots"], 4)
+        self.assertEqual(engine._token_pool_page_tables[req.req_id], {0: 0})
+        self.assertEqual(
+            engine._token_pool_page_owned_slots[req.req_id],
+            {0, 1, 2, 3},
+        )
+        self.assertEqual(page_table_tensor[req_slot, :1].tolist(), [0])
+
+        original_prepare_layer_metadata = (
+            engine._token_pool_prepare_layer_decode_metadata
+        )
+
+        def raise_after_decode_page_alloc(*args, **kwargs):
+            raise RuntimeError("forced metadata failure")
+
+        engine._token_pool_prepare_layer_decode_metadata = (  # type: ignore[method-assign]
+            raise_after_decode_page_alloc
+        )
+        try:
+            with self.assertRaisesRegex(RuntimeError, "forced metadata failure"):
+                engine._token_pool_prepare_decode_batch([req])
+        finally:
+            engine._token_pool_prepare_layer_decode_metadata = (  # type: ignore[method-assign]
+                original_prepare_layer_metadata
+            )
+
+        self.assertEqual(engine.stats()["token_pool"]["allocated_token_slots"], 4)
+        self.assertEqual(engine._token_table.length(req_slot), 4)
+        self.assertEqual(
+            engine._token_table.slots_for(req.req_id).tolist(),
+            [0, 1, 2, 3],
+        )
+        self.assertEqual(engine._token_pool_page_tables[req.req_id], {0: 0})
+        self.assertEqual(
+            engine._token_pool_page_owned_slots[req.req_id],
+            {0, 1, 2, 3},
+        )
+        self.assertEqual(page_table_tensor[req_slot, :2].tolist(), [0, -1])
+
     def test_token_pool_clear_prefix_reclaims_page_blocks_without_dropped_slots(self) -> None:
         import torch
         from wkvm.gemma_engine import GemmaNativeEngine
