@@ -88,12 +88,72 @@ class TokenPoolLayerDecodeBinding:
     paged_metadata: PagedDecodeBatchMetadata | None
 
 
+class TokenPoolAttentionWorkspace:
+    """Backend-owned reusable scratch buffers for token-pool attention."""
+
+    def __init__(self) -> None:
+        self._output_buffers: dict[tuple[Any, ...], Any] = {}
+        self._split_workspaces: dict[tuple[Any, ...], tuple[Any, Any, Any]] = {}
+
+    def attention_output_buffer(
+        self,
+        *,
+        batch: int,
+        query_heads: int,
+        head_dim: int,
+        dtype: Any,
+        device: Any,
+    ) -> Any:
+        import torch
+
+        shape = (int(batch), 1, int(query_heads), int(head_dim))
+        key = (str(device), dtype, shape)
+        output = self._output_buffers.get(key)
+        if output is None:
+            output = torch.empty(shape, dtype=dtype, device=device)
+            self._output_buffers[key] = output
+        return output
+
+    def attention_split_workspace(
+        self,
+        *,
+        batch: int,
+        kv_heads: int,
+        max_splits: int,
+        block_groups: int,
+        head_dim: int,
+        device: Any,
+    ) -> tuple[Any, Any, Any]:
+        import torch
+
+        batch = int(batch)
+        kv_heads = int(kv_heads)
+        max_splits = int(max_splits)
+        block_groups = int(block_groups)
+        head_dim = int(head_dim)
+        if min(batch, kv_heads, max_splits, block_groups, head_dim) < 1:
+            raise ValueError("attention split workspace dimensions must be >= 1")
+        stats_shape = (batch, kv_heads, max_splits, block_groups)
+        acc_shape = (batch, kv_heads, max_splits, block_groups, head_dim)
+        key = (str(device), torch.float32, stats_shape, acc_shape)
+        workspace = self._split_workspaces.get(key)
+        if workspace is None:
+            workspace = (
+                torch.empty(stats_shape, dtype=torch.float32, device=device),
+                torch.empty(stats_shape, dtype=torch.float32, device=device),
+                torch.empty(acc_shape, dtype=torch.float32, device=device),
+            )
+            self._split_workspaces[key] = workspace
+        return workspace
+
+
 @dataclass(frozen=True)
 class TokenPoolAttentionBinding:
     layer_idx: int | None
     metadata: DecodeBatchMetadata | None
     paged_metadata: PagedDecodeBatchMetadata | None
     kv_pool: Any | None
+    attention_workspace: Any | None = None
 
     def out_cache_loc_for_write(self) -> Any | None:
         return _metadata_out_cache_loc_for_write(self.metadata)
@@ -119,6 +179,14 @@ class TokenPoolAttentionBinding:
         dtype: Any,
         device: Any,
     ) -> Any | None:
+        if self.attention_workspace is not None:
+            return self.attention_workspace.attention_output_buffer(
+                batch=batch,
+                query_heads=query_heads,
+                head_dim=head_dim,
+                dtype=dtype,
+                device=device,
+            )
         if self.kv_pool is None:
             return None
         output_buffer = getattr(self.kv_pool, "attention_output_buffer", None)
@@ -142,6 +210,15 @@ class TokenPoolAttentionBinding:
         head_dim: int,
         device: Any,
     ) -> Any | None:
+        if self.attention_workspace is not None:
+            return self.attention_workspace.attention_split_workspace(
+                batch=batch,
+                kv_heads=kv_heads,
+                max_splits=max_splits,
+                block_groups=block_groups,
+                head_dim=head_dim,
+                device=device,
+            )
         if self.kv_pool is None:
             return None
         workspace = getattr(self.kv_pool, "attention_split_workspace", None)
@@ -368,6 +445,7 @@ def resolve_token_pool_attention_binding(
         "attention_metadata_for_layer",
         None,
     )
+    attention_workspace = getattr(token_pool_decode, "attention_workspace", None)
     if attention_metadata_for_layer is not None:
         metadata, paged_metadata, token_kv_pool = attention_metadata_for_layer(
             layer_idx,
@@ -379,6 +457,7 @@ def resolve_token_pool_attention_binding(
             metadata=metadata,
             paged_metadata=paged_metadata,
             kv_pool=token_kv_pool,
+            attention_workspace=attention_workspace,
         )
 
     metadata_for_layer = getattr(token_pool_decode, "metadata_for_layer", None)
@@ -408,6 +487,7 @@ def resolve_token_pool_attention_binding(
         metadata=metadata,
         paged_metadata=paged_metadata,
         kv_pool=token_kv_pool,
+        attention_workspace=attention_workspace,
     )
 
 
@@ -452,6 +532,7 @@ def resolve_token_pool_attention_plan(
 class TokenPoolDecodeContext:
     metadata_by_layer_type: dict[str, DecodeBatchMetadata]
     kv_pool: Any | None = None
+    attention_workspace: Any | None = None
     metadata_by_layer_id: dict[int, DecodeBatchMetadata] | None = None
     paged_metadata_by_layer_type: dict[str, PagedDecodeBatchMetadata] | None = None
     paged_metadata_by_layer_id: dict[int, PagedDecodeBatchMetadata] | None = None
@@ -583,6 +664,7 @@ class TokenPoolDecodeContext:
                 metadata=None,
                 paged_metadata=None,
                 kv_pool=None,
+                attention_workspace=self.attention_workspace,
             )
         layer_idx = int(layer_idx)
         metadata = self.metadata_for_layer(layer_idx, layer_type)
@@ -594,6 +676,7 @@ class TokenPoolDecodeContext:
                 metadata=metadata,
                 paged_metadata=paged_metadata,
                 kv_pool=None,
+                attention_workspace=self.attention_workspace,
             )
         layer_specs = getattr(token_kv_pool, "layer_specs", {})
         if layer_idx not in layer_specs:
@@ -607,12 +690,14 @@ class TokenPoolDecodeContext:
                 metadata=None,
                 paged_metadata=None,
                 kv_pool=None,
+                attention_workspace=self.attention_workspace,
             )
         return TokenPoolAttentionBinding(
             layer_idx=layer_idx,
             metadata=metadata,
             paged_metadata=paged_metadata,
             kv_pool=token_kv_pool,
+            attention_workspace=self.attention_workspace,
         )
 
 
@@ -3305,6 +3390,7 @@ class TokenPoolDecodeBackendState:
         self.full_attention_decode_metadata_workspace = (
             self.decode_metadata_workspace.flat_workspace("full_attention")
         )
+        self.attention_workspace = TokenPoolAttentionWorkspace()
 
     @property
     def page_table_tensor(self):
@@ -3546,6 +3632,7 @@ class TokenPoolDecodeBackendState:
         return TokenPoolDecodeContext(
             metadata_by_layer_type=metadata_by_layer_type,
             kv_pool=self.kv_pool,
+            attention_workspace=self.attention_workspace,
             metadata_by_layer_id=metadata_by_layer_id,
             paged_metadata_by_layer_type=paged_metadata_by_layer_type,
             paged_metadata_by_layer_id=paged_metadata_by_layer_id,
@@ -3702,8 +3789,7 @@ class TokenKVPool:
         self._buffers: dict[int, tuple[Any, Any]] = {}
         self._defer_buffer_allocation = bool(defer_buffer_allocation)
         self.validate_slot_writes = bool(validate_slot_writes)
-        self._attention_output_buffers: dict[tuple[Any, ...], Any] = {}
-        self._attention_split_workspaces: dict[tuple[Any, ...], tuple[Any, Any, Any]] = {}
+        self._attention_workspace = TokenPoolAttentionWorkspace()
         self.kv_set_calls = 0
         self.kv_set_tokens = 0
         self.kv_set_index_copy_calls = 0
@@ -3879,15 +3965,13 @@ class TokenKVPool:
         dtype,
         device,
     ):
-        import torch
-
-        shape = (int(batch), 1, int(query_heads), int(head_dim))
-        key = (str(device), dtype, shape)
-        output = self._attention_output_buffers.get(key)
-        if output is None:
-            output = torch.empty(shape, dtype=dtype, device=device)
-            self._attention_output_buffers[key] = output
-        return output
+        return self._attention_workspace.attention_output_buffer(
+            batch=batch,
+            query_heads=query_heads,
+            head_dim=head_dim,
+            dtype=dtype,
+            device=device,
+        )
 
     def attention_split_workspace(
         self,
@@ -3899,27 +3983,14 @@ class TokenKVPool:
         head_dim: int,
         device,
     ):
-        import torch
-
-        batch = int(batch)
-        kv_heads = int(kv_heads)
-        max_splits = int(max_splits)
-        block_groups = int(block_groups)
-        head_dim = int(head_dim)
-        if min(batch, kv_heads, max_splits, block_groups, head_dim) < 1:
-            raise ValueError("attention split workspace dimensions must be >= 1")
-        stats_shape = (batch, kv_heads, max_splits, block_groups)
-        acc_shape = (batch, kv_heads, max_splits, block_groups, head_dim)
-        key = (str(device), torch.float32, stats_shape, acc_shape)
-        workspace = self._attention_split_workspaces.get(key)
-        if workspace is None:
-            workspace = (
-                torch.empty(stats_shape, dtype=torch.float32, device=device),
-                torch.empty(stats_shape, dtype=torch.float32, device=device),
-                torch.empty(acc_shape, dtype=torch.float32, device=device),
-            )
-            self._attention_split_workspaces[key] = workspace
-        return workspace
+        return self._attention_workspace.attention_split_workspace(
+            batch=batch,
+            kv_heads=kv_heads,
+            max_splits=max_splits,
+            block_groups=block_groups,
+            head_dim=head_dim,
+            device=device,
+        )
 
     def target_layer(self, layer_id: int) -> int:
         return self._target_layers[int(layer_id)]

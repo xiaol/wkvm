@@ -2476,6 +2476,105 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(len(owned_binding.output_calls), 1)
         self.assertEqual(len(owned_binding.split_calls), 1)
 
+    def test_decode_backend_owns_attention_workspace(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenPoolAttentionWorkspace,
+            TokenPoolDecodeBackendState,
+            build_decode_metadata_from_token_slot_rows,
+        )
+
+        workspace = TokenPoolAttentionWorkspace()
+        first = workspace.attention_output_buffer(
+            batch=2,
+            query_heads=4,
+            head_dim=8,
+            dtype=torch.float32,
+            device="cpu",
+        )
+        second = workspace.attention_output_buffer(
+            batch=2,
+            query_heads=4,
+            head_dim=8,
+            dtype=torch.float32,
+            device="cpu",
+        )
+        other = workspace.attention_output_buffer(
+            batch=1,
+            query_heads=4,
+            head_dim=8,
+            dtype=torch.float32,
+            device="cpu",
+        )
+        self.assertIs(first, second)
+        self.assertEqual(tuple(first.shape), (2, 1, 4, 8))
+        self.assertIsNot(first, other)
+
+        split_first = workspace.attention_split_workspace(
+            batch=2,
+            kv_heads=1,
+            max_splits=3,
+            block_groups=4,
+            head_dim=8,
+            device="cpu",
+        )
+        split_second = workspace.attention_split_workspace(
+            batch=2,
+            kv_heads=1,
+            max_splits=3,
+            block_groups=4,
+            head_dim=8,
+            device="cpu",
+        )
+        self.assertIs(split_first, split_second)
+
+        class PoolWithoutScratch:
+            layer_specs = {7: object()}
+            capacity = 16
+
+        table = ReqToTokenTable(max_requests=1, max_context_len=8)
+        backend = TokenPoolDecodeBackendState(
+            table=table,
+            kv_pool=PoolWithoutScratch(),
+            block_size=2,
+            token_pool_capacity=16,
+        )
+        metadata = build_decode_metadata_from_token_slot_rows(
+            [[3, 4]],
+            out_cache_loc=[4],
+        )
+        context = backend.build_decode_context(
+            metadata_by_layer_type={"full_attention": metadata},
+        )
+        self.assertIs(context.attention_workspace, backend.attention_workspace)
+        binding = context.attention_binding_for_layer(7, "full_attention")
+        self.assertIs(binding.attention_workspace, backend.attention_workspace)
+        plan = context.attention_plan_for_layer(
+            7,
+            "full_attention",
+            query_seq_len=1,
+        )
+        planned = plan.attention_output_buffer(
+            batch=1,
+            query_heads=2,
+            head_dim=4,
+            dtype=torch.float32,
+            device="cpu",
+        )
+        direct = backend.attention_workspace.attention_output_buffer(
+            batch=1,
+            query_heads=2,
+            head_dim=4,
+            dtype=torch.float32,
+            device="cpu",
+        )
+        self.assertIs(planned, direct)
+
     def test_graph_clone_and_copy_handles_paged_metadata(self) -> None:
         try:
             import torch  # noqa: F401
