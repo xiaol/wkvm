@@ -3128,6 +3128,60 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(tracker.discard_touching({"a"}), 1)
         self.assertFalse(tracker.signatures)
 
+    def test_graph_decode_context_graphable_requires_cuda_metadata(self) -> None:
+        from wkvm.runner.gemma_token_pool import (
+            DecodeBatchMetadata,
+            TokenPoolDecodeBackendState,
+            TokenPoolDecodeContext,
+        )
+
+        class FakeTensor:
+            dtype = "torch.int32"
+            device = "cuda:0"
+
+            def __init__(self, *, is_cuda: bool) -> None:
+                self.is_cuda = is_cuda
+                self.shape = (1,)
+
+            def numel(self) -> int:
+                return 1
+
+        def context(*, is_cuda: bool, kv_pool=object()) -> TokenPoolDecodeContext:
+            tensor = FakeTensor(is_cuda=is_cuda)
+            metadata = DecodeBatchMetadata(
+                req_pool_indices=tensor,
+                seq_lens=tensor,
+                logical_seq_lens=tensor,
+                out_cache_loc=tensor,
+                kv_indptr=tensor,
+                kv_indices=tensor,
+            )
+            return TokenPoolDecodeContext(
+                metadata_by_layer_type={"sliding_attention": metadata},
+                kv_pool=kv_pool,
+                metadata_by_layer_id={0: metadata},
+                covered_layer_types=frozenset({"sliding_attention"}),
+            )
+
+        self.assertFalse(
+            TokenPoolDecodeBackendState.graph_decode_context_is_graphable(None)
+        )
+        self.assertFalse(
+            TokenPoolDecodeBackendState.graph_decode_context_is_graphable(
+                context(is_cuda=True, kv_pool=None),
+            )
+        )
+        self.assertFalse(
+            TokenPoolDecodeBackendState.graph_decode_context_is_graphable(
+                context(is_cuda=False),
+            )
+        )
+        self.assertTrue(
+            TokenPoolDecodeBackendState.graph_decode_context_is_graphable(
+                context(is_cuda=True),
+            )
+        )
+
     def test_decode_metadata_owns_triton_decode_plan(self) -> None:
         try:
             import torch  # noqa: F401

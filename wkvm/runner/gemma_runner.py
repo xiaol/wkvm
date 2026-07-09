@@ -1479,10 +1479,13 @@ class GemmaRoutedSpanRunner:
         token_pool_covered_layer_types = _token_pool_covered_layer_types(
             native_forward_kwargs.get("wkvm_token_pool_decode"),
         )
+        from wkvm.runner.gemma_token_pool import TokenPoolDecodeBackendState
+
+        token_pool_decode = native_forward_kwargs.get("wkvm_token_pool_decode")
         use_cuda_graph = self._can_cuda_graph_decode() and (
             not token_pool_covered_layer_types
-            or _token_pool_decode_graphable(
-                native_forward_kwargs.get("wkvm_token_pool_decode"),
+            or TokenPoolDecodeBackendState.graph_decode_context_is_graphable(
+                token_pool_decode,
             )
         )
         merged_cache, info = NativeGemmaRoutedCache.merge_padded_decode(
@@ -1797,41 +1800,6 @@ def _token_pool_covered_layer_types(token_pool_decode) -> frozenset[str]:
         if metadata is not None and getattr(metadata, "out_cache_loc", None) is not None
     }
     return frozenset(covered)
-
-
-def _token_pool_decode_graphable(token_pool_decode) -> bool:
-    if token_pool_decode is None:
-        return False
-    if getattr(token_pool_decode, "kv_pool", None) is None:
-        return False
-    metadata_groups = [getattr(token_pool_decode, "metadata_by_layer_type", {})]
-    for group_name in (
-        "metadata_by_layer_id",
-        "paged_metadata_by_layer_type",
-        "paged_metadata_by_layer_id",
-    ):
-        group = getattr(token_pool_decode, group_name, None)
-        if group:
-            metadata_groups.append(group)
-    for group in metadata_groups:
-        for metadata in group.values():
-            for name in (
-                "req_pool_indices",
-                "seq_lens",
-                "logical_seq_lens",
-                "out_cache_loc",
-                "kv_indptr",
-                "kv_indices",
-                "block_tables",
-                "block_table_lens",
-                "selected_start_positions",
-                "slot_mapping",
-                "out_cache_loc_long",
-            ):
-                tensor = getattr(metadata, name, None)
-                if tensor is not None and not bool(getattr(tensor, "is_cuda", False)):
-                    return False
-    return True
 
 
 class _GraphedPaddedDecodeStep:
