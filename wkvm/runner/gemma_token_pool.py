@@ -1009,6 +1009,147 @@ def _ensure_decode_metadata_workspace(
     return target
 
 
+def _ensure_paged_decode_metadata_workspace(
+    workspace: dict[str, Any] | None,
+    *,
+    device: Any,
+    row_count: int,
+    block_table_width: int,
+) -> dict[str, Any]:
+    import torch
+
+    row_count = int(row_count)
+    block_table_width = int(block_table_width)
+    if row_count < 1:
+        raise ValueError("row_count must be >= 1")
+    if block_table_width < 1:
+        raise ValueError("block_table_width must be >= 1")
+    target = workspace if workspace is not None else {}
+    target_device = torch.empty(0, device=device).device
+
+    def valid_1d(name: str, dtype: Any) -> bool:
+        tensor = target.get(name)
+        return (
+            tensor is not None
+            and int(tensor.numel()) >= row_count
+            and tensor.dtype == dtype
+            and tensor.device == target_device
+        )
+
+    def valid_block_tables() -> bool:
+        tensor = target.get("block_tables")
+        return (
+            tensor is not None
+            and len(tuple(tensor.shape)) == 2
+            and int(tensor.shape[0]) >= row_count
+            and int(tensor.shape[1]) >= block_table_width
+            and tensor.dtype == torch.int32
+            and tensor.device == target_device
+        )
+
+    if (
+        not valid_1d("req_pool_indices", torch.int32)
+        or not valid_1d("seq_lens", torch.int32)
+        or not valid_1d("logical_seq_lens", torch.int32)
+        or not valid_1d("out_cache_loc", torch.int32)
+        or not valid_1d("out_cache_loc_long", torch.long)
+        or not valid_1d("block_table_lens", torch.int32)
+        or not valid_1d("selected_start_positions", torch.int32)
+        or not valid_block_tables()
+    ):
+        old = target
+
+        def reuse_1d(name: str, dtype: Any):
+            tensor = old.get(name)
+            if (
+                tensor is not None
+                and int(tensor.numel()) >= row_count
+                and tensor.dtype == dtype
+                and tensor.device == target_device
+            ):
+                return tensor
+            return torch.empty(row_count, dtype=dtype, device=device)
+
+        block_tables = old.get("block_tables")
+        if not (
+            block_tables is not None
+            and len(tuple(block_tables.shape)) == 2
+            and int(block_tables.shape[0]) >= row_count
+            and int(block_tables.shape[1]) >= block_table_width
+            and block_tables.dtype == torch.int32
+            and block_tables.device == target_device
+        ):
+            block_tables = torch.empty(
+                (row_count, block_table_width),
+                dtype=torch.int32,
+                device=device,
+            )
+        new_workspace = {
+            "req_pool_indices": reuse_1d("req_pool_indices", torch.int32),
+            "seq_lens": reuse_1d("seq_lens", torch.int32),
+            "logical_seq_lens": reuse_1d("logical_seq_lens", torch.int32),
+            "out_cache_loc": reuse_1d("out_cache_loc", torch.int32),
+            "out_cache_loc_long": reuse_1d("out_cache_loc_long", torch.long),
+            "block_table_lens": reuse_1d("block_table_lens", torch.int32),
+            "selected_start_positions": reuse_1d(
+                "selected_start_positions",
+                torch.int32,
+            ),
+            "block_tables": block_tables,
+        }
+        target.clear()
+        target.update(new_workspace)
+    return target
+
+
+class TokenPoolDecodeMetadataWorkspace:
+    """Typed owner for reusable decode metadata workspaces."""
+
+    def __init__(self) -> None:
+        self.flat_workspaces: dict[str, dict[str, Any]] = {}
+        self.paged_workspaces: dict[str, dict[str, Any]] = {}
+
+    @staticmethod
+    def _key(key: str | None) -> str:
+        return "__default__" if key is None else str(key)
+
+    def flat_workspace(self, key: str | None = None) -> dict[str, Any]:
+        return self.flat_workspaces.setdefault(self._key(key), {})
+
+    def paged_workspace(self, key: str | None = None) -> dict[str, Any]:
+        return self.paged_workspaces.setdefault(self._key(key), {})
+
+    def ensure_flat(
+        self,
+        key: str | None = None,
+        *,
+        device: Any,
+        row_count: int,
+        kv_capacity: int,
+    ) -> dict[str, Any]:
+        return _ensure_decode_metadata_workspace(
+            self.flat_workspace(key),
+            device=device,
+            row_count=row_count,
+            kv_capacity=kv_capacity,
+        )
+
+    def ensure_paged(
+        self,
+        key: str | None = None,
+        *,
+        device: Any,
+        row_count: int,
+        block_table_width: int,
+    ) -> dict[str, Any]:
+        return _ensure_paged_decode_metadata_workspace(
+            self.paged_workspace(key),
+            device=device,
+            row_count=row_count,
+            block_table_width=block_table_width,
+        )
+
+
 def build_decode_metadata_from_token_slot_rows(
     token_slot_rows: Iterable[Iterable[int] | Any],
     *,
@@ -1018,7 +1159,8 @@ def build_decode_metadata_from_token_slot_rows(
     device: Any | None = None,
     dtype: Any | None = None,
     token_pool_capacity: int | None = None,
-    workspace: dict[str, Any] | None = None,
+    workspace: dict[str, Any] | TokenPoolDecodeMetadataWorkspace | None = None,
+    workspace_key: str | None = None,
     kv_indices_padding_slots: int = 0,
     trusted_aux_metadata: bool = False,
 ) -> DecodeBatchMetadata:
@@ -1174,12 +1316,21 @@ def build_decode_metadata_from_token_slot_rows(
     indptr_source = torch.as_tensor(indptr, dtype=torch.int32, device=device)
 
     if workspace is not None:
-        workspace = _ensure_decode_metadata_workspace(
-            workspace,
-            device=device,
-            row_count=row_count,
-            kv_capacity=visible_kv,
-        )
+        if isinstance(workspace, TokenPoolDecodeMetadataWorkspace):
+            metadata_workspace = workspace.ensure_flat(
+                workspace_key,
+                device=device,
+                row_count=row_count,
+                kv_capacity=visible_kv,
+            )
+        else:
+            metadata_workspace = _ensure_decode_metadata_workspace(
+                workspace,
+                device=device,
+                row_count=row_count,
+                kv_capacity=visible_kv,
+            )
+        workspace = metadata_workspace
         req_pool_indices = workspace["req_pool_indices"][:row_count]
         seq_lens = workspace["seq_lens"][:row_count]
         logical_lens = workspace["logical_seq_lens"][:row_count]
@@ -1547,8 +1698,13 @@ class ReqToTokenTable:
         self._req_to_slot: dict[str, int] = {}
         self._slot_to_req: dict[int, str] = {}
         self._cleared_prefix_lengths = [0 for _ in range(self.max_requests)]
-        self._decode_metadata_workspaces: dict[str, dict[str, Any]] = {}
-        self._paged_decode_metadata_workspaces: dict[str, dict[str, Any]] = {}
+        self.decode_metadata_workspace = TokenPoolDecodeMetadataWorkspace()
+        self._decode_metadata_workspaces = (
+            self.decode_metadata_workspace.flat_workspaces
+        )
+        self._paged_decode_metadata_workspaces = (
+            self.decode_metadata_workspace.paged_workspaces
+        )
 
     def allocate(self, req_id: str) -> int:
         req_id = str(req_id)
@@ -1826,89 +1982,12 @@ class ReqToTokenTable:
         row_count: int,
         kv_capacity: int,
     ) -> dict[str, Any]:
-        import torch
-
-        row_count = int(row_count)
-        kv_capacity = int(kv_capacity)
-        if row_count < 1:
-            raise ValueError("row_count must be >= 1")
-        if kv_capacity < 0:
-            raise ValueError("kv_capacity must be >= 0")
-        workspace = self._decode_metadata_workspaces.get(key)
-        row_buffer_size = row_count
-        indptr_size = row_count + 1
-        kv_buffer_size = max(1, kv_capacity)
-
-        def needs(name: str, size: int) -> bool:
-            return workspace is None or int(workspace[name].numel()) < int(size)
-
-        if (
-            workspace is None
-            or needs("req_pool_indices", row_buffer_size)
-            or needs("kv_indptr", indptr_size)
-            or needs("kv_indices", kv_buffer_size)
-        ):
-            old = workspace or {}
-            workspace = {
-                "req_pool_indices": old.get("req_pool_indices")
-                if old.get("req_pool_indices") is not None
-                and int(old["req_pool_indices"].numel()) >= row_buffer_size
-                else torch.empty(
-                    row_buffer_size,
-                    dtype=torch.int32,
-                    device=self.req_to_token.device,
-                ),
-                "seq_lens": old.get("seq_lens")
-                if old.get("seq_lens") is not None
-                and int(old["seq_lens"].numel()) >= row_buffer_size
-                else torch.empty(
-                    row_buffer_size,
-                    dtype=torch.int32,
-                    device=self.req_to_token.device,
-                ),
-                "logical_seq_lens": old.get("logical_seq_lens")
-                if old.get("logical_seq_lens") is not None
-                and int(old["logical_seq_lens"].numel()) >= row_buffer_size
-                else torch.empty(
-                    row_buffer_size,
-                    dtype=torch.int32,
-                    device=self.req_to_token.device,
-                ),
-                "out_cache_loc": old.get("out_cache_loc")
-                if old.get("out_cache_loc") is not None
-                and int(old["out_cache_loc"].numel()) >= row_buffer_size
-                else torch.empty(
-                    row_buffer_size,
-                    dtype=torch.int32,
-                    device=self.req_to_token.device,
-                ),
-                "out_cache_loc_long": old.get("out_cache_loc_long")
-                if old.get("out_cache_loc_long") is not None
-                and int(old["out_cache_loc_long"].numel()) >= row_buffer_size
-                else torch.empty(
-                    row_buffer_size,
-                    dtype=torch.long,
-                    device=self.req_to_token.device,
-                ),
-                "kv_indptr": old.get("kv_indptr")
-                if old.get("kv_indptr") is not None
-                and int(old["kv_indptr"].numel()) >= indptr_size
-                else torch.empty(
-                    indptr_size,
-                    dtype=torch.int32,
-                    device=self.req_to_token.device,
-                ),
-                "kv_indices": old.get("kv_indices")
-                if old.get("kv_indices") is not None
-                and int(old["kv_indices"].numel()) >= kv_buffer_size
-                else torch.empty(
-                    kv_buffer_size,
-                    dtype=torch.int32,
-                    device=self.req_to_token.device,
-                ),
-            }
-            self._decode_metadata_workspaces[key] = workspace
-        return workspace
+        return self.decode_metadata_workspace.ensure_flat(
+            key,
+            device=self.req_to_token.device,
+            row_count=row_count,
+            kv_capacity=kv_capacity,
+        )
 
     def build_paged_decode_metadata(
         self,
@@ -2591,107 +2670,12 @@ class ReqToTokenTable:
         row_count: int,
         block_table_width: int,
     ) -> dict[str, Any]:
-        import torch
-
-        row_count = int(row_count)
-        block_table_width = int(block_table_width)
-        if row_count < 1:
-            raise ValueError("row_count must be >= 1")
-        if block_table_width < 1:
-            raise ValueError("block_table_width must be >= 1")
-        workspace = self._paged_decode_metadata_workspaces.get(key)
-
-        def has_1d(name: str) -> bool:
-            return (
-                workspace is not None
-                and workspace.get(name) is not None
-                and int(workspace[name].numel()) >= row_count
-            )
-
-        def has_block_tables() -> bool:
-            return (
-                workspace is not None
-                and workspace.get("block_tables") is not None
-                and int(workspace["block_tables"].shape[0]) >= row_count
-                and int(workspace["block_tables"].shape[1]) >= block_table_width
-            )
-
-        if (
-            workspace is None
-            or not has_1d("req_pool_indices")
-            or not has_1d("out_cache_loc_long")
-            or not has_block_tables()
-        ):
-            old = workspace or {}
-            workspace = {
-                "req_pool_indices": old.get("req_pool_indices")
-                if old.get("req_pool_indices") is not None
-                and int(old["req_pool_indices"].numel()) >= row_count
-                else torch.empty(
-                    row_count,
-                    dtype=torch.int32,
-                    device=self.req_to_token.device,
-                ),
-                "seq_lens": old.get("seq_lens")
-                if old.get("seq_lens") is not None
-                and int(old["seq_lens"].numel()) >= row_count
-                else torch.empty(
-                    row_count,
-                    dtype=torch.int32,
-                    device=self.req_to_token.device,
-                ),
-                "logical_seq_lens": old.get("logical_seq_lens")
-                if old.get("logical_seq_lens") is not None
-                and int(old["logical_seq_lens"].numel()) >= row_count
-                else torch.empty(
-                    row_count,
-                    dtype=torch.int32,
-                    device=self.req_to_token.device,
-                ),
-                "out_cache_loc": old.get("out_cache_loc")
-                if old.get("out_cache_loc") is not None
-                and int(old["out_cache_loc"].numel()) >= row_count
-                else torch.empty(
-                    row_count,
-                    dtype=torch.int32,
-                    device=self.req_to_token.device,
-                ),
-                "out_cache_loc_long": old.get("out_cache_loc_long")
-                if old.get("out_cache_loc_long") is not None
-                and int(old["out_cache_loc_long"].numel()) >= row_count
-                else torch.empty(
-                    row_count,
-                    dtype=torch.long,
-                    device=self.req_to_token.device,
-                ),
-                "block_table_lens": old.get("block_table_lens")
-                if old.get("block_table_lens") is not None
-                and int(old["block_table_lens"].numel()) >= row_count
-                else torch.empty(
-                    row_count,
-                    dtype=torch.int32,
-                    device=self.req_to_token.device,
-                ),
-                "selected_start_positions": old.get("selected_start_positions")
-                if old.get("selected_start_positions") is not None
-                and int(old["selected_start_positions"].numel()) >= row_count
-                else torch.empty(
-                    row_count,
-                    dtype=torch.int32,
-                    device=self.req_to_token.device,
-                ),
-                "block_tables": old.get("block_tables")
-                if old.get("block_tables") is not None
-                and int(old["block_tables"].shape[0]) >= row_count
-                and int(old["block_tables"].shape[1]) >= block_table_width
-                else torch.empty(
-                    (row_count, block_table_width),
-                    dtype=torch.int32,
-                    device=self.req_to_token.device,
-                ),
-            }
-            self._paged_decode_metadata_workspaces[key] = workspace
-        return workspace
+        return self.decode_metadata_workspace.ensure_paged(
+            key,
+            device=self.req_to_token.device,
+            row_count=row_count,
+            block_table_width=block_table_width,
+        )
 
     def _resolve_req_slot(self, req_id_or_slot: str | int) -> int:
         if isinstance(req_id_or_slot, str):

@@ -523,9 +523,20 @@ class TestGemmaTokenPool(unittest.TestCase):
         except ImportError:
             self.skipTest("torch unavailable")
 
-        from wkvm.runner.gemma_token_pool import ReqToTokenTable
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenPoolDecodeMetadataWorkspace,
+        )
 
         table = ReqToTokenTable(max_requests=2, max_context_len=8)
+        self.assertIsInstance(
+            table.decode_metadata_workspace,
+            TokenPoolDecodeMetadataWorkspace,
+        )
+        self.assertIs(
+            table._decode_metadata_workspaces,
+            table.decode_metadata_workspace.flat_workspaces,
+        )
         a = table.allocate("a")
         b = table.allocate("b")
         table.append_slots(a, [10, 11, 12, 13])
@@ -564,9 +575,20 @@ class TestGemmaTokenPool(unittest.TestCase):
         except ImportError:
             self.skipTest("torch unavailable")
 
-        from wkvm.runner.gemma_token_pool import ReqToTokenTable
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenPoolDecodeMetadataWorkspace,
+        )
 
         table = ReqToTokenTable(max_requests=2, max_context_len=8)
+        self.assertIsInstance(
+            table.decode_metadata_workspace,
+            TokenPoolDecodeMetadataWorkspace,
+        )
+        self.assertIs(
+            table._paged_decode_metadata_workspaces,
+            table.decode_metadata_workspace.paged_workspaces,
+        )
         a = table.allocate("a")
         b = table.allocate("b")
         table.append_slots(a, [0, 1, 2, 3])
@@ -665,6 +687,25 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(dense_metadata.block_table_lens.tolist(), [2, 2])
         self.assertEqual(dense_metadata.out_cache_loc.tolist(), [9, 37])
         self.assertEqual(dense_metadata.slot_mapping.dtype, torch.long)
+        dense_block_ptr = int(dense_metadata.block_tables.data_ptr())
+        dense_again = table.build_paged_decode_metadata_from_page_table_tensor(
+            [a, b],
+            dense_page_table,
+            block_size=4,
+            block_table_width=4,
+            seq_lens=[10, 18],
+            out_cache_loc=[9, 37],
+            sliding_window=6,
+            token_pool_capacity=64,
+            workspace_key="sliding_attention_paged_tensor",
+        )
+        self.assertEqual(int(dense_again.block_tables.data_ptr()), dense_block_ptr)
+        self.assertIs(
+            table._paged_decode_metadata_workspaces["sliding_attention_paged_tensor"],
+            table.decode_metadata_workspace.paged_workspace(
+                "sliding_attention_paged_tensor"
+            ),
+        )
 
         dense_page_table[a, 2] = -1
         with self.assertRaisesRegex(ValueError, "missing"):
@@ -849,6 +890,55 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(second.out_cache_loc_long.dtype, torch.long)
         self.assertEqual(second.kv_indptr.tolist(), [0, 4, 6])
         self.assertEqual(second.kv_indices.tolist(), [31, 12, 13, 41, 8, 6, 6, 6])
+
+    def test_explicit_token_slot_rows_accept_typed_decode_metadata_workspace(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            TokenPoolDecodeMetadataWorkspace,
+            build_decode_metadata_from_token_slot_rows,
+        )
+
+        workspace = TokenPoolDecodeMetadataWorkspace()
+        first = build_decode_metadata_from_token_slot_rows(
+            [[10, 11], [20, 21]],
+            req_slots=[1, 2],
+            logical_seq_lens=[8, 9],
+            out_cache_loc=[11, 21],
+            workspace=workspace,
+            workspace_key="full",
+        )
+        first_ptr = int(first.kv_indices.data_ptr())
+        second = build_decode_metadata_from_token_slot_rows(
+            [[12, 13], [22, 23]],
+            req_slots=[3, 4],
+            logical_seq_lens=[10, 11],
+            out_cache_loc=[13, 23],
+            workspace=workspace,
+            workspace_key="full",
+        )
+        self.assertEqual(int(second.kv_indices.data_ptr()), first_ptr)
+        self.assertEqual(second.kv_indices.tolist(), [12, 13, 22, 23])
+        self.assertEqual(second.req_pool_indices.tolist(), [3, 4])
+        self.assertEqual(second.out_cache_loc_long.dtype, torch.long)
+
+        sliding = build_decode_metadata_from_token_slot_rows(
+            [[30, 31]],
+            req_slots=[5],
+            logical_seq_lens=[12],
+            out_cache_loc=[31],
+            workspace=workspace,
+            workspace_key="sliding",
+        )
+        self.assertNotEqual(int(sliding.kv_indices.data_ptr()), first_ptr)
+        self.assertIs(
+            workspace.flat_workspaces["full"],
+            workspace.flat_workspace("full"),
+        )
+        self.assertIn("sliding", workspace.flat_workspaces)
 
     def test_explicit_token_slot_row_chunks_fill_workspace_without_cat(self) -> None:
         try:
