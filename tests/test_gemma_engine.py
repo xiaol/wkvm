@@ -1315,6 +1315,7 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         import torch
         from wkvm.gemma_engine import GemmaNativeEngine
         from wkvm.models.gemma import gemma4_e4b_routed_span_config
+        from wkvm.runner.gemma_token_pool import TokenPoolDecodeBackendState
 
         class FakeNativeTokenPoolModel:
             wkvm_no_hf_transformer_forward = True
@@ -1348,6 +1349,14 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
             enable_token_pool_attention=True,
             token_pool_max_context_len=4,
             token_pool_capacity=32,
+        )
+        self.assertIsInstance(
+            engine._token_pool_decode_backend,
+            TokenPoolDecodeBackendState,
+        )
+        self.assertIs(
+            engine._token_pool_decode_backend.block_tables,
+            engine._token_pool_block_tables,
         )
         req = Request(prompt_token_ids=[1, 2, 3], max_new_tokens=2, req_id="tp")
         keys = torch.arange(12, dtype=torch.float32).reshape(1, 1, 3, 4)

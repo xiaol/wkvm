@@ -566,6 +566,17 @@ def build_token_pool_triton_decode_plan(
     )
 
 
+def _token_pool_paged_metadata_requested() -> bool:
+    return any(
+        _env_flag(name)
+        for name in (
+            "WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON",
+            "WKVM_ENABLE_TOKEN_POOL_PAGED_SPLIT_TRITON",
+            "WKVM_TOKEN_POOL_BUILD_PAGED_METADATA",
+        )
+    )
+
+
 def _token_pool_timing_enabled() -> bool:
     return _env_flag("WKVM_TOKEN_POOL_TIMING") or _env_flag("WKVM_NATIVE_FORWARD_TIMING")
 
@@ -1966,6 +1977,23 @@ def _slot_values_to_list(slots: Iterable[int] | Any) -> list[int]:
         return [int(slots)]
 
 
+def _slot_values_source_and_count(slots: Iterable[int] | Any) -> tuple[Any, int]:
+    if isinstance(slots, int):
+        return [int(slots)], 1
+    numel = getattr(slots, "numel", None)
+    if numel is not None:
+        return slots, int(numel())
+    if isinstance(slots, range):
+        return slots, len(slots)
+    if isinstance(slots, (list, tuple)):
+        return slots, len(slots)
+    try:
+        return slots, len(slots)
+    except TypeError:
+        values = _slot_values_to_list(slots)
+        return values, len(values)
+
+
 class ReqToTokenTable:
     """Request-slot to token-slot table for decode metadata construction."""
 
@@ -2994,6 +3022,284 @@ class ReqToTokenTable:
     def _validate_allocated_slot(self, slot: int) -> None:
         if slot < 0 or slot >= self.max_requests or slot not in self._slot_to_req:
             raise KeyError(f"request slot {slot} is not allocated")
+
+
+def pad_decode_metadata_kv_indices(
+    metadata: DecodeBatchMetadata,
+    *,
+    extra_slots: int,
+    max_seq_len: int | None = None,
+) -> DecodeBatchMetadata:
+    import torch
+
+    extra_slots = max(0, int(extra_slots))
+    if extra_slots < 1:
+        return metadata
+    kv_indices = metadata.kv_indices
+    current = int(kv_indices.numel())
+    if current > 0:
+        padding = kv_indices[-1:].expand(extra_slots)
+    else:
+        padding = torch.zeros(
+            extra_slots,
+            dtype=kv_indices.dtype,
+            device=kv_indices.device,
+        )
+
+    return DecodeBatchMetadata(
+        req_pool_indices=metadata.req_pool_indices,
+        seq_lens=metadata.seq_lens,
+        logical_seq_lens=metadata.logical_seq_lens,
+        out_cache_loc=metadata.out_cache_loc,
+        kv_indptr=metadata.kv_indptr,
+        kv_indices=torch.cat((kv_indices, padding), dim=0).contiguous(),
+        out_cache_loc_long=metadata.out_cache_loc_long,
+        max_seq_len=(
+            getattr(metadata, "max_seq_len", None)
+            if max_seq_len is None
+            else int(max_seq_len)
+        ),
+    )
+
+
+def pad_sliding_decode_metadata_kv_indices(
+    metadata: DecodeBatchMetadata,
+    *,
+    sliding_window: int,
+    extra_steps: int,
+    current_seq_lens: Iterable[int] | None = None,
+) -> DecodeBatchMetadata:
+    extra_steps = max(0, int(extra_steps))
+    if extra_steps < 1:
+        return metadata
+    if current_seq_lens is None:
+        try:
+            seq_lens = [
+                int(value)
+                for value in metadata.seq_lens.detach().cpu().reshape(-1).tolist()
+            ]
+        except AttributeError:
+            return metadata
+    else:
+        seq_lens = [int(value) for value in current_seq_lens]
+    if not seq_lens:
+        return metadata
+    window = max(1, int(sliding_window))
+    target_total = sum(min(window, seq_len + extra_steps) for seq_len in seq_lens)
+    target_max_seq_len = max(min(window, seq_len + extra_steps) for seq_len in seq_lens)
+    return pad_decode_metadata_kv_indices(
+        metadata,
+        extra_slots=max(0, int(target_total) - int(metadata.kv_indices.numel())),
+        max_seq_len=target_max_seq_len,
+    )
+
+
+class TokenPoolDecodeBackendState:
+    """Backend-owned decode metadata builder for token-pool attention."""
+
+    def __init__(
+        self,
+        *,
+        table: ReqToTokenTable,
+        kv_pool: Any | None = None,
+        block_tables: TokenPoolBlockTables | None = None,
+        block_size: int = 16,
+        page_table_metadata_max_rows: int = 2,
+        token_pool_capacity: int | None = None,
+    ) -> None:
+        block_size = int(block_size)
+        if block_size < 1:
+            raise ValueError("block_size must be >= 1")
+        if token_pool_capacity is not None and int(token_pool_capacity) < 1:
+            raise ValueError("token_pool_capacity must be >= 1 or None")
+        self.table = table
+        self.kv_pool = kv_pool
+        self.block_tables = block_tables
+        self.block_size = block_size
+        self.page_table_metadata_max_rows = max(0, int(page_table_metadata_max_rows))
+        if token_pool_capacity is None and kv_pool is not None:
+            token_pool_capacity = getattr(kv_pool, "capacity", None)
+        self.token_pool_capacity = (
+            None if token_pool_capacity is None else int(token_pool_capacity)
+        )
+
+    @property
+    def page_table_tensor(self):
+        block_tables = self.block_tables
+        return None if block_tables is None else block_tables.tensor
+
+    def should_build_sliding_paged_metadata(self) -> bool:
+        if _token_pool_paged_metadata_requested():
+            return True
+        req_to_token = getattr(self.table, "req_to_token", None)
+        if req_to_token is None:
+            return False
+        return not bool(getattr(req_to_token, "is_cuda", False))
+
+    def sliding_block_table_width(self, sliding_window: int) -> int:
+        sliding_window = max(1, int(sliding_window))
+        # A full sliding window can start at the last token of a page, so it may
+        # span one more physical page than ceil(window / block_size).
+        return (
+            sliding_window + self.block_size - 1 + self.block_size - 1
+        ) // self.block_size
+
+    def build_sliding_decode_metadata(
+        self,
+        *,
+        req_slots: Iterable[int],
+        logical_seq_lens: Iterable[int],
+        out_cache_loc: Iterable[int] | Any,
+        sliding_window: int,
+        build_paged_metadata: bool | None = None,
+        page_tables: Iterable[dict[int, int]] | None = None,
+        kv_indices_padding_steps: int = 0,
+    ) -> tuple[DecodeBatchMetadata, PagedDecodeBatchMetadata | None]:
+        req_slots_list = [int(slot) for slot in req_slots]
+        logical_lens = [int(length) for length in logical_seq_lens]
+        if not req_slots_list:
+            raise ValueError("sliding decode metadata requires at least one request slot")
+        if len(logical_lens) != len(req_slots_list):
+            raise ValueError("logical_seq_lens length must match req_slots")
+        sliding_window = max(1, int(sliding_window))
+        out_cache_loc_source, out_cache_loc_count = _slot_values_source_and_count(
+            out_cache_loc
+        )
+        if out_cache_loc_count != len(req_slots_list):
+            raise ValueError("out_cache_loc length must match req_slots")
+
+        metadata = self.table.build_decode_metadata(
+            req_slots_list,
+            seq_lens=logical_lens,
+            out_cache_loc=out_cache_loc_source,
+            sliding_window=sliding_window,
+            allow_padding=True,
+            workspace_key="sliding_attention",
+        )
+        current_seq_lens = [
+            min(sliding_window, max(0, length)) for length in logical_lens
+        ]
+        metadata = pad_sliding_decode_metadata_kv_indices(
+            metadata,
+            sliding_window=sliding_window,
+            extra_steps=kv_indices_padding_steps,
+            current_seq_lens=current_seq_lens,
+        )
+
+        should_build_paged = (
+            self.should_build_sliding_paged_metadata()
+            if build_paged_metadata is None
+            else bool(build_paged_metadata)
+        )
+        paged_metadata = None
+        if should_build_paged:
+            paged_metadata = self.build_sliding_paged_decode_metadata(
+                req_slots=req_slots_list,
+                logical_seq_lens=logical_lens,
+                out_cache_loc=out_cache_loc_source,
+                sliding_window=sliding_window,
+                page_tables=page_tables,
+            )
+        return metadata, paged_metadata
+
+    def build_sliding_paged_decode_metadata(
+        self,
+        *,
+        req_slots: Iterable[int],
+        logical_seq_lens: Iterable[int],
+        out_cache_loc: Iterable[int] | Any,
+        sliding_window: int,
+        page_tables: Iterable[dict[int, int]] | None = None,
+    ) -> PagedDecodeBatchMetadata | None:
+        req_slots_list = [int(slot) for slot in req_slots]
+        logical_lens = [int(length) for length in logical_seq_lens]
+        if not req_slots_list:
+            raise ValueError("sliding paged metadata requires at least one request slot")
+        if len(logical_lens) != len(req_slots_list):
+            raise ValueError("logical_seq_lens length must match req_slots")
+        out_cache_loc_source, out_cache_loc_count = _slot_values_source_and_count(
+            out_cache_loc
+        )
+        if out_cache_loc_count != len(req_slots_list):
+            raise ValueError("out_cache_loc length must match req_slots")
+
+        block_table_width = self.sliding_block_table_width(sliding_window)
+        page_table_tensor = self.page_table_tensor
+        if page_table_tensor is not None:
+            try:
+                return self.table.build_paged_decode_metadata_from_page_table_tensor(
+                    req_slots_list,
+                    page_table_tensor,
+                    block_size=self.block_size,
+                    block_table_width=block_table_width,
+                    seq_lens=logical_lens,
+                    out_cache_loc=out_cache_loc_source,
+                    sliding_window=max(1, int(sliding_window)),
+                    token_pool_capacity=self.token_pool_capacity,
+                    workspace_key="sliding_attention_paged",
+                    validate=False,
+                )
+            except (RuntimeError, ValueError, KeyError):
+                pass
+
+        page_table_list = (
+            None if page_tables is None else [dict(table) for table in page_tables]
+        )
+        if (
+            page_table_list is not None
+            and len(page_table_list) == len(req_slots_list)
+            and len(req_slots_list) <= self.page_table_metadata_max_rows
+        ):
+            try:
+                return self.table.build_paged_decode_metadata_from_page_tables(
+                    req_slots_list,
+                    page_table_list,
+                    block_size=self.block_size,
+                    block_table_width=block_table_width,
+                    seq_lens=logical_lens,
+                    out_cache_loc=out_cache_loc_source,
+                    sliding_window=max(1, int(sliding_window)),
+                    token_pool_capacity=self.token_pool_capacity,
+                    workspace_key="sliding_attention_paged_from_dict",
+                )
+            except (RuntimeError, ValueError, KeyError):
+                pass
+
+        try:
+            return self.table.build_paged_decode_metadata(
+                req_slots_list,
+                block_size=self.block_size,
+                block_table_width=block_table_width,
+                seq_lens=logical_lens,
+                out_cache_loc=out_cache_loc_source,
+                sliding_window=max(1, int(sliding_window)),
+                token_pool_capacity=self.token_pool_capacity,
+                workspace_key="sliding_attention_paged_from_table",
+            )
+        except (RuntimeError, ValueError, KeyError):
+            return None
+
+    def build_decode_context(
+        self,
+        *,
+        metadata_by_layer_type: dict[str, DecodeBatchMetadata],
+        metadata_by_layer_id: dict[int, DecodeBatchMetadata] | None = None,
+        paged_metadata_by_layer_type: (
+            dict[str, PagedDecodeBatchMetadata] | None
+        ) = None,
+        paged_metadata_by_layer_id: dict[int, PagedDecodeBatchMetadata] | None = None,
+        covered_layer_types: frozenset[str] | None = None,
+        layer_id_metadata_only_types: frozenset[str] = frozenset(),
+    ) -> TokenPoolDecodeContext:
+        return TokenPoolDecodeContext(
+            metadata_by_layer_type=metadata_by_layer_type,
+            kv_pool=self.kv_pool,
+            metadata_by_layer_id=metadata_by_layer_id,
+            paged_metadata_by_layer_type=paged_metadata_by_layer_type,
+            paged_metadata_by_layer_id=paged_metadata_by_layer_id,
+            covered_layer_types=covered_layer_types,
+            layer_id_metadata_only_types=layer_id_metadata_only_types,
+        )
 
 
 class TokenSlotAllocator:

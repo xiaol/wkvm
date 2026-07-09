@@ -601,6 +601,124 @@ class TestGemmaTokenPool(unittest.TestCase):
         tables.reset_row(0)
         self.assertEqual(tables.tensor.tolist(), [[-1, -1, -1]])
 
+    def test_token_pool_decode_backend_builds_sliding_metadata_from_block_tables(self) -> None:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenPoolBlockTables,
+            TokenPoolDecodeBackendState,
+        )
+
+        table = ReqToTokenTable(max_requests=2, max_context_len=16)
+        a = table.allocate("a")
+        b = table.allocate("b")
+        table.append_slots(a, [0, 1, 2, 3, 4, 5])
+        table.append_slots(b, [8, 9, 10, 11, 16, 17, 18, 19, 20, 21])
+
+        block_tables = TokenPoolBlockTables(
+            max_requests=2,
+            max_context_len=16,
+            block_size=4,
+        )
+        block_tables.set_block(a, 0, 0)
+        block_tables.set_block(a, 1, 1)
+        block_tables.set_block(b, 0, 2)
+        block_tables.set_block(b, 1, 4)
+        block_tables.set_block(b, 2, 5)
+        backend = TokenPoolDecodeBackendState(
+            table=table,
+            block_tables=block_tables,
+            block_size=4,
+            page_table_metadata_max_rows=0,
+            token_pool_capacity=32,
+        )
+
+        metadata, paged = backend.build_sliding_decode_metadata(
+            req_slots=[a, b],
+            logical_seq_lens=[6, 10],
+            out_cache_loc=[5, 21],
+            sliding_window=5,
+            build_paged_metadata=True,
+        )
+
+        self.assertEqual(metadata.req_pool_indices.tolist(), [a, b])
+        self.assertEqual(metadata.seq_lens.tolist(), [5, 5])
+        self.assertEqual(metadata.logical_seq_lens.tolist(), [6, 10])
+        self.assertEqual(
+            metadata.kv_indices.tolist(),
+            [1, 2, 3, 4, 5, 17, 18, 19, 20, 21],
+        )
+        self.assertEqual(metadata.out_cache_loc_long.tolist(), [5, 21])
+        self.assertIsNotNone(paged)
+        self.assertEqual(paged.block_tables.tolist(), [[0, 1], [4, 5]])
+        self.assertEqual(paged.block_table_lens.tolist(), [2, 2])
+        self.assertEqual(paged.selected_start_positions.tolist(), [1, 5])
+        self.assertEqual(paged.slot_mapping.tolist(), [5, 21])
+        block_ptr = int(paged.block_tables.data_ptr())
+        kv_ptr = int(metadata.kv_indices.data_ptr())
+
+        metadata_again, paged_again = backend.build_sliding_decode_metadata(
+            req_slots=[a, b],
+            logical_seq_lens=[6, 10],
+            out_cache_loc=[5, 21],
+            sliding_window=5,
+            build_paged_metadata=True,
+        )
+        self.assertEqual(int(metadata_again.kv_indices.data_ptr()), kv_ptr)
+        self.assertEqual(int(paged_again.block_tables.data_ptr()), block_ptr)
+        self.assertIs(backend.page_table_tensor, block_tables.tensor)
+
+    def test_token_pool_decode_backend_falls_back_to_dict_page_tables_and_pads(self) -> None:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenPoolDecodeBackendState,
+        )
+
+        table = ReqToTokenTable(max_requests=2, max_context_len=16)
+        a = table.allocate("a")
+        b = table.allocate("b")
+        table.append_slots(a, [0, 1, 2, 3, 4, 5])
+        table.append_slots(b, [8, 9, 10, 11, 16, 17, 18, 19, 20, 21])
+        backend = TokenPoolDecodeBackendState(
+            table=table,
+            block_size=4,
+            page_table_metadata_max_rows=2,
+            token_pool_capacity=32,
+        )
+
+        self.assertTrue(backend.should_build_sliding_paged_metadata())
+        metadata, paged = backend.build_sliding_decode_metadata(
+            req_slots=[a, b],
+            logical_seq_lens=[2, 10],
+            out_cache_loc=[1, 21],
+            sliding_window=5,
+            build_paged_metadata=True,
+            page_tables=[{0: 0}, {1: 4, 2: 5}],
+            kv_indices_padding_steps=2,
+        )
+
+        self.assertEqual(metadata.seq_lens.tolist(), [2, 5])
+        self.assertEqual(metadata.kv_indptr.tolist(), [0, 2, 7])
+        self.assertEqual(
+            metadata.kv_indices.tolist(),
+            [0, 1, 17, 18, 19, 20, 21, 21, 21],
+        )
+        self.assertEqual(metadata.max_seq_len, 5)
+        self.assertIsNotNone(paged)
+        self.assertEqual(paged.block_tables.tolist(), [[0, -1], [4, 5]])
+        self.assertEqual(paged.block_table_lens.tolist(), [1, 2])
+        self.assertEqual(paged.selected_start_positions.tolist(), [0, 5])
+        self.assertEqual(paged.slot_mapping.tolist(), [1, 21])
+
     def test_req_to_token_table_reuses_decode_metadata_workspace_by_key(self) -> None:
         try:
             import torch

@@ -34,6 +34,7 @@ from wkvm.runner.gemma_token_pool import (
     TokenKVLayerSpec,
     TokenKVPool,
     TokenPoolBlockTables,
+    TokenPoolDecodeBackendState,
     TokenPoolDecodeContext,
     TokenSlotRowChunks,
     TokenSlotAllocator,
@@ -65,17 +66,6 @@ def _env_flag(name: str) -> bool:
     if raw is None:
         return False
     return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _token_pool_paged_metadata_requested() -> bool:
-    return any(
-        _env_flag(name)
-        for name in (
-            "WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON",
-            "WKVM_ENABLE_TOKEN_POOL_PAGED_SPLIT_TRITON",
-            "WKVM_TOKEN_POOL_BUILD_PAGED_METADATA",
-        )
-    )
 
 
 def _token_pool_full_attention_paged_metadata_requested() -> bool:
@@ -691,6 +681,7 @@ class GemmaNativeEngine:
         self._token_pool_page_tables: dict[str, dict[int, int]] = {}
         self._token_pool_page_owned_slots: dict[str, set[int]] = {}
         self._token_pool_block_tables: TokenPoolBlockTables | None = None
+        self._token_pool_decode_backend: TokenPoolDecodeBackendState | None = None
         self._token_pool_full_attention_slots: dict[str, list[int]] = {}
         self._token_pool_full_attention_rows: dict[str, _TokenPoolFullAttentionRow] = {}
         self._token_pool_full_attention_decode_metadata_workspace: dict[str, Any] = {}
@@ -730,6 +721,7 @@ class GemmaNativeEngine:
                 self._token_pool_block_tables = self._new_token_pool_block_tables()
             else:
                 self._token_slot_allocator = TokenSlotAllocator(capacity=token_pool_capacity)
+            self._token_pool_decode_backend = self._new_token_pool_decode_backend()
         self._record_cuda_memory_phase("engine_init")
 
     def add_request(self, request: Request, *, break_mask: list[bool] | None = None) -> None:
@@ -1817,6 +1809,23 @@ class GemmaNativeEngine:
             device=table.req_to_token.device,
         )
 
+    def _new_token_pool_decode_backend(self) -> TokenPoolDecodeBackendState | None:
+        table = self._token_table
+        if table is None:
+            return None
+        return TokenPoolDecodeBackendState(
+            table=table,
+            kv_pool=self._token_kv_pool,
+            block_tables=self._token_pool_block_tables,
+            block_size=self.token_pool_paged_block_size,
+            page_table_metadata_max_rows=(
+                self.token_pool_page_table_metadata_max_rows
+            ),
+            token_pool_capacity=(
+                None if self._token_kv_pool is None else self._token_kv_pool.capacity
+            ),
+        )
+
     def _token_pool_ensure_page_table_width(self, context_len: int) -> None:
         block_tables = self._token_pool_block_tables
         if block_tables is None:
@@ -2354,28 +2363,30 @@ class GemmaNativeEngine:
                     ),
                 }
             else:
-                sliding_metadata = table.build_decode_metadata(
-                    req_slots,
-                    out_cache_loc=out_cache_loc,
-                    sliding_window=self.config.sliding_window,
-                    allow_padding=True,
-                    workspace_key="sliding_attention",
-                )
-                sliding_paged_metadata = None
-                if self._should_build_sliding_paged_decode_metadata():
-                    sliding_paged_metadata = self._build_sliding_paged_decode_metadata(
-                        reservations,
+                backend = self._token_pool_decode_backend
+                if backend is None:
+                    raise RuntimeError("token-pool decode backend is not initialized")
+                logical_lens = [
+                    int(reservation.previous_length) + 1
+                    for reservation in reservations
+                ]
+                sliding_metadata, sliding_paged_metadata = (
+                    backend.build_sliding_decode_metadata(
+                        req_slots=req_slots,
+                        logical_seq_lens=logical_lens,
+                        out_cache_loc=out_cache_loc,
+                        sliding_window=self.config.sliding_window,
+                        page_tables=[
+                            self._token_pool_page_tables.get(
+                                reservation.req_id,
+                                {},
+                            )
+                            for reservation in reservations
+                        ],
+                        kv_indices_padding_steps=(
+                            sliding_attention_kv_indices_padding_steps
+                        ),
                     )
-                sliding_metadata = self._pad_sliding_decode_metadata_kv_indices(
-                    sliding_metadata,
-                    extra_steps=sliding_attention_kv_indices_padding_steps,
-                    current_seq_lens=[
-                        min(
-                            max(1, int(self.config.sliding_window)),
-                            reservation.previous_length + 1,
-                        )
-                        for reservation in reservations
-                    ],
                 )
                 (
                     layer_metadata,
@@ -2457,87 +2468,6 @@ class GemmaNativeEngine:
             self._token_pool_discard_decode_reservations(reservations)
             raise
 
-    def _build_sliding_paged_decode_metadata(
-        self,
-        reservations: list[_TokenPoolDecodeReservation],
-    ) -> PagedDecodeBatchMetadata | None:
-        table = self._token_table
-        pool = self._token_kv_pool
-        if table is None or pool is None:
-            return None
-        req_slots = [reservation.req_slot for reservation in reservations]
-        out_cache_loc = [reservation.token_slot for reservation in reservations]
-        logical_lens = [
-            int(reservation.previous_length) + 1 for reservation in reservations
-        ]
-        block_size = self.token_pool_paged_block_size
-        sliding_window = max(1, int(self.config.sliding_window))
-        # A full sliding window can start at the last token of a page, so it may
-        # span one more physical page than ceil(window / block_size).
-        block_table_width = (
-            sliding_window + block_size - 1 + block_size - 1
-        ) // block_size
-        page_table_tensor = self._token_pool_page_table_tensor
-        if page_table_tensor is not None:
-            try:
-                return table.build_paged_decode_metadata_from_page_table_tensor(
-                    req_slots,
-                    page_table_tensor,
-                    block_size=block_size,
-                    block_table_width=block_table_width,
-                    seq_lens=logical_lens,
-                    out_cache_loc=out_cache_loc,
-                    sliding_window=sliding_window,
-                    token_pool_capacity=pool.capacity,
-                    workspace_key="sliding_attention_paged",
-                    validate=False,
-                )
-            except (RuntimeError, ValueError, KeyError):
-                pass
-        page_tables = [
-            self._token_pool_page_tables.get(reservation.req_id, {})
-            for reservation in reservations
-        ]
-        if len(reservations) <= self.token_pool_page_table_metadata_max_rows:
-            try:
-                return table.build_paged_decode_metadata_from_page_tables(
-                    req_slots,
-                    page_tables,
-                    block_size=block_size,
-                    block_table_width=block_table_width,
-                    seq_lens=logical_lens,
-                    out_cache_loc=out_cache_loc,
-                    sliding_window=sliding_window,
-                    token_pool_capacity=pool.capacity,
-                    workspace_key="sliding_attention_paged_from_dict",
-                )
-            except (RuntimeError, ValueError, KeyError):
-                pass
-        try:
-            return table.build_paged_decode_metadata(
-                req_slots,
-                block_size=block_size,
-                block_table_width=block_table_width,
-                seq_lens=logical_lens,
-                out_cache_loc=out_cache_loc,
-                sliding_window=sliding_window,
-                token_pool_capacity=pool.capacity,
-                workspace_key="sliding_attention_paged_from_table",
-            )
-        except (RuntimeError, ValueError, KeyError):
-            return None
-
-    def _should_build_sliding_paged_decode_metadata(self) -> bool:
-        if _token_pool_paged_metadata_requested():
-            return True
-        table = self._token_table
-        if table is None:
-            return False
-        req_to_token = getattr(table, "req_to_token", None)
-        if req_to_token is None:
-            return False
-        return not bool(getattr(req_to_token, "is_cuda", False))
-
     def _token_pool_decode_context(
         self,
         reservations: list[_TokenPoolDecodeReservation],
@@ -2548,9 +2478,11 @@ class GemmaNativeEngine:
             or self._token_kv_pool is None
         ):
             return None
-        return TokenPoolDecodeContext(
+        backend = self._token_pool_decode_backend
+        if backend is None:
+            raise RuntimeError("token-pool decode backend is not initialized")
+        return backend.build_decode_context(
             metadata_by_layer_type=self.last_token_pool_decode_metadata,
-            kv_pool=self._token_kv_pool,
             metadata_by_layer_id=self.last_token_pool_decode_metadata_by_layer_id,
             paged_metadata_by_layer_type=self.last_token_pool_paged_decode_metadata,
             paged_metadata_by_layer_id=(
@@ -3236,78 +3168,6 @@ class GemmaNativeEngine:
         except (DistinctCacheBatchError, RuntimeError, ValueError, KeyError):
             self._token_pool_clear_full_attention_rows(req_ids)
             return None, None
-
-    @staticmethod
-    def _pad_decode_metadata_kv_indices(
-        metadata: DecodeBatchMetadata,
-        *,
-        extra_slots: int,
-        max_seq_len: int | None = None,
-    ) -> DecodeBatchMetadata:
-        extra_slots = max(0, int(extra_slots))
-        if extra_slots < 1:
-            return metadata
-        kv_indices = metadata.kv_indices
-        current = int(kv_indices.numel())
-        if current > 0:
-            padding = kv_indices[-1:].expand(extra_slots)
-        else:
-            import torch
-
-            padding = torch.zeros(
-                extra_slots,
-                dtype=kv_indices.dtype,
-                device=kv_indices.device,
-            )
-        import torch
-
-        return DecodeBatchMetadata(
-            req_pool_indices=metadata.req_pool_indices,
-            seq_lens=metadata.seq_lens,
-            logical_seq_lens=metadata.logical_seq_lens,
-            out_cache_loc=metadata.out_cache_loc,
-            kv_indptr=metadata.kv_indptr,
-            kv_indices=torch.cat((kv_indices, padding), dim=0).contiguous(),
-            out_cache_loc_long=metadata.out_cache_loc_long,
-            max_seq_len=(
-                getattr(metadata, "max_seq_len", None)
-                if max_seq_len is None
-                else int(max_seq_len)
-            ),
-        )
-
-    def _pad_sliding_decode_metadata_kv_indices(
-        self,
-        metadata: DecodeBatchMetadata,
-        *,
-        extra_steps: int,
-        current_seq_lens: list[int] | None = None,
-    ) -> DecodeBatchMetadata:
-        extra_steps = max(0, int(extra_steps))
-        if extra_steps < 1:
-            return metadata
-        if current_seq_lens is None:
-            try:
-                seq_lens = [
-                    int(value)
-                    for value in metadata.seq_lens.detach().cpu().reshape(-1).tolist()
-                ]
-            except AttributeError:
-                return metadata
-        else:
-            seq_lens = [int(value) for value in current_seq_lens]
-        if not seq_lens:
-            return metadata
-        window = max(1, int(self.config.sliding_window))
-        target_total = sum(min(window, seq_len + extra_steps) for seq_len in seq_lens)
-        target_max_seq_len = max(
-            min(window, seq_len + extra_steps) for seq_len in seq_lens
-        )
-        return self._pad_decode_metadata_kv_indices(
-            metadata,
-            extra_slots=max(0, int(target_total) - int(metadata.kv_indices.numel())),
-            max_seq_len=target_max_seq_len,
-        )
 
     def _token_pool_full_attention_owner_layer_ids(self) -> list[int]:
         pool = self._token_kv_pool
