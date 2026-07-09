@@ -96,12 +96,7 @@ class TokenPoolAttentionBinding:
     kv_pool: Any | None
 
     def out_cache_loc_for_write(self) -> Any | None:
-        if self.metadata is None:
-            return None
-        out_cache_loc = getattr(self.metadata, "out_cache_loc_long", None)
-        if out_cache_loc is None:
-            out_cache_loc = self.metadata.out_cache_loc
-        return out_cache_loc
+        return _metadata_out_cache_loc_for_write(self.metadata)
 
     def store_current_kv(self, key_states: Any, value_states: Any) -> Any | None:
         out_cache_loc = self.out_cache_loc_for_write()
@@ -114,6 +109,232 @@ class TokenPoolAttentionBinding:
             value_states,
         )
         return out_cache_loc
+
+
+@dataclass(frozen=True)
+class TokenPoolAttentionPlan:
+    layer_idx: int | None
+    metadata: DecodeBatchMetadata | None
+    paged_metadata: PagedDecodeBatchMetadata | None
+    kv_pool: Any | None
+    binding: Any | None = None
+    use_decode_attention: bool = False
+
+    @classmethod
+    def from_binding(
+        cls,
+        binding: Any | None,
+        *,
+        layer_idx: int | None,
+        attention_mask_present: bool = False,
+        query_seq_len: int | None = None,
+    ) -> "TokenPoolAttentionPlan":
+        if binding is None:
+            return cls(
+                layer_idx=None,
+                metadata=None,
+                paged_metadata=None,
+                kv_pool=None,
+                binding=None,
+                use_decode_attention=False,
+            )
+        metadata = getattr(binding, "metadata", None)
+        paged_metadata = getattr(binding, "paged_metadata", None)
+        kv_pool = getattr(binding, "kv_pool", None)
+        bound_layer_idx = getattr(binding, "layer_idx", layer_idx)
+        use_decode_attention = _token_pool_decode_attention_enabled(
+            layer_idx=bound_layer_idx,
+            metadata=metadata,
+            kv_pool=kv_pool,
+            attention_mask_present=attention_mask_present,
+            query_seq_len=query_seq_len,
+        )
+        return cls(
+            layer_idx=bound_layer_idx,
+            metadata=metadata,
+            paged_metadata=paged_metadata,
+            kv_pool=kv_pool,
+            binding=binding,
+            use_decode_attention=use_decode_attention,
+        )
+
+    def attention_kwargs(self) -> dict[str, Any]:
+        return {
+            "decode_metadata": self.metadata,
+            "paged_decode_metadata": self.paged_metadata,
+            "token_kv_pool": self.kv_pool,
+            "layer_idx": self.layer_idx,
+        }
+
+    def store_current_kv(self, key_states: Any, value_states: Any) -> Any | None:
+        if key_states is None or value_states is None:
+            return None
+        out_cache_loc = _binding_out_cache_loc_for_write(self.binding, self.metadata)
+        if self.layer_idx is None or self.kv_pool is None or out_cache_loc is None:
+            return None
+        store_current_kv = getattr(self.binding, "store_current_kv", None)
+        if store_current_kv is not None:
+            return store_current_kv(key_states, value_states)
+        self.kv_pool.set_kv(
+            int(self.layer_idx),
+            out_cache_loc,
+            key_states,
+            value_states,
+        )
+        return out_cache_loc
+
+
+def _metadata_out_cache_loc_for_write(metadata: Any | None) -> Any | None:
+    if metadata is None:
+        return None
+    out_cache_loc = getattr(metadata, "out_cache_loc_long", None)
+    if out_cache_loc is None:
+        out_cache_loc = getattr(metadata, "out_cache_loc", None)
+    return out_cache_loc
+
+
+def _binding_out_cache_loc_for_write(binding: Any | None, metadata: Any | None) -> Any | None:
+    out_cache_loc_for_write = getattr(binding, "out_cache_loc_for_write", None)
+    if out_cache_loc_for_write is not None:
+        return out_cache_loc_for_write()
+    return _metadata_out_cache_loc_for_write(metadata)
+
+
+def _token_pool_decode_attention_enabled(
+    *,
+    layer_idx: int | None,
+    metadata: Any | None,
+    kv_pool: Any | None,
+    attention_mask_present: bool,
+    query_seq_len: int | None,
+) -> bool:
+    if metadata is None or kv_pool is None or layer_idx is None:
+        return False
+    if bool(attention_mask_present):
+        return False
+    if getattr(metadata, "out_cache_loc", None) is None:
+        return False
+    try:
+        return int(query_seq_len) == 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _null_attention_binding() -> TokenPoolAttentionBinding:
+    return TokenPoolAttentionBinding(
+        layer_idx=None,
+        metadata=None,
+        paged_metadata=None,
+        kv_pool=None,
+    )
+
+
+def resolve_token_pool_attention_binding(
+    token_pool_decode: Any | None,
+    layer_idx: int | None,
+    layer_type: str | None,
+    *,
+    attention_mask_present: bool = False,
+) -> Any:
+    if token_pool_decode is None or layer_idx is None or layer_type is None:
+        return _null_attention_binding()
+
+    attention_binding_for_layer = getattr(
+        token_pool_decode,
+        "attention_binding_for_layer",
+        None,
+    )
+    if attention_binding_for_layer is not None:
+        binding = attention_binding_for_layer(
+            layer_idx,
+            layer_type,
+            attention_mask_present=attention_mask_present,
+        )
+        return binding if binding is not None else _null_attention_binding()
+
+    attention_metadata_for_layer = getattr(
+        token_pool_decode,
+        "attention_metadata_for_layer",
+        None,
+    )
+    if attention_metadata_for_layer is not None:
+        metadata, paged_metadata, token_kv_pool = attention_metadata_for_layer(
+            layer_idx,
+            layer_type,
+            attention_mask_present=attention_mask_present,
+        )
+        return TokenPoolAttentionBinding(
+            layer_idx=int(layer_idx),
+            metadata=metadata,
+            paged_metadata=paged_metadata,
+            kv_pool=token_kv_pool,
+        )
+
+    metadata_for_layer = getattr(token_pool_decode, "metadata_for_layer", None)
+    if metadata_for_layer is not None:
+        metadata = metadata_for_layer(layer_idx, layer_type)
+    else:
+        metadata_by_layer_type = getattr(token_pool_decode, "metadata_by_layer_type", {})
+        metadata = metadata_by_layer_type.get(str(layer_type))
+
+    paged_metadata = None
+    paged_metadata_for_layer = getattr(token_pool_decode, "paged_metadata_for_layer", None)
+    if paged_metadata_for_layer is not None:
+        paged_metadata = paged_metadata_for_layer(layer_idx, layer_type)
+    token_kv_pool = getattr(token_pool_decode, "kv_pool", None)
+    layer_specs = getattr(token_kv_pool, "layer_specs", {}) if token_kv_pool is not None else {}
+    if token_kv_pool is not None and int(layer_idx) not in layer_specs:
+        if metadata is not None and not bool(attention_mask_present):
+            raise RuntimeError(
+                f"token-pool metadata was provided for layer {int(layer_idx)}, "
+                "but the KV pool has no spec for that layer"
+            )
+        metadata = None
+        paged_metadata = None
+        token_kv_pool = None
+    return TokenPoolAttentionBinding(
+        layer_idx=int(layer_idx),
+        metadata=metadata,
+        paged_metadata=paged_metadata,
+        kv_pool=token_kv_pool,
+    )
+
+
+def resolve_token_pool_attention_plan(
+    token_pool_decode: Any | None,
+    layer_idx: int | None,
+    layer_type: str | None,
+    *,
+    attention_mask_present: bool = False,
+    query_seq_len: int | None = None,
+) -> TokenPoolAttentionPlan:
+    if token_pool_decode is not None:
+        attention_plan_for_layer = getattr(
+            token_pool_decode,
+            "attention_plan_for_layer",
+            None,
+        )
+        if attention_plan_for_layer is not None:
+            plan = attention_plan_for_layer(
+                layer_idx,
+                layer_type,
+                attention_mask_present=attention_mask_present,
+                query_seq_len=query_seq_len,
+            )
+            if plan is not None:
+                return plan
+    binding = resolve_token_pool_attention_binding(
+        token_pool_decode,
+        layer_idx,
+        layer_type,
+        attention_mask_present=attention_mask_present,
+    )
+    return TokenPoolAttentionPlan.from_binding(
+        binding,
+        layer_idx=layer_idx,
+        attention_mask_present=attention_mask_present,
+        query_seq_len=query_seq_len,
+    )
 
 
 @dataclass(frozen=True)
@@ -217,6 +438,26 @@ class TokenPoolDecodeContext:
             attention_mask_present=attention_mask_present,
         )
         return binding.metadata, binding.paged_metadata, binding.kv_pool
+
+    def attention_plan_for_layer(
+        self,
+        layer_idx: int | None,
+        layer_type: str | None,
+        *,
+        attention_mask_present: bool = False,
+        query_seq_len: int | None = None,
+    ) -> TokenPoolAttentionPlan:
+        binding = self.attention_binding_for_layer(
+            layer_idx,
+            layer_type,
+            attention_mask_present=attention_mask_present,
+        )
+        return TokenPoolAttentionPlan.from_binding(
+            binding,
+            layer_idx=layer_idx,
+            attention_mask_present=attention_mask_present,
+            query_seq_len=query_seq_len,
+        )
 
     def attention_binding_for_layer(
         self,

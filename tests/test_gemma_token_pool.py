@@ -1698,6 +1698,153 @@ class TestGemmaTokenPool(unittest.TestCase):
         )
         self.assertIsNone(null_binding.store_current_kv(key_states, value_states))
 
+    def test_attention_plan_resolves_decode_eligibility_and_write(self) -> None:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            DecodeBatchMetadata,
+            TokenPoolAttentionBinding,
+            TokenPoolAttentionPlan,
+            TokenPoolDecodeContext,
+            build_decode_metadata_from_token_slot_rows,
+            resolve_token_pool_attention_plan,
+        )
+
+        class CapturePool:
+            layer_specs = {7: object()}
+
+            def __init__(self) -> None:
+                self.calls = []
+
+            def set_kv(self, layer_idx, out_cache_loc, key_states, value_states):
+                self.calls.append(
+                    (layer_idx, out_cache_loc, key_states, value_states)
+                )
+
+        metadata = build_decode_metadata_from_token_slot_rows(
+            [[3, 4]],
+            out_cache_loc=[4],
+        )
+        pool = CapturePool()
+        context = TokenPoolDecodeContext(
+            metadata_by_layer_type={"full_attention": metadata},
+            kv_pool=pool,
+        )
+
+        plan = context.attention_plan_for_layer(
+            7,
+            "full_attention",
+            query_seq_len=1,
+        )
+
+        self.assertTrue(plan.use_decode_attention)
+        self.assertIs(plan.metadata, metadata)
+        self.assertIs(plan.kv_pool, pool)
+        self.assertEqual(
+            plan.attention_kwargs(),
+            {
+                "decode_metadata": metadata,
+                "paged_decode_metadata": None,
+                "token_kv_pool": pool,
+                "layer_idx": 7,
+            },
+        )
+
+        key_states = object()
+        value_states = object()
+        out_cache_loc = plan.store_current_kv(key_states, value_states)
+
+        self.assertIs(out_cache_loc, metadata.out_cache_loc_long)
+        self.assertEqual(len(pool.calls), 1)
+        self.assertEqual(pool.calls[0][0], 7)
+        self.assertIs(pool.calls[0][1], metadata.out_cache_loc_long)
+        self.assertIs(pool.calls[0][2], key_states)
+        self.assertIs(pool.calls[0][3], value_states)
+
+        masked_plan = context.attention_plan_for_layer(
+            7,
+            "full_attention",
+            attention_mask_present=True,
+            query_seq_len=1,
+        )
+        self.assertFalse(masked_plan.use_decode_attention)
+        multi_token_plan = context.attention_plan_for_layer(
+            7,
+            "full_attention",
+            query_seq_len=2,
+        )
+        self.assertFalse(multi_token_plan.use_decode_attention)
+        no_write_metadata = DecodeBatchMetadata(
+            req_pool_indices=metadata.req_pool_indices,
+            seq_lens=metadata.seq_lens,
+            logical_seq_lens=metadata.logical_seq_lens,
+            out_cache_loc=None,
+            kv_indptr=metadata.kv_indptr,
+            kv_indices=metadata.kv_indices,
+        )
+        no_write_plan = TokenPoolAttentionPlan.from_binding(
+            TokenPoolAttentionBinding(
+                layer_idx=7,
+                metadata=no_write_metadata,
+                paged_metadata=None,
+                kv_pool=pool,
+            ),
+            layer_idx=7,
+            query_seq_len=1,
+        )
+        self.assertFalse(no_write_plan.use_decode_attention)
+        self.assertIsNone(no_write_plan.store_current_kv(key_states, value_states))
+
+        legacy_context = type(
+            "LegacyContext",
+            (),
+            {
+                "kv_pool": pool,
+                "metadata_by_layer_type": {"full_attention": metadata},
+            },
+        )()
+        legacy_plan = resolve_token_pool_attention_plan(
+            legacy_context,
+            7,
+            "full_attention",
+            query_seq_len=1,
+        )
+        self.assertTrue(legacy_plan.use_decode_attention)
+        self.assertIs(legacy_plan.metadata, metadata)
+        self.assertIs(legacy_plan.kv_pool, pool)
+
+        class BindingWithOwnStore:
+            def __init__(self) -> None:
+                self.layer_idx = 7
+                self.metadata = metadata
+                self.paged_metadata = None
+                self.kv_pool = pool
+                self.calls = []
+
+            def out_cache_loc_for_write(self):
+                return self.metadata.out_cache_loc
+
+            def store_current_kv(self, key_states, value_states):
+                self.calls.append((key_states, value_states))
+                return self.metadata.out_cache_loc
+
+        owned_binding = BindingWithOwnStore()
+        owned_plan = TokenPoolAttentionPlan.from_binding(
+            owned_binding,
+            layer_idx=7,
+            query_seq_len=1,
+        )
+        previous_pool_calls = len(pool.calls)
+        self.assertIs(
+            owned_plan.store_current_kv(key_states, value_states),
+            metadata.out_cache_loc,
+        )
+        self.assertEqual(owned_binding.calls, [(key_states, value_states)])
+        self.assertEqual(len(pool.calls), previous_pool_calls)
+
     def test_graph_clone_and_copy_handles_paged_metadata(self) -> None:
         try:
             import torch  # noqa: F401

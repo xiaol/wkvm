@@ -429,6 +429,84 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
         self.assertIsNone(actual_weights)
         self.assertLess((expected - actual).abs().max().item(), 1e-6)
 
+    def test_attention_forward_respects_disabled_token_pool_plan(self) -> None:
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4TextDecoderLayer
+        from wkvm.runner.gemma_native_forward import (
+            NativeGemma4TextDecoderLayer,
+            _attention_forward,
+            _attention_forward_manual_gqa,
+        )
+        from wkvm.runner.gemma_token_pool import (
+            TokenKVLayerSpec,
+            TokenKVPool,
+            TokenPoolAttentionPlan,
+            build_decode_metadata_from_token_slot_rows,
+        )
+
+        torch.manual_seed(195)
+        cfg = _tiny_config()
+        hf_layer = Gemma4TextDecoderLayer(cfg, layer_idx=0).eval()
+        native_layer = NativeGemma4TextDecoderLayer(
+            hf_layer,
+            native_attention_backend="manual_gqa",
+        )
+        pool = TokenKVPool(
+            capacity=3,
+            layer_specs=[
+                TokenKVLayerSpec(
+                    layer_id=0,
+                    num_kv_heads=cfg.num_key_value_heads,
+                    head_dim=cfg.head_dim,
+                    dtype=torch.float32,
+                )
+            ],
+            dtype=torch.float32,
+        )
+        slots = pool.alloc_slots(3)
+        pool.set_kv(
+            0,
+            slots,
+            torch.randn(3, cfg.num_key_value_heads, cfg.head_dim),
+            torch.randn(3, cfg.num_key_value_heads, cfg.head_dim),
+        )
+        metadata = build_decode_metadata_from_token_slot_rows(
+            [[0, 1, 2]],
+            out_cache_loc=[2],
+        )
+        plan = TokenPoolAttentionPlan(
+            layer_idx=0,
+            metadata=metadata,
+            paged_metadata=None,
+            kv_pool=pool,
+            use_decode_attention=False,
+        )
+        query = torch.randn(1, cfg.num_attention_heads, 1, cfg.head_dim)
+        dense_keys = torch.randn(1, cfg.num_key_value_heads, 2, cfg.head_dim)
+        dense_values = torch.randn(1, cfg.num_key_value_heads, 2, cfg.head_dim)
+
+        with torch.inference_mode():
+            expected, expected_weights = _attention_forward_manual_gqa(
+                native_layer.attn_meta,
+                query,
+                dense_keys,
+                dense_values,
+                None,
+            )
+            actual, actual_weights = _attention_forward(
+                native_layer.attn_meta,
+                query,
+                dense_keys,
+                dense_values,
+                None,
+                backend="manual_gqa",
+                token_pool_plan=plan,
+            )
+
+        self.assertIsNotNone(actual_weights)
+        self.assertLess((expected - actual).abs().max().item(), 1e-6)
+        self.assertLess((expected_weights - actual_weights).abs().max().item(), 1e-6)
+
     def test_token_pool_triton_stats_account_recoverable_fallback(self) -> None:
         import os
         import sys

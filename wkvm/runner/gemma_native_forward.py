@@ -1813,18 +1813,27 @@ def _attention_forward(
     paged_decode_metadata=None,
     token_kv_pool=None,
     layer_idx: int | None = None,
+    token_pool_plan=None,
 ):
     torch = _torch()
     import torch.nn.functional as F
 
     backend = _normalize_attention_backend(backend)
-    if (
-        decode_metadata is not None
-        and token_kv_pool is not None
-        and layer_idx is not None
-        and attention_mask is None
-        and query_states.shape[2] == 1
-    ):
+    if token_pool_plan is not None:
+        decode_metadata = token_pool_plan.metadata
+        paged_decode_metadata = token_pool_plan.paged_metadata
+        token_kv_pool = token_pool_plan.kv_pool
+        layer_idx = token_pool_plan.layer_idx
+        token_pool_decode_attention = bool(token_pool_plan.use_decode_attention)
+    else:
+        token_pool_decode_attention = (
+            decode_metadata is not None
+            and token_kv_pool is not None
+            and layer_idx is not None
+            and attention_mask is None
+            and query_states.shape[2] == 1
+        )
+    if token_pool_decode_attention:
         return _attention_forward_token_pool_gqa(
             attn,
             query_states,
@@ -2270,91 +2279,25 @@ class NativeGemma4TextDecoderLayer:
                     time.perf_counter() - phase_start,
                 )
 
-        decode_metadata = None
-        paged_decode_metadata = None
-        token_kv_pool = None
-        token_pool_binding = None
+        token_pool_plan = None
         phase_start = time.perf_counter() if timing_enabled else 0.0
         if wkvm_token_pool_decode is not None and attn.layer_type is not None:
-            attention_metadata_for_layer = None
-            attention_binding_for_layer = getattr(
+            from wkvm.runner.gemma_token_pool import resolve_token_pool_attention_plan
+
+            token_pool_plan = resolve_token_pool_attention_plan(
                 wkvm_token_pool_decode,
-                "attention_binding_for_layer",
-                None,
+                self.layer_idx,
+                attn.layer_type,
+                attention_mask_present=attention_mask is not None,
+                query_seq_len=query_states.shape[2],
             )
-            if attention_binding_for_layer is not None:
-                token_pool_binding = attention_binding_for_layer(
-                    self.layer_idx,
-                    attn.layer_type,
-                    attention_mask_present=attention_mask is not None,
-                )
-                decode_metadata = token_pool_binding.metadata
-                paged_decode_metadata = token_pool_binding.paged_metadata
-                token_kv_pool = token_pool_binding.kv_pool
-            else:
-                attention_metadata_for_layer = getattr(
-                    wkvm_token_pool_decode,
-                    "attention_metadata_for_layer",
-                    None,
-                )
-            if token_pool_binding is None:
-                if attention_metadata_for_layer is not None:
-                    (
-                        decode_metadata,
-                        paged_decode_metadata,
-                        token_kv_pool,
-                    ) = attention_metadata_for_layer(
-                        self.layer_idx,
-                        attn.layer_type,
-                        attention_mask_present=attention_mask is not None,
-                    )
-                else:
-                    metadata_for_layer = getattr(
-                        wkvm_token_pool_decode,
-                        "metadata_for_layer",
-                        None,
-                    )
-                    if metadata_for_layer is not None:
-                        decode_metadata = metadata_for_layer(self.layer_idx, attn.layer_type)
-                    else:
-                        decode_metadata = wkvm_token_pool_decode.metadata_by_layer_type.get(
-                            attn.layer_type
-                        )
-                    paged_metadata_for_layer = getattr(
-                        wkvm_token_pool_decode,
-                        "paged_metadata_for_layer",
-                        None,
-                    )
-                    if paged_metadata_for_layer is not None:
-                        paged_decode_metadata = paged_metadata_for_layer(
-                            self.layer_idx,
-                            attn.layer_type,
-                        )
-                    token_kv_pool = wkvm_token_pool_decode.kv_pool
-                    if (
-                        token_kv_pool is not None
-                        and self.layer_idx not in getattr(token_kv_pool, "layer_specs", {})
-                    ):
-                        if decode_metadata is not None and attention_mask is None:
-                            raise RuntimeError(
-                                f"token-pool metadata was provided for layer {self.layer_idx}, "
-                                "but the KV pool has no spec for that layer"
-                            )
-                        decode_metadata = None
-                        paged_decode_metadata = None
-                        token_kv_pool = None
         if timing_enabled:
             _record_native_timing(
                 "self_attention_metadata_wall_s",
                 time.perf_counter() - phase_start,
             )
         token_pool_decode_attention = (
-            decode_metadata is not None
-            and token_kv_pool is not None
-            and decode_metadata.out_cache_loc is not None
-            and self.layer_idx is not None
-            and attention_mask is None
-            and query_states.shape[2] == 1
+            token_pool_plan is not None and token_pool_plan.use_decode_attention
         )
 
         current_key_states = None if attn.is_kv_shared_layer else key_states
@@ -2378,33 +2321,16 @@ class NativeGemma4TextDecoderLayer:
         if attn.store_full_length_kv:
             shared_kv_states[attn.layer_type] = key_states, value_states
         if (
-            decode_metadata is not None
-            and token_kv_pool is not None
-            and decode_metadata.out_cache_loc is not None
+            token_pool_plan is not None
             and current_key_states is not None
             and current_value_states is not None
         ):
             kv_write_start = time.perf_counter() if timing_enabled else 0.0
-            if token_pool_binding is not None:
-                out_cache_loc = token_pool_binding.store_current_kv(
-                    current_key_states,
-                    current_value_states,
-                )
-            else:
-                out_cache_loc = getattr(
-                    decode_metadata,
-                    "out_cache_loc_long",
-                    None,
-                )
-                if out_cache_loc is None:
-                    out_cache_loc = decode_metadata.out_cache_loc
-                token_kv_pool.set_kv(
-                    self.layer_idx,
-                    out_cache_loc,
-                    current_key_states,
-                    current_value_states,
-                )
-            if timing_enabled:
+            out_cache_loc = token_pool_plan.store_current_kv(
+                current_key_states,
+                current_value_states,
+            )
+            if timing_enabled and out_cache_loc is not None:
                 _record_token_pool_kv_write_timing(
                     tokens=_slot_count(out_cache_loc),
                     elapsed=time.perf_counter() - kv_write_start,
@@ -2418,10 +2344,7 @@ class NativeGemma4TextDecoderLayer:
             value_states,
             attention_mask,
             backend=self.native_attention_backend,
-            decode_metadata=decode_metadata,
-            paged_decode_metadata=paged_decode_metadata,
-            token_kv_pool=token_kv_pool,
-            layer_idx=self.layer_idx,
+            token_pool_plan=token_pool_plan,
         )
         if timing_enabled:
             _record_native_timing(
