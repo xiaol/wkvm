@@ -589,6 +589,71 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
             {"recoverable_runtime_error": 1, "disabled_shape": 1},
         )
 
+    def test_token_pool_attention_dispatch_stores_current_kv_before_attention(self) -> None:
+        import os
+        from types import SimpleNamespace
+        import torch
+        import wkvm.runner.gemma_native_forward as native_forward
+
+        old_disable = os.environ.get("WKVM_DISABLE_TOKEN_POOL_TRITON")
+        old_reference = native_forward._attention_forward_token_pool_gqa_reference
+        native_forward.reset_token_pool_triton_stats(clear_disabled_shapes=True)
+        events: list[str] = []
+        query_states = torch.randn(1, 1, 1, 2)
+        key_states = torch.randn(1, 1, 1, 2)
+        value_states = torch.randn(1, 1, 1, 2)
+
+        class Plan:
+            metadata = SimpleNamespace(
+                kv_indptr=torch.tensor([0, 1], dtype=torch.int32),
+                kv_indices=torch.tensor([0], dtype=torch.int32),
+                out_cache_loc=torch.tensor([0], dtype=torch.int32),
+                out_cache_loc_long=torch.tensor([0], dtype=torch.long),
+            )
+            paged_metadata = None
+            kv_pool = object()
+            layer_idx = 0
+            use_decode_attention = True
+
+            def store_current_kv(self, key, value):
+                events.append("store")
+                self.stored_key = key
+                self.stored_value = value
+                return self.metadata.out_cache_loc
+
+        plan = Plan()
+
+        def reference(*_args, **_kwargs):
+            events.append("reference")
+            return torch.zeros_like(query_states), None
+
+        try:
+            os.environ["WKVM_DISABLE_TOKEN_POOL_TRITON"] = "1"
+            native_forward._attention_forward_token_pool_gqa_reference = reference
+            output, _weights = native_forward._attention_forward(
+                SimpleNamespace(num_key_value_groups=1, scaling=1.0),
+                query_states,
+                key_states,
+                value_states,
+                None,
+                backend="manual_gqa",
+                token_pool_plan=plan,
+                current_key_states=key_states,
+                current_value_states=value_states,
+            )
+        finally:
+            native_forward._attention_forward_token_pool_gqa_reference = old_reference
+            if old_disable is None:
+                os.environ.pop("WKVM_DISABLE_TOKEN_POOL_TRITON", None)
+            else:
+                os.environ["WKVM_DISABLE_TOKEN_POOL_TRITON"] = old_disable
+            native_forward.reset_token_pool_triton_stats(clear_disabled_shapes=True)
+
+        self.assertEqual(events, ["store", "reference"])
+        self.assertIs(plan.stored_key, key_states)
+        self.assertIs(plan.stored_value, value_states)
+        self.assertTrue(torch.equal(output, torch.zeros_like(query_states)))
+
     def test_token_pool_triton_auto_default_and_explicit_disable(self) -> None:
         import os
         import sys

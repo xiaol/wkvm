@@ -1503,6 +1503,8 @@ def _attention_forward_token_pool_gqa(
     token_kv_pool,
     layer_idx: int,
     token_pool_plan=None,
+    current_key_states=None,
+    current_value_states=None,
 ):
     timing_enabled = _native_forward_timing_enabled()
     attention_start = time.perf_counter() if timing_enabled else 0.0
@@ -1541,6 +1543,21 @@ def _attention_forward_token_pool_gqa(
         _TOKEN_POOL_TRITON_STATS["split_enabled_calls"] += 1
     if paged_split_triton_enabled:
         _TOKEN_POOL_TRITON_STATS["paged_split_enabled_calls"] += 1
+    if (
+        token_pool_plan is not None
+        and current_key_states is not None
+        and current_value_states is not None
+    ):
+        kv_write_start = time.perf_counter() if timing_enabled else 0.0
+        out_cache_loc = token_pool_plan.store_current_kv(
+            current_key_states,
+            current_value_states,
+        )
+        if timing_enabled and out_cache_loc is not None:
+            _record_token_pool_kv_write_timing(
+                tokens=_slot_count(out_cache_loc),
+                elapsed=time.perf_counter() - kv_write_start,
+            )
     if query_states.is_cuda and dispatch_plan.effective_enabled:
         triton_shape_key = (
             int(query_states.shape[1]),
@@ -1822,6 +1839,8 @@ def _attention_forward(
     token_kv_pool=None,
     layer_idx: int | None = None,
     token_pool_plan=None,
+    current_key_states=None,
+    current_value_states=None,
 ):
     torch = _torch()
     import torch.nn.functional as F
@@ -1850,6 +1869,8 @@ def _attention_forward(
             token_kv_pool=token_kv_pool,
             layer_idx=int(layer_idx),
             token_pool_plan=token_pool_plan,
+            current_key_states=current_key_states,
+            current_value_states=current_value_states,
         )
     if backend == "manual_gqa" or (
         backend == "sdpa_single_gqa"
@@ -2329,22 +2350,6 @@ class NativeGemma4TextDecoderLayer:
                 )
         if attn.store_full_length_kv:
             shared_kv_states[attn.layer_type] = key_states, value_states
-        if (
-            token_pool_plan is not None
-            and current_key_states is not None
-            and current_value_states is not None
-        ):
-            kv_write_start = time.perf_counter() if timing_enabled else 0.0
-            out_cache_loc = token_pool_plan.store_current_kv(
-                current_key_states,
-                current_value_states,
-            )
-            if timing_enabled and out_cache_loc is not None:
-                _record_token_pool_kv_write_timing(
-                    tokens=_slot_count(out_cache_loc),
-                    elapsed=time.perf_counter() - kv_write_start,
-                )
-
         phase_start = time.perf_counter() if timing_enabled else 0.0
         attn_output, attn_weights = _attention_forward(
             attn,
@@ -2354,6 +2359,12 @@ class NativeGemma4TextDecoderLayer:
             attention_mask,
             backend=self.native_attention_backend,
             token_pool_plan=token_pool_plan,
+            current_key_states=(
+                current_key_states if token_pool_decode_attention else None
+            ),
+            current_value_states=(
+                current_value_states if token_pool_decode_attention else None
+            ),
         )
         if timing_enabled:
             _record_native_timing(
