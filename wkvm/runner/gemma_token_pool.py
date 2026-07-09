@@ -89,6 +89,34 @@ class TokenPoolLayerDecodeBinding:
 
 
 @dataclass(frozen=True)
+class TokenPoolAttentionBinding:
+    layer_idx: int | None
+    metadata: DecodeBatchMetadata | None
+    paged_metadata: PagedDecodeBatchMetadata | None
+    kv_pool: Any | None
+
+    def out_cache_loc_for_write(self) -> Any | None:
+        if self.metadata is None:
+            return None
+        out_cache_loc = getattr(self.metadata, "out_cache_loc_long", None)
+        if out_cache_loc is None:
+            out_cache_loc = self.metadata.out_cache_loc
+        return out_cache_loc
+
+    def store_current_kv(self, key_states: Any, value_states: Any) -> Any | None:
+        out_cache_loc = self.out_cache_loc_for_write()
+        if self.layer_idx is None or self.kv_pool is None or out_cache_loc is None:
+            return None
+        self.kv_pool.set_kv(
+            int(self.layer_idx),
+            out_cache_loc,
+            key_states,
+            value_states,
+        )
+        return out_cache_loc
+
+
+@dataclass(frozen=True)
 class TokenPoolDecodeContext:
     metadata_by_layer_type: dict[str, DecodeBatchMetadata]
     kv_pool: Any | None = None
@@ -183,22 +211,57 @@ class TokenPoolDecodeContext:
         *,
         attention_mask_present: bool = False,
     ) -> tuple[DecodeBatchMetadata | None, PagedDecodeBatchMetadata | None, Any | None]:
+        binding = self.attention_binding_for_layer(
+            layer_idx,
+            layer_type,
+            attention_mask_present=attention_mask_present,
+        )
+        return binding.metadata, binding.paged_metadata, binding.kv_pool
+
+    def attention_binding_for_layer(
+        self,
+        layer_idx: int | None,
+        layer_type: str | None,
+        *,
+        attention_mask_present: bool = False,
+    ) -> TokenPoolAttentionBinding:
         if layer_idx is None or layer_type is None:
-            return None, None, None
+            return TokenPoolAttentionBinding(
+                layer_idx=None,
+                metadata=None,
+                paged_metadata=None,
+                kv_pool=None,
+            )
+        layer_idx = int(layer_idx)
         metadata = self.metadata_for_layer(layer_idx, layer_type)
         paged_metadata = self.paged_metadata_for_layer(layer_idx, layer_type)
         token_kv_pool = self.kv_pool
         if token_kv_pool is None:
-            return metadata, paged_metadata, None
+            return TokenPoolAttentionBinding(
+                layer_idx=layer_idx,
+                metadata=metadata,
+                paged_metadata=paged_metadata,
+                kv_pool=None,
+            )
         layer_specs = getattr(token_kv_pool, "layer_specs", {})
-        if int(layer_idx) not in layer_specs:
+        if layer_idx not in layer_specs:
             if metadata is not None and not bool(attention_mask_present):
                 raise RuntimeError(
                     f"token-pool metadata was provided for layer {layer_idx}, "
                     "but the KV pool has no spec for that layer"
                 )
-            return None, None, None
-        return metadata, paged_metadata, token_kv_pool
+            return TokenPoolAttentionBinding(
+                layer_idx=layer_idx,
+                metadata=None,
+                paged_metadata=None,
+                kv_pool=None,
+            )
+        return TokenPoolAttentionBinding(
+            layer_idx=layer_idx,
+            metadata=metadata,
+            paged_metadata=paged_metadata,
+            kv_pool=token_kv_pool,
+        )
 
 
 def _env_flag(name: str) -> bool:

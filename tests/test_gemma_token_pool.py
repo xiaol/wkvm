@@ -1621,6 +1621,83 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertIsNone(resolved_paged)
         self.assertIsNone(resolved_pool)
 
+    def test_attention_binding_owns_current_kv_write(self) -> None:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            DecodeBatchMetadata,
+            TokenPoolAttentionBinding,
+            TokenPoolDecodeContext,
+            build_decode_metadata_from_token_slot_rows,
+        )
+
+        class CapturePool:
+            layer_specs = {7: object()}
+
+            def __init__(self) -> None:
+                self.calls = []
+
+            def set_kv(self, layer_idx, out_cache_loc, key_states, value_states):
+                self.calls.append(
+                    (layer_idx, out_cache_loc, key_states, value_states)
+                )
+
+        metadata = build_decode_metadata_from_token_slot_rows(
+            [[3, 4]],
+            out_cache_loc=[4],
+        )
+        pool = CapturePool()
+        context = TokenPoolDecodeContext(
+            metadata_by_layer_type={"full_attention": metadata},
+            kv_pool=pool,
+        )
+        binding = context.attention_binding_for_layer(7, "full_attention")
+
+        key_states = object()
+        value_states = object()
+        out_cache_loc = binding.store_current_kv(key_states, value_states)
+
+        self.assertIs(binding.metadata, metadata)
+        self.assertIs(binding.kv_pool, pool)
+        self.assertIs(out_cache_loc, metadata.out_cache_loc_long)
+        self.assertEqual(len(pool.calls), 1)
+        layer_idx, written_slots, written_keys, written_values = pool.calls[0]
+        self.assertEqual(layer_idx, 7)
+        self.assertIs(written_slots, metadata.out_cache_loc_long)
+        self.assertIs(written_keys, key_states)
+        self.assertIs(written_values, value_states)
+
+        fallback_metadata = DecodeBatchMetadata(
+            req_pool_indices=metadata.req_pool_indices,
+            seq_lens=metadata.seq_lens,
+            logical_seq_lens=metadata.logical_seq_lens,
+            out_cache_loc=metadata.out_cache_loc,
+            kv_indptr=metadata.kv_indptr,
+            kv_indices=metadata.kv_indices,
+            out_cache_loc_long=None,
+            max_seq_len=metadata.max_seq_len,
+        )
+        fallback_binding = TokenPoolAttentionBinding(
+            layer_idx=7,
+            metadata=fallback_metadata,
+            paged_metadata=None,
+            kv_pool=pool,
+        )
+        self.assertIs(
+            fallback_binding.out_cache_loc_for_write(),
+            fallback_metadata.out_cache_loc,
+        )
+        null_binding = TokenPoolAttentionBinding(
+            layer_idx=None,
+            metadata=None,
+            paged_metadata=None,
+            kv_pool=None,
+        )
+        self.assertIsNone(null_binding.store_current_kv(key_states, value_states))
+
     def test_graph_clone_and_copy_handles_paged_metadata(self) -> None:
         try:
             import torch  # noqa: F401
