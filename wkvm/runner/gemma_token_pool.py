@@ -578,8 +578,30 @@ class TokenPoolAttentionBinding:
     kv_pool: Any | None
     attention_workspace: Any | None = None
 
+    @property
+    def has_kv_pool(self) -> bool:
+        return self.kv_pool is not None
+
     def out_cache_loc_for_write(self) -> Any | None:
         return _metadata_out_cache_loc_for_write(self.metadata)
+
+    def has_write_location(self) -> bool:
+        return self.out_cache_loc_for_write() is not None
+
+    def should_use_decode_attention(
+        self,
+        *,
+        attention_mask_present: bool = False,
+        query_seq_len: int | None = None,
+    ) -> bool:
+        return _token_pool_decode_attention_enabled(
+            layer_idx=self.layer_idx,
+            metadata=self.metadata,
+            kv_pool=self.kv_pool,
+            attention_mask_present=attention_mask_present,
+            query_seq_len=query_seq_len,
+            out_cache_loc=self.out_cache_loc_for_write(),
+        )
 
     def store_current_kv(self, key_states: Any, value_states: Any) -> Any | None:
         out_cache_loc = self.out_cache_loc_for_write()
@@ -688,13 +710,27 @@ class TokenPoolAttentionPlan:
         paged_metadata = getattr(binding, "paged_metadata", None)
         kv_pool = getattr(binding, "kv_pool", None)
         bound_layer_idx = getattr(binding, "layer_idx", layer_idx)
-        use_decode_attention = _token_pool_decode_attention_enabled(
-            layer_idx=bound_layer_idx,
-            metadata=metadata,
-            kv_pool=kv_pool,
-            attention_mask_present=attention_mask_present,
-            query_seq_len=query_seq_len,
+        should_use_decode_attention = getattr(
+            binding,
+            "should_use_decode_attention",
+            None,
         )
+        if should_use_decode_attention is not None:
+            use_decode_attention = bool(
+                should_use_decode_attention(
+                    attention_mask_present=attention_mask_present,
+                    query_seq_len=query_seq_len,
+                )
+            )
+        else:
+            use_decode_attention = _token_pool_decode_attention_enabled(
+                layer_idx=bound_layer_idx,
+                metadata=metadata,
+                kv_pool=kv_pool,
+                attention_mask_present=attention_mask_present,
+                query_seq_len=query_seq_len,
+                out_cache_loc=_binding_out_cache_loc_for_write(binding, metadata),
+            )
         return cls(
             layer_idx=bound_layer_idx,
             metadata=metadata,
@@ -818,12 +854,15 @@ def _token_pool_decode_attention_enabled(
     kv_pool: Any | None,
     attention_mask_present: bool,
     query_seq_len: int | None,
+    out_cache_loc: Any | None = None,
 ) -> bool:
     if metadata is None or kv_pool is None or layer_idx is None:
         return False
     if bool(attention_mask_present):
         return False
-    if getattr(metadata, "out_cache_loc", None) is None:
+    if out_cache_loc is None:
+        out_cache_loc = getattr(metadata, "out_cache_loc", None)
+    if out_cache_loc is None:
         return False
     try:
         return int(query_seq_len) == 1

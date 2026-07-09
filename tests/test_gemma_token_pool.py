@@ -2492,6 +2492,16 @@ class TestGemmaTokenPool(unittest.TestCase):
 
         self.assertIs(binding.metadata, metadata)
         self.assertIs(binding.kv_pool, pool)
+        self.assertTrue(binding.has_kv_pool)
+        self.assertTrue(binding.has_write_location())
+        self.assertTrue(binding.should_use_decode_attention(query_seq_len=1))
+        self.assertFalse(
+            binding.should_use_decode_attention(
+                attention_mask_present=True,
+                query_seq_len=1,
+            )
+        )
+        self.assertFalse(binding.should_use_decode_attention(query_seq_len=2))
         self.assertIs(out_cache_loc, metadata.out_cache_loc_long)
         self.assertEqual(len(pool.calls), 1)
         layer_idx, written_slots, written_keys, written_values = pool.calls[0]
@@ -2520,12 +2530,16 @@ class TestGemmaTokenPool(unittest.TestCase):
             fallback_binding.out_cache_loc_for_write(),
             fallback_metadata.out_cache_loc,
         )
+        self.assertTrue(fallback_binding.has_write_location())
         null_binding = TokenPoolAttentionBinding(
             layer_idx=None,
             metadata=None,
             paged_metadata=None,
             kv_pool=None,
         )
+        self.assertFalse(null_binding.has_kv_pool)
+        self.assertFalse(null_binding.has_write_location())
+        self.assertFalse(null_binding.should_use_decode_attention(query_seq_len=1))
         self.assertIsNone(null_binding.store_current_kv(key_states, value_states))
 
     def test_attention_plan_resolves_decode_eligibility_and_write(self) -> None:
@@ -2627,6 +2641,26 @@ class TestGemmaTokenPool(unittest.TestCase):
         )
         self.assertFalse(no_write_plan.use_decode_attention)
         self.assertIsNone(no_write_plan.store_current_kv(key_states, value_states))
+        long_only_metadata = DecodeBatchMetadata(
+            req_pool_indices=metadata.req_pool_indices,
+            seq_lens=metadata.seq_lens,
+            logical_seq_lens=metadata.logical_seq_lens,
+            out_cache_loc=None,
+            out_cache_loc_long=metadata.out_cache_loc_long,
+            kv_indptr=metadata.kv_indptr,
+            kv_indices=metadata.kv_indices,
+        )
+        long_only_plan = TokenPoolAttentionPlan.from_binding(
+            TokenPoolAttentionBinding(
+                layer_idx=7,
+                metadata=long_only_metadata,
+                paged_metadata=None,
+                kv_pool=pool,
+            ),
+            layer_idx=7,
+            query_seq_len=1,
+        )
+        self.assertTrue(long_only_plan.use_decode_attention)
 
         legacy_context = type(
             "LegacyContext",
@@ -2674,6 +2708,30 @@ class TestGemmaTokenPool(unittest.TestCase):
         )
         self.assertEqual(owned_binding.calls, [(key_states, value_states)])
         self.assertEqual(len(pool.calls), previous_pool_calls)
+
+        class BindingWithOwnDecision:
+            def __init__(self) -> None:
+                self.layer_idx = 7
+                self.metadata = metadata
+                self.paged_metadata = None
+                self.kv_pool = pool
+                self.calls = []
+
+            def should_use_decode_attention(self, **kwargs):
+                self.calls.append(kwargs)
+                return False
+
+        decision_binding = BindingWithOwnDecision()
+        decision_plan = TokenPoolAttentionPlan.from_binding(
+            decision_binding,
+            layer_idx=7,
+            query_seq_len=1,
+        )
+        self.assertFalse(decision_plan.use_decode_attention)
+        self.assertEqual(
+            decision_binding.calls,
+            [{"attention_mask_present": False, "query_seq_len": 1}],
+        )
 
     def test_attention_plan_owns_attention_workspaces(self) -> None:
         try:
