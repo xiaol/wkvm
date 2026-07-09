@@ -38,8 +38,6 @@ from wkvm.runner.gemma_token_pool import (
     TokenPoolDecodeContext,
     TokenSlotRowChunks,
     TokenSlotAllocator,
-    build_decode_metadata_from_token_slot_rows,
-    build_paged_decode_metadata_from_token_slot_rows,
 )
 
 
@@ -684,7 +682,6 @@ class GemmaNativeEngine:
         self._token_pool_decode_backend: TokenPoolDecodeBackendState | None = None
         self._token_pool_full_attention_slots: dict[str, list[int]] = {}
         self._token_pool_full_attention_rows: dict[str, _TokenPoolFullAttentionRow] = {}
-        self._token_pool_full_attention_decode_metadata_workspace: dict[str, Any] = {}
         self.last_token_pool_decode_metadata: dict[str, DecodeBatchMetadata] | None = None
         self.last_token_pool_decode_metadata_by_layer_id: dict[int, DecodeBatchMetadata] | None = None
         self.last_token_pool_paged_decode_metadata: (
@@ -2895,7 +2892,8 @@ class GemmaNativeEngine:
     ) -> tuple[DecodeBatchMetadata | None, PagedDecodeBatchMetadata | None]:
         pool = self._token_kv_pool
         allocator = self._token_slot_allocator
-        if pool is None or allocator is None:
+        backend = self._token_pool_decode_backend
+        if pool is None or allocator is None or backend is None:
             return None, None
         import torch
 
@@ -3124,43 +3122,23 @@ class GemmaNativeEngine:
                     paged_rows.append(list(persistent_row.row_slots))
                 if persistent_rows:
                     self.metrics.token_pool_full_attention_row_rebuilds += 1
-            metadata = build_decode_metadata_from_token_slot_rows(
-                rows,
+            metadata = backend.build_full_attention_decode_metadata(
+                rows=rows,
                 req_slots=req_slots,
                 logical_seq_lens=logical_lens,
                 out_cache_loc=out_cache_loc,
-                device=pool.device,
-                token_pool_capacity=pool.capacity,
-                workspace=self._token_pool_full_attention_decode_metadata_workspace,
-                kv_indices_padding_slots=int(kv_indices_padding_steps) * len(rows),
+                kv_indices_padding_steps=kv_indices_padding_steps,
                 trusted_aux_metadata=True,
             )
             paged_metadata = None
             if build_paged_rows and paged_rows:
                 try:
-                    paged_block_size = max(1, int(self.token_pool_paged_block_size))
-                    max_paged_row_len = max(len(row) for row in paged_rows)
-                    padded_paged_row_len = max_paged_row_len + max(
-                        0,
-                        int(kv_indices_padding_steps),
-                    )
-                    block_table_width = max(
-                        1,
-                        (padded_paged_row_len + paged_block_size - 1)
-                        // paged_block_size,
-                    )
-                    paged_metadata = build_paged_decode_metadata_from_token_slot_rows(
-                        paged_rows,
-                        block_size=paged_block_size,
-                        block_table_width=block_table_width,
+                    paged_metadata = backend.build_full_attention_paged_decode_metadata(
+                        paged_rows=paged_rows,
                         req_slots=req_slots,
                         logical_seq_lens=logical_lens,
                         out_cache_loc=out_cache_loc,
-                        selected_start_positions=[0 for _ in paged_rows],
-                        device=pool.device,
-                        token_pool_capacity=pool.capacity,
-                        allow_selected_len_gt_logical_len=True,
-                        max_seq_len=padded_paged_row_len,
+                        kv_indices_padding_steps=kv_indices_padding_steps,
                     )
                 except (RuntimeError, ValueError, KeyError):
                     paged_metadata = None

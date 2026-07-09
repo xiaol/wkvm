@@ -1744,6 +1744,8 @@ def build_paged_decode_metadata_from_token_slot_rows(
     padding_block: int = -1,
     allow_selected_len_gt_logical_len: bool = False,
     max_seq_len: int | None = None,
+    workspace: dict[str, Any] | TokenPoolDecodeMetadataWorkspace | None = None,
+    workspace_key: str | None = None,
 ) -> PagedDecodeBatchMetadata:
     """Build selected-window-relative block tables from page-aligned token rows.
 
@@ -1923,6 +1925,72 @@ def build_paged_decode_metadata_from_token_slot_rows(
         if max_seq_len < metadata_max_seq_len:
             raise ValueError("max_seq_len is smaller than the live selected length")
         metadata_max_seq_len = max_seq_len
+    if workspace is not None:
+        if isinstance(workspace, TokenPoolDecodeMetadataWorkspace):
+            metadata_workspace = workspace.ensure_paged(
+                workspace_key,
+                device=device,
+                row_count=row_count,
+                block_table_width=max_blocks,
+            )
+        else:
+            metadata_workspace = _ensure_paged_decode_metadata_workspace(
+                workspace,
+                device=device,
+                row_count=row_count,
+                block_table_width=max_blocks,
+            )
+        req_pool_ws = metadata_workspace["req_pool_indices"][:row_count]
+        seq_lens_ws = metadata_workspace["seq_lens"][:row_count]
+        logical_lens_ws = metadata_workspace["logical_seq_lens"][:row_count]
+        out_ws = metadata_workspace["out_cache_loc"][:row_count]
+        out_long_ws = metadata_workspace["out_cache_loc_long"][:row_count]
+        block_lens_ws = metadata_workspace["block_table_lens"][:row_count]
+        starts_ws = metadata_workspace["selected_start_positions"][:row_count]
+        block_tables_ws = metadata_workspace["block_tables"][
+            :row_count,
+            :max_blocks,
+        ]
+        req_pool_ws.copy_(req_pool_indices)
+        seq_lens_ws.copy_(
+            torch.as_tensor(selected_lens, dtype=torch.int32, device=device)
+        )
+        logical_lens_ws.copy_(logical_lens)
+        block_lens_ws.copy_(
+            torch.as_tensor(
+                [len(row) for row in block_rows],
+                dtype=torch.int32,
+                device=device,
+            )
+        )
+        starts_ws.copy_(
+            torch.as_tensor(start_positions, dtype=torch.int32, device=device)
+        )
+        block_tables_ws.fill_(int(padding_block))
+        for row_idx, blocks in enumerate(block_rows):
+            block_tables_ws[row_idx, : len(blocks)].copy_(
+                torch.as_tensor(blocks, dtype=torch.int32, device=device)
+            )
+        out_result = None
+        out_long_result = None
+        if out is not None:
+            out_ws.copy_(out)
+            out_long_ws.copy_(out.to(dtype=torch.long))
+            out_result = out_ws
+            out_long_result = out_long_ws
+        return PagedDecodeBatchMetadata(
+            req_pool_indices=req_pool_ws,
+            seq_lens=seq_lens_ws,
+            logical_seq_lens=logical_lens_ws,
+            out_cache_loc=out_result,
+            block_tables=block_tables_ws,
+            block_table_lens=block_lens_ws,
+            selected_start_positions=starts_ws,
+            block_size=block_size,
+            slot_mapping=out_long_result,
+            out_cache_loc_long=out_long_result,
+            max_seq_len=metadata_max_seq_len,
+        )
     block_tables = torch.full(
         (row_count, max_blocks),
         int(padding_block),
@@ -3122,6 +3190,10 @@ class TokenPoolDecodeBackendState:
         self.token_pool_capacity = (
             None if token_pool_capacity is None else int(token_pool_capacity)
         )
+        self.decode_metadata_workspace = TokenPoolDecodeMetadataWorkspace()
+        self.full_attention_decode_metadata_workspace = (
+            self.decode_metadata_workspace.flat_workspace("full_attention")
+        )
 
     @property
     def page_table_tensor(self):
@@ -3278,6 +3350,75 @@ class TokenPoolDecodeBackendState:
             )
         except (RuntimeError, ValueError, KeyError):
             return None
+
+    @property
+    def device(self):
+        if self.kv_pool is not None:
+            return getattr(self.kv_pool, "device", self.table.req_to_token.device)
+        return self.table.req_to_token.device
+
+    def build_full_attention_decode_metadata(
+        self,
+        *,
+        rows: Iterable[Iterable[int] | Any],
+        req_slots: Iterable[int],
+        logical_seq_lens: Iterable[int],
+        out_cache_loc: Iterable[int] | Any,
+        kv_indices_padding_steps: int = 0,
+        trusted_aux_metadata: bool = True,
+    ) -> DecodeBatchMetadata:
+        rows_list = list(rows)
+        if not rows_list:
+            raise ValueError("full-attention decode metadata requires rows")
+        return build_decode_metadata_from_token_slot_rows(
+            rows_list,
+            req_slots=req_slots,
+            logical_seq_lens=logical_seq_lens,
+            out_cache_loc=out_cache_loc,
+            device=self.device,
+            token_pool_capacity=self.token_pool_capacity,
+            workspace=self.decode_metadata_workspace,
+            workspace_key="full_attention",
+            kv_indices_padding_slots=int(kv_indices_padding_steps) * len(rows_list),
+            trusted_aux_metadata=trusted_aux_metadata,
+        )
+
+    def build_full_attention_paged_decode_metadata(
+        self,
+        *,
+        paged_rows: Iterable[Iterable[int] | Any],
+        req_slots: Iterable[int],
+        logical_seq_lens: Iterable[int],
+        out_cache_loc: Iterable[int] | Any,
+        kv_indices_padding_steps: int = 0,
+    ) -> PagedDecodeBatchMetadata:
+        paged_rows_list = [list(row) for row in paged_rows]
+        if not paged_rows_list:
+            raise ValueError("full-attention paged metadata requires rows")
+        max_paged_row_len = max(len(row) for row in paged_rows_list)
+        padded_paged_row_len = max_paged_row_len + max(
+            0,
+            int(kv_indices_padding_steps),
+        )
+        block_table_width = max(
+            1,
+            (padded_paged_row_len + self.block_size - 1) // self.block_size,
+        )
+        return build_paged_decode_metadata_from_token_slot_rows(
+            paged_rows_list,
+            block_size=self.block_size,
+            block_table_width=block_table_width,
+            req_slots=req_slots,
+            logical_seq_lens=logical_seq_lens,
+            out_cache_loc=out_cache_loc,
+            selected_start_positions=[0 for _ in paged_rows_list],
+            device=self.device,
+            token_pool_capacity=self.token_pool_capacity,
+            allow_selected_len_gt_logical_len=True,
+            max_seq_len=padded_paged_row_len,
+            workspace=self.decode_metadata_workspace,
+            workspace_key="full_attention_paged",
+        )
 
     def build_decode_context(
         self,

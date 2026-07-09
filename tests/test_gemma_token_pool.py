@@ -719,6 +719,129 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(paged.selected_start_positions.tolist(), [0, 5])
         self.assertEqual(paged.slot_mapping.tolist(), [1, 21])
 
+    def test_token_pool_decode_backend_builds_full_attention_metadata_from_workspace(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenPoolDecodeBackendState,
+            TokenSlotRowChunks,
+        )
+
+        table = ReqToTokenTable(max_requests=2, max_context_len=8)
+        backend = TokenPoolDecodeBackendState(
+            table=table,
+            block_size=2,
+            token_pool_capacity=16,
+        )
+        self.assertIs(
+            backend.full_attention_decode_metadata_workspace,
+            backend.decode_metadata_workspace.flat_workspace("full_attention"),
+        )
+
+        first = backend.build_full_attention_decode_metadata(
+            rows=[
+                TokenSlotRowChunks(
+                    (
+                        torch.tensor([0, 1], dtype=torch.int32),
+                        torch.tensor([2], dtype=torch.int32),
+                    ),
+                    trusted=True,
+                ),
+                TokenSlotRowChunks(
+                    (
+                        torch.tensor([4], dtype=torch.int32),
+                        torch.tensor([5], dtype=torch.int32),
+                    ),
+                    trusted=True,
+                ),
+            ],
+            req_slots=[0, 1],
+            logical_seq_lens=[3, 2],
+            out_cache_loc=[2, 5],
+            kv_indices_padding_steps=1,
+        )
+        flat_ptrs = {
+            name: int(getattr(first, name).data_ptr())
+            for name in (
+                "req_pool_indices",
+                "seq_lens",
+                "logical_seq_lens",
+                "out_cache_loc",
+                "kv_indptr",
+                "kv_indices",
+                "out_cache_loc_long",
+            )
+        }
+        self.assertEqual(first.kv_indices.tolist(), [0, 1, 2, 4, 5, 5, 5])
+        self.assertEqual(first.kv_indptr.tolist(), [0, 3, 5])
+        self.assertEqual(first.max_seq_len, 4)
+
+        second = backend.build_full_attention_decode_metadata(
+            rows=[
+                TokenSlotRowChunks(
+                    (
+                        torch.tensor([6, 7], dtype=torch.int32),
+                        torch.tensor([8], dtype=torch.int32),
+                    ),
+                    trusted=True,
+                ),
+                TokenSlotRowChunks(
+                    (
+                        torch.tensor([10], dtype=torch.int32),
+                        torch.tensor([11], dtype=torch.int32),
+                    ),
+                    trusted=True,
+                ),
+            ],
+            req_slots=[0, 1],
+            logical_seq_lens=[3, 2],
+            out_cache_loc=[8, 11],
+            kv_indices_padding_steps=1,
+        )
+        for name, ptr in flat_ptrs.items():
+            self.assertEqual(int(getattr(second, name).data_ptr()), ptr)
+        self.assertEqual(second.kv_indices.tolist(), [6, 7, 8, 10, 11, 11, 11])
+        self.assertEqual(second.out_cache_loc_long.dtype, torch.long)
+
+        paged = backend.build_full_attention_paged_decode_metadata(
+            paged_rows=[[0, 1, 4, 5], [8, 9]],
+            req_slots=[0, 1],
+            logical_seq_lens=[2, 2],
+            out_cache_loc=[5, 9],
+            kv_indices_padding_steps=2,
+        )
+        paged_block_ptr = int(paged.block_tables.data_ptr())
+        paged_start_ptr = int(paged.selected_start_positions.data_ptr())
+        self.assertEqual(paged.seq_lens.tolist(), [4, 2])
+        self.assertEqual(paged.logical_seq_lens.tolist(), [2, 2])
+        self.assertEqual(paged.block_tables.tolist(), [[0, 2, -1], [4, -1, -1]])
+        self.assertEqual(paged.block_table_lens.tolist(), [2, 1])
+        self.assertEqual(paged.selected_start_positions.tolist(), [0, 0])
+        self.assertEqual(paged.slot_mapping.tolist(), [5, 9])
+        self.assertEqual(paged.max_seq_len, 6)
+
+        paged_again = backend.build_full_attention_paged_decode_metadata(
+            paged_rows=[[2, 3, 6, 7], [10, 11]],
+            req_slots=[0, 1],
+            logical_seq_lens=[2, 2],
+            out_cache_loc=[7, 11],
+            kv_indices_padding_steps=2,
+        )
+        self.assertEqual(int(paged_again.block_tables.data_ptr()), paged_block_ptr)
+        self.assertEqual(
+            int(paged_again.selected_start_positions.data_ptr()),
+            paged_start_ptr,
+        )
+        self.assertEqual(paged_again.block_tables.tolist(), [[1, 3, -1], [5, -1, -1]])
+        self.assertIs(
+            backend.decode_metadata_workspace.paged_workspaces["full_attention_paged"],
+            backend.decode_metadata_workspace.paged_workspace("full_attention_paged"),
+        )
+
     def test_req_to_token_table_reuses_decode_metadata_workspace_by_key(self) -> None:
         try:
             import torch
@@ -1141,6 +1264,85 @@ class TestGemmaTokenPool(unittest.TestCase):
             workspace.flat_workspace("full"),
         )
         self.assertIn("sliding", workspace.flat_workspaces)
+
+    def test_paged_token_slot_rows_accept_typed_decode_metadata_workspace(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            TokenPoolDecodeMetadataWorkspace,
+            build_paged_decode_metadata_from_token_slot_rows,
+        )
+
+        workspace = TokenPoolDecodeMetadataWorkspace()
+        first = build_paged_decode_metadata_from_token_slot_rows(
+            [[0, 1, 4, 5], [8, 9]],
+            block_size=2,
+            block_table_width=3,
+            req_slots=[1, 2],
+            logical_seq_lens=[4, 2],
+            out_cache_loc=[5, 9],
+            token_pool_capacity=16,
+            padding_block=-7,
+            workspace=workspace,
+            workspace_key="full_paged",
+        )
+        ptrs = {
+            name: int(getattr(first, name).data_ptr())
+            for name in (
+                "req_pool_indices",
+                "seq_lens",
+                "logical_seq_lens",
+                "out_cache_loc",
+                "out_cache_loc_long",
+                "block_table_lens",
+                "selected_start_positions",
+                "block_tables",
+            )
+        }
+
+        second = build_paged_decode_metadata_from_token_slot_rows(
+            [[2, 3, 6, 7], torch.tensor([10, 11], dtype=torch.int64)],
+            block_size=2,
+            block_table_width=3,
+            req_slots=[3, 4],
+            logical_seq_lens=[4, 2],
+            out_cache_loc=[7, 11],
+            token_pool_capacity=16,
+            padding_block=-7,
+            workspace=workspace,
+            workspace_key="full_paged",
+        )
+
+        for name, ptr in ptrs.items():
+            self.assertEqual(int(getattr(second, name).data_ptr()), ptr)
+        self.assertEqual(second.req_pool_indices.tolist(), [3, 4])
+        self.assertEqual(second.seq_lens.tolist(), [4, 2])
+        self.assertEqual(second.logical_seq_lens.tolist(), [4, 2])
+        self.assertEqual(second.out_cache_loc.tolist(), [7, 11])
+        self.assertEqual(second.out_cache_loc_long.dtype, torch.long)
+        self.assertEqual(second.block_table_lens.tolist(), [2, 1])
+        self.assertEqual(second.selected_start_positions.tolist(), [0, 0])
+        self.assertEqual(second.block_tables.tolist(), [[1, 3, -7], [5, -7, -7]])
+        self.assertIs(
+            workspace.paged_workspaces["full_paged"],
+            workspace.paged_workspace("full_paged"),
+        )
+
+        separate = build_paged_decode_metadata_from_token_slot_rows(
+            [[12, 13]],
+            block_size=2,
+            req_slots=[5],
+            logical_seq_lens=[2],
+            out_cache_loc=[13],
+            token_pool_capacity=16,
+            workspace=workspace,
+            workspace_key="sliding_paged",
+        )
+        self.assertNotEqual(int(separate.block_tables.data_ptr()), ptrs["block_tables"])
+        self.assertIn("sliding_paged", workspace.paged_workspaces)
 
     def test_explicit_token_slot_row_chunks_fill_workspace_without_cat(self) -> None:
         try:
