@@ -678,6 +678,14 @@ class TokenPoolAttentionBinding:
             device=device,
         )
 
+    def kv_buffers_for_attention(self) -> tuple[Any, Any] | None:
+        if self.layer_idx is None or self.kv_pool is None:
+            return None
+        get_kv_buffer = getattr(self.kv_pool, "get_kv_buffer", None)
+        if get_kv_buffer is None:
+            return None
+        return get_kv_buffer(int(self.layer_idx))
+
 
 @dataclass(frozen=True)
 class TokenPoolAttentionPlan:
@@ -795,6 +803,21 @@ class TokenPoolAttentionPlan:
             dtype=dtype,
             device=device,
         )
+
+    def kv_buffers_for_attention(self) -> tuple[Any, Any] | None:
+        kv_buffers_for_attention = getattr(
+            self.binding,
+            "kv_buffers_for_attention",
+            None,
+        )
+        if kv_buffers_for_attention is not None:
+            return kv_buffers_for_attention()
+        if self.layer_idx is None or self.kv_pool is None:
+            return None
+        get_kv_buffer = getattr(self.kv_pool, "get_kv_buffer", None)
+        if get_kv_buffer is None:
+            return None
+        return get_kv_buffer(int(self.layer_idx))
 
     def attention_split_workspace(
         self,

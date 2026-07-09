@@ -1575,7 +1575,18 @@ def _attention_forward_token_pool_gqa(
             _TOKEN_POOL_TRITON_STATS["attempts"] += 1
             triton_attempt_start = time.perf_counter() if timing_enabled else 0.0
             try:
-                key_buffer, value_buffer = token_kv_pool.get_kv_buffer(layer_idx)
+                kv_buffers = None
+                if token_pool_plan is not None:
+                    kv_buffers_for_attention = getattr(
+                        token_pool_plan,
+                        "kv_buffers_for_attention",
+                        None,
+                    )
+                    if kv_buffers_for_attention is not None:
+                        kv_buffers = kv_buffers_for_attention()
+                if kv_buffers is None:
+                    kv_buffers = token_kv_pool.get_kv_buffer(layer_idx)
+                key_buffer, value_buffer = kv_buffers
                 output_buffer = None
                 workspace_owner = (
                     token_pool_plan if token_pool_plan is not None else token_kv_pool

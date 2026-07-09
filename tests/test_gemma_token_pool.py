@@ -2469,11 +2469,17 @@ class TestGemmaTokenPool(unittest.TestCase):
 
             def __init__(self) -> None:
                 self.calls = []
+                self.buffer_calls = []
+                self.buffers = (object(), object())
 
             def set_kv(self, layer_idx, out_cache_loc, key_states, value_states):
                 self.calls.append(
                     (layer_idx, out_cache_loc, key_states, value_states)
                 )
+
+            def get_kv_buffer(self, layer_idx):
+                self.buffer_calls.append(layer_idx)
+                return self.buffers
 
         metadata = build_decode_metadata_from_token_slot_rows(
             [[3, 4]],
@@ -2502,6 +2508,8 @@ class TestGemmaTokenPool(unittest.TestCase):
             )
         )
         self.assertFalse(binding.should_use_decode_attention(query_seq_len=2))
+        self.assertIs(binding.kv_buffers_for_attention(), pool.buffers)
+        self.assertEqual(pool.buffer_calls, [7])
         self.assertIs(out_cache_loc, metadata.out_cache_loc_long)
         self.assertEqual(len(pool.calls), 1)
         layer_idx, written_slots, written_keys, written_values = pool.calls[0]
@@ -2562,11 +2570,17 @@ class TestGemmaTokenPool(unittest.TestCase):
 
             def __init__(self) -> None:
                 self.calls = []
+                self.buffer_calls = []
+                self.buffers = (object(), object())
 
             def set_kv(self, layer_idx, out_cache_loc, key_states, value_states):
                 self.calls.append(
                     (layer_idx, out_cache_loc, key_states, value_states)
                 )
+
+            def get_kv_buffer(self, layer_idx):
+                self.buffer_calls.append(layer_idx)
+                return self.buffers
 
         metadata = build_decode_metadata_from_token_slot_rows(
             [[3, 4]],
@@ -2587,6 +2601,8 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertTrue(plan.use_decode_attention)
         self.assertIs(plan.metadata, metadata)
         self.assertIs(plan.kv_pool, pool)
+        self.assertIs(plan.kv_buffers_for_attention(), pool.buffers)
+        self.assertEqual(pool.buffer_calls, [7])
         self.assertEqual(
             plan.attention_kwargs(),
             {
