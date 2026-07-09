@@ -704,6 +704,66 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(manager.rows, {})
         self.assertEqual(allocator.allocated_count, 0)
 
+    def test_full_attention_row_manager_prepares_decode_row_chunks(self) -> None:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            TokenPoolFullAttentionRowManager,
+            TokenSlotAllocator,
+        )
+
+        allocator = TokenSlotAllocator(capacity=16)
+        manager = TokenPoolFullAttentionRowManager(
+            allocator=allocator,
+            block_size=4,
+        )
+        reservation_slots, reservation_slot_ids = allocator.alloc_slots_with_ids(1)
+
+        first = manager.prepare_decode_row(
+            "persist",
+            materialized_width=2,
+            decode_token_slot=reservation_slot_ids[0],
+            decode_token_slot_tensor=reservation_slots[:1],
+            persistent_rows=True,
+            build_paged_rows=False,
+            append_reserve_slots=2,
+            device="cpu",
+        )
+
+        self.assertFalse(first.reused_existing_row)
+        self.assertTrue(first.rebuilt_persistent_row)
+        self.assertEqual(first.materialized_slot_ids, [1, 2])
+        self.assertEqual(first.full_token_slot, 3)
+        self.assertEqual(first.row_chunks.chunks[0].tolist(), [1, 2])
+        self.assertEqual(first.row_chunks.chunks[1].tolist(), [3])
+        self.assertEqual(manager.rows["persist"].append_slots, [4])
+
+        reused = manager.prepare_decode_row(
+            "persist",
+            materialized_width=3,
+            decode_token_slot=reservation_slot_ids[0],
+            decode_token_slot_tensor=reservation_slots[:1],
+            persistent_rows=True,
+            build_paged_rows=False,
+            append_reserve_slots=2,
+            device="cpu",
+        )
+
+        self.assertTrue(reused.reused_existing_row)
+        self.assertTrue(reused.appended_existing_row)
+        self.assertFalse(reused.rebuilt_persistent_row)
+        self.assertEqual(reused.materialized_slot_ids, [])
+        self.assertEqual(reused.full_token_slot, 4)
+        self.assertEqual(reused.row_chunks.chunks[0].tolist(), [1, 2, 3, 4])
+
+        manager.clear(["persist"])
+        self.assertEqual(allocator.allocated_count, 1)
+        allocator.free_slots(reservation_slot_ids)
+        self.assertEqual(allocator.allocated_count, 0)
+
     def test_token_pool_decode_backend_builds_sliding_metadata_from_block_tables(self) -> None:
         try:
             import torch  # noqa: F401

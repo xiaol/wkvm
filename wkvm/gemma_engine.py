@@ -37,7 +37,6 @@ from wkvm.runner.gemma_token_pool import (
     TokenPoolDecodeBackendState,
     TokenPoolDecodeContext,
     TokenPoolFullAttentionRow,
-    TokenSlotRowChunks,
     TokenSlotAllocator,
 )
 
@@ -2869,8 +2868,6 @@ class GemmaNativeEngine:
         backend = self._token_pool_decode_backend
         if pool is None or allocator is None or backend is None:
             return None, None
-        import torch
-
         row_manager = backend.full_attention_rows
         if row_manager is None:
             return None, None
@@ -2933,152 +2930,45 @@ class GemmaNativeEngine:
                         )
                     routed_layers.append((layer_id, layer, writer))
                 materialized_width = int(materialized_width or 0)
-                existing_row = (
-                    row_manager.rows.get(req.req_id)
-                    if persistent_rows
-                    else None
-                )
-                if (
-                    existing_row is not None
-                    and build_paged_rows
-                    and not existing_row.page_aligned
-                ):
-                    self._token_pool_invalidate_full_attention_rows([req.req_id])
-                    existing_row = None
                 append_reserve_slots = max(1, int(kv_indices_padding_steps) + 1)
-                if existing_row is not None:
-                    if len(existing_row.row_slots) == materialized_width:
-                        append = row_manager.append_existing_row(
-                            req.req_id,
-                            append_reserve_slots=append_reserve_slots,
-                        )
-                        if append is None:
-                            raise RuntimeError("existing full-attention row disappeared")
-                        existing_row = append.row
-                        full_token_slot = append.full_token_slot
-                        reservation.full_attention_token_slot = full_token_slot
-
-                        rows.append(
-                            TokenSlotRowChunks(
-                                (
-                                    torch.as_tensor(
-                                        existing_row.row_slots,
-                                        dtype=torch.int32,
-                                        device=pool.device,
-                                    ),
-                                ),
-                                trusted=True,
-                            )
-                        )
-                        req_slots.append(reservation.req_slot)
-                        out_cache_loc.append(full_token_slot)
-                        first_layer = routed_layers[0][1]
-                        logical_lens.append(int(first_layer.cumulative_length) + 1)
-                        if build_paged_rows and existing_row.page_aligned:
-                            paged_rows.append(list(existing_row.row_slots))
-                        self.metrics.token_pool_full_attention_row_reuses += 1
-                        self.metrics.token_pool_full_attention_row_appends += 1
-                        continue
-                    self._token_pool_invalidate_full_attention_rows([req.req_id])
-                persistent_row: TokenPoolFullAttentionRow | None = None
-                if persistent_rows and build_paged_rows:
-                    (
-                        materialized_slots,
-                        materialized_slot_list,
-                        append,
-                    ) = row_manager.start_page_aligned_persistent_row(
-                        req.req_id,
-                        materialized_width=materialized_width,
-                        append_reserve_slots=append_reserve_slots,
+                prepared_row = row_manager.prepare_decode_row(
+                    req.req_id,
+                    materialized_width=materialized_width,
+                    decode_token_slot=reservation.token_slot,
+                    decode_token_slot_tensor=reservation.token_slot_tensor,
+                    persistent_rows=persistent_rows,
+                    build_paged_rows=build_paged_rows,
+                    append_reserve_slots=append_reserve_slots,
+                    device=pool.device,
+                )
+                if prepared_row.invalidated_existing_rows:
+                    self.metrics.token_pool_full_attention_row_invalidations += (
+                        prepared_row.invalidated_existing_rows
                     )
-                    materialized_slots_long = materialized_slots.to(dtype=torch.long)
-                    persistent_row = append.row
-                    full_token_slot = append.full_token_slot
+                full_token_slot = prepared_row.full_token_slot
+                if persistent_rows:
                     reservation.full_attention_token_slot = full_token_slot
-                    decode_slot = torch.as_tensor(
-                        [full_token_slot],
-                        dtype=torch.int32,
-                        device=pool.device,
-                    )
-                else:
-                    if materialized_width:
-                        (
-                            materialized_slots,
-                            materialized_slot_list,
-                        ) = allocator.alloc_slots_with_ids(materialized_width)
-                        materialized_slots_long = materialized_slots.to(dtype=torch.long)
-                    else:
-                        materialized_slots = torch.empty(
-                            0,
-                            dtype=torch.int32,
-                            device=pool.device,
-                        )
-                        materialized_slot_list = []
-                        materialized_slots_long = materialized_slots.to(dtype=torch.long)
-                    if persistent_rows:
-                        append = row_manager.start_persistent_row(
-                            req.req_id,
-                            materialized_slots=materialized_slot_list,
-                            append_reserve_slots=append_reserve_slots,
-                            page_aligned=False,
-                        )
-                        persistent_row = append.row
-                        full_token_slot = append.full_token_slot
-                        reservation.full_attention_token_slot = full_token_slot
-                        decode_slot = torch.as_tensor(
-                            [full_token_slot],
-                            dtype=torch.int32,
-                            device=pool.device,
-                        )
-                    else:
-                        row_manager.record_transient_materialized_slots(
-                            req.req_id,
-                            materialized_slot_list,
-                        )
-                        full_token_slot = reservation.token_slot
-                        decode_slot = reservation.token_slot_tensor
-                        decode_device = getattr(decode_slot, "device", None)
-                        decode_device_matches = (
-                            decode_device is not None
-                            and torch.device(decode_device) == torch.device(pool.device)
-                        )
-                        if (
-                            not hasattr(decode_slot, "numel")
-                            or int(decode_slot.numel()) != 1
-                            or getattr(decode_slot, "dtype", None) != torch.int32
-                            or not decode_device_matches
-                        ):
-                            decode_slot = torch.as_tensor(
-                                [full_token_slot],
-                                dtype=torch.int32,
-                                device=pool.device,
-                            )
-                if materialized_width:
+                if materialized_width and not prepared_row.reused_existing_row:
                     for layer_id, _layer, writer in routed_layers:
                         writer(
                             pool,
-                            materialized_slots,
+                            prepared_row.materialized_slots,
                             layer_id=int(layer_id),
-                            token_slots_long=materialized_slots_long,
-                            token_slot_ids=materialized_slot_list,
+                            token_slots_long=prepared_row.materialized_slots_long,
+                            token_slot_ids=prepared_row.materialized_slot_ids,
                         )
-                rows.append(
-                    TokenSlotRowChunks(
-                        (materialized_slots, decode_slot),
-                        trusted=True,
-                    )
-                )
+                rows.append(prepared_row.row_chunks)
                 req_slots.append(reservation.req_slot)
                 out_cache_loc.append(full_token_slot)
                 first_layer = routed_layers[0][1]
                 logical_lens.append(int(first_layer.cumulative_length) + 1)
-                if (
-                    build_paged_rows
-                    and persistent_row is not None
-                    and persistent_row.page_aligned
-                ):
-                    paged_rows.append(list(persistent_row.row_slots))
-                if persistent_rows:
+                if prepared_row.paged_row is not None:
+                    paged_rows.append(prepared_row.paged_row)
+                if prepared_row.reused_existing_row:
+                    self.metrics.token_pool_full_attention_row_reuses += 1
+                if prepared_row.appended_existing_row:
+                    self.metrics.token_pool_full_attention_row_appends += 1
+                if prepared_row.rebuilt_persistent_row:
                     self.metrics.token_pool_full_attention_row_rebuilds += 1
             metadata = backend.build_full_attention_decode_metadata(
                 rows=rows,

@@ -162,6 +162,21 @@ class TokenPoolFullAttentionRowAppend:
     reused_existing_row: bool
 
 
+@dataclass(frozen=True)
+class TokenPoolFullAttentionPreparedDecodeRow:
+    row_chunks: TokenSlotRowChunks
+    full_token_slot: int
+    materialized_slots: Any
+    materialized_slot_ids: list[int]
+    materialized_slots_long: Any
+    persistent_row: TokenPoolFullAttentionRow | None = None
+    paged_row: list[int] | None = None
+    reused_existing_row: bool = False
+    rebuilt_persistent_row: bool = False
+    appended_existing_row: bool = False
+    invalidated_existing_rows: int = 0
+
+
 class TokenPoolFullAttentionRowManager:
     """Backend-owned lifecycle for materialized full-attention token rows."""
 
@@ -369,6 +384,163 @@ class TokenPoolFullAttentionRowManager:
         materialized_slots: Iterable[int] | Any,
     ) -> None:
         self.transient_slots[str(req_id)] = _slot_values_to_list(materialized_slots)
+
+    def prepare_decode_row(
+        self,
+        req_id: str,
+        *,
+        materialized_width: int,
+        decode_token_slot: int,
+        decode_token_slot_tensor: Any,
+        persistent_rows: bool,
+        build_paged_rows: bool,
+        append_reserve_slots: int,
+        device: Any,
+    ) -> TokenPoolFullAttentionPreparedDecodeRow:
+        import torch
+
+        req_key = str(req_id)
+        materialized_width = max(0, int(materialized_width))
+        append_reserve_slots = max(1, int(append_reserve_slots))
+        invalidated = 0
+        existing_row = self.rows.get(req_key) if persistent_rows else None
+        if existing_row is not None and build_paged_rows and not existing_row.page_aligned:
+            invalidated += self.invalidate([req_key])
+            existing_row = None
+
+        if existing_row is not None:
+            if len(existing_row.row_slots) == materialized_width:
+                append = self.append_existing_row(
+                    req_key,
+                    append_reserve_slots=append_reserve_slots,
+                )
+                if append is None:
+                    raise RuntimeError("existing full-attention row disappeared")
+                empty_slots = torch.empty(0, dtype=torch.int32, device=device)
+                paged_row = (
+                    list(append.row.row_slots)
+                    if build_paged_rows and append.row.page_aligned
+                    else None
+                )
+                return TokenPoolFullAttentionPreparedDecodeRow(
+                    row_chunks=TokenSlotRowChunks(
+                        (
+                            torch.as_tensor(
+                                append.row.row_slots,
+                                dtype=torch.int32,
+                                device=device,
+                            ),
+                        ),
+                        trusted=True,
+                    ),
+                    full_token_slot=append.full_token_slot,
+                    materialized_slots=empty_slots,
+                    materialized_slot_ids=[],
+                    materialized_slots_long=empty_slots.to(dtype=torch.long),
+                    persistent_row=append.row,
+                    paged_row=paged_row,
+                    reused_existing_row=True,
+                    appended_existing_row=True,
+                    invalidated_existing_rows=invalidated,
+                )
+            invalidated += self.invalidate([req_key])
+
+        persistent_row: TokenPoolFullAttentionRow | None = None
+        if persistent_rows and build_paged_rows:
+            materialized_slots, materialized_slot_ids, append = (
+                self.start_page_aligned_persistent_row(
+                    req_key,
+                    materialized_width=materialized_width,
+                    append_reserve_slots=append_reserve_slots,
+                )
+            )
+            persistent_row = append.row
+            full_token_slot = append.full_token_slot
+            decode_slot = torch.as_tensor(
+                [full_token_slot],
+                dtype=torch.int32,
+                device=device,
+            )
+        else:
+            if materialized_width:
+                materialized_slots, materialized_slot_ids = (
+                    self.allocator.alloc_slots_with_ids(materialized_width)
+                )
+            else:
+                materialized_slots = torch.empty(0, dtype=torch.int32, device=device)
+                materialized_slot_ids = []
+            if persistent_rows:
+                append = self.start_persistent_row(
+                    req_key,
+                    materialized_slots=materialized_slot_ids,
+                    append_reserve_slots=append_reserve_slots,
+                    page_aligned=False,
+                )
+                persistent_row = append.row
+                full_token_slot = append.full_token_slot
+                decode_slot = torch.as_tensor(
+                    [full_token_slot],
+                    dtype=torch.int32,
+                    device=device,
+                )
+            else:
+                self.record_transient_materialized_slots(req_key, materialized_slot_ids)
+                full_token_slot = int(decode_token_slot)
+                decode_slot = self._normalized_decode_slot_tensor(
+                    decode_token_slot_tensor,
+                    full_token_slot=full_token_slot,
+                    device=device,
+                )
+
+        materialized_slots_long = materialized_slots.to(dtype=torch.long)
+        paged_row = (
+            list(persistent_row.row_slots)
+            if build_paged_rows
+            and persistent_row is not None
+            and persistent_row.page_aligned
+            else None
+        )
+        return TokenPoolFullAttentionPreparedDecodeRow(
+            row_chunks=TokenSlotRowChunks(
+                (materialized_slots, decode_slot),
+                trusted=True,
+            ),
+            full_token_slot=full_token_slot,
+            materialized_slots=materialized_slots,
+            materialized_slot_ids=list(materialized_slot_ids),
+            materialized_slots_long=materialized_slots_long,
+            persistent_row=persistent_row,
+            paged_row=paged_row,
+            rebuilt_persistent_row=bool(persistent_rows),
+            invalidated_existing_rows=invalidated,
+        )
+
+    @staticmethod
+    def _normalized_decode_slot_tensor(
+        decode_slot: Any,
+        *,
+        full_token_slot: int,
+        device: Any,
+    ) -> Any:
+        import torch
+
+        decode_device = getattr(decode_slot, "device", None)
+        decode_device_matches = (
+            decode_device is not None
+            and torch.device(decode_device) == torch.device(device)
+        )
+        if (
+            hasattr(decode_slot, "numel")
+            and int(decode_slot.numel()) == 1
+            and getattr(decode_slot, "dtype", None) == torch.int32
+            and decode_device_matches
+        ):
+            return decode_slot
+        return torch.as_tensor(
+            [int(full_token_slot)],
+            dtype=torch.int32,
+            device=device,
+        )
 
 
 @dataclass(frozen=True)
