@@ -36,6 +36,7 @@ from wkvm.runner.gemma_token_pool import (
     TokenPoolBlockTables,
     TokenPoolDecodeBackendState,
     TokenPoolDecodeContext,
+    TokenPoolFullAttentionRow,
     TokenSlotRowChunks,
     TokenSlotAllocator,
 )
@@ -424,14 +425,6 @@ class _TokenPoolDecodeReservation:
     persistent_full_attention_row: bool = False
 
 
-@dataclass
-class _TokenPoolFullAttentionRow:
-    row_slots: list[int]
-    owned_slots: list[int]
-    append_slots: list[int] = field(default_factory=list)
-    page_aligned: bool = False
-
-
 class GemmaNativeEngine:
     """Scheduler-owned native Gemma routed-span engine.
 
@@ -681,7 +674,7 @@ class GemmaNativeEngine:
         self._token_pool_block_tables: TokenPoolBlockTables | None = None
         self._token_pool_decode_backend: TokenPoolDecodeBackendState | None = None
         self._token_pool_full_attention_slots: dict[str, list[int]] = {}
-        self._token_pool_full_attention_rows: dict[str, _TokenPoolFullAttentionRow] = {}
+        self._token_pool_full_attention_rows: dict[str, TokenPoolFullAttentionRow] = {}
         self.last_token_pool_decode_metadata: dict[str, DecodeBatchMetadata] | None = None
         self.last_token_pool_decode_metadata_by_layer_id: dict[int, DecodeBatchMetadata] | None = None
         self.last_token_pool_paged_decode_metadata: (
@@ -719,6 +712,14 @@ class GemmaNativeEngine:
             else:
                 self._token_slot_allocator = TokenSlotAllocator(capacity=token_pool_capacity)
             self._token_pool_decode_backend = self._new_token_pool_decode_backend()
+            row_manager = (
+                None
+                if self._token_pool_decode_backend is None
+                else self._token_pool_decode_backend.full_attention_rows
+            )
+            if row_manager is not None:
+                self._token_pool_full_attention_slots = row_manager.transient_slots
+                self._token_pool_full_attention_rows = row_manager.rows
         self._record_cuda_memory_phase("engine_init")
 
     def add_request(self, request: Request, *, break_mask: list[bool] | None = None) -> None:
@@ -1812,6 +1813,7 @@ class GemmaNativeEngine:
             return None
         return TokenPoolDecodeBackendState(
             table=table,
+            allocator=self._token_slot_allocator,
             kv_pool=self._token_kv_pool,
             block_tables=self._token_pool_block_tables,
             block_size=self.token_pool_paged_block_size,
@@ -2162,41 +2164,13 @@ class GemmaNativeEngine:
         start_position: int,
         min_slots: int,
     ):
-        allocator = self._token_slot_allocator
-        if allocator is None:
-            raise RuntimeError("token-pool allocator is not initialized")
-        alloc_page = getattr(allocator, "alloc_page_block_with_ids", None)
-        if alloc_page is None:
-            slots_tensor, slot_ids = allocator.alloc_slots_with_ids(min_slots)
-            return slots_tensor, slot_ids, list(slot_ids)
-        import torch
-
-        block_size = max(1, int(self.token_pool_paged_block_size))
-        start_position = int(start_position)
-        min_slots = int(min_slots)
-        if start_position < 0:
-            raise ValueError("start_position must be non-negative")
-        if min_slots < 1:
-            raise ValueError("min_slots must be >= 1")
-        if start_position % block_size:
-            raise RuntimeError("page-aligned full-attention row append must start at a page boundary")
-        end_position = start_position + min_slots
-        rounded_end = ((end_position + block_size - 1) // block_size) * block_size
-        slots: list[int] = []
-        owned_slots: list[int] = []
-        first_block = start_position // block_size
-        last_block = (rounded_end - 1) // block_size
-        for logical_block in range(first_block, last_block + 1):
-            _physical_block, block_slots = alloc_page(block_size)
-            owned_slots.extend(int(slot) for slot in block_slots)
-            block_start = max(start_position, logical_block * block_size)
-            block_end = min(rounded_end, (logical_block + 1) * block_size)
-            for logical_pos in range(block_start, block_end):
-                slots.append(int(block_slots[logical_pos % block_size]))
-        return (
-            torch.as_tensor(slots, dtype=torch.int32, device=allocator.device),
-            slots,
-            owned_slots,
+        backend = self._token_pool_decode_backend
+        row_manager = None if backend is None else backend.full_attention_rows
+        if row_manager is None:
+            raise RuntimeError("token-pool full-attention row manager is not initialized")
+        return row_manager.allocate_page_aligned_row_slots(
+            start_position,
+            min_slots,
         )
 
     def _token_pool_release_prefill_sliding_storage(self, cache) -> None:
@@ -2897,6 +2871,9 @@ class GemmaNativeEngine:
             return None, None
         import torch
 
+        row_manager = backend.full_attention_rows
+        if row_manager is None:
+            return None, None
         owner_layer_ids = self._token_pool_full_attention_owner_layer_ids()
         if not owner_layer_ids:
             return None, None
@@ -2957,7 +2934,7 @@ class GemmaNativeEngine:
                     routed_layers.append((layer_id, layer, writer))
                 materialized_width = int(materialized_width or 0)
                 existing_row = (
-                    self._token_pool_full_attention_rows.get(req.req_id)
+                    row_manager.rows.get(req.req_id)
                     if persistent_rows
                     else None
                 )
@@ -2971,29 +2948,15 @@ class GemmaNativeEngine:
                 append_reserve_slots = max(1, int(kv_indices_padding_steps) + 1)
                 if existing_row is not None:
                     if len(existing_row.row_slots) == materialized_width:
-                        if existing_row.append_slots:
-                            full_token_slot = int(existing_row.append_slots.pop(0))
-                        elif existing_row.page_aligned:
-                            (
-                                append_slots_tensor,
-                                append_slot_list,
-                                append_owned_slots,
-                            ) = self._token_pool_alloc_page_aligned_full_attention_row_slots(
-                                len(existing_row.row_slots),
-                                append_reserve_slots,
-                            )
-                            full_token_slot = int(append_slot_list[0])
-                            existing_row.owned_slots.extend(append_owned_slots)
-                            existing_row.append_slots.extend(append_slot_list[1:])
-                        else:
-                            _, append_slot_list = allocator.alloc_slots_with_ids(
-                                append_reserve_slots
-                            )
-                            full_token_slot = int(append_slot_list[0])
-                            existing_row.owned_slots.extend(append_slot_list)
-                            existing_row.append_slots.extend(append_slot_list[1:])
+                        append = row_manager.append_existing_row(
+                            req.req_id,
+                            append_reserve_slots=append_reserve_slots,
+                        )
+                        if append is None:
+                            raise RuntimeError("existing full-attention row disappeared")
+                        existing_row = append.row
+                        full_token_slot = append.full_token_slot
                         reservation.full_attention_token_slot = full_token_slot
-                        existing_row.row_slots.append(full_token_slot)
 
                         rows.append(
                             TokenSlotRowChunks(
@@ -3017,32 +2980,26 @@ class GemmaNativeEngine:
                         self.metrics.token_pool_full_attention_row_appends += 1
                         continue
                     self._token_pool_invalidate_full_attention_rows([req.req_id])
-                persistent_row: _TokenPoolFullAttentionRow | None = None
+                persistent_row: TokenPoolFullAttentionRow | None = None
                 if persistent_rows and build_paged_rows:
                     (
-                        row_slots_tensor,
-                        row_slot_list,
-                        row_owned_slots,
-                    ) = self._token_pool_alloc_page_aligned_full_attention_row_slots(
-                        0,
-                        materialized_width + append_reserve_slots,
+                        materialized_slots,
+                        materialized_slot_list,
+                        append,
+                    ) = row_manager.start_page_aligned_persistent_row(
+                        req.req_id,
+                        materialized_width=materialized_width,
+                        append_reserve_slots=append_reserve_slots,
                     )
-                    materialized_slots = row_slots_tensor[:materialized_width]
-                    materialized_slot_list = row_slot_list[:materialized_width]
                     materialized_slots_long = materialized_slots.to(dtype=torch.long)
-                    persistent_row = _TokenPoolFullAttentionRow(
-                        row_slots=list(materialized_slot_list),
-                        owned_slots=list(row_owned_slots),
-                        page_aligned=True,
-                    )
-                    self._token_pool_full_attention_rows[req.req_id] = persistent_row
-                    full_token_slot = int(row_slot_list[materialized_width])
+                    persistent_row = append.row
+                    full_token_slot = append.full_token_slot
                     reservation.full_attention_token_slot = full_token_slot
-                    persistent_row.row_slots.append(full_token_slot)
-                    persistent_row.append_slots.extend(row_slot_list[materialized_width + 1:])
-                    decode_slot = row_slots_tensor[
-                        materialized_width : materialized_width + 1
-                    ]
+                    decode_slot = torch.as_tensor(
+                        [full_token_slot],
+                        dtype=torch.int32,
+                        device=pool.device,
+                    )
                 else:
                     if materialized_width:
                         (
@@ -3059,23 +3016,24 @@ class GemmaNativeEngine:
                         materialized_slot_list = []
                         materialized_slots_long = materialized_slots.to(dtype=torch.long)
                     if persistent_rows:
-                        persistent_row = _TokenPoolFullAttentionRow(
-                            row_slots=list(materialized_slot_list),
-                            owned_slots=list(materialized_slot_list),
+                        append = row_manager.start_persistent_row(
+                            req.req_id,
+                            materialized_slots=materialized_slot_list,
+                            append_reserve_slots=append_reserve_slots,
+                            page_aligned=False,
                         )
-                        self._token_pool_full_attention_rows[req.req_id] = persistent_row
-                        append_slots_tensor, append_slot_list = allocator.alloc_slots_with_ids(
-                            append_reserve_slots
-                        )
-                        full_token_slot = int(append_slot_list[0])
+                        persistent_row = append.row
+                        full_token_slot = append.full_token_slot
                         reservation.full_attention_token_slot = full_token_slot
-                        persistent_row.row_slots.append(full_token_slot)
-                        persistent_row.owned_slots.extend(append_slot_list)
-                        persistent_row.append_slots.extend(append_slot_list[1:])
-                        decode_slot = append_slots_tensor[:1]
+                        decode_slot = torch.as_tensor(
+                            [full_token_slot],
+                            dtype=torch.int32,
+                            device=pool.device,
+                        )
                     else:
-                        self._token_pool_full_attention_slots[req.req_id] = list(
-                            materialized_slot_list
+                        row_manager.record_transient_materialized_slots(
+                            req.req_id,
+                            materialized_slot_list,
                         )
                         full_token_slot = reservation.token_slot
                         decode_slot = reservation.token_slot_tensor
@@ -3229,42 +3187,29 @@ class GemmaNativeEngine:
             self._token_pool_invalidate_full_attention_rows(invalidate_req_ids)
 
     def _token_pool_clear_full_attention_rows(self, req_ids) -> None:
-        allocator = self._token_slot_allocator
-        if allocator is None:
+        backend = self._token_pool_decode_backend
+        row_manager = None if backend is None else backend.full_attention_rows
+        if row_manager is None:
             return
-        slots: list[int] = []
-        req_id_list = [req_ids] if isinstance(req_ids, str) else list(req_ids)
-        for req_id in req_id_list:
-            req_key = str(req_id)
-            slots.extend(self._token_pool_full_attention_slots.pop(req_key, []))
-            persistent_row = self._token_pool_full_attention_rows.pop(req_key, None)
-            if persistent_row is not None:
-                slots.extend(persistent_row.owned_slots)
-        if slots:
-            allocator.free_slots(slots)
+        row_manager.clear(req_ids)
 
     def _token_pool_invalidate_full_attention_rows(self, req_ids) -> None:
-        req_id_list = [req_ids] if isinstance(req_ids, str) else list(req_ids)
-        invalidated = sum(
-            1
-            for req_id in req_id_list
-            if str(req_id) in self._token_pool_full_attention_rows
-        )
-        self._token_pool_clear_full_attention_rows(req_id_list)
+        backend = self._token_pool_decode_backend
+        row_manager = None if backend is None else backend.full_attention_rows
+        if row_manager is None:
+            return
+        invalidated = row_manager.invalidate(req_ids)
         if invalidated:
             self.metrics.token_pool_full_attention_row_invalidations += invalidated
 
     def _token_pool_invalidate_full_attention_rows_containing(self, slots) -> None:
-        slot_set = {int(slot) for slot in slots}
-        if not slot_set:
+        backend = self._token_pool_decode_backend
+        row_manager = None if backend is None else backend.full_attention_rows
+        if row_manager is None:
             return
-        req_ids = [
-            req_id
-            for req_id, row in self._token_pool_full_attention_rows.items()
-            if any(int(slot) in slot_set for slot in row.row_slots)
-        ]
-        if req_ids:
-            self._token_pool_invalidate_full_attention_rows(req_ids)
+        invalidated = row_manager.invalidate_containing(slots)
+        if invalidated:
+            self.metrics.token_pool_full_attention_row_invalidations += invalidated
 
     def _token_pool_discard_decode_reservations(
         self,

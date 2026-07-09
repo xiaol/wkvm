@@ -601,6 +601,109 @@ class TestGemmaTokenPool(unittest.TestCase):
         tables.reset_row(0)
         self.assertEqual(tables.tensor.tolist(), [[-1, -1, -1]])
 
+    def test_full_attention_row_manager_reuses_and_frees_slots(self) -> None:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            TokenPoolFullAttentionRowManager,
+            TokenSlotAllocator,
+        )
+
+        allocator = TokenSlotAllocator(capacity=16)
+        manager = TokenPoolFullAttentionRowManager(
+            allocator=allocator,
+            block_size=4,
+        )
+        materialized_slots, materialized_slot_ids = allocator.alloc_slots_with_ids(2)
+
+        first = manager.start_persistent_row(
+            "persist",
+            materialized_slots=materialized_slots,
+            append_reserve_slots=2,
+            page_aligned=False,
+        )
+
+        self.assertFalse(first.reused_existing_row)
+        self.assertEqual(first.full_token_slot, 2)
+        self.assertEqual(first.row.row_slots, [0, 1, 2])
+        self.assertEqual(first.row.owned_slots, [0, 1, 2, 3])
+        self.assertEqual(first.row.append_slots, [3])
+        self.assertEqual(materialized_slot_ids, [0, 1])
+
+        appended = manager.append_existing_row(
+            "persist",
+            append_reserve_slots=2,
+        )
+        self.assertIsNotNone(appended)
+        self.assertTrue(appended.reused_existing_row)
+        self.assertIs(appended.row, first.row)
+        self.assertEqual(appended.full_token_slot, 3)
+        self.assertEqual(first.row.row_slots, [0, 1, 2, 3])
+        self.assertEqual(first.row.append_slots, [])
+        self.assertEqual(allocator.allocated_count, 4)
+
+        self.assertEqual(manager.invalidate_containing([3, 9]), 1)
+        self.assertEqual(manager.rows, {})
+        self.assertEqual(allocator.allocated_count, 0)
+
+    def test_full_attention_row_manager_page_aligned_appends_at_boundaries(self) -> None:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            TokenPoolFullAttentionRowManager,
+            TokenSlotAllocator,
+        )
+
+        allocator = TokenSlotAllocator(capacity=32)
+        manager = TokenPoolFullAttentionRowManager(
+            allocator=allocator,
+            block_size=4,
+        )
+
+        materialized_slots, materialized_slot_ids, first = (
+            manager.start_page_aligned_persistent_row(
+                "paged",
+                materialized_width=3,
+                append_reserve_slots=2,
+            )
+        )
+
+        self.assertEqual(materialized_slots.tolist(), [0, 1, 2])
+        self.assertEqual(materialized_slot_ids, [0, 1, 2])
+        self.assertEqual(first.full_token_slot, 3)
+        self.assertTrue(first.row.page_aligned)
+        self.assertEqual(first.row.row_slots, [0, 1, 2, 3])
+        self.assertEqual(first.row.append_slots, [4, 5, 6, 7])
+        self.assertEqual(first.row.owned_slots, list(range(8)))
+
+        for expected_slot in (4, 5, 6, 7):
+            appended = manager.append_existing_row(
+                "paged",
+                append_reserve_slots=1,
+            )
+            self.assertIsNotNone(appended)
+            self.assertEqual(appended.full_token_slot, expected_slot)
+
+        self.assertEqual(first.row.append_slots, [])
+        boundary_append = manager.append_existing_row(
+            "paged",
+            append_reserve_slots=1,
+        )
+        self.assertIsNotNone(boundary_append)
+        self.assertEqual(boundary_append.full_token_slot, 8)
+        self.assertEqual(first.row.append_slots, [9, 10, 11])
+        self.assertEqual(first.row.owned_slots, list(range(12)))
+
+        manager.clear(["paged"])
+        self.assertEqual(manager.rows, {})
+        self.assertEqual(allocator.allocated_count, 0)
+
     def test_token_pool_decode_backend_builds_sliding_metadata_from_block_tables(self) -> None:
         try:
             import torch  # noqa: F401

@@ -147,6 +147,230 @@ class TokenPoolAttentionWorkspace:
         return workspace
 
 
+@dataclass
+class TokenPoolFullAttentionRow:
+    row_slots: list[int]
+    owned_slots: list[int]
+    append_slots: list[int] = field(default_factory=list)
+    page_aligned: bool = False
+
+
+@dataclass(frozen=True)
+class TokenPoolFullAttentionRowAppend:
+    row: TokenPoolFullAttentionRow
+    full_token_slot: int
+    reused_existing_row: bool
+
+
+class TokenPoolFullAttentionRowManager:
+    """Backend-owned lifecycle for materialized full-attention token rows."""
+
+    def __init__(
+        self,
+        *,
+        allocator: Any,
+        block_size: int = 16,
+    ) -> None:
+        block_size = int(block_size)
+        if block_size < 1:
+            raise ValueError("block_size must be >= 1")
+        self.allocator = allocator
+        self.block_size = block_size
+        self.transient_slots: dict[str, list[int]] = {}
+        self.rows: dict[str, TokenPoolFullAttentionRow] = {}
+
+    def allocate_page_aligned_row_slots(
+        self,
+        start_position: int,
+        min_slots: int,
+    ) -> tuple[Any, list[int], list[int]]:
+        allocator = self.allocator
+        alloc_page = getattr(allocator, "alloc_page_block_with_ids", None)
+        if alloc_page is None:
+            slots_tensor, slot_ids = allocator.alloc_slots_with_ids(min_slots)
+            return slots_tensor, slot_ids, list(slot_ids)
+        import torch
+
+        block_size = self.block_size
+        start_position = int(start_position)
+        min_slots = int(min_slots)
+        if start_position < 0:
+            raise ValueError("start_position must be non-negative")
+        if min_slots < 1:
+            raise ValueError("min_slots must be >= 1")
+        if start_position % block_size:
+            raise RuntimeError(
+                "page-aligned full-attention row append must start at a page boundary"
+            )
+        end_position = start_position + min_slots
+        rounded_end = ((end_position + block_size - 1) // block_size) * block_size
+        slots: list[int] = []
+        owned_slots: list[int] = []
+        first_block = start_position // block_size
+        last_block = (rounded_end - 1) // block_size
+        for logical_block in range(first_block, last_block + 1):
+            _physical_block, block_slots = alloc_page(block_size)
+            owned_slots.extend(int(slot) for slot in block_slots)
+            block_start = max(start_position, logical_block * block_size)
+            block_end = min(rounded_end, (logical_block + 1) * block_size)
+            for logical_pos in range(block_start, block_end):
+                slots.append(int(block_slots[logical_pos % block_size]))
+        return (
+            torch.as_tensor(slots, dtype=torch.int32, device=allocator.device),
+            slots,
+            owned_slots,
+        )
+
+    def clear(self, req_ids: str | Iterable[Any]) -> None:
+        req_id_list = [req_ids] if isinstance(req_ids, str) else list(req_ids)
+        slots: list[int] = []
+        for req_id in req_id_list:
+            req_key = str(req_id)
+            slots.extend(self.transient_slots.pop(req_key, []))
+            persistent_row = self.rows.pop(req_key, None)
+            if persistent_row is not None:
+                slots.extend(persistent_row.owned_slots)
+        if slots:
+            self.allocator.free_slots(slots)
+
+    def invalidate(self, req_ids: str | Iterable[Any]) -> int:
+        req_id_list = [req_ids] if isinstance(req_ids, str) else list(req_ids)
+        invalidated = sum(
+            1 for req_id in req_id_list if str(req_id) in self.rows
+        )
+        self.clear(req_id_list)
+        return invalidated
+
+    def invalidate_containing(self, slots: Iterable[int] | Any) -> int:
+        slot_set = {int(slot) for slot in _slot_values_to_list(slots)}
+        if not slot_set:
+            return 0
+        req_ids = [
+            req_id
+            for req_id, row in self.rows.items()
+            if any(int(slot) in slot_set for slot in row.row_slots)
+        ]
+        if not req_ids:
+            return 0
+        return self.invalidate(req_ids)
+
+    def append_existing_row(
+        self,
+        req_id: str,
+        *,
+        append_reserve_slots: int,
+    ) -> TokenPoolFullAttentionRowAppend | None:
+        row = self.rows.get(str(req_id))
+        if row is None:
+            return None
+        append_reserve_slots = max(1, int(append_reserve_slots))
+        if row.append_slots:
+            full_token_slot = int(row.append_slots.pop(0))
+        elif row.page_aligned:
+            _, append_slot_list, append_owned_slots = (
+                self.allocate_page_aligned_row_slots(
+                    len(row.row_slots),
+                    append_reserve_slots,
+                )
+            )
+            full_token_slot = int(append_slot_list[0])
+            row.owned_slots.extend(append_owned_slots)
+            row.append_slots.extend(append_slot_list[1:])
+        else:
+            _, append_slot_list = self.allocator.alloc_slots_with_ids(
+                append_reserve_slots
+            )
+            full_token_slot = int(append_slot_list[0])
+            row.owned_slots.extend(append_slot_list)
+            row.append_slots.extend(append_slot_list[1:])
+        row.row_slots.append(full_token_slot)
+        return TokenPoolFullAttentionRowAppend(
+            row=row,
+            full_token_slot=full_token_slot,
+            reused_existing_row=True,
+        )
+
+    def start_persistent_row(
+        self,
+        req_id: str,
+        *,
+        materialized_slots: Iterable[int] | Any,
+        append_reserve_slots: int,
+        page_aligned: bool,
+    ) -> TokenPoolFullAttentionRowAppend:
+        req_key = str(req_id)
+        materialized_slot_list = _slot_values_to_list(materialized_slots)
+        append_reserve_slots = max(1, int(append_reserve_slots))
+        row = TokenPoolFullAttentionRow(
+            row_slots=list(materialized_slot_list),
+            owned_slots=list(materialized_slot_list),
+            page_aligned=bool(page_aligned),
+        )
+        if row.page_aligned:
+            _, append_slot_list, append_owned_slots = (
+                self.allocate_page_aligned_row_slots(
+                    len(row.row_slots),
+                    append_reserve_slots,
+                )
+            )
+            row.owned_slots.extend(append_owned_slots)
+        else:
+            _, append_slot_list = self.allocator.alloc_slots_with_ids(
+                append_reserve_slots
+            )
+            row.owned_slots.extend(append_slot_list)
+        full_token_slot = int(append_slot_list[0])
+        row.row_slots.append(full_token_slot)
+        row.append_slots.extend(append_slot_list[1:])
+        self.rows[req_key] = row
+        return TokenPoolFullAttentionRowAppend(
+            row=row,
+            full_token_slot=full_token_slot,
+            reused_existing_row=False,
+        )
+
+    def start_page_aligned_persistent_row(
+        self,
+        req_id: str,
+        *,
+        materialized_width: int,
+        append_reserve_slots: int,
+    ) -> tuple[Any, list[int], TokenPoolFullAttentionRowAppend]:
+        materialized_width = max(0, int(materialized_width))
+        row_slots_tensor, row_slot_list, row_owned_slots = (
+            self.allocate_page_aligned_row_slots(
+                0,
+                materialized_width + max(1, int(append_reserve_slots)),
+            )
+        )
+        materialized_slot_list = row_slot_list[:materialized_width]
+        row = TokenPoolFullAttentionRow(
+            row_slots=list(materialized_slot_list),
+            owned_slots=list(row_owned_slots),
+            page_aligned=True,
+        )
+        full_token_slot = int(row_slot_list[materialized_width])
+        row.row_slots.append(full_token_slot)
+        row.append_slots.extend(row_slot_list[materialized_width + 1:])
+        self.rows[str(req_id)] = row
+        return (
+            row_slots_tensor[:materialized_width],
+            materialized_slot_list,
+            TokenPoolFullAttentionRowAppend(
+                row=row,
+                full_token_slot=full_token_slot,
+                reused_existing_row=False,
+            ),
+        )
+
+    def record_transient_materialized_slots(
+        self,
+        req_id: str,
+        materialized_slots: Iterable[int] | Any,
+    ) -> None:
+        self.transient_slots[str(req_id)] = _slot_values_to_list(materialized_slots)
+
+
 @dataclass(frozen=True)
 class TokenPoolAttentionBinding:
     layer_idx: int | None
@@ -3365,6 +3589,7 @@ class TokenPoolDecodeBackendState:
         self,
         *,
         table: ReqToTokenTable,
+        allocator: Any | None = None,
         kv_pool: Any | None = None,
         block_tables: TokenPoolBlockTables | None = None,
         block_size: int = 16,
@@ -3378,6 +3603,7 @@ class TokenPoolDecodeBackendState:
             raise ValueError("token_pool_capacity must be >= 1 or None")
         self.table = table
         self.kv_pool = kv_pool
+        self.allocator = allocator if allocator is not None else kv_pool
         self.block_tables = block_tables
         self.block_size = block_size
         self.page_table_metadata_max_rows = max(0, int(page_table_metadata_max_rows))
@@ -3391,6 +3617,14 @@ class TokenPoolDecodeBackendState:
             self.decode_metadata_workspace.flat_workspace("full_attention")
         )
         self.attention_workspace = TokenPoolAttentionWorkspace()
+        self.full_attention_rows = (
+            None
+            if self.allocator is None
+            else TokenPoolFullAttentionRowManager(
+                allocator=self.allocator,
+                block_size=block_size,
+            )
+        )
 
     @property
     def page_table_tensor(self):
