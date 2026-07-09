@@ -2339,6 +2339,143 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(owned_binding.calls, [(key_states, value_states)])
         self.assertEqual(len(pool.calls), previous_pool_calls)
 
+    def test_attention_plan_owns_attention_workspaces(self) -> None:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            TokenPoolAttentionBinding,
+            TokenPoolAttentionPlan,
+            build_decode_metadata_from_token_slot_rows,
+        )
+
+        class WorkspacePool:
+            layer_specs = {7: object()}
+
+            def __init__(self) -> None:
+                self.output_calls = []
+                self.split_calls = []
+
+            def attention_output_buffer(self, **kwargs):
+                self.output_calls.append(kwargs)
+                return ("pool_output", kwargs)
+
+            def attention_split_workspace(self, **kwargs):
+                self.split_calls.append(kwargs)
+                return ("pool_split", kwargs)
+
+        metadata = build_decode_metadata_from_token_slot_rows(
+            [[3, 4]],
+            out_cache_loc=[4],
+        )
+        pool = WorkspacePool()
+        binding = TokenPoolAttentionBinding(
+            layer_idx=7,
+            metadata=metadata,
+            paged_metadata=None,
+            kv_pool=pool,
+        )
+        plan = TokenPoolAttentionPlan.from_binding(
+            binding,
+            layer_idx=7,
+            query_seq_len=1,
+        )
+
+        output = plan.attention_output_buffer(
+            batch=2,
+            query_heads=4,
+            head_dim=8,
+            dtype="float32",
+            device="cpu",
+        )
+        split = plan.attention_split_workspace(
+            batch=2,
+            kv_heads=1,
+            max_splits=3,
+            block_groups=4,
+            head_dim=8,
+            device="cpu",
+        )
+
+        self.assertEqual(output[0], "pool_output")
+        self.assertEqual(split[0], "pool_split")
+        self.assertEqual(
+            pool.output_calls,
+            [
+                {
+                    "batch": 2,
+                    "query_heads": 4,
+                    "head_dim": 8,
+                    "dtype": "float32",
+                    "device": "cpu",
+                }
+            ],
+        )
+        self.assertEqual(
+            pool.split_calls,
+            [
+                {
+                    "batch": 2,
+                    "kv_heads": 1,
+                    "max_splits": 3,
+                    "block_groups": 4,
+                    "head_dim": 8,
+                    "device": "cpu",
+                }
+            ],
+        )
+
+        class BindingWithOwnWorkspaces:
+            def __init__(self) -> None:
+                self.layer_idx = 7
+                self.metadata = metadata
+                self.paged_metadata = None
+                self.kv_pool = pool
+                self.output_calls = []
+                self.split_calls = []
+
+            def attention_output_buffer(self, **kwargs):
+                self.output_calls.append(kwargs)
+                return "owned_output"
+
+            def attention_split_workspace(self, **kwargs):
+                self.split_calls.append(kwargs)
+                return "owned_split"
+
+        owned_binding = BindingWithOwnWorkspaces()
+        owned_plan = TokenPoolAttentionPlan.from_binding(
+            owned_binding,
+            layer_idx=7,
+            query_seq_len=1,
+        )
+        self.assertEqual(
+            owned_plan.attention_output_buffer(
+                batch=1,
+                query_heads=2,
+                head_dim=4,
+                dtype="float16",
+                device="cuda",
+            ),
+            "owned_output",
+        )
+        self.assertEqual(
+            owned_plan.attention_split_workspace(
+                batch=1,
+                kv_heads=1,
+                max_splits=2,
+                block_groups=2,
+                head_dim=4,
+                device="cuda",
+            ),
+            "owned_split",
+        )
+        self.assertEqual(len(pool.output_calls), 1)
+        self.assertEqual(len(pool.split_calls), 1)
+        self.assertEqual(len(owned_binding.output_calls), 1)
+        self.assertEqual(len(owned_binding.split_calls), 1)
+
     def test_graph_clone_and_copy_handles_paged_metadata(self) -> None:
         try:
             import torch  # noqa: F401

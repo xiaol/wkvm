@@ -1502,6 +1502,7 @@ def _attention_forward_token_pool_gqa(
     paged_decode_metadata=None,
     token_kv_pool,
     layer_idx: int,
+    token_pool_plan=None,
 ):
     timing_enabled = _native_forward_timing_enabled()
     attention_start = time.perf_counter() if timing_enabled else 0.0
@@ -1559,7 +1560,14 @@ def _attention_forward_token_pool_gqa(
             try:
                 key_buffer, value_buffer = token_kv_pool.get_kv_buffer(layer_idx)
                 output_buffer = None
-                output_buffer_fn = getattr(token_kv_pool, "attention_output_buffer", None)
+                workspace_owner = (
+                    token_pool_plan if token_pool_plan is not None else token_kv_pool
+                )
+                output_buffer_fn = getattr(
+                    workspace_owner,
+                    "attention_output_buffer",
+                    None,
+                )
                 if output_buffer_fn is not None:
                     output_buffer = output_buffer_fn(
                         batch=int(query_states.shape[0]),
@@ -1583,7 +1591,7 @@ def _attention_forward_token_pool_gqa(
                             _TOKEN_POOL_TRITON_STATS["paged_split_attempts"] += 1
                             _TOKEN_POOL_TRITON_STATS["split_attempts"] += 1
                             output_workspace_fn = getattr(
-                                token_kv_pool,
+                                workspace_owner,
                                 "attention_split_workspace",
                                 None,
                             )
@@ -1669,7 +1677,7 @@ def _attention_forward_token_pool_gqa(
                         if should_split:
                             _TOKEN_POOL_TRITON_STATS["split_attempts"] += 1
                             output_workspace_fn = getattr(
-                                token_kv_pool,
+                                workspace_owner,
                                 "attention_split_workspace",
                                 None,
                             )
@@ -1841,6 +1849,7 @@ def _attention_forward(
             paged_decode_metadata=paged_decode_metadata,
             token_kv_pool=token_kv_pool,
             layer_idx=int(layer_idx),
+            token_pool_plan=token_pool_plan,
         )
     if backend == "manual_gqa" or (
         backend == "sdpa_single_gqa"

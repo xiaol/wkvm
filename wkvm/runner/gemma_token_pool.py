@@ -110,6 +110,52 @@ class TokenPoolAttentionBinding:
         )
         return out_cache_loc
 
+    def attention_output_buffer(
+        self,
+        *,
+        batch: int,
+        query_heads: int,
+        head_dim: int,
+        dtype: Any,
+        device: Any,
+    ) -> Any | None:
+        if self.kv_pool is None:
+            return None
+        output_buffer = getattr(self.kv_pool, "attention_output_buffer", None)
+        if output_buffer is None:
+            return None
+        return output_buffer(
+            batch=batch,
+            query_heads=query_heads,
+            head_dim=head_dim,
+            dtype=dtype,
+            device=device,
+        )
+
+    def attention_split_workspace(
+        self,
+        *,
+        batch: int,
+        kv_heads: int,
+        max_splits: int,
+        block_groups: int,
+        head_dim: int,
+        device: Any,
+    ) -> Any | None:
+        if self.kv_pool is None:
+            return None
+        workspace = getattr(self.kv_pool, "attention_split_workspace", None)
+        if workspace is None:
+            return None
+        return workspace(
+            batch=batch,
+            kv_heads=kv_heads,
+            max_splits=max_splits,
+            block_groups=block_groups,
+            head_dim=head_dim,
+            device=device,
+        )
+
 
 @dataclass(frozen=True)
 class TokenPoolAttentionPlan:
@@ -182,6 +228,71 @@ class TokenPoolAttentionPlan:
             value_states,
         )
         return out_cache_loc
+
+    def attention_output_buffer(
+        self,
+        *,
+        batch: int,
+        query_heads: int,
+        head_dim: int,
+        dtype: Any,
+        device: Any,
+    ) -> Any | None:
+        output_buffer = getattr(self.binding, "attention_output_buffer", None)
+        if output_buffer is not None:
+            return output_buffer(
+                batch=batch,
+                query_heads=query_heads,
+                head_dim=head_dim,
+                dtype=dtype,
+                device=device,
+            )
+        if self.kv_pool is None:
+            return None
+        output_buffer = getattr(self.kv_pool, "attention_output_buffer", None)
+        if output_buffer is None:
+            return None
+        return output_buffer(
+            batch=batch,
+            query_heads=query_heads,
+            head_dim=head_dim,
+            dtype=dtype,
+            device=device,
+        )
+
+    def attention_split_workspace(
+        self,
+        *,
+        batch: int,
+        kv_heads: int,
+        max_splits: int,
+        block_groups: int,
+        head_dim: int,
+        device: Any,
+    ) -> Any | None:
+        workspace = getattr(self.binding, "attention_split_workspace", None)
+        if workspace is not None:
+            return workspace(
+                batch=batch,
+                kv_heads=kv_heads,
+                max_splits=max_splits,
+                block_groups=block_groups,
+                head_dim=head_dim,
+                device=device,
+            )
+        if self.kv_pool is None:
+            return None
+        workspace = getattr(self.kv_pool, "attention_split_workspace", None)
+        if workspace is None:
+            return None
+        return workspace(
+            batch=batch,
+            kv_heads=kv_heads,
+            max_splits=max_splits,
+            block_groups=block_groups,
+            head_dim=head_dim,
+            device=device,
+        )
 
 
 def _metadata_out_cache_loc_for_write(metadata: Any | None) -> Any | None:
