@@ -507,6 +507,62 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
         self.assertLess((expected - actual).abs().max().item(), 1e-6)
         self.assertLess((expected_weights - actual_weights).abs().max().item(), 1e-6)
 
+    def test_attention_forward_uses_plan_attention_kwargs_and_enabled_hook(self) -> None:
+        from types import SimpleNamespace
+        import wkvm.runner.gemma_native_forward as native_forward
+
+        old_token_pool = native_forward._attention_forward_token_pool_gqa
+        events = []
+        calls = {}
+
+        class FakeQuery:
+            shape = (1, 8, 1, 512)
+
+        class MethodOnlyPlan:
+            def attention_kwargs(self):
+                events.append("kwargs")
+                return {
+                    "decode_metadata": "owned_metadata",
+                    "paged_decode_metadata": "owned_paged_metadata",
+                    "token_kv_pool": "owned_pool",
+                    "layer_idx": 17,
+                }
+
+            def decode_attention_enabled(self):
+                events.append("enabled")
+                return True
+
+        def token_pool_dispatch(*args, **kwargs):
+            events.append("dispatch")
+            calls.update(kwargs)
+            return "token_pool", None
+
+        try:
+            native_forward._attention_forward_token_pool_gqa = token_pool_dispatch
+            actual = native_forward._attention_forward(
+                SimpleNamespace(num_key_value_groups=4, scaling=1.0),
+                FakeQuery(),
+                "dense_key_states",
+                "dense_value_states",
+                None,
+                backend="manual_gqa",
+                token_pool_plan=MethodOnlyPlan(),
+                current_key_states="current_key_states",
+                current_value_states="current_value_states",
+            )
+        finally:
+            native_forward._attention_forward_token_pool_gqa = old_token_pool
+
+        self.assertEqual(actual, ("token_pool", None))
+        self.assertEqual(events, ["kwargs", "enabled", "dispatch"])
+        self.assertEqual(calls["decode_metadata"], "owned_metadata")
+        self.assertEqual(calls["paged_decode_metadata"], "owned_paged_metadata")
+        self.assertEqual(calls["token_kv_pool"], "owned_pool")
+        self.assertEqual(calls["layer_idx"], 17)
+        self.assertIsInstance(calls["token_pool_plan"], MethodOnlyPlan)
+        self.assertEqual(calls["current_key_states"], "current_key_states")
+        self.assertEqual(calls["current_value_states"], "current_value_states")
+
     def test_token_pool_triton_stats_account_recoverable_fallback(self) -> None:
         import os
         import sys

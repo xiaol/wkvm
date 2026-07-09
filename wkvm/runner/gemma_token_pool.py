@@ -910,6 +910,9 @@ class TokenPoolAttentionPlan:
             "layer_idx": self.layer_idx,
         }
 
+    def decode_attention_enabled(self) -> bool:
+        return bool(self.use_decode_attention)
+
     def store_current_kv(self, key_states: Any, value_states: Any) -> Any | None:
         if key_states is None or value_states is None:
             return None

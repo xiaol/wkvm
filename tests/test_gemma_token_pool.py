@@ -2617,6 +2617,7 @@ class TestGemmaTokenPool(unittest.TestCase):
         )
 
         self.assertTrue(plan.use_decode_attention)
+        self.assertTrue(plan.decode_attention_enabled())
         self.assertIs(plan.metadata, metadata)
         self.assertIs(plan.kv_pool, pool)
         self.assertIs(plan.kv_buffers_for_attention(), pool.buffers)

@@ -1806,6 +1806,29 @@ def _is_recoverable_token_pool_triton_error(exc: RuntimeError) -> bool:
     )
 
 
+def _token_pool_plan_attention_kwargs(token_pool_plan) -> dict[str, Any]:
+    attention_kwargs = getattr(token_pool_plan, "attention_kwargs", None)
+    if attention_kwargs is not None:
+        return dict(attention_kwargs())
+    return {
+        "decode_metadata": getattr(token_pool_plan, "metadata", None),
+        "paged_decode_metadata": getattr(token_pool_plan, "paged_metadata", None),
+        "token_kv_pool": getattr(token_pool_plan, "kv_pool", None),
+        "layer_idx": getattr(token_pool_plan, "layer_idx", None),
+    }
+
+
+def _token_pool_plan_decode_attention_enabled(token_pool_plan) -> bool:
+    decode_attention_enabled = getattr(
+        token_pool_plan,
+        "decode_attention_enabled",
+        None,
+    )
+    if decode_attention_enabled is not None:
+        return bool(decode_attention_enabled())
+    return bool(getattr(token_pool_plan, "use_decode_attention", False))
+
+
 def _attention_forward(
     attn,
     query_states,
@@ -1827,11 +1850,14 @@ def _attention_forward(
 
     backend = _normalize_attention_backend(backend)
     if token_pool_plan is not None:
-        decode_metadata = token_pool_plan.metadata
-        paged_decode_metadata = token_pool_plan.paged_metadata
-        token_kv_pool = token_pool_plan.kv_pool
-        layer_idx = token_pool_plan.layer_idx
-        token_pool_decode_attention = bool(token_pool_plan.use_decode_attention)
+        plan_kwargs = _token_pool_plan_attention_kwargs(token_pool_plan)
+        decode_metadata = plan_kwargs.get("decode_metadata")
+        paged_decode_metadata = plan_kwargs.get("paged_decode_metadata")
+        token_kv_pool = plan_kwargs.get("token_kv_pool")
+        layer_idx = plan_kwargs.get("layer_idx")
+        token_pool_decode_attention = _token_pool_plan_decode_attention_enabled(
+            token_pool_plan
+        )
     else:
         token_pool_decode_attention = (
             decode_metadata is not None
@@ -2307,7 +2333,8 @@ class NativeGemma4TextDecoderLayer:
                 time.perf_counter() - phase_start,
             )
         token_pool_decode_attention = (
-            token_pool_plan is not None and token_pool_plan.use_decode_attention
+            token_pool_plan is not None
+            and _token_pool_plan_decode_attention_enabled(token_pool_plan)
         )
 
         current_key_states = None if attn.is_kv_shared_layer else key_states
