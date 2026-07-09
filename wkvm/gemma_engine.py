@@ -1169,6 +1169,7 @@ class GemmaNativeEngine:
         reservations: list[_TokenPoolDecodeReservation] = []
         started_new = merged_cache is None
         post_step_remaining_capacity: int | None = None
+        token_pool_decode: TokenPoolDecodeContext | None = None
         try:
             if started_new:
                 reserve_steps = self._persistent_padded_reserve_steps(reqs)
@@ -1252,6 +1253,16 @@ class GemmaNativeEngine:
                 post_step_remaining_capacity = int(remaining_capacity) - 1
             self._token_pool_commit_decode_reservations(reservations)
         except DistinctCacheBatchError as exc:
+            if (
+                self.record_token_pool_decode_graph_signatures
+                and token_pool_decode is not None
+                and "token-pool cuda graph metadata incompatible" in str(exc)
+            ):
+                self._record_persistent_padded_token_pool_decode_signature(
+                    key,
+                    token_pool_decode,
+                    started_new=started_new,
+                )
             self._token_pool_discard_decode_reservations(reservations)
             self._record_decode_batch_fallback(exc)
             if key in self._persistent_padded_decode_groups:

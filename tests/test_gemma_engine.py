@@ -656,6 +656,42 @@ class FakePersistentPaddedBatchRunner(FakeBatchRunner):
         raise AssertionError("persistent padded decode should avoid regular decode_batch")
 
 
+class FakeGraphMismatchPersistentPaddedBatchRunner(FakePersistentPaddedBatchRunner):
+    def decode_persistent_padded_batch(
+        self,
+        merged_cache,
+        last_tokens,
+        *,
+        position_ids=None,
+        token_pool_decode=None,
+    ):
+        self.persistent_padded_reuses.append(
+            (list(last_tokens), list(position_ids or []))
+        )
+        from wkvm.runner.gemma_runner import DistinctCacheBatchError
+
+        raise DistinctCacheBatchError(
+            "token-pool cuda graph metadata incompatible: "
+            "metadata_by_layer_type.sliding_attention.kv_indices"
+        )
+
+    def decode_batch(
+        self,
+        caches,
+        last_tokens,
+        *,
+        position_ids=None,
+        token_pool_decode=None,
+    ):
+        return FakeBatchRunner.decode_batch(
+            self,
+            caches,
+            last_tokens,
+            position_ids=position_ids,
+            token_pool_decode=token_pool_decode,
+        )
+
+
 class TestGemmaRoutedSpanRunner(unittest.TestCase):
     def test_prefill_chunk_step_passes_explicit_position_ids(self) -> None:
         from wkvm.runner.gemma_runner import GemmaRoutedSpanRunner
@@ -2914,6 +2950,69 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
                 "metadata_by_layer_id.0.kv_indices": 1,
             },
         )
+        self.assertFalse(engine._persistent_padded_token_pool_decode_signatures)
+
+    def test_persistent_padded_graph_metadata_fallback_records_shape_mismatch(self) -> None:
+        from wkvm.gemma_engine import GemmaNativeEngine
+        from wkvm.models.gemma import gemma4_e4b_routed_span_config
+
+        cfg = gemma4_e4b_routed_span_config(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("sliding_attention",),
+        )
+        engine = GemmaNativeEngine(
+            model=FakeModel(),
+            config=cfg,
+            num_slots=2,
+            scheduler_config=SchedulerConfig(
+                max_tokens_per_step=16,
+                max_running_requests=2,
+                max_tokens_per_request_per_step=8,
+            ),
+            persistent_exact_decode=False,
+            persistent_padded_decode_steps=3,
+            persistent_padded_decode_cuda_graph=True,
+        )
+        runner = FakeGraphMismatchPersistentPaddedBatchRunner()
+        engine.runner = runner  # type: ignore[assignment]
+        contexts = [
+            fake_token_pool_decode_context(kv_indices=4),
+            fake_token_pool_decode_context(kv_indices=5),
+            fake_token_pool_decode_context(kv_indices=5),
+        ]
+        discarded: list[list[object]] = []
+        engine._token_pool_prepare_decode_batch = lambda reqs, **kwargs: [object()]  # type: ignore[method-assign]
+        engine._token_pool_decode_context = lambda reservations: contexts.pop(0)  # type: ignore[method-assign]
+        engine._token_pool_commit_decode_reservations = lambda reservations: None  # type: ignore[method-assign]
+        engine._token_pool_discard_decode_reservations = (  # type: ignore[method-assign]
+            lambda reservations: discarded.append(list(reservations))
+        )
+
+        reqs = [
+            Request(prompt_token_ids=[1, 2, 3], max_new_tokens=4, req_id="a"),
+            Request(prompt_token_ids=[4, 5, 6], max_new_tokens=4, req_id="b"),
+        ]
+        for req in reqs:
+            engine.add_request(req)
+
+        engine.step()
+        engine.step()
+        engine.step()
+
+        self.assertEqual(engine.metrics.token_pool_decode_graph_candidate_batches, 2)
+        self.assertEqual(engine.metrics.token_pool_decode_graph_static_shape_starts, 1)
+        self.assertEqual(engine.metrics.token_pool_decode_graph_static_shape_reuses, 0)
+        self.assertEqual(engine.metrics.token_pool_decode_graph_shape_mismatches, 1)
+        self.assertEqual(
+            engine.metrics.token_pool_decode_graph_shape_mismatch_reasons,
+            {
+                "metadata_by_layer_type.sliding_attention.kv_indices": 1,
+                "metadata_by_layer_id.0.kv_indices": 1,
+            },
+        )
+        self.assertEqual(len(discarded), 1)
+        self.assertEqual(len(runner.decode_batch_calls), 1)
         self.assertFalse(engine._persistent_padded_token_pool_decode_signatures)
 
     def test_persistent_padded_token_pool_graph_shape_metrics_skip_without_graph_recording(self) -> None:
