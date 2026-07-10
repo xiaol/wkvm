@@ -2123,6 +2123,8 @@ class TokenPoolDecodeGraphBuffer:
 
     def __init__(self, context: TokenPoolDecodeContext | None) -> None:
         self.context = context
+        self._cached_alias_fastpath_key: tuple[Any, ...] | None = None
+        self._cached_alias_fastpath_metadata_count = 0
 
     @classmethod
     def capture(
@@ -2193,6 +2195,8 @@ class TokenPoolDecodeGraphBuffer:
         )
 
     def copy_from(self, token_pool_decode: TokenPoolDecodeContext | None) -> dict[str, int]:
+        self._cached_alias_fastpath_key = None
+        self._cached_alias_fastpath_metadata_count = 0
         stats = {
             "cuda_graph_metadata_tensor_copies": 0,
             "cuda_graph_metadata_tensor_copy_skips": 0,
@@ -2252,9 +2256,22 @@ class TokenPoolDecodeGraphBuffer:
         self,
         token_pool_decode: TokenPoolDecodeContext | None,
     ) -> dict[str, int]:
+        cached_alias_stats = self._copy_cached_aliasing_workspace_compatible(
+            token_pool_decode
+        )
+        if cached_alias_stats is not None:
+            return cached_alias_stats
         alias_stats = self._copy_aliasing_workspace_compatible(token_pool_decode)
         if alias_stats is not None:
+            self._cached_alias_fastpath_key = self._alias_workspace_fastpath_key(
+                token_pool_decode
+            )
+            self._cached_alias_fastpath_metadata_count = (
+                self._alias_workspace_metadata_count(token_pool_decode)
+            )
             return alias_stats
+        self._cached_alias_fastpath_key = None
+        self._cached_alias_fastpath_metadata_count = 0
         compatibility_error = self.replay_compatibility_error(token_pool_decode)
         if compatibility_error is not None:
             raise ValueError(
@@ -2262,6 +2279,23 @@ class TokenPoolDecodeGraphBuffer:
                 f"{compatibility_error}"
             )
         return self.copy_from(token_pool_decode)
+
+    def _copy_cached_aliasing_workspace_compatible(
+        self,
+        token_pool_decode: TokenPoolDecodeContext | None,
+    ) -> dict[str, int] | None:
+        cached_key = self._cached_alias_fastpath_key
+        if cached_key is None:
+            return None
+        if cached_key != self._alias_workspace_fastpath_key(token_pool_decode):
+            return None
+        return {
+            "cuda_graph_metadata_tensor_copies": 0,
+            "cuda_graph_metadata_tensor_copy_skips": 0,
+            "cuda_graph_metadata_alias_fastpath_metadata_skips": (
+                self._cached_alias_fastpath_metadata_count
+            ),
+        }
 
     def _copy_aliasing_workspace_compatible(
         self,
@@ -2494,6 +2528,88 @@ class TokenPoolDecodeGraphBuffer:
                 return False
             checked_metadata.add(metadata_pair)
         return True
+
+    def _alias_workspace_fastpath_key(
+        self,
+        token_pool_decode: TokenPoolDecodeContext | None,
+    ) -> tuple[Any, ...] | None:
+        if self.context is None or token_pool_decode is None:
+            return None
+        return (
+            id(self.context.kv_pool),
+            id(token_pool_decode.kv_pool),
+            self.context.covered_layer_types,
+            token_pool_decode.covered_layer_types,
+            self.context.layer_id_metadata_only_types,
+            token_pool_decode.layer_id_metadata_only_types,
+            self._alias_metadata_group_key(
+                self.context.metadata_by_layer_type,
+                token_pool_decode.metadata_by_layer_type,
+            ),
+            self._alias_metadata_group_key(
+                self.context.metadata_by_layer_id or {},
+                token_pool_decode.metadata_by_layer_id or {},
+            ),
+            self._alias_metadata_group_key(
+                self.context.paged_metadata_by_layer_type or {},
+                token_pool_decode.paged_metadata_by_layer_type or {},
+            ),
+            self._alias_metadata_group_key(
+                self.context.paged_metadata_by_layer_id or {},
+                token_pool_decode.paged_metadata_by_layer_id or {},
+            ),
+        )
+
+    @staticmethod
+    def _alias_metadata_group_key(
+        dst_group: dict[Any, Any],
+        src_group: dict[Any, Any],
+    ) -> tuple[Any, ...] | None:
+        if set(dst_group) != set(src_group):
+            return None
+        return tuple(
+            (
+                key,
+                id(dst_group[key]),
+                id(src_group[key]),
+                int(getattr(dst_group[key], "block_size", -1)),
+                int(getattr(src_group[key], "block_size", -1)),
+                getattr(dst_group[key], "max_seq_len", None),
+                getattr(src_group[key], "max_seq_len", None),
+                getattr(dst_group[key], "triton_decode_plan", None),
+                getattr(src_group[key], "triton_decode_plan", None),
+            )
+            for key in dst_group
+        )
+
+    def _alias_workspace_metadata_count(
+        self,
+        token_pool_decode: TokenPoolDecodeContext | None,
+    ) -> int:
+        if self.context is None or token_pool_decode is None:
+            return 0
+        count = 0
+        for dst_group, src_group in (
+            (
+                self.context.metadata_by_layer_type,
+                token_pool_decode.metadata_by_layer_type,
+            ),
+            (
+                self.context.metadata_by_layer_id or {},
+                token_pool_decode.metadata_by_layer_id or {},
+            ),
+            (
+                self.context.paged_metadata_by_layer_type or {},
+                token_pool_decode.paged_metadata_by_layer_type or {},
+            ),
+            (
+                self.context.paged_metadata_by_layer_id or {},
+                token_pool_decode.paged_metadata_by_layer_id or {},
+            ),
+        ):
+            if set(dst_group) == set(src_group):
+                count += len(dst_group)
+        return count
 
     @classmethod
     def _decode_metadata_aliases_same_workspace(

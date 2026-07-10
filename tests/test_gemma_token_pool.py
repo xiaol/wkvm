@@ -5689,6 +5689,27 @@ class TestGemmaTokenPool(unittest.TestCase):
             ].kv_indices.tolist(),
             [4, 5],
         )
+        with patch.object(
+            TokenPoolDecodeGraphBuffer,
+            "replay_compatibility_error",
+            side_effect=AssertionError("slow compatibility path used"),
+        ), patch.object(
+            TokenPoolDecodeGraphBuffer,
+            "_copy_decode_metadata_tensor",
+            side_effect=AssertionError("slow metadata copy path used"),
+        ), patch.object(
+            TokenPoolDecodeGraphBuffer,
+            "_decode_metadata_tensor_aliases_same_workspace",
+            side_effect=AssertionError("tensor alias walk used"),
+        ):
+            cached_stats = graph_metadata.copy_compatible_from(updated)
+
+        self.assertEqual(cached_stats["cuda_graph_metadata_tensor_copies"], 0)
+        self.assertEqual(cached_stats["cuda_graph_metadata_tensor_copy_skips"], 0)
+        self.assertGreater(
+            cached_stats["cuda_graph_metadata_alias_fastpath_metadata_skips"],
+            0,
+        )
 
     def test_graph_signature_tracker_records_reuse_and_mismatch(self) -> None:
         from wkvm.runner.gemma_token_pool import (
