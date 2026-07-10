@@ -6362,14 +6362,17 @@ class TokenPoolDecodeBackendState:
             int(getattr(reservation, "previous_length")) + 1
             for reservation in reservation_tuple
         ]
+        page_tables = None
+        if self.page_table_tensor is None:
+            page_tables = self.page_tables_for_requests(
+                getattr(reservation, "req_id") for reservation in reservation_tuple
+            )
         sliding_metadata, sliding_paged_metadata = self.build_sliding_decode_metadata(
             req_slots=req_slots,
             logical_seq_lens=logical_lens,
             out_cache_loc=out_cache_loc,
             sliding_window=sliding_window,
-            page_tables=self.page_tables_for_requests(
-                getattr(reservation, "req_id") for reservation in reservation_tuple
-            ),
+            page_tables=page_tables,
             kv_indices_padding_steps=sliding_attention_kv_indices_padding_steps,
         )
         metadata_by_type = {"sliding_attention": sliding_metadata}

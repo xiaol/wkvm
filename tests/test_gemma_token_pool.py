@@ -2048,6 +2048,76 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(int(paged_again.block_tables.data_ptr()), block_ptr)
         self.assertIs(backend.page_table_tensor, block_tables.tensor)
 
+    def test_token_pool_decode_backend_prepare_state_uses_page_table_tensor(
+        self,
+    ) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenPoolBlockTables,
+            TokenPoolDecodeBackendState,
+            TokenPoolDecodeReservation,
+        )
+
+        table = ReqToTokenTable(max_requests=1, max_context_len=16)
+        req_slot = table.allocate("req")
+        table.append_slots(req_slot, [0, 1, 2, 3, 4, 5])
+        block_tables = TokenPoolBlockTables(
+            max_requests=1,
+            max_context_len=16,
+            block_size=4,
+        )
+        block_tables.set_block(req_slot, 0, 0)
+        block_tables.set_block(req_slot, 1, 1)
+        pool = SimpleNamespace(
+            layer_specs={0: object()},
+            capacity=32,
+            device="cpu",
+        )
+        backend = TokenPoolDecodeBackendState(
+            table=table,
+            kv_pool=pool,
+            block_tables=block_tables,
+            block_size=4,
+            token_pool_capacity=32,
+        )
+        reservation = TokenPoolDecodeReservation(
+            req_id="req",
+            req_slot=req_slot,
+            token_slot=5,
+            token_slot_tensor=torch.tensor([5], dtype=torch.int32),
+            previous_length=5,
+        )
+
+        with patch.object(
+            backend,
+            "page_tables_for_requests",
+            side_effect=AssertionError("dict page tables used"),
+        ):
+            prepared = backend.prepare_decode_batch_state(
+                [reservation],
+                sliding_window=5,
+                layer_type_by_layer_id={0: "sliding_attention"},
+            )
+
+        context = prepared.build_context(
+            kv_pool=pool,
+            attention_workspace=backend.attention_workspace,
+        )
+        paged = context.paged_metadata_by_layer_type["sliding_attention"]
+
+        self.assertEqual(paged.block_tables.tolist(), [[0, 1]])
+        self.assertEqual(paged.block_table_lens.tolist(), [2])
+        self.assertEqual(paged.selected_start_positions.tolist(), [1])
+        self.assertEqual(paged.slot_mapping.tolist(), [5])
+
     def test_token_pool_decode_backend_falls_back_to_dict_page_tables_and_pads(self) -> None:
         try:
             import torch  # noqa: F401
