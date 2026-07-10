@@ -1380,6 +1380,90 @@ class TestGemmaTokenPool(unittest.TestCase):
         )
         self.assertIsNone(typed_context.metadata_for_layer(8, "unknown"))
 
+    def test_token_pool_decode_backend_commits_decode_transaction_prefix(self) -> None:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenPoolDecodeBackendState,
+            TokenPoolDecodeReservation,
+            TokenSlotAllocator,
+        )
+
+        table = ReqToTokenTable(max_requests=1, max_context_len=8)
+        allocator = TokenSlotAllocator(capacity=8)
+        backend = TokenPoolDecodeBackendState(table=table, allocator=allocator)
+        req_slot = backend.admit_request("req")
+        token_slot_tensor, token_slot_ids = allocator.alloc_slots_with_ids(6)
+        backend.append_table_slots(req_slot, token_slot_tensor[:5])
+        backend.append_request_token_slots("req", token_slot_ids[:5])
+        backend.append_table_slots(req_slot, token_slot_tensor[5:6])
+        backend.append_request_token_slot("req", token_slot_ids[5])
+        reservation = TokenPoolDecodeReservation(
+            req_id="req",
+            req_slot=req_slot,
+            token_slot=token_slot_ids[5],
+            token_slot_tensor=token_slot_tensor[5:6],
+            previous_length=5,
+        )
+
+        prepared = backend.prepared_decode_batch([reservation])
+        result = backend.commit_decode_batch(prepared, attention_window=3)
+
+        self.assertEqual(result.cleared_prefix_slots, tuple(token_slot_ids[:3]))
+        self.assertEqual(result.released_prefix_slots, tuple(token_slot_ids[:3]))
+        self.assertEqual(result.expired_page_slots, ())
+        self.assertEqual(result.invalidated_full_attention_rows, 0)
+        self.assertEqual(
+            table.slots_for("req").tolist(),
+            [-1, -1, -1, token_slot_ids[3], token_slot_ids[4], token_slot_ids[5]],
+        )
+        self.assertEqual(backend.request_token_slots["req"], token_slot_ids[3:])
+        self.assertEqual(allocator.allocated_count, 3)
+
+    def test_token_pool_decode_backend_discards_decode_transaction(self) -> None:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenPoolDecodeBackendState,
+            TokenPoolDecodeReservation,
+            TokenSlotAllocator,
+        )
+
+        table = ReqToTokenTable(max_requests=1, max_context_len=8)
+        allocator = TokenSlotAllocator(capacity=8)
+        backend = TokenPoolDecodeBackendState(table=table, allocator=allocator)
+        req_slot = backend.admit_request("req")
+        prefill_tensor, prefill_ids = allocator.alloc_slots_with_ids(2)
+        backend.append_table_slots(req_slot, prefill_tensor)
+        backend.append_request_token_slots("req", prefill_ids)
+        decode_tensor, decode_ids = allocator.alloc_slots_with_ids(1)
+        backend.append_table_slots(req_slot, decode_tensor)
+        backend.append_request_token_slot("req", decode_ids[0])
+        reservation = TokenPoolDecodeReservation(
+            req_id="req",
+            req_slot=req_slot,
+            token_slot=decode_ids[0],
+            token_slot_tensor=decode_tensor,
+            previous_length=2,
+        )
+
+        result = backend.discard_decode_batch([reservation])
+
+        self.assertEqual(result.freed_token_slots, (decode_ids[0],))
+        self.assertEqual(result.restored_page_slots, ())
+        self.assertEqual(table.length(req_slot), 2)
+        self.assertEqual(table.slots_for("req").tolist(), prefill_ids)
+        self.assertEqual(backend.request_token_slots["req"], prefill_ids)
+        self.assertEqual(allocator.allocated_count, 2)
+
     def test_token_pool_decode_backend_builds_sliding_metadata_from_block_tables(self) -> None:
         try:
             import torch  # noqa: F401

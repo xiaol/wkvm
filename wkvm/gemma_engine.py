@@ -2605,9 +2605,14 @@ class GemmaNativeEngine:
                 )
             self.metrics.token_pool_decode_metadata_batches += 1
             self.metrics.token_pool_decode_metadata_rows += len(reqs)
-            covered_layer_types = (
-                backend.current_covered_layer_types
+            prepared_batch = (
+                backend.prepared_decode_batch(reservations)
                 if backend is not None
+                else None
+            )
+            covered_layer_types = (
+                prepared_batch.covered_layer_types
+                if prepared_batch is not None
                 else frozenset()
             )
             for layer_type in covered_layer_types:
@@ -2644,7 +2649,8 @@ class GemmaNativeEngine:
         backend = self._token_pool_decode_backend
         if backend is None:
             raise RuntimeError("token-pool decode backend is not initialized")
-        return backend.build_current_decode_context(
+        return backend.build_decode_context_for_batch(
+            reservations,
             layer_id_metadata_only_types=frozenset({"full_attention"}),
         )
 
@@ -2740,6 +2746,23 @@ class GemmaNativeEngine:
     ) -> None:
         allocator = self._token_slot_allocator
         if allocator is None or not reservations:
+            return
+        backend = self._token_pool_decode_backend
+        if backend is not None:
+            result = backend.commit_decode_batch(
+                reservations,
+                caches_by_req_id=self._caches,
+                owner_layer_ids=self._token_pool_full_attention_owner_layer_ids(),
+                attention_window=self._token_pool_attention_window(),
+            )
+            if result.invalidated_full_attention_rows:
+                self.metrics.token_pool_full_attention_row_invalidations += (
+                    result.invalidated_full_attention_rows
+                )
+            self.metrics.token_pool_slot_high_watermark = max(
+                self.metrics.token_pool_slot_high_watermark,
+                allocator.high_watermark,
+            )
             return
         try:
             self._token_pool_commit_decode_to_full_attention_caches(reservations)
@@ -3008,6 +3031,10 @@ class GemmaNativeEngine:
         allocator = self._token_slot_allocator
         if table is None or allocator is None:
             return
+        backend = self._token_pool_decode_backend
+        if backend is not None:
+            backend.discard_decode_batch(reservations)
+            return
         self._token_pool_clear_full_attention_rows(
             [reservation.req_id for reservation in reservations]
         )
@@ -3017,24 +3044,13 @@ class GemmaNativeEngine:
                     reservation.req_slot,
                     reservation.previous_length,
                 )
-            backend = self._token_pool_decode_backend
-            if backend is not None:
-                backend.remove_request_token_slot(
-                    reservation.req_id,
-                    reservation.token_slot,
-                )
-            else:
-                token_slots = self._token_pool_token_slots.get(reservation.req_id)
-                if token_slots is not None and reservation.token_slot in token_slots:
-                    token_slots.remove(reservation.token_slot)
+            token_slots = self._token_pool_token_slots.get(reservation.req_id)
+            if token_slots is not None and reservation.token_slot in token_slots:
+                token_slots.remove(reservation.token_slot)
             if reservation.page_state_snapshot is not None:
-                if backend is not None:
-                    backend.restore_request_page_state(reservation.page_state_snapshot)
                 continue
             page_owned = (
-                backend.page_owned_slots_for_request(reservation.req_id)
-                if backend is not None
-                else self._token_pool_page_owned_slots.get(reservation.req_id, set())
+                self._token_pool_page_owned_slots.get(reservation.req_id, set())
             )
             if reservation.token_slot not in page_owned:
                 allocator.free_slots([reservation.token_slot])

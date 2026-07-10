@@ -1854,6 +1854,52 @@ class TokenPoolDecodeBatchState:
         )
 
 
+@dataclass(frozen=True)
+class TokenPoolPreparedDecodeBatch:
+    """Backend-owned decode transaction state for one prepared model step."""
+
+    reservations: tuple[TokenPoolDecodeReservation, ...]
+    state: TokenPoolDecodeBatchState | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "reservations", tuple(self.reservations))
+
+    @property
+    def covered_layer_types(self) -> frozenset[str]:
+        if self.state is None:
+            return frozenset()
+        return self.state.covered_layer_types
+
+    def build_context(
+        self,
+        *,
+        kv_pool: Any | None,
+        attention_workspace: Any | None,
+        layer_id_metadata_only_types: frozenset[str] = frozenset(),
+    ) -> TokenPoolDecodeContext | None:
+        if not self.reservations or self.state is None or kv_pool is None:
+            return None
+        return self.state.build_context(
+            kv_pool=kv_pool,
+            attention_workspace=attention_workspace,
+            layer_id_metadata_only_types=layer_id_metadata_only_types,
+        )
+
+
+@dataclass(frozen=True)
+class TokenPoolDecodeCommitResult:
+    invalidated_full_attention_rows: int = 0
+    cleared_prefix_slots: tuple[int, ...] = ()
+    released_prefix_slots: tuple[int, ...] = ()
+    expired_page_slots: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class TokenPoolDecodeDiscardResult:
+    freed_token_slots: tuple[int, ...] = ()
+    restored_page_slots: tuple[int, ...] = ()
+
+
 def token_pool_decode_covered_layer_types(
     token_pool_decode: Any | None,
 ) -> frozenset[str]:
@@ -5252,6 +5298,154 @@ class TokenPoolDecodeBackendState:
             kv_pool=self.kv_pool,
             attention_workspace=self.attention_workspace,
             layer_id_metadata_only_types=layer_id_metadata_only_types,
+        )
+
+    @staticmethod
+    def _decode_batch_reservations(
+        batch_or_reservations: Any,
+    ) -> tuple[Any, ...]:
+        reservations = getattr(batch_or_reservations, "reservations", None)
+        if reservations is not None:
+            return tuple(reservations)
+        if batch_or_reservations is None:
+            return ()
+        return tuple(batch_or_reservations)
+
+    def prepared_decode_batch(
+        self,
+        reservations: Iterable[Any],
+    ) -> TokenPoolPreparedDecodeBatch:
+        return TokenPoolPreparedDecodeBatch(
+            reservations=tuple(reservations),
+            state=self.current_decode_batch_state,
+        )
+
+    def build_decode_context_for_batch(
+        self,
+        batch_or_reservations: Any,
+        *,
+        layer_id_metadata_only_types: frozenset[str] = frozenset(),
+    ) -> TokenPoolDecodeContext | None:
+        prepared = (
+            batch_or_reservations
+            if isinstance(batch_or_reservations, TokenPoolPreparedDecodeBatch)
+            else self.prepared_decode_batch(
+                self._decode_batch_reservations(batch_or_reservations)
+            )
+        )
+        return prepared.build_context(
+            kv_pool=self.kv_pool,
+            attention_workspace=self.attention_workspace,
+            layer_id_metadata_only_types=layer_id_metadata_only_types,
+        )
+
+    def commit_decode_batch(
+        self,
+        batch_or_reservations: Any,
+        *,
+        caches_by_req_id: Any | None = None,
+        owner_layer_ids: Iterable[int] = (),
+        attention_window: int | None = None,
+        clear_nonpersistent_full_attention_rows: bool = True,
+    ) -> TokenPoolDecodeCommitResult:
+        reservations = self._decode_batch_reservations(batch_or_reservations)
+        if not reservations:
+            return TokenPoolDecodeCommitResult()
+
+        invalidated_full_attention_rows = 0
+        try:
+            if caches_by_req_id is not None:
+                invalidate_req_ids = self.commit_full_attention_decode_to_caches(
+                    reservations=reservations,
+                    caches_by_req_id=caches_by_req_id,
+                    owner_layer_ids=owner_layer_ids,
+                )
+                if invalidate_req_ids:
+                    invalidated_full_attention_rows += (
+                        self.invalidate_full_attention_rows(invalidate_req_ids)
+                    )
+        finally:
+            if clear_nonpersistent_full_attention_rows:
+                self.clear_full_attention_rows(
+                    [
+                        getattr(reservation, "req_id")
+                        for reservation in reservations
+                        if not bool(
+                            getattr(
+                                reservation,
+                                "persistent_full_attention_row",
+                                False,
+                            )
+                        )
+                    ]
+                )
+
+        cleared_prefix_slots: list[int] = []
+        released_prefix_slots: list[int] = []
+        expired_page_slots: list[int] = []
+        if attention_window is not None:
+            window = int(attention_window)
+            for reservation in reservations:
+                previous_length = int(getattr(reservation, "previous_length"))
+                clear_before = max(previous_length + 1 - window, 0)
+                result = self.clear_request_prefix(
+                    str(getattr(reservation, "req_id")),
+                    int(getattr(reservation, "req_slot")),
+                    clear_before,
+                )
+                invalidated_full_attention_rows += (
+                    result.invalidated_full_attention_rows
+                )
+                cleared_prefix_slots.extend(result.dropped_slots)
+                released_prefix_slots.extend(result.released_slots)
+                expired_page_slots.extend(result.expired_page_slots)
+
+        return TokenPoolDecodeCommitResult(
+            invalidated_full_attention_rows=int(invalidated_full_attention_rows),
+            cleared_prefix_slots=tuple(cleared_prefix_slots),
+            released_prefix_slots=tuple(released_prefix_slots),
+            expired_page_slots=tuple(expired_page_slots),
+        )
+
+    def discard_decode_batch(
+        self,
+        batch_or_reservations: Any,
+    ) -> TokenPoolDecodeDiscardResult:
+        reservations = self._decode_batch_reservations(batch_or_reservations)
+        if not reservations:
+            return TokenPoolDecodeDiscardResult()
+
+        self.clear_full_attention_rows(
+            [getattr(reservation, "req_id") for reservation in reservations]
+        )
+        freed_token_slots: list[int] = []
+        restored_page_slots: list[int] = []
+        for reservation in reversed(reservations):
+            req_id = str(getattr(reservation, "req_id"))
+            req_slot = int(getattr(reservation, "req_slot"))
+            token_slot = int(getattr(reservation, "token_slot"))
+            if req_id in self.request_slots:
+                self.truncate_table_row(
+                    req_slot,
+                    int(getattr(reservation, "previous_length")),
+                )
+            self.remove_request_token_slot(req_id, token_slot)
+            page_state_snapshot = getattr(reservation, "page_state_snapshot", None)
+            if page_state_snapshot is not None:
+                restored_page_slots.extend(
+                    self.restore_request_page_state(page_state_snapshot)
+                )
+                continue
+            if token_slot not in self.page_owned_slots_for_request(req_id):
+                allocator = self.allocator
+                if allocator is None:
+                    raise RuntimeError("token-pool allocator is not initialized")
+                allocator.free_slots([token_slot])
+                freed_token_slots.append(token_slot)
+
+        return TokenPoolDecodeDiscardResult(
+            freed_token_slots=tuple(freed_token_slots),
+            restored_page_slots=tuple(restored_page_slots),
         )
 
     @property
