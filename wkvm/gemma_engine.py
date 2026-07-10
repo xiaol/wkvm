@@ -2485,59 +2485,62 @@ class GemmaNativeEngine:
         req_slots: list[int] = []
         out_cache_loc: list[int] = []
         try:
-            for req in reqs:
-                self._token_pool_admit_request(req)
-                req_slot = self._token_pool_request_slot(req.req_id)
-                previous_length = self._token_pool_request_length(req_slot)
-                if previous_length != req.num_computed_tokens:
-                    raise RuntimeError(
-                        f"{req.req_id}: token table length {previous_length} "
-                        f"does not match computed tokens {req.num_computed_tokens}"
+            if backend is not None:
+                reservations = list(
+                    backend.prepare_decode_reservations(
+                        reqs,
+                        expected_lengths=(
+                            req.num_computed_tokens for req in reqs
+                        ),
+                        persistent_full_attention_rows=(
+                            persistent_full_attention_rows
+                        ),
                     )
-                self._token_pool_ensure_context_len(previous_length + 1)
-                page_state_snapshot = None
-                if self._token_kv_pool is not None:
-                    if (
-                        getattr(allocator, "alloc_page_block_with_ids", None)
-                        is not None
-                    ):
-                        backend = self._token_pool_decode_backend
-                        if backend is not None:
-                            page_state_snapshot = backend.snapshot_request_page_state(
-                                req.req_id,
-                                req_slot,
-                            )
-                    token_slot_tensor, token_slot_ids = (
-                        self._token_pool_alloc_page_aligned_slots(
-                            req.req_id,
-                            previous_length,
-                            1,
-                        )
-                    )
-                else:
-                    token_slot_tensor, token_slot_ids = allocator.alloc_slots_with_ids(1)
-                token_slot = token_slot_ids[0]
-                reservation = _TokenPoolDecodeReservation(
-                    req_id=req.req_id,
-                    req_slot=req_slot,
-                    token_slot=token_slot,
-                    token_slot_tensor=token_slot_tensor[:1],
-                    previous_length=previous_length,
-                    persistent_full_attention_row=bool(
-                        persistent_full_attention_rows
-                    ),
-                    page_state_snapshot=page_state_snapshot,
                 )
-                reservations.append(reservation)
-                self._token_pool_append_table_slots(req_slot, token_slot_tensor)
-                if self._token_kv_pool is None:
-                    backend = self._token_pool_decode_backend
-                    if backend is not None:
-                        backend.append_request_token_slot(req.req_id, token_slot)
+                req_slots = [reservation.req_slot for reservation in reservations]
+                out_cache_loc = [
+                    reservation.token_slot for reservation in reservations
+                ]
+            else:
+                for req in reqs:
+                    self._token_pool_admit_request(req)
+                    req_slot = self._token_pool_request_slot(req.req_id)
+                    previous_length = self._token_pool_request_length(req_slot)
+                    if previous_length != req.num_computed_tokens:
+                        raise RuntimeError(
+                            f"{req.req_id}: token table length {previous_length} "
+                            f"does not match computed tokens {req.num_computed_tokens}"
+                        )
+                    self._token_pool_ensure_context_len(previous_length + 1)
+                    if self._token_kv_pool is not None:
+                        token_slot_tensor, token_slot_ids = (
+                            self._token_pool_alloc_page_aligned_slots(
+                                req.req_id,
+                                previous_length,
+                                1,
+                            )
+                        )
                     else:
+                        token_slot_tensor, token_slot_ids = (
+                            allocator.alloc_slots_with_ids(1)
+                        )
+                    token_slot = token_slot_ids[0]
+                    reservation = _TokenPoolDecodeReservation(
+                        req_id=req.req_id,
+                        req_slot=req_slot,
+                        token_slot=token_slot,
+                        token_slot_tensor=token_slot_tensor[:1],
+                        previous_length=previous_length,
+                        persistent_full_attention_row=bool(
+                            persistent_full_attention_rows
+                        ),
+                    )
+                    reservations.append(reservation)
+                    self._token_pool_append_table_slots(req_slot, token_slot_tensor)
+                    if self._token_kv_pool is None:
                         self._token_pool_token_slots[req.req_id].append(token_slot)
-                req_slots.append(req_slot)
-                out_cache_loc.append(token_slot)
+                    req_slots.append(req_slot)
+                    out_cache_loc.append(token_slot)
             if self._token_kv_pool is None:
                 if backend is None:
                     raise RuntimeError("token-pool decode backend is not initialized")

@@ -5841,6 +5841,71 @@ class TokenPoolDecodeBackendState:
         self.table.ensure_context_len(context_len)
         self.ensure_page_table_width(context_len)
 
+    def prepare_decode_reservations(
+        self,
+        requests: Iterable[Any],
+        *,
+        expected_lengths: Iterable[int],
+        persistent_full_attention_rows: bool = False,
+    ) -> tuple[TokenPoolDecodeReservation, ...]:
+        request_list = list(requests)
+        expected_length_list = [int(length) for length in expected_lengths]
+        if len(request_list) != len(expected_length_list):
+            raise ValueError("requests length must match expected_lengths")
+        if not request_list:
+            return ()
+        allocator = self.allocator
+        if allocator is None:
+            raise RuntimeError("token-pool allocator is not initialized")
+
+        reservations: list[TokenPoolDecodeReservation] = []
+        try:
+            for request, expected_length in zip(request_list, expected_length_list):
+                req_id = str(getattr(request, "req_id", request))
+                req_slot = self.admit_request(req_id)
+                previous_length = self.request_length(req_slot)
+                if previous_length != expected_length:
+                    raise RuntimeError(
+                        f"{req_id}: token table length {previous_length} "
+                        f"does not match computed tokens {expected_length}"
+                    )
+                self.ensure_context_len(previous_length + 1)
+                page_state_snapshot = None
+                if self.kv_pool is not None:
+                    if getattr(allocator, "alloc_page_block_with_ids", None) is not None:
+                        page_state_snapshot = self.snapshot_request_page_state(
+                            req_id,
+                            req_slot,
+                        )
+                    token_slot_tensor, token_slot_ids = self.allocate_page_aligned_slots(
+                        req_id,
+                        previous_length,
+                        1,
+                        req_slot=req_slot,
+                    )
+                else:
+                    token_slot_tensor, token_slot_ids = allocator.alloc_slots_with_ids(1)
+                token_slot = int(token_slot_ids[0])
+                reservation = TokenPoolDecodeReservation(
+                    req_id=req_id,
+                    req_slot=int(req_slot),
+                    token_slot=token_slot,
+                    token_slot_tensor=token_slot_tensor[:1],
+                    previous_length=int(previous_length),
+                    persistent_full_attention_row=bool(
+                        persistent_full_attention_rows
+                    ),
+                    page_state_snapshot=page_state_snapshot,
+                )
+                reservations.append(reservation)
+                self.append_table_slots(req_slot, token_slot_tensor)
+                if self.kv_pool is None:
+                    self.append_request_token_slot(req_id, token_slot)
+            return tuple(reservations)
+        except Exception:
+            self.discard_decode_batch(reservations)
+            raise
+
     def append_table_slots(
         self,
         req_id_or_slot: str | int,

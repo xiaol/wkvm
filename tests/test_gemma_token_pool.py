@@ -1424,6 +1424,90 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(backend.request_token_slots["req"], token_slot_ids[3:])
         self.assertEqual(allocator.allocated_count, 3)
 
+    def test_token_pool_decode_backend_prepares_decode_reservations(self) -> None:
+        from types import SimpleNamespace
+
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenPoolDecodeBackendState,
+            TokenSlotAllocator,
+        )
+
+        table = ReqToTokenTable(max_requests=1, max_context_len=8)
+        allocator = TokenSlotAllocator(capacity=8)
+        backend = TokenPoolDecodeBackendState(table=table, allocator=allocator)
+        req_slot = backend.admit_request("req")
+        prefill_tensor, prefill_ids = allocator.alloc_slots_with_ids(2)
+        backend.append_table_slots(req_slot, prefill_tensor)
+        backend.append_request_token_slots("req", prefill_ids)
+
+        reservations = backend.prepare_decode_reservations(
+            [SimpleNamespace(req_id="req")],
+            expected_lengths=[2],
+        )
+
+        self.assertEqual(len(reservations), 1)
+        reservation = reservations[0]
+        self.assertEqual(reservation.req_id, "req")
+        self.assertEqual(reservation.req_slot, req_slot)
+        self.assertEqual(reservation.previous_length, 2)
+        self.assertEqual(table.length(req_slot), 3)
+        self.assertEqual(
+            table.slots_for("req").tolist(),
+            prefill_ids + [reservation.token_slot],
+        )
+        self.assertEqual(
+            backend.request_token_slots["req"],
+            prefill_ids + [reservation.token_slot],
+        )
+        self.assertEqual(allocator.allocated_count, 3)
+
+    def test_token_pool_decode_backend_prepare_rolls_back_allocated_slot(self) -> None:
+        from types import SimpleNamespace
+
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenPoolDecodeBackendState,
+            TokenSlotAllocator,
+        )
+
+        table = ReqToTokenTable(max_requests=1, max_context_len=8)
+        allocator = TokenSlotAllocator(capacity=8)
+        backend = TokenPoolDecodeBackendState(table=table, allocator=allocator)
+        req_slot = backend.admit_request("req")
+        prefill_tensor, prefill_ids = allocator.alloc_slots_with_ids(2)
+        backend.append_table_slots(req_slot, prefill_tensor)
+        backend.append_request_token_slots("req", prefill_ids)
+        original_append_table_slots = backend.append_table_slots
+
+        def raise_after_decode_alloc(*args, **kwargs):
+            raise RuntimeError("forced append failure")
+
+        backend.append_table_slots = raise_after_decode_alloc  # type: ignore[method-assign]
+        try:
+            with self.assertRaisesRegex(RuntimeError, "forced append failure"):
+                backend.prepare_decode_reservations(
+                    [SimpleNamespace(req_id="req")],
+                    expected_lengths=[2],
+                )
+        finally:
+            backend.append_table_slots = original_append_table_slots  # type: ignore[method-assign]
+
+        self.assertEqual(table.length(req_slot), 2)
+        self.assertEqual(table.slots_for("req").tolist(), prefill_ids)
+        self.assertEqual(backend.request_token_slots["req"], prefill_ids)
+        self.assertEqual(allocator.allocated_count, 2)
+
     def test_token_pool_decode_backend_discards_decode_transaction(self) -> None:
         try:
             import torch  # noqa: F401
