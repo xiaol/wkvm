@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -324,6 +324,69 @@ def benchmark_fatal_error(exc: BaseException, *, phase: str) -> dict[str, Any]:
     }
 
 
+class SyntheticBenchTokenResult:
+    def __init__(self, input_ids: list[int]) -> None:
+        self.input_ids = input_ids
+
+
+class SyntheticBenchTokenizer:
+    """Small deterministic token source for tokenizer-free throughput runs."""
+
+    def __init__(
+        self,
+        *,
+        vocab_size: int = 262_144,
+        bos_token_id: int | None = 2,
+        break_period: int = 31,
+    ) -> None:
+        vocab_size = int(vocab_size)
+        if vocab_size < 16:
+            raise ValueError("synthetic vocab size must be >= 16")
+        self.vocab_size = vocab_size
+        self.bos_token_id = bos_token_id
+        self.break_period = max(2, int(break_period))
+
+    def __call__(
+        self,
+        text: str,
+        *,
+        add_special_tokens: bool = False,
+    ) -> SyntheticBenchTokenResult:
+        text = str(text)
+        token_count = max(1, (len(text) + 3) // 4)
+        usable = self.vocab_size - 4
+        seed = 0x345678
+        ids: list[int] = []
+        for i in range(token_count):
+            ch = ord(text[i % len(text)]) if text else 0
+            seed = (seed * 1_103_515_245 + ch + i + 12_345) & 0x7FFF_FFFF
+            ids.append(4 + (seed % usable))
+        if add_special_tokens and self.bos_token_id is not None:
+            ids = [int(self.bos_token_id), *ids]
+        return SyntheticBenchTokenResult(ids)
+
+    def decode(self, token_ids: Iterable[int]) -> str:
+        return "." if any(int(tid) % self.break_period == 0 for tid in token_ids) else "x"
+
+
+def prompt_token_source(args) -> str:
+    return "synthetic" if getattr(args, "synthetic_prompts", False) else "hf_tokenizer"
+
+
+def uses_hf_tokenizer(args) -> bool:
+    return prompt_token_source(args) == "hf_tokenizer"
+
+
+def load_bench_tokenizer(path: str, args):
+    if getattr(args, "synthetic_prompts", False):
+        return SyntheticBenchTokenizer(
+            vocab_size=getattr(args, "synthetic_vocab_size", 262_144),
+        )
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(path)
+
+
 def build_benchmark_payload(
     args,
     *,
@@ -348,6 +411,8 @@ def build_benchmark_payload(
         "headroom_gib": args.headroom_gib,
         "torch_usable_gib": round_or_none(usable_gib),
         "model_path": path,
+        "prompt_token_source": prompt_token_source(args),
+        "uses_hf_tokenizer": uses_hf_tokenizer(args),
         "dtype": "bfloat16",
         "device": args.device,
         "attn": args.attn,
@@ -420,6 +485,8 @@ def build_benchmark_payload(
                 args.token_pool_sliding_paged_metadata_only
             ),
             "token_pool_triton_env": token_pool_triton_env,
+            "synthetic_prompts": getattr(args, "synthetic_prompts", False),
+            "synthetic_vocab_size": getattr(args, "synthetic_vocab_size", None),
             "slots": args.slots,
             "token_budget": args.token_budget,
         },
@@ -883,7 +950,6 @@ def run_row(model, tok, cfg, B: int, args, usable_gib: float | None) -> dict[str
 
 def run(args) -> dict[str, Any]:
     import torch
-    from transformers import AutoTokenizer
 
     token_pool_triton_env = apply_token_pool_triton_bench_env(args)
     path = resolve_model_path(args.model_path)
@@ -893,8 +959,12 @@ def run(args) -> dict[str, Any]:
     try:
         setup_phase = "torch_memory_probe"
         usable_gib = torch_usable_gib(args.mem_cap_gib)
-        setup_phase = "tokenizer_load"
-        tok = AutoTokenizer.from_pretrained(path)
+        setup_phase = (
+            "synthetic_tokenizer_init"
+            if getattr(args, "synthetic_prompts", False)
+            else "tokenizer_load"
+        )
+        tok = load_bench_tokenizer(path, args)
         setup_phase = "native_checkpoint_argument_validation"
         if args.native_gemma_checkpoint_loader:
             args.use_native_gemma_forward = True
@@ -1001,6 +1071,20 @@ def main() -> None:
     ap.add_argument("--out", type=int, default=128)
     ap.add_argument("--concurrency", type=parse_concurrency, default=parse_concurrency("1,8,16,32"))
     ap.add_argument("--prompt-lengths", choices=["staggered", "uniform"], default="staggered")
+    ap.add_argument(
+        "--synthetic-prompts",
+        action="store_true",
+        help=(
+            "Generate deterministic prompt token IDs locally instead of loading "
+            "a Hugging Face tokenizer."
+        ),
+    )
+    ap.add_argument(
+        "--synthetic-vocab-size",
+        type=int,
+        default=262_144,
+        help="Vocabulary size used by --synthetic-prompts.",
+    )
     ap.add_argument("--mem-cap-gib", type=float, default=float(os.environ.get("WKVM_MEM_CAP_GIB", 19)))
     ap.add_argument("--headroom-gib", type=float, default=1.0)
     ap.add_argument("--json", default=None)

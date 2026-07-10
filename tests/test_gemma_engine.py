@@ -82,6 +82,8 @@ class TestGemmaSchedulerAssumptions(unittest.TestCase):
             "ctx": 512,
             "prompt_lengths": "uniform",
             "out": 8,
+            "synthetic_prompts": False,
+            "synthetic_vocab_size": 262_144,
             "mem_cap_gib": 19.0,
             "headroom_gib": 1.0,
             "device": "cuda",
@@ -223,6 +225,10 @@ class TestGemmaSchedulerAssumptions(unittest.TestCase):
         self.assertEqual(payload["rows"], [])
         self.assertEqual(payload["summary"]["bmax_green"], 0)
         self.assertEqual(payload["torch_usable_gib"], None)
+        self.assertEqual(payload["prompt_token_source"], "hf_tokenizer")
+        self.assertTrue(payload["uses_hf_tokenizer"])
+        self.assertFalse(payload["config"]["synthetic_prompts"])
+        self.assertEqual(payload["config"]["synthetic_vocab_size"], 262_144)
         self.assertFalse(payload["uses_hf_transformer_forward"])
         self.assertFalse(payload["uses_hf_model_construction"])
         self.assertTrue(payload["native_gemma_checkpoint_loader"])
@@ -236,6 +242,63 @@ class TestGemmaSchedulerAssumptions(unittest.TestCase):
             [{"B": None, "problems": ["no_successful_rows_to_check"]}],
         )
         self.assertFalse(payload["native_no_hf_requirement"]["passed"])
+
+    def test_native_bench_synthetic_tokenizer_avoids_hf_tokenizer(self) -> None:
+        from experiments.native_gemma_bench import (
+            load_bench_tokenizer,
+            prompt_token_source,
+            uses_hf_tokenizer,
+        )
+
+        class FailingAutoTokenizer:
+            @classmethod
+            def from_pretrained(cls, path):
+                raise AssertionError(f"unexpected HF tokenizer load from {path}")
+
+        old_transformers = sys.modules.get("transformers")
+        sys.modules["transformers"] = SimpleNamespace(
+            AutoTokenizer=FailingAutoTokenizer,
+        )
+        try:
+            args = self.native_bench_payload_args(
+                synthetic_prompts=True,
+                synthetic_vocab_size=128,
+            )
+            tok = load_bench_tokenizer("/unused/model", args)
+        finally:
+            if old_transformers is None:
+                sys.modules.pop("transformers", None)
+            else:
+                sys.modules["transformers"] = old_transformers
+
+        ids = tok("abcde", add_special_tokens=True).input_ids
+        self.assertGreaterEqual(len(ids), 2)
+        self.assertEqual(ids[0], tok.bos_token_id)
+        self.assertTrue(all(0 <= token_id < 128 for token_id in ids))
+        self.assertIsInstance(tok.decode([ids[-1]]), str)
+        self.assertEqual(prompt_token_source(args), "synthetic")
+        self.assertFalse(uses_hf_tokenizer(args))
+
+    def test_native_bench_payload_records_synthetic_prompt_source(self) -> None:
+        from experiments.native_gemma_bench import build_benchmark_payload
+
+        args = self.native_bench_payload_args(
+            synthetic_prompts=True,
+            synthetic_vocab_size=128,
+        )
+
+        payload = build_benchmark_payload(
+            args,
+            path="/models/gemma",
+            rows=[],
+            usable_gib=7.5,
+            token_pool_triton_env={},
+        )
+
+        self.assertEqual(payload["prompt_token_source"], "synthetic")
+        self.assertFalse(payload["uses_hf_tokenizer"])
+        self.assertTrue(payload["config"]["synthetic_prompts"])
+        self.assertEqual(payload["config"]["synthetic_vocab_size"], 128)
 
     def test_native_bench_applies_token_pool_triton_env_flags(self) -> None:
         from experiments.native_gemma_bench import (
