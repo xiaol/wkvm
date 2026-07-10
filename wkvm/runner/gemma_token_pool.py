@@ -3504,6 +3504,7 @@ class TokenPoolBlockTables:
         *,
         block_table_width: int | None = None,
         workspace_key: str | None = None,
+        out: Any | None = None,
     ):
         import torch
 
@@ -3535,6 +3536,28 @@ class TokenPoolBlockTables:
         self.ensure_width(max_required + 1)
 
         device = self.request_block_tables.device
+        if out is not None:
+            if getattr(out, "ndim", None) != 2:
+                raise ValueError("out must have shape [batch, max_blocks]")
+            if int(out.shape[0]) < len(req_slots_list) or int(out.shape[1]) < max_blocks:
+                raise ValueError("out is smaller than requested block table")
+            if out.dtype != self.request_block_tables.dtype:
+                raise ValueError("out dtype must match block table dtype")
+            if out.device != device:
+                raise ValueError("out device must match block table device")
+            result = out[: len(req_slots_list), :max_blocks]
+            result.fill_(self.padding_block)
+            for row, (req_slot, first_block, block_len) in enumerate(
+                zip(req_slots_list, first_block_list, block_lens_list)
+            ):
+                result[row, :block_len].copy_(
+                    self.request_block_tables[
+                        req_slot,
+                        first_block : first_block + block_len,
+                    ]
+                )
+            return result
+
         req_slots_tensor = torch.as_tensor(req_slots_list, dtype=torch.long, device=device)
         first_blocks_tensor = torch.as_tensor(
             first_block_list,
@@ -7041,6 +7064,19 @@ class TokenPoolDecodeBackendState:
             raise ValueError("out_cache_loc length must match req_slots")
 
         block_table_width = self.sliding_block_table_width(sliding_window)
+        block_tables = self.block_tables
+        if block_tables is not None:
+            try:
+                return self.build_sliding_paged_decode_metadata_from_block_tables(
+                    req_slots=req_slots_list,
+                    logical_seq_lens=logical_lens,
+                    out_cache_loc=out_cache_loc_source,
+                    sliding_window=max(1, int(sliding_window)),
+                    block_table_width=block_table_width,
+                )
+            except (RuntimeError, ValueError, KeyError):
+                pass
+
         page_table_tensor = self.page_table_tensor
         if page_table_tensor is not None:
             try:
@@ -7095,6 +7131,125 @@ class TokenPoolDecodeBackendState:
             )
         except (RuntimeError, ValueError, KeyError):
             return None
+
+    def build_sliding_paged_decode_metadata_from_block_tables(
+        self,
+        *,
+        req_slots: Iterable[int],
+        logical_seq_lens: Iterable[int],
+        out_cache_loc: Iterable[int] | Any,
+        sliding_window: int,
+        block_table_width: int,
+        workspace_key: str = "sliding_attention_paged",
+    ) -> PagedDecodeBatchMetadata:
+        import torch
+
+        block_tables_owner = self.block_tables
+        if block_tables_owner is None:
+            raise RuntimeError("token-pool block tables are not initialized")
+        req_slots_list = [int(slot) for slot in req_slots]
+        logical_lens = [int(length) for length in logical_seq_lens]
+        if not req_slots_list:
+            raise ValueError("sliding paged metadata requires at least one request slot")
+        if len(logical_lens) != len(req_slots_list):
+            raise ValueError("logical_seq_lens length must match req_slots")
+        out_cache_loc_source, out_cache_loc_count = _slot_values_source_and_count(
+            out_cache_loc
+        )
+        if out_cache_loc_count != len(req_slots_list):
+            raise ValueError("out_cache_loc length must match req_slots")
+        sliding_window = max(1, int(sliding_window))
+        block_table_width = int(block_table_width)
+        if block_table_width < 1:
+            raise ValueError("block_table_width must be >= 1")
+
+        starts: list[int] = []
+        selected_lens: list[int] = []
+        block_lens: list[int] = []
+        first_blocks: list[int] = []
+        for req_slot, seq_len in zip(req_slots_list, logical_lens):
+            self.table._validate_allocated_slot(req_slot)
+            table_len = int(self.table._lengths[req_slot].item())
+            if seq_len < 0 or seq_len > table_len:
+                raise ValueError("seq_lens cannot exceed request table length")
+            start = max(int(seq_len) - sliding_window, 0)
+            selected_len = int(seq_len) - int(start)
+            if selected_len < 1:
+                raise ValueError("paged token-slot rows must be non-empty")
+            first_block = int(start) // self.block_size
+            last_block = (int(start) + selected_len - 1) // self.block_size
+            block_count = last_block - first_block + 1
+            if block_count > block_table_width:
+                raise ValueError("block_table_width is smaller than the live block table")
+            starts.append(int(start))
+            selected_lens.append(int(selected_len))
+            first_blocks.append(int(first_block))
+            block_lens.append(int(block_count))
+
+        workspace = self.decode_metadata_workspace.ensure_paged(
+            workspace_key,
+            device=self.device,
+            row_count=len(req_slots_list),
+            block_table_width=block_table_width,
+        )
+        req_pool_indices = workspace["req_pool_indices"][: len(req_slots_list)]
+        seq_lens_tensor = workspace["seq_lens"][: len(req_slots_list)]
+        logical_seq_lens_tensor = workspace["logical_seq_lens"][: len(req_slots_list)]
+        block_table_lens_tensor = workspace["block_table_lens"][: len(req_slots_list)]
+        selected_start_positions_tensor = workspace["selected_start_positions"][
+            : len(req_slots_list)
+        ]
+        block_tables = workspace["block_tables"][
+            : len(req_slots_list),
+            :block_table_width,
+        ]
+        req_pool_indices.copy_(
+            torch.as_tensor(req_slots_list, dtype=torch.int32, device=self.device)
+        )
+        seq_lens_tensor.copy_(
+            torch.as_tensor(selected_lens, dtype=torch.int32, device=self.device)
+        )
+        logical_seq_lens_tensor.copy_(
+            torch.as_tensor(logical_lens, dtype=torch.int32, device=self.device)
+        )
+        block_table_lens_tensor.copy_(
+            torch.as_tensor(block_lens, dtype=torch.int32, device=self.device)
+        )
+        selected_start_positions_tensor.copy_(
+            torch.as_tensor(starts, dtype=torch.int32, device=self.device)
+        )
+        block_tables_owner.gather_block_tables(
+            req_slots_list,
+            first_blocks,
+            block_lens,
+            block_table_width=block_table_width,
+            out=block_tables,
+        )
+        out = workspace["out_cache_loc"][: len(req_slots_list)]
+        out.copy_(
+            torch.as_tensor(out_cache_loc_source, dtype=torch.int32, device=self.device)
+        )
+        out_long = workspace["out_cache_loc_long"][: len(req_slots_list)]
+        out_long.copy_(out.to(dtype=torch.long))
+
+        return PagedDecodeBatchMetadata(
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens_tensor,
+            logical_seq_lens=logical_seq_lens_tensor,
+            out_cache_loc=out,
+            block_tables=block_tables,
+            block_table_lens=block_table_lens_tensor,
+            selected_start_positions=selected_start_positions_tensor,
+            block_size=self.block_size,
+            slot_mapping=out_long,
+            out_cache_loc_long=out_long,
+            max_seq_len=max(selected_lens),
+            workspace_signature=_decode_metadata_workspace_signature(
+                kind="paged",
+                key=workspace_key,
+                workspace=workspace,
+            ),
+        )
 
     @property
     def device(self):

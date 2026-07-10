@@ -591,6 +591,16 @@ class TestGemmaTokenPool(unittest.TestCase):
         )
         self.assertEqual(int(gathered_again.data_ptr()), gathered_ptr)
         self.assertEqual(gathered_again.tolist(), [[3, 6, -1], [8, -1, -1]])
+        out = torch.empty((2, 3), dtype=torch.int32)
+        gathered_out = tables.gather_block_tables(
+            [0, 1],
+            [0, 2],
+            [2, 1],
+            block_table_width=3,
+            out=out,
+        )
+        self.assertEqual(int(gathered_out.data_ptr()), int(out.data_ptr()))
+        self.assertEqual(out.tolist(), [[3, 6, -1], [8, -1, -1]])
 
         slots = tables.compute_slot_mapping(
             [0, 1],
@@ -2100,6 +2110,10 @@ class TestGemmaTokenPool(unittest.TestCase):
             backend,
             "page_tables_for_requests",
             side_effect=AssertionError("dict page tables used"),
+        ), patch.object(
+            table,
+            "build_paged_decode_metadata_from_page_table_tensor",
+            side_effect=AssertionError("raw page-table tensor builder used"),
         ):
             prepared = backend.prepare_decode_batch_state(
                 [reservation],
