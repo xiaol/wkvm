@@ -2040,6 +2040,7 @@ class TestGemmaTokenPool(unittest.TestCase):
         )
         self.assertEqual(metadata.out_cache_loc_long.tolist(), [5, 21])
         self.assertIsNotNone(paged)
+        self.assertTrue(paged.block_tables_materialized)
         self.assertEqual(paged.block_tables.tolist(), [[0, 1], [4, 5]])
         self.assertEqual(paged.block_table_lens.tolist(), [2, 2])
         self.assertEqual(paged.selected_start_positions.tolist(), [1, 5])
@@ -2197,7 +2198,8 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertNotIn("sliding_attention", prepared.state.metadata_by_layer_type)
         self.assertIn("sliding_attention", prepared.state.covered_layer_types)
         paged = prepared.state.paged_metadata_by_layer_type["sliding_attention"]
-        self.assertEqual(paged.block_tables.tolist(), [[0, 1]])
+        self.assertFalse(paged.block_tables_materialized)
+        self.assertIs(paged.request_block_tables, block_tables.tensor)
         self.assertEqual(paged.block_table_lens.tolist(), [2])
         self.assertEqual(paged.selected_start_positions.tolist(), [1])
         self.assertEqual(paged.slot_mapping.tolist(), [5])
@@ -5234,6 +5236,7 @@ class TestGemmaTokenPool(unittest.TestCase):
                         selected_start_positions="starts",
                         seq_lens="seq_lens",
                         block_size=16,
+                        block_tables_materialized=False,
                     ),
                 )
 

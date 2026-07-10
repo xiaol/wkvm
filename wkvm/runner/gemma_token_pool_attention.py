@@ -685,6 +685,8 @@ class TokenPoolTritonAttentionBackend:
         metadata = kernel_dispatch.metadata
         self._stats["paged_attempts"] += 1
         if kernel_dispatch.is_split:
+            if not bool(getattr(metadata, "block_tables_materialized", True)):
+                raise RuntimeError("paged split decode requires compact block tables")
             self._stats["paged_split_attempts"] += 1
             self._stats["split_attempts"] += 1
             split_workspace = self._split_workspace(
@@ -744,6 +746,8 @@ class TokenPoolTritonAttentionBackend:
                     self._stats.get("paged_request_table_successes", 0) + 1
                 )
             else:
+                if not bool(getattr(metadata, "block_tables_materialized", True)):
+                    raise RuntimeError("paged decode requires materialized block tables")
                 output = self._hooks.paged_decode_fn()(
                     query_states,
                     key_buffer,

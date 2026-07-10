@@ -75,6 +75,7 @@ class PagedDecodeBatchMetadata:
     triton_decode_plan: TokenPoolTritonDecodePlan | None = None
     workspace_signature: Any | None = None
     request_block_tables: Any | None = None
+    block_tables_materialized: bool = True
 
     def __post_init__(self) -> None:
         if self.triton_decode_plan is None:
@@ -2115,6 +2116,16 @@ def _token_pool_sliding_paged_metadata_only_requested() -> bool:
     )
 
 
+def _token_pool_paged_split_requested() -> bool:
+    return any(
+        _env_flag(name)
+        for name in (
+            "WKVM_ENABLE_TOKEN_POOL_PAGED_SPLIT_TRITON",
+            "WKVM_TOKEN_POOL_TRITON_PAGED_SPLIT_KV",
+        )
+    )
+
+
 def _token_pool_timing_enabled() -> bool:
     return _env_flag("WKVM_TOKEN_POOL_TIMING") or _env_flag("WKVM_NATIVE_FORWARD_TIMING")
 
@@ -2430,6 +2441,9 @@ class TokenPoolDecodeGraphBuffer:
                     if getattr(metadata, "request_block_tables", None) is None
                     else metadata.request_block_tables.clone()
                 ),
+                block_tables_materialized=bool(
+                    getattr(metadata, "block_tables_materialized", True)
+                ),
             )
         return DecodeBatchMetadata(
             req_pool_indices=metadata.req_pool_indices.clone(),
@@ -2500,6 +2514,12 @@ class TokenPoolDecodeGraphBuffer:
             raise ValueError(f"token-pool graph {prefix}.block_size changed")
         if getattr(dst, "max_seq_len", None) != getattr(src, "max_seq_len", None):
             raise ValueError(f"token-pool graph {prefix}.max_seq_len changed")
+        if bool(getattr(dst, "block_tables_materialized", True)) != bool(
+            getattr(src, "block_tables_materialized", True)
+        ):
+            raise ValueError(
+                f"token-pool graph {prefix}.block_tables_materialized changed"
+            )
         if getattr(dst, "triton_decode_plan", None) != getattr(
             src,
             "triton_decode_plan",
@@ -2649,6 +2669,7 @@ class TokenPoolDecodeGraphBuffer:
             ),
             int(getattr(metadata, "block_size", -1)),
             getattr(metadata, "max_seq_len", None),
+            bool(getattr(metadata, "block_tables_materialized", True)),
             getattr(metadata, "triton_decode_plan", None),
             TokenPoolDecodeGraphBuffer._tensor_alias_key(
                 getattr(metadata, "request_block_tables", None)
@@ -2685,6 +2706,10 @@ class TokenPoolDecodeGraphBuffer:
         if int(getattr(dst, "block_size", -1)) != int(getattr(src, "block_size", -1)):
             return False
         if getattr(dst, "max_seq_len", None) != getattr(src, "max_seq_len", None):
+            return False
+        if bool(getattr(dst, "block_tables_materialized", True)) != bool(
+            getattr(src, "block_tables_materialized", True)
+        ):
             return False
         if getattr(dst, "triton_decode_plan", None) != getattr(
             src,
@@ -3026,6 +3051,9 @@ class TokenPoolDecodeGraphSignatureTracker:
             ),
             "block_size": int(metadata.block_size),
             "max_seq_len": getattr(metadata, "max_seq_len", None),
+            "block_tables_materialized": bool(
+                getattr(metadata, "block_tables_materialized", True)
+            ),
             "triton_decode_plan": cls.triton_decode_plan_signature(
                 getattr(metadata, "triton_decode_plan", None)
             ),
@@ -3156,6 +3184,7 @@ class TokenPoolDecodeGraphSignatureTracker:
                 "out_cache_loc_long",
                 "block_size",
                 "max_seq_len",
+                "block_tables_materialized",
                 "triton_decode_plan",
             ):
                 if expected_metadata.get(field) != actual_metadata.get(field):
@@ -5230,6 +5259,7 @@ class ReqToTokenTable:
         token_pool_capacity: int | None = None,
         workspace_key: str | None = None,
         validate: bool = True,
+        compact_block_tables: bool = True,
     ) -> PagedDecodeBatchMetadata:
         import torch
 
@@ -5253,6 +5283,9 @@ class ReqToTokenTable:
                 raise ValueError("block_table_width must be >= 1 or None")
         if token_pool_capacity is not None and int(token_pool_capacity) < 1:
             raise ValueError("token_pool_capacity must be >= 1 or None")
+        compact_block_tables = bool(compact_block_tables)
+        if validate and not compact_block_tables:
+            raise ValueError("compact block tables are required when validate=True")
         if len(set(req_slots_list)) != len(req_slots_list):
             raise ValueError("req_slots must be unique")
         if getattr(page_table, "ndim", None) != 2:
@@ -5311,28 +5344,43 @@ class ReqToTokenTable:
                     raise ValueError("out_cache_loc must be unique")
             out_long = out.to(dtype=torch.long)
 
-        req_slots_tensor = torch.as_tensor(req_slots_list, dtype=torch.long, device=device)
-        first_blocks_tensor = torch.as_tensor(first_blocks, dtype=torch.long, device=device)
-        offsets = torch.arange(max_blocks, dtype=torch.long, device=device)
-        logical_blocks = first_blocks_tensor[:, None] + offsets[None, :]
-        valid = offsets[None, :] < torch.as_tensor(
-            block_lens,
-            dtype=torch.long,
-            device=device,
-        )[:, None]
-        gathered = page_table[
-            req_slots_tensor[:, None],
-            logical_blocks.clamp(min=0, max=int(page_table.shape[1]) - 1),
-        ].to(dtype=torch.int32)
-        if validate and bool((gathered[valid] < 0).any().item()):
-            raise ValueError("page table is missing a selected logical block")
-        filled_block_tables = torch.where(
-            valid,
-            gathered,
-            torch.full_like(gathered, -1),
-        )
+        filled_block_tables = None
+        if compact_block_tables:
+            req_slots_tensor = torch.as_tensor(
+                req_slots_list,
+                dtype=torch.long,
+                device=device,
+            )
+            first_blocks_tensor = torch.as_tensor(
+                first_blocks,
+                dtype=torch.long,
+                device=device,
+            )
+            offsets = torch.arange(max_blocks, dtype=torch.long, device=device)
+            logical_blocks = first_blocks_tensor[:, None] + offsets[None, :]
+            valid = offsets[None, :] < torch.as_tensor(
+                block_lens,
+                dtype=torch.long,
+                device=device,
+            )[:, None]
+            gathered = page_table[
+                req_slots_tensor[:, None],
+                logical_blocks.clamp(min=0, max=int(page_table.shape[1]) - 1),
+            ].to(dtype=torch.int32)
+            if validate and bool((gathered[valid] < 0).any().item()):
+                raise ValueError("page table is missing a selected logical block")
+            filled_block_tables = torch.where(
+                valid,
+                gathered,
+                torch.full_like(gathered, -1),
+            )
 
         if out is not None and validate:
+            req_slots_tensor = torch.as_tensor(
+                req_slots_list,
+                dtype=torch.long,
+                device=device,
+            )
             final_positions = torch.as_tensor(logical_lens, dtype=torch.long, device=device) - 1
             final_blocks = final_positions // block_size
             final_offsets = final_positions % block_size
@@ -5376,7 +5424,8 @@ class ReqToTokenTable:
             selected_start_positions_tensor.copy_(
                 torch.as_tensor(starts, dtype=torch.int32, device=device)
             )
-            block_tables.copy_(filled_block_tables)
+            if filled_block_tables is not None:
+                block_tables.copy_(filled_block_tables)
             if out is not None:
                 out_ws = workspace["out_cache_loc"][: len(req_slots_list)]
                 out_ws.copy_(out)
@@ -5401,8 +5450,15 @@ class ReqToTokenTable:
                     workspace=workspace,
                 ),
                 request_block_tables=page_table,
+                block_tables_materialized=compact_block_tables,
             )
 
+        if filled_block_tables is None:
+            filled_block_tables = torch.empty(
+                (len(req_slots_list), max_blocks),
+                dtype=torch.int32,
+                device=device,
+            )
         return PagedDecodeBatchMetadata(
             req_pool_indices=torch.as_tensor(req_slots_list, dtype=torch.int32, device=device),
             seq_lens=torch.as_tensor(selected_lens, dtype=torch.int32, device=device),
@@ -5416,6 +5472,7 @@ class ReqToTokenTable:
             out_cache_loc_long=out_long,
             max_seq_len=max(selected_lens),
             request_block_tables=page_table,
+            block_tables_materialized=compact_block_tables,
         )
 
     def _ensure_paged_decode_metadata_workspace(
@@ -7085,6 +7142,9 @@ class TokenPoolDecodeBackendState:
         )
         if paged_only:
             should_build_paged = True
+        compact_paged_block_tables = not (
+            paged_only and not _token_pool_paged_split_requested()
+        )
 
         paged_metadata = None
         if should_build_paged:
@@ -7094,6 +7154,7 @@ class TokenPoolDecodeBackendState:
                 out_cache_loc=out_cache_loc_source,
                 sliding_window=sliding_window,
                 page_tables=page_tables,
+                compact_block_tables=compact_paged_block_tables,
             )
         if paged_only:
             if paged_metadata is None:
@@ -7127,6 +7188,7 @@ class TokenPoolDecodeBackendState:
         out_cache_loc: Iterable[int] | Any,
         sliding_window: int,
         page_tables: Iterable[dict[int, int]] | None = None,
+        compact_block_tables: bool = True,
     ) -> PagedDecodeBatchMetadata | None:
         req_slots_list = [int(slot) for slot in req_slots]
         logical_lens = [int(length) for length in logical_seq_lens]
@@ -7155,6 +7217,7 @@ class TokenPoolDecodeBackendState:
                     token_pool_capacity=self.token_pool_capacity,
                     workspace_key="sliding_attention_paged",
                     validate=False,
+                    compact_block_tables=compact_block_tables,
                 )
             except (RuntimeError, ValueError, KeyError):
                 pass
