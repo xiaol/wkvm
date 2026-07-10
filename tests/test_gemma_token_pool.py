@@ -3765,6 +3765,70 @@ class TestGemmaTokenPool(unittest.TestCase):
             reset_token_pool_triton_fallback_reasons()
             reset_token_pool_triton_stats_counts()
 
+    def test_token_pool_triton_stats_report_owns_dispatch_fields(self) -> None:
+        import os
+
+        from wkvm.runner.gemma_token_pool_attention import (
+            TOKEN_POOL_TRITON_DISPATCH_ENV_NAMES,
+            clear_token_pool_triton_disabled_shapes,
+            record_token_pool_triton_fallback,
+            reset_token_pool_triton_dispatch_plan_cache,
+            reset_token_pool_triton_fallback_reasons,
+            reset_token_pool_triton_stats_counts,
+            token_pool_triton_disabled_shapes,
+            token_pool_triton_stats_report,
+            token_pool_triton_stats_storage,
+        )
+
+        old_env = {
+            name: os.environ.get(name)
+            for name in TOKEN_POOL_TRITON_DISPATCH_ENV_NAMES
+        }
+        try:
+            for name in TOKEN_POOL_TRITON_DISPATCH_ENV_NAMES:
+                os.environ.pop(name, None)
+            os.environ["WKVM_ENABLE_TOKEN_POOL_TRITON"] = "1"
+            os.environ["WKVM_ENABLE_TOKEN_POOL_SPLIT_TRITON"] = "1"
+            os.environ["WKVM_ENABLE_TOKEN_POOL_PAGED_SPLIT_TRITON"] = "1"
+            os.environ["WKVM_TOKEN_POOL_TRITON_INPUT_PRECISION"] = "ieee"
+            os.environ["WKVM_TOKEN_POOL_TRITON_DOT_DTYPE"] = "native"
+            reset_token_pool_triton_dispatch_plan_cache()
+            reset_token_pool_triton_stats_counts()
+            reset_token_pool_triton_fallback_reasons()
+            clear_token_pool_triton_disabled_shapes()
+
+            token_pool_triton_stats_storage()["calls"] = 3
+            token_pool_triton_disabled_shapes().add(("shape", 1))
+            record_token_pool_triton_fallback("runtime")
+
+            stats = token_pool_triton_stats_report(
+                split_plan=(False, 128, 2, None),
+            )
+
+            self.assertEqual(stats["calls"], 3)
+            self.assertEqual(stats["fallback_reasons"], {"runtime": 1})
+            self.assertEqual(stats["disabled_shape_count"], 1)
+            self.assertTrue(stats["env_enabled"])
+            self.assertFalse(stats["env_disabled"])
+            self.assertTrue(stats["split_enabled"])
+            self.assertTrue(stats["paged_split_enabled"])
+            self.assertEqual(stats["split_size"], 128)
+            self.assertEqual(stats["split_min_splits"], 2)
+            self.assertEqual(stats["input_precision_policy"], "ieee")
+            self.assertEqual(stats["dot_dtype_policy"], "native")
+            self.assertTrue(stats["effective_enabled"])
+            self.assertFalse(stats["auto_default_enabled"])
+        finally:
+            for name, value in old_env.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+            clear_token_pool_triton_disabled_shapes()
+            reset_token_pool_triton_fallback_reasons()
+            reset_token_pool_triton_stats_counts()
+            reset_token_pool_triton_dispatch_plan_cache()
+
     def test_decode_backend_owns_attention_workspace(self) -> None:
         try:
             import torch

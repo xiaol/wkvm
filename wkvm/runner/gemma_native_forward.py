@@ -269,28 +269,9 @@ def _token_pool_attention_backend():
 
 
 def token_pool_triton_stats() -> dict[str, Any]:
-    from wkvm.runner.gemma_token_pool_attention import (
-        token_pool_triton_disabled_shape_count,
-        token_pool_triton_fallback_reasons,
-        token_pool_triton_stats_snapshot,
-    )
+    from wkvm.runner.gemma_token_pool_attention import token_pool_triton_stats_report
 
-    stats = token_pool_triton_stats_snapshot()
-    plan = _token_pool_triton_dispatch_plan()
-    split_plan = _token_pool_triton_split_plan(None)
-    stats["fallback_reasons"] = token_pool_triton_fallback_reasons()
-    stats["disabled_shape_count"] = token_pool_triton_disabled_shape_count()
-    stats["env_enabled"] = plan.env_enabled
-    stats["env_disabled"] = plan.env_disabled
-    stats["split_enabled"] = plan.split_enabled
-    stats["paged_split_enabled"] = plan.paged_split_enabled
-    stats["split_size"] = split_plan[1]
-    stats["split_min_splits"] = split_plan[2]
-    stats["input_precision_policy"] = plan.input_precision_policy
-    stats["dot_dtype_policy"] = plan.dot_dtype_policy
-    stats["effective_enabled"] = plan.effective_enabled
-    stats["auto_default_enabled"] = plan.auto_default_enabled
-    return stats
+    return token_pool_triton_stats_report(split_plan=_token_pool_triton_split_plan(None))
 
 
 def reset_token_pool_triton_stats(*, clear_disabled_shapes: bool = False) -> None:

@@ -289,6 +289,27 @@ def token_pool_triton_stats_snapshot() -> dict[str, int]:
     return dict(_TOKEN_POOL_TRITON_STATS)
 
 
+def token_pool_triton_stats_report(
+    *,
+    split_plan: tuple[bool, int, int, int | None],
+) -> dict[str, Any]:
+    stats: dict[str, Any] = token_pool_triton_stats_snapshot()
+    plan = token_pool_triton_dispatch_plan()
+    stats["fallback_reasons"] = token_pool_triton_fallback_reasons()
+    stats["disabled_shape_count"] = token_pool_triton_disabled_shape_count()
+    stats["env_enabled"] = plan.env_enabled
+    stats["env_disabled"] = plan.env_disabled
+    stats["split_enabled"] = plan.split_enabled
+    stats["paged_split_enabled"] = plan.paged_split_enabled
+    stats["split_size"] = int(split_plan[1])
+    stats["split_min_splits"] = int(split_plan[2])
+    stats["input_precision_policy"] = plan.input_precision_policy
+    stats["dot_dtype_policy"] = plan.dot_dtype_policy
+    stats["effective_enabled"] = plan.effective_enabled
+    stats["auto_default_enabled"] = plan.auto_default_enabled
+    return stats
+
+
 def reset_token_pool_triton_stats_counts() -> None:
     for key in _TOKEN_POOL_TRITON_STATS:
         _TOKEN_POOL_TRITON_STATS[key] = 0
