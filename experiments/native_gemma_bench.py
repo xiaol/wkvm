@@ -377,6 +377,14 @@ def uses_hf_tokenizer(args) -> bool:
     return prompt_token_source(args) == "hf_tokenizer"
 
 
+def uses_hf_config(args) -> bool:
+    return not bool(getattr(args, "native_gemma_checkpoint_loader", False))
+
+
+def native_gemma_config_loader(args) -> bool:
+    return not uses_hf_config(args)
+
+
 def load_bench_tokenizer(path: str, args):
     if getattr(args, "synthetic_prompts", False):
         return SyntheticBenchTokenizer(
@@ -413,6 +421,8 @@ def build_benchmark_payload(
         "model_path": path,
         "prompt_token_source": prompt_token_source(args),
         "uses_hf_tokenizer": uses_hf_tokenizer(args),
+        "uses_hf_config": uses_hf_config(args),
+        "native_gemma_config_loader": native_gemma_config_loader(args),
         "dtype": "bfloat16",
         "device": args.device,
         "attn": args.attn,
@@ -487,6 +497,8 @@ def build_benchmark_payload(
             "token_pool_triton_env": token_pool_triton_env,
             "synthetic_prompts": getattr(args, "synthetic_prompts", False),
             "synthetic_vocab_size": getattr(args, "synthetic_vocab_size", None),
+            "uses_hf_config": uses_hf_config(args),
+            "native_gemma_config_loader": native_gemma_config_loader(args),
             "slots": args.slots,
             "token_budget": args.token_budget,
         },

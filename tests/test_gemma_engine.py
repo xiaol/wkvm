@@ -227,8 +227,12 @@ class TestGemmaSchedulerAssumptions(unittest.TestCase):
         self.assertEqual(payload["torch_usable_gib"], None)
         self.assertEqual(payload["prompt_token_source"], "hf_tokenizer")
         self.assertTrue(payload["uses_hf_tokenizer"])
+        self.assertFalse(payload["uses_hf_config"])
+        self.assertTrue(payload["native_gemma_config_loader"])
         self.assertFalse(payload["config"]["synthetic_prompts"])
         self.assertEqual(payload["config"]["synthetic_vocab_size"], 262_144)
+        self.assertFalse(payload["config"]["uses_hf_config"])
+        self.assertTrue(payload["config"]["native_gemma_config_loader"])
         self.assertFalse(payload["uses_hf_transformer_forward"])
         self.assertFalse(payload["uses_hf_model_construction"])
         self.assertTrue(payload["native_gemma_checkpoint_loader"])
@@ -297,8 +301,33 @@ class TestGemmaSchedulerAssumptions(unittest.TestCase):
 
         self.assertEqual(payload["prompt_token_source"], "synthetic")
         self.assertFalse(payload["uses_hf_tokenizer"])
+        self.assertFalse(payload["uses_hf_config"])
+        self.assertTrue(payload["native_gemma_config_loader"])
         self.assertTrue(payload["config"]["synthetic_prompts"])
         self.assertEqual(payload["config"]["synthetic_vocab_size"], 128)
+        self.assertFalse(payload["config"]["uses_hf_config"])
+        self.assertTrue(payload["config"]["native_gemma_config_loader"])
+
+    def test_native_bench_payload_records_hf_config_for_hf_loader(self) -> None:
+        from experiments.native_gemma_bench import build_benchmark_payload
+
+        args = self.native_bench_payload_args(
+            native_gemma_checkpoint_loader=False,
+            use_native_gemma_forward=False,
+        )
+
+        payload = build_benchmark_payload(
+            args,
+            path="/models/gemma",
+            rows=[],
+            usable_gib=7.5,
+            token_pool_triton_env={},
+        )
+
+        self.assertTrue(payload["uses_hf_config"])
+        self.assertFalse(payload["native_gemma_config_loader"])
+        self.assertTrue(payload["config"]["uses_hf_config"])
+        self.assertFalse(payload["config"]["native_gemma_config_loader"])
 
     def test_native_bench_applies_token_pool_triton_env_flags(self) -> None:
         from experiments.native_gemma_bench import (
