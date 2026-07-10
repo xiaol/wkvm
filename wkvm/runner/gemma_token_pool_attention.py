@@ -4,8 +4,42 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+import os
 import time
 from typing import Any
+
+
+TOKEN_POOL_TRITON_DISPATCH_ENV_NAMES = (
+    "WKVM_ENABLE_TOKEN_POOL_TRITON",
+    "WKVM_DISABLE_TOKEN_POOL_TRITON",
+    "WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON",
+    "WKVM_ENABLE_TOKEN_POOL_SPLIT_TRITON",
+    "WKVM_TOKEN_POOL_TRITON_SPLIT_KV",
+    "WKVM_ENABLE_TOKEN_POOL_PAGED_SPLIT_TRITON",
+    "WKVM_TOKEN_POOL_TRITON_PAGED_SPLIT_KV",
+    "WKVM_TOKEN_POOL_TRITON_INPUT_PRECISION",
+    "WKVM_TOKEN_POOL_TRITON_DOT_DTYPE",
+    "WKVM_TOKEN_POOL_TRITON_STRICT",
+)
+
+
+@dataclass(frozen=True)
+class TokenPoolTritonDispatchPlan:
+    env_enabled: bool
+    env_forced_off: bool
+    env_disabled: bool
+    effective_enabled: bool
+    auto_default_enabled: bool
+    paged_enabled: bool
+    split_enabled: bool
+    paged_split_enabled: bool
+    input_precision_policy: str
+    dot_dtype_policy: str
+    strict: bool
+
+
+_TOKEN_POOL_TRITON_DISPATCH_ENV_KEY: tuple[str | None, ...] | None = None
+_TOKEN_POOL_TRITON_DISPATCH_PLAN: TokenPoolTritonDispatchPlan | None = None
 
 
 @dataclass(frozen=True)
@@ -42,6 +76,102 @@ class TokenPoolAttentionBackendHooks:
     record_triton_attempt_timing: Callable[[float], None]
     record_attention_timing: Callable[[str, int, float], None]
     now: Callable[[], float] = time.perf_counter
+
+
+def _coerce_env_bool(raw: str | None) -> bool | None:
+    if raw is None:
+        return None
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return False
+
+
+def token_pool_triton_input_precision_policy() -> str:
+    return token_pool_triton_input_precision_policy_from_raw(
+        os.environ.get("WKVM_TOKEN_POOL_TRITON_INPUT_PRECISION")
+    )
+
+
+def token_pool_triton_dot_dtype_policy() -> str:
+    return token_pool_triton_dot_dtype_policy_from_raw(
+        os.environ.get("WKVM_TOKEN_POOL_TRITON_DOT_DTYPE")
+    )
+
+
+def token_pool_triton_input_precision_policy_from_raw(raw: str | None) -> str:
+    return raw if raw is not None else "auto_float32_ieee_low_precision_tf32"
+
+
+def token_pool_triton_dot_dtype_policy_from_raw(raw: str | None) -> str:
+    return raw if raw is not None else "auto_float32_fp32_low_precision_native"
+
+
+def token_pool_triton_effective_enabled() -> tuple[bool, bool]:
+    plan = token_pool_triton_dispatch_plan()
+    return plan.effective_enabled, plan.auto_default_enabled
+
+
+def token_pool_triton_effective_enabled_from_values(
+    enabled: bool | None,
+    disabled: bool | None,
+) -> tuple[bool, bool]:
+    if disabled is True or enabled is False:
+        return False, False
+    if enabled is True:
+        return True, False
+    return True, True
+
+
+def token_pool_triton_dispatch_plan() -> TokenPoolTritonDispatchPlan:
+    global _TOKEN_POOL_TRITON_DISPATCH_ENV_KEY, _TOKEN_POOL_TRITON_DISPATCH_PLAN
+
+    env_key = tuple(
+        os.environ.get(name) for name in TOKEN_POOL_TRITON_DISPATCH_ENV_NAMES
+    )
+    if (
+        _TOKEN_POOL_TRITON_DISPATCH_PLAN is not None
+        and env_key == _TOKEN_POOL_TRITON_DISPATCH_ENV_KEY
+    ):
+        return _TOKEN_POOL_TRITON_DISPATCH_PLAN
+
+    enabled = _coerce_env_bool(env_key[0])
+    disabled = _coerce_env_bool(env_key[1])
+    effective_enabled, auto_default_enabled = (
+        token_pool_triton_effective_enabled_from_values(enabled, disabled)
+    )
+    plan = TokenPoolTritonDispatchPlan(
+        env_enabled=enabled is True,
+        env_forced_off=enabled is False,
+        env_disabled=disabled is True,
+        effective_enabled=effective_enabled,
+        auto_default_enabled=auto_default_enabled,
+        paged_enabled=_coerce_env_bool(env_key[2]) is True,
+        split_enabled=(
+            _coerce_env_bool(env_key[3]) is True
+            or _coerce_env_bool(env_key[4]) is True
+        ),
+        paged_split_enabled=(
+            _coerce_env_bool(env_key[5]) is True
+            or _coerce_env_bool(env_key[6]) is True
+        ),
+        input_precision_policy=token_pool_triton_input_precision_policy_from_raw(
+            env_key[7]
+        ),
+        dot_dtype_policy=token_pool_triton_dot_dtype_policy_from_raw(env_key[8]),
+        strict=str(env_key[9] or "").lower() in {"1", "true", "yes"},
+    )
+    _TOKEN_POOL_TRITON_DISPATCH_ENV_KEY = env_key
+    _TOKEN_POOL_TRITON_DISPATCH_PLAN = plan
+    return plan
+
+
+def reset_token_pool_triton_dispatch_plan_cache() -> None:
+    global _TOKEN_POOL_TRITON_DISPATCH_ENV_KEY, _TOKEN_POOL_TRITON_DISPATCH_PLAN
+    _TOKEN_POOL_TRITON_DISPATCH_ENV_KEY = None
+    _TOKEN_POOL_TRITON_DISPATCH_PLAN = None
 
 
 class TokenPoolAttentionBackend:

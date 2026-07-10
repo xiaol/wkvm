@@ -3156,6 +3156,61 @@ class TestGemmaTokenPool(unittest.TestCase):
             base_metadata,
         )
 
+    def test_attention_module_owns_triton_dispatch_plan_env_cache(self) -> None:
+        import os
+        from wkvm.runner.gemma_token_pool_attention import (
+            TOKEN_POOL_TRITON_DISPATCH_ENV_NAMES,
+            reset_token_pool_triton_dispatch_plan_cache,
+            token_pool_triton_dispatch_plan,
+        )
+
+        old_env = {
+            name: os.environ.get(name)
+            for name in TOKEN_POOL_TRITON_DISPATCH_ENV_NAMES
+        }
+        try:
+            for name in TOKEN_POOL_TRITON_DISPATCH_ENV_NAMES:
+                os.environ.pop(name, None)
+            reset_token_pool_triton_dispatch_plan_cache()
+            auto = token_pool_triton_dispatch_plan()
+            cached_auto = token_pool_triton_dispatch_plan()
+            self.assertIs(auto, cached_auto)
+            self.assertTrue(auto.effective_enabled)
+            self.assertTrue(auto.auto_default_enabled)
+            self.assertFalse(auto.paged_enabled)
+
+            os.environ["WKVM_ENABLE_TOKEN_POOL_TRITON"] = "0"
+            forced_off = token_pool_triton_dispatch_plan()
+            self.assertIsNot(auto, forced_off)
+            self.assertFalse(forced_off.effective_enabled)
+            self.assertFalse(forced_off.auto_default_enabled)
+            self.assertTrue(forced_off.env_forced_off)
+
+            os.environ["WKVM_ENABLE_TOKEN_POOL_TRITON"] = "1"
+            os.environ["WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON"] = "1"
+            os.environ["WKVM_TOKEN_POOL_TRITON_SPLIT_KV"] = "1"
+            os.environ["WKVM_TOKEN_POOL_TRITON_PAGED_SPLIT_KV"] = "1"
+            os.environ["WKVM_TOKEN_POOL_TRITON_INPUT_PRECISION"] = "ieee"
+            os.environ["WKVM_TOKEN_POOL_TRITON_DOT_DTYPE"] = "native"
+            os.environ["WKVM_TOKEN_POOL_TRITON_STRICT"] = "yes"
+            explicit = token_pool_triton_dispatch_plan()
+            self.assertTrue(explicit.env_enabled)
+            self.assertTrue(explicit.effective_enabled)
+            self.assertFalse(explicit.auto_default_enabled)
+            self.assertTrue(explicit.paged_enabled)
+            self.assertTrue(explicit.split_enabled)
+            self.assertTrue(explicit.paged_split_enabled)
+            self.assertEqual(explicit.input_precision_policy, "ieee")
+            self.assertEqual(explicit.dot_dtype_policy, "native")
+            self.assertTrue(explicit.strict)
+        finally:
+            for name, value in old_env.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+            reset_token_pool_triton_dispatch_plan_cache()
+
     def test_attention_backend_owns_reference_fallback_ordering(self) -> None:
         from types import SimpleNamespace
         from wkvm.runner.gemma_token_pool_attention import (

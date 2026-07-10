@@ -17,20 +17,6 @@ _TOKEN_POOL_TRITON_SPLIT_DECODE_FN = None
 _TOKEN_POOL_TRITON_PAGED_DECODE_FN = None
 _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN = None
 _TOKEN_POOL_ATTENTION_BACKEND = None
-_TOKEN_POOL_TRITON_DISPATCH_ENV_NAMES = (
-    "WKVM_ENABLE_TOKEN_POOL_TRITON",
-    "WKVM_DISABLE_TOKEN_POOL_TRITON",
-    "WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON",
-    "WKVM_ENABLE_TOKEN_POOL_SPLIT_TRITON",
-    "WKVM_TOKEN_POOL_TRITON_SPLIT_KV",
-    "WKVM_ENABLE_TOKEN_POOL_PAGED_SPLIT_TRITON",
-    "WKVM_TOKEN_POOL_TRITON_PAGED_SPLIT_KV",
-    "WKVM_TOKEN_POOL_TRITON_INPUT_PRECISION",
-    "WKVM_TOKEN_POOL_TRITON_DOT_DTYPE",
-    "WKVM_TOKEN_POOL_TRITON_STRICT",
-)
-_TOKEN_POOL_TRITON_DISPATCH_ENV_KEY = None
-_TOKEN_POOL_TRITON_DISPATCH_PLAN = None
 _TOKEN_POOL_TRITON_STATS: dict[str, int] = {
     "calls": 0,
     "env_enabled_calls": 0,
@@ -58,21 +44,6 @@ _TOKEN_POOL_TRITON_STATS: dict[str, int] = {
     "split_skips_by_min_splits": 0,
 }
 _TOKEN_POOL_TRITON_FALLBACK_REASONS: dict[str, int] = {}
-
-
-@dataclass(frozen=True)
-class TokenPoolTritonDispatchPlan:
-    env_enabled: bool
-    env_forced_off: bool
-    env_disabled: bool
-    effective_enabled: bool
-    auto_default_enabled: bool
-    paged_enabled: bool
-    split_enabled: bool
-    paged_split_enabled: bool
-    input_precision_policy: str
-    dot_dtype_policy: str
-    strict: bool
 
 
 _NATIVE_FORWARD_TIMING_STATS: dict[str, float | int] = {
@@ -220,66 +191,41 @@ def _token_pool_triton_min_splits() -> int:
 
 
 def _token_pool_triton_input_precision_policy() -> str:
-    return _token_pool_triton_input_precision_policy_from_raw(
-        os.environ.get("WKVM_TOKEN_POOL_TRITON_INPUT_PRECISION")
+    from wkvm.runner.gemma_token_pool_attention import (
+        token_pool_triton_input_precision_policy,
     )
+
+    return token_pool_triton_input_precision_policy()
 
 
 def _token_pool_triton_dot_dtype_policy() -> str:
-    return _token_pool_triton_dot_dtype_policy_from_raw(
-        os.environ.get("WKVM_TOKEN_POOL_TRITON_DOT_DTYPE")
+    from wkvm.runner.gemma_token_pool_attention import (
+        token_pool_triton_dot_dtype_policy,
     )
+
+    return token_pool_triton_dot_dtype_policy()
 
 
 def _token_pool_triton_input_precision_policy_from_raw(raw: str | None) -> str:
-    return raw if raw is not None else "auto_float32_ieee_low_precision_tf32"
+    from wkvm.runner.gemma_token_pool_attention import (
+        token_pool_triton_input_precision_policy_from_raw,
+    )
+
+    return token_pool_triton_input_precision_policy_from_raw(raw)
 
 
 def _token_pool_triton_dot_dtype_policy_from_raw(raw: str | None) -> str:
-    return raw if raw is not None else "auto_float32_fp32_low_precision_native"
-
-
-def _token_pool_triton_dispatch_plan() -> TokenPoolTritonDispatchPlan:
-    global _TOKEN_POOL_TRITON_DISPATCH_ENV_KEY, _TOKEN_POOL_TRITON_DISPATCH_PLAN
-
-    env_key = tuple(
-        os.environ.get(name) for name in _TOKEN_POOL_TRITON_DISPATCH_ENV_NAMES
+    from wkvm.runner.gemma_token_pool_attention import (
+        token_pool_triton_dot_dtype_policy_from_raw,
     )
-    if (
-        _TOKEN_POOL_TRITON_DISPATCH_PLAN is not None
-        and env_key == _TOKEN_POOL_TRITON_DISPATCH_ENV_KEY
-    ):
-        return _TOKEN_POOL_TRITON_DISPATCH_PLAN
 
-    enabled = _coerce_env_bool(env_key[0])
-    disabled = _coerce_env_bool(env_key[1])
-    effective_enabled, auto_default_enabled = (
-        _token_pool_triton_effective_enabled_from_values(enabled, disabled)
-    )
-    plan = TokenPoolTritonDispatchPlan(
-        env_enabled=enabled is True,
-        env_forced_off=enabled is False,
-        env_disabled=disabled is True,
-        effective_enabled=effective_enabled,
-        auto_default_enabled=auto_default_enabled,
-        paged_enabled=_coerce_env_bool(env_key[2]) is True,
-        split_enabled=(
-            _coerce_env_bool(env_key[3]) is True
-            or _coerce_env_bool(env_key[4]) is True
-        ),
-        paged_split_enabled=(
-            _coerce_env_bool(env_key[5]) is True
-            or _coerce_env_bool(env_key[6]) is True
-        ),
-        input_precision_policy=_token_pool_triton_input_precision_policy_from_raw(
-            env_key[7]
-        ),
-        dot_dtype_policy=_token_pool_triton_dot_dtype_policy_from_raw(env_key[8]),
-        strict=str(env_key[9] or "").lower() in {"1", "true", "yes"},
-    )
-    _TOKEN_POOL_TRITON_DISPATCH_ENV_KEY = env_key
-    _TOKEN_POOL_TRITON_DISPATCH_PLAN = plan
-    return plan
+    return token_pool_triton_dot_dtype_policy_from_raw(raw)
+
+
+def _token_pool_triton_dispatch_plan():
+    from wkvm.runner.gemma_token_pool_attention import token_pool_triton_dispatch_plan
+
+    return token_pool_triton_dispatch_plan()
 
 
 def _token_pool_triton_block_groups(groups: int, dtype: Any) -> int:
@@ -321,19 +267,22 @@ def _token_pool_triton_metadata_split_plan(
 
 
 def _token_pool_triton_effective_enabled() -> tuple[bool, bool]:
-    plan = _token_pool_triton_dispatch_plan()
-    return plan.effective_enabled, plan.auto_default_enabled
+    from wkvm.runner.gemma_token_pool_attention import (
+        token_pool_triton_effective_enabled,
+    )
+
+    return token_pool_triton_effective_enabled()
 
 
 def _token_pool_triton_effective_enabled_from_values(
     enabled: bool | None,
     disabled: bool | None,
 ) -> tuple[bool, bool]:
-    if disabled is True or enabled is False:
-        return False, False
-    if enabled is True:
-        return True, False
-    return True, True
+    from wkvm.runner.gemma_token_pool_attention import (
+        token_pool_triton_effective_enabled_from_values,
+    )
+
+    return token_pool_triton_effective_enabled_from_values(enabled, disabled)
 
 
 def _token_pool_triton_decode_fn():
@@ -447,8 +396,11 @@ def token_pool_triton_stats() -> dict[str, Any]:
 def reset_token_pool_triton_stats(*, clear_disabled_shapes: bool = False) -> None:
     global _TOKEN_POOL_TRITON_DECODE_FN, _TOKEN_POOL_TRITON_SPLIT_DECODE_FN
     global _TOKEN_POOL_TRITON_PAGED_DECODE_FN, _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN
-    global _TOKEN_POOL_TRITON_DISPATCH_ENV_KEY, _TOKEN_POOL_TRITON_DISPATCH_PLAN
     global _TOKEN_POOL_ATTENTION_BACKEND
+    from wkvm.runner.gemma_token_pool_attention import (
+        reset_token_pool_triton_dispatch_plan_cache,
+    )
+
     for key in _TOKEN_POOL_TRITON_STATS:
         _TOKEN_POOL_TRITON_STATS[key] = 0
     _TOKEN_POOL_TRITON_FALLBACK_REASONS.clear()
@@ -457,8 +409,7 @@ def reset_token_pool_triton_stats(*, clear_disabled_shapes: bool = False) -> Non
     _TOKEN_POOL_TRITON_PAGED_DECODE_FN = None
     _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN = None
     _TOKEN_POOL_ATTENTION_BACKEND = None
-    _TOKEN_POOL_TRITON_DISPATCH_ENV_KEY = None
-    _TOKEN_POOL_TRITON_DISPATCH_PLAN = None
+    reset_token_pool_triton_dispatch_plan_cache()
     if clear_disabled_shapes:
         _TOKEN_POOL_TRITON_DISABLED_SHAPES.clear()
 
