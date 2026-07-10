@@ -141,6 +141,34 @@ def token_pool_triton_dot_dtype_policy_from_raw(raw: str | None) -> str:
     return raw if raw is not None else "auto_float32_fp32_low_precision_native"
 
 
+def token_pool_triton_block_groups(groups: int, dtype: Any) -> int:
+    groups = int(groups)
+    fallback = 1 << (groups - 1).bit_length()
+    try:
+        from wkvm.runner.gemma_token_pool_triton import _block_g, _resolve_native_dot
+
+        return int(_block_g(groups, _resolve_native_dot(dtype)))
+    except Exception:
+        return fallback
+
+
+def is_recoverable_token_pool_triton_error(exc: RuntimeError) -> bool:
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "out of resource",
+            "shared memory",
+            "ptxas",
+            "triton",
+            "cuda error",
+            "invalid argument",
+            "illegal memory access",
+            "no kernel image",
+        )
+    )
+
+
 def token_pool_triton_effective_enabled() -> tuple[bool, bool]:
     plan = token_pool_triton_dispatch_plan()
     return plan.effective_enabled, plan.auto_default_enabled
@@ -745,12 +773,16 @@ def build_token_pool_attention_backend(
     record_kv_write_timing: Callable[..., None],
     record_triton_attempt_timing: Callable[[float], None],
     record_attention_timing: Callable[[str, int, float], None],
-    block_groups: Callable[[int, Any], int],
-    is_recoverable_runtime_error: Callable[[RuntimeError], bool],
+    block_groups: Callable[[int, Any], int] | None = None,
+    is_recoverable_runtime_error: Callable[[RuntimeError], bool] | None = None,
     now: Callable[[], float] = time.perf_counter,
     stats: dict[str, int] | None = None,
     disabled_shapes: set[tuple[Any, ...]] | None = None,
 ) -> TokenPoolAttentionBackend:
+    block_groups = block_groups or token_pool_triton_block_groups
+    is_recoverable_runtime_error = (
+        is_recoverable_runtime_error or is_recoverable_token_pool_triton_error
+    )
     triton_hooks = TokenPoolTritonAttentionBackendHooks(
         decode_fn=token_pool_triton_decode_fn,
         split_decode_fn=token_pool_triton_split_decode_fn,

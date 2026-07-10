@@ -175,14 +175,11 @@ def _token_pool_triton_dispatch_plan():
 
 
 def _token_pool_triton_block_groups(groups: int, dtype: Any) -> int:
-    groups = int(groups)
-    fallback = 1 << (groups - 1).bit_length()
-    try:
-        from wkvm.runner.gemma_token_pool_triton import _block_g, _resolve_native_dot
+    from wkvm.runner.gemma_token_pool_attention import (
+        token_pool_triton_block_groups,
+    )
 
-        return int(_block_g(groups, _resolve_native_dot(dtype)))
-    except Exception:
-        return fallback
+    return token_pool_triton_block_groups(groups, dtype)
 
 
 def _token_pool_triton_split_plan(max_seq_len: Any) -> tuple[bool, int, int, int | None]:
@@ -261,8 +258,6 @@ def _token_pool_attention_backend():
             record_kv_write_timing=_record_token_pool_kv_write_timing,
             record_triton_attempt_timing=_record_token_pool_triton_attempt_timing,
             record_attention_timing=_record_token_pool_attention_backend_timing,
-            block_groups=_token_pool_triton_block_groups,
-            is_recoverable_runtime_error=_is_recoverable_token_pool_triton_error,
             now=time.perf_counter,
         )
     return _TOKEN_POOL_ATTENTION_BACKEND
@@ -1403,20 +1398,11 @@ def _attention_forward_token_pool_gqa(
 
 
 def _is_recoverable_token_pool_triton_error(exc: RuntimeError) -> bool:
-    text = str(exc).lower()
-    return any(
-        marker in text
-        for marker in (
-            "out of resource",
-            "shared memory",
-            "ptxas",
-            "triton",
-            "cuda error",
-            "invalid argument",
-            "illegal memory access",
-            "no kernel image",
-        )
+    from wkvm.runner.gemma_token_pool_attention import (
+        is_recoverable_token_pool_triton_error,
     )
+
+    return is_recoverable_token_pool_triton_error(exc)
 
 
 def _attention_forward(

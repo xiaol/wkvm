@@ -4307,10 +4307,12 @@ class TestGemmaTokenPool(unittest.TestCase):
         from wkvm.runner.gemma_token_pool_attention import (
             build_token_pool_attention_backend,
             clear_token_pool_triton_disabled_shapes,
+            is_recoverable_token_pool_triton_error,
             reset_token_pool_triton_fallback_reasons,
             reset_token_pool_triton_stats_counts,
             token_pool_triton_disabled_shapes,
             token_pool_triton_fallback_reasons,
+            token_pool_triton_block_groups,
             token_pool_triton_stats_snapshot,
         )
 
@@ -4367,8 +4369,6 @@ class TestGemmaTokenPool(unittest.TestCase):
                 record_kv_write_timing=lambda **kwargs: None,
                 record_triton_attempt_timing=lambda elapsed: None,
                 record_attention_timing=lambda kind, rows, elapsed: None,
-                block_groups=lambda groups, dtype: groups,
-                is_recoverable_runtime_error=lambda exc: True,
                 now=lambda: 0.0,
             )
             result = backend.decode(
@@ -4386,6 +4386,19 @@ class TestGemmaTokenPool(unittest.TestCase):
             self.assertEqual(
                 token_pool_triton_fallback_reasons(),
                 {"disabled_shape": 1},
+            )
+            block_groups = token_pool_triton_block_groups(3, object())
+            self.assertIsInstance(block_groups, int)
+            self.assertGreaterEqual(block_groups, 3)
+            self.assertTrue(
+                is_recoverable_token_pool_triton_error(
+                    RuntimeError("out of resource: shared memory")
+                )
+            )
+            self.assertFalse(
+                is_recoverable_token_pool_triton_error(
+                    RuntimeError("deterministic validation failure")
+                )
             )
             self.assertEqual(
                 reference_calls,
