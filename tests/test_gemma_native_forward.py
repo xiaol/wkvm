@@ -71,6 +71,42 @@ def _checkpoint_layout_state_dict(hf_model):
     return state
 
 
+def _token_pool_backend_decode(
+    native_forward,
+    attn,
+    query_states,
+    *,
+    decode_metadata,
+    paged_decode_metadata=None,
+    token_kv_pool,
+    layer_idx: int,
+    token_pool_plan=None,
+    current_key_states=None,
+    current_value_states=None,
+):
+    from wkvm.runner.gemma_token_pool import build_token_pool_attention_call
+
+    attention_call = build_token_pool_attention_call(
+        token_pool_plan=token_pool_plan,
+        decode_metadata=decode_metadata,
+        paged_decode_metadata=paged_decode_metadata,
+        token_kv_pool=token_kv_pool,
+        layer_idx=layer_idx,
+        attention_mask_present=False,
+        query_seq_len=query_states.shape[2],
+    ).with_current_kv(
+        current_key_states,
+        current_value_states,
+    )
+    result = native_forward._token_pool_attention_backend().decode_call(
+        attn,
+        query_states,
+        attention_call=attention_call,
+        timing_enabled=False,
+    )
+    return result.output, result.weights
+
+
 class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
     def test_prefill_layer_matches_hf_decoder_layer(self) -> None:
         import torch
@@ -566,6 +602,51 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
         self.assertEqual(calls["current_key_states"], "current_key_states")
         self.assertEqual(calls["current_value_states"], "current_value_states")
 
+    def test_token_pool_attention_adapter_delegates_to_backend_call(self) -> None:
+        from types import SimpleNamespace
+        import wkvm.runner.gemma_native_forward as native_forward
+
+        old_backend = native_forward._TOKEN_POOL_ATTENTION_BACKEND
+        calls = {}
+
+        class FakeQuery:
+            shape = (1, 8, 1, 512)
+
+        class Backend:
+            def decode_call(self, actual_attn, actual_query_states, **kwargs):
+                calls["attn"] = actual_attn
+                calls["query_states"] = actual_query_states
+                calls.update(kwargs["attention_call"].backend_decode_kwargs())
+                return SimpleNamespace(output="token_pool", weights="weights")
+
+        attn = SimpleNamespace(num_key_value_groups=4, scaling=1.0)
+        query_states = FakeQuery()
+        try:
+            native_forward._TOKEN_POOL_ATTENTION_BACKEND = Backend()
+            actual = native_forward._attention_forward_token_pool_gqa(
+                attn,
+                query_states,
+                decode_metadata="metadata",
+                paged_decode_metadata="paged_metadata",
+                token_kv_pool="pool",
+                layer_idx=5,
+                current_key_states="key",
+                current_value_states="value",
+            )
+        finally:
+            native_forward._TOKEN_POOL_ATTENTION_BACKEND = old_backend
+
+        self.assertEqual(actual, ("token_pool", "weights"))
+        self.assertIs(calls["attn"], attn)
+        self.assertIs(calls["query_states"], query_states)
+        self.assertEqual(calls["decode_metadata"], "metadata")
+        self.assertEqual(calls["paged_decode_metadata"], "paged_metadata")
+        self.assertEqual(calls["token_kv_pool"], "pool")
+        self.assertEqual(calls["layer_idx"], 5)
+        self.assertIsNone(calls["token_pool_plan"])
+        self.assertEqual(calls["current_key_states"], "key")
+        self.assertEqual(calls["current_value_states"], "value")
+
     def test_token_pool_triton_stats_account_recoverable_fallback(self) -> None:
         import os
         import sys
@@ -602,7 +683,8 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
                 return "key_buffer", "value_buffer"
 
         try:
-            actual = native_forward._attention_forward_token_pool_gqa(
+            actual = _token_pool_backend_decode(
+                native_forward,
                 SimpleNamespace(num_key_value_groups=4, scaling=1.0),
                 FakeQuery(),
                 decode_metadata=SimpleNamespace(kv_indptr="indptr", kv_indices="indices"),
@@ -610,7 +692,8 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
                 layer_idx=0,
             )
             self.assertEqual(actual, ("reference", None))
-            second = native_forward._attention_forward_token_pool_gqa(
+            second = _token_pool_backend_decode(
+                native_forward,
                 SimpleNamespace(num_key_value_groups=4, scaling=1.0),
                 FakeQuery(),
                 decode_metadata=SimpleNamespace(kv_indptr="indptr", kv_indices="indices"),
@@ -797,7 +880,8 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
         plan = Plan()
 
         try:
-            actual = native_forward._attention_forward_token_pool_gqa(
+            actual = _token_pool_backend_decode(
+                native_forward,
                 SimpleNamespace(num_key_value_groups=4, scaling=1.0),
                 FakeQuery(),
                 decode_metadata=plan.metadata,
@@ -894,7 +978,8 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
         try:
             os.environ["WKVM_DISABLE_TOKEN_POOL_TRITON"] = "1"
             native_forward._attention_forward_token_pool_gqa_reference = reference
-            actual = native_forward._attention_forward_token_pool_gqa(
+            actual = _token_pool_backend_decode(
+                native_forward,
                 SimpleNamespace(num_key_value_groups=4, scaling=1.0),
                 FakeQuery(),
                 decode_metadata=SimpleNamespace(
@@ -963,7 +1048,8 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
                 return "key_buffer", "value_buffer"
 
         try:
-            auto = native_forward._attention_forward_token_pool_gqa(
+            auto = _token_pool_backend_decode(
+                native_forward,
                 SimpleNamespace(num_key_value_groups=4, scaling=1.0),
                 FakeQuery(),
                 decode_metadata=SimpleNamespace(kv_indptr="indptr", kv_indices="indices"),
@@ -971,7 +1057,8 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
                 layer_idx=0,
             )
             os.environ["WKVM_DISABLE_TOKEN_POOL_TRITON"] = "1"
-            disabled = native_forward._attention_forward_token_pool_gqa(
+            disabled = _token_pool_backend_decode(
+                native_forward,
                 SimpleNamespace(num_key_value_groups=4, scaling=1.0),
                 FakeQuery(),
                 decode_metadata=SimpleNamespace(kv_indptr="indptr", kv_indices="indices"),
@@ -1119,7 +1206,8 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
             block_size=32,
         )
         try:
-            actual = native_forward._attention_forward_token_pool_gqa(
+            actual = _token_pool_backend_decode(
+                native_forward,
                 SimpleNamespace(num_key_value_groups=4, scaling=1.0),
                 FakeQuery(),
                 decode_metadata=metadata,
