@@ -311,6 +311,59 @@ class TestGemmaSchedulerAssumptions(unittest.TestCase):
         self.assertEqual(prompt_token_source(args), "synthetic")
         self.assertFalse(uses_hf_tokenizer(args))
 
+    def test_native_bench_no_hf_preflight_runs_before_tokenizer_load(self) -> None:
+        import json
+        import tempfile
+        from pathlib import Path
+
+        import experiments.native_gemma_bench as bench
+
+        def fail_tokenizer_load(path, args):
+            raise AssertionError(f"unexpected tokenizer load from {path}")
+
+        old_torch_usable_gib = bench.torch_usable_gib
+        old_resolve_model_path = bench.resolve_model_path
+        old_load_bench_tokenizer = bench.load_bench_tokenizer
+        try:
+            bench.torch_usable_gib = lambda mem_cap_gib: None
+            bench.resolve_model_path = lambda explicit: "/unused/model"
+            bench.load_bench_tokenizer = fail_tokenizer_load
+            with tempfile.TemporaryDirectory() as raw_tmp:
+                payload_path = Path(raw_tmp) / "payload.json"
+                args = self.native_bench_payload_args(
+                    json=str(payload_path),
+                    model_path="/unused/model",
+                    synthetic_prompts=False,
+                    require_native_no_hf=True,
+                    enable_token_pool_triton=False,
+                    enable_token_pool_paged_triton=False,
+                    enable_token_pool_paged_split_triton=False,
+                    token_pool_triton_strict=False,
+                    token_pool_sliding_paged_metadata_only=False,
+                )
+
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "native no-HF setup requirement failed before tokenizer",
+                ):
+                    bench.run(args)
+
+                payload = json.loads(payload_path.read_text())
+        finally:
+            bench.torch_usable_gib = old_torch_usable_gib
+            bench.resolve_model_path = old_resolve_model_path
+            bench.load_bench_tokenizer = old_load_bench_tokenizer
+
+        self.assertEqual(
+            payload["fatal_error"]["phase"],
+            "native_no_hf_setup_validation",
+        )
+        self.assertEqual(
+            payload["native_no_hf_requirement"]["setup_problems"],
+            ["uses_hf_tokenizer_not_false"],
+        )
+        self.assertEqual(payload["rows"], [])
+
     def test_native_bench_payload_records_synthetic_prompt_source(self) -> None:
         from experiments.native_gemma_bench import build_benchmark_payload
 

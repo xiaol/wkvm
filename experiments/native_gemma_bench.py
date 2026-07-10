@@ -995,12 +995,6 @@ def run(args) -> dict[str, Any]:
     try:
         setup_phase = "torch_memory_probe"
         usable_gib = torch_usable_gib(args.mem_cap_gib)
-        setup_phase = (
-            "synthetic_tokenizer_init"
-            if getattr(args, "synthetic_prompts", False)
-            else "tokenizer_load"
-        )
-        tok = load_bench_tokenizer(path, args)
         setup_phase = "native_checkpoint_argument_validation"
         if args.native_gemma_checkpoint_loader:
             args.use_native_gemma_forward = True
@@ -1015,6 +1009,20 @@ def run(args) -> dict[str, Any]:
                     "decoder layers, so "
                     "--native-gemma-release-hf-decoder-layers is invalid"
                 )
+        setup_phase = "native_no_hf_setup_validation"
+        if args.require_native_no_hf:
+            setup_problems = native_no_hf_setup_problems(args)
+            if setup_problems:
+                raise RuntimeError(
+                    "native no-HF setup requirement failed before tokenizer/model "
+                    f"load: {setup_problems}"
+                )
+        setup_phase = (
+            "synthetic_tokenizer_init"
+            if getattr(args, "synthetic_prompts", False)
+            else "tokenizer_load"
+        )
+        tok = load_bench_tokenizer(path, args)
         release_per_row = bool(args.native_gemma_release_hf_decoder_layers)
 
         model = None
