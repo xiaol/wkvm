@@ -2106,6 +2106,7 @@ class TestGemmaTokenPool(unittest.TestCase):
             previous_length=5,
         )
 
+        raw_page_table_builder = table.build_paged_decode_metadata_from_page_table_tensor
         with patch.object(
             backend,
             "page_tables_for_requests",
@@ -2113,13 +2114,14 @@ class TestGemmaTokenPool(unittest.TestCase):
         ), patch.object(
             table,
             "build_paged_decode_metadata_from_page_table_tensor",
-            side_effect=AssertionError("raw page-table tensor builder used"),
-        ):
+            wraps=raw_page_table_builder,
+        ) as build_from_tensor:
             prepared = backend.prepare_decode_batch_state(
                 [reservation],
                 sliding_window=5,
                 layer_type_by_layer_id={0: "sliding_attention"},
             )
+        self.assertEqual(build_from_tensor.call_count, 1)
 
         context = prepared.build_context(
             kv_pool=pool,
