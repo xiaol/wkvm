@@ -843,7 +843,8 @@ class TokenPoolAttentionBinding:
         return self.kv_pool is not None
 
     def out_cache_loc_for_write(self) -> Any | None:
-        return _metadata_out_cache_loc_for_write(self.metadata)
+        metadata = self.metadata if self.metadata is not None else self.paged_metadata
+        return _metadata_out_cache_loc_for_write(metadata)
 
     def has_write_location(self) -> bool:
         return self.out_cache_loc_for_write() is not None
@@ -873,7 +874,7 @@ class TokenPoolAttentionBinding:
     ) -> bool:
         return _token_pool_decode_attention_enabled(
             layer_idx=self.layer_idx,
-            metadata=self.metadata,
+            metadata=self.metadata if self.metadata is not None else self.paged_metadata,
             kv_pool=self.kv_pool,
             attention_mask_present=attention_mask_present,
             query_seq_len=query_seq_len,
@@ -1357,7 +1358,7 @@ def build_token_pool_attention_call(
             "layer_idx": layer_idx,
         },
         decode_attention_enabled=(
-            decode_metadata is not None
+            (decode_metadata is not None or paged_decode_metadata is not None)
             and token_kv_pool is not None
             and layer_idx is not None
             and not bool(attention_mask_present)
@@ -1457,6 +1458,8 @@ def _binding_out_cache_loc_for_write(binding: Any | None, metadata: Any | None) 
     out_cache_loc_for_write = getattr(binding, "out_cache_loc_for_write", None)
     if out_cache_loc_for_write is not None:
         return out_cache_loc_for_write()
+    if metadata is None:
+        metadata = getattr(binding, "paged_metadata", None)
     return _metadata_out_cache_loc_for_write(metadata)
 
 
@@ -2092,6 +2095,21 @@ def _token_pool_paged_metadata_requested() -> bool:
             "WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON",
             "WKVM_ENABLE_TOKEN_POOL_PAGED_SPLIT_TRITON",
             "WKVM_TOKEN_POOL_BUILD_PAGED_METADATA",
+        )
+    )
+
+
+def _token_pool_sliding_paged_metadata_only_requested() -> bool:
+    if _env_flag("WKVM_TOKEN_POOL_SLIDING_PAGED_METADATA_ONLY"):
+        return True
+    if not _env_flag("WKVM_TOKEN_POOL_TRITON_STRICT"):
+        return False
+    return any(
+        _env_flag(name)
+        for name in (
+            "WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON",
+            "WKVM_ENABLE_TOKEN_POOL_PAGED_SPLIT_TRITON",
+            "WKVM_TOKEN_POOL_TRITON_PAGED_SPLIT_KV",
         )
     )
 
@@ -5556,16 +5574,23 @@ class TokenPoolDecodeBackendState:
         covered_layer_types: Iterable[str] | None = None,
     ) -> TokenPoolDecodeBatchState:
         if covered_layer_types is None:
-            covered_layer_types = (
-                ()
-                if self.kv_pool is None
-                else (
-                    layer_type
-                    for layer_type, metadata in metadata_by_layer_type.items()
-                    if metadata is not None
-                    and getattr(metadata, "out_cache_loc", None) is not None
-                )
-            )
+            covered: set[str] = set()
+            if self.kv_pool is not None:
+                for layer_type, metadata in metadata_by_layer_type.items():
+                    if (
+                        metadata is not None
+                        and getattr(metadata, "out_cache_loc", None) is not None
+                    ):
+                        covered.add(str(layer_type))
+                for layer_type, metadata in (
+                    paged_metadata_by_layer_type or {}
+                ).items():
+                    if (
+                        metadata is not None
+                        and getattr(metadata, "out_cache_loc", None) is not None
+                    ):
+                        covered.add(str(layer_type))
+            covered_layer_types = covered
         state = TokenPoolDecodeBatchState(
             metadata_by_layer_type=metadata_by_layer_type,
             metadata_by_layer_id=metadata_by_layer_id,
@@ -6395,6 +6420,7 @@ class TokenPoolDecodeBackendState:
         full_attention_metadata: DecodeBatchMetadata | None = None,
         full_attention_paged_metadata: PagedDecodeBatchMetadata | None = None,
         sliding_attention_kv_indices_padding_steps: int = 0,
+        sliding_attention_paged_only: bool | None = None,
     ) -> TokenPoolPreparedDecodeBatch:
         reservation_tuple = self._decode_batch_reservations(reservations)
         if not reservation_tuple:
@@ -6440,6 +6466,7 @@ class TokenPoolDecodeBackendState:
             sliding_window=sliding_window,
             page_tables=page_tables,
             kv_indices_padding_steps=sliding_attention_kv_indices_padding_steps,
+            paged_only=sliding_attention_paged_only,
         )
         metadata_by_type = {"sliding_attention": sliding_metadata}
         paged_metadata_by_type = None
@@ -6994,7 +7021,8 @@ class TokenPoolDecodeBackendState:
         build_paged_metadata: bool | None = None,
         page_tables: Iterable[dict[int, int]] | None = None,
         kv_indices_padding_steps: int = 0,
-    ) -> tuple[DecodeBatchMetadata, PagedDecodeBatchMetadata | None]:
+        paged_only: bool | None = None,
+    ) -> tuple[DecodeBatchMetadata | None, PagedDecodeBatchMetadata | None]:
         req_slots_list = [int(slot) for slot in req_slots]
         logical_lens = [int(length) for length in logical_seq_lens]
         if not req_slots_list:
@@ -7007,6 +7035,33 @@ class TokenPoolDecodeBackendState:
         )
         if out_cache_loc_count != len(req_slots_list):
             raise ValueError("out_cache_loc length must match req_slots")
+
+        should_build_paged = (
+            self.should_build_sliding_paged_metadata()
+            if build_paged_metadata is None
+            else bool(build_paged_metadata)
+        )
+        paged_only = (
+            _token_pool_sliding_paged_metadata_only_requested()
+            if paged_only is None
+            else bool(paged_only)
+        )
+        if paged_only:
+            should_build_paged = True
+
+        paged_metadata = None
+        if should_build_paged:
+            paged_metadata = self.build_sliding_paged_decode_metadata(
+                req_slots=req_slots_list,
+                logical_seq_lens=logical_lens,
+                out_cache_loc=out_cache_loc_source,
+                sliding_window=sliding_window,
+                page_tables=page_tables,
+            )
+        if paged_only:
+            if paged_metadata is None:
+                raise RuntimeError("sliding paged decode metadata is required")
+            return None, paged_metadata
 
         metadata = self.table.build_decode_metadata(
             req_slots_list,
@@ -7025,21 +7080,6 @@ class TokenPoolDecodeBackendState:
             extra_steps=kv_indices_padding_steps,
             current_seq_lens=current_seq_lens,
         )
-
-        should_build_paged = (
-            self.should_build_sliding_paged_metadata()
-            if build_paged_metadata is None
-            else bool(build_paged_metadata)
-        )
-        paged_metadata = None
-        if should_build_paged:
-            paged_metadata = self.build_sliding_paged_decode_metadata(
-                req_slots=req_slots_list,
-                logical_seq_lens=logical_lens,
-                out_cache_loc=out_cache_loc_source,
-                sliding_window=sliding_window,
-                page_tables=page_tables,
-            )
         return metadata, paged_metadata
 
     def build_sliding_paged_decode_metadata(
