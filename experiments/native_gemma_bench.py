@@ -28,6 +28,11 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 from native_gemma_engine_smoke import build_prompt, chunked_scheduler_config, prompt_lengths
 from native_gemma_smoke import break_mask_for, load_model, resolve_model_path
+from bench_prompt_utils import (
+    SyntheticBenchTokenizer,
+    prompt_fingerprint_row_fields,
+    prompt_set_fingerprint,
+)
 
 from wkvm.core.request import Request
 from wkvm.gemma_engine import GemmaNativeEngine
@@ -83,6 +88,56 @@ def round_or_none(x: float | None, ndigits: int = 3) -> float | None:
     if x is None or not math.isfinite(x):
         return None
     return round(x, ndigits)
+
+
+def summarize_request_traces(traces: Iterable[Any]) -> dict[str, Any]:
+    trace_rows = [
+        trace.as_dict() if hasattr(trace, "as_dict") else dict(trace)
+        for trace in traces
+    ]
+
+    def numeric_values(key: str) -> list[float]:
+        values = []
+        for trace in trace_rows:
+            value = trace.get(key)
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                values.append(float(value))
+        return values
+
+    def timing_summary(key: str) -> dict[str, float | None]:
+        values = numeric_values(key)
+        return {
+            f"{key}_p50": round_or_none(
+                statistics.median(values) if values else None,
+                6,
+            ),
+            f"{key}_p95": round_or_none(percentile(values, 0.95), 6),
+            f"{key}_max": round_or_none(max(values) if values else None, 6),
+        }
+
+    finish_reasons: dict[str, int] = {}
+    errors = 0
+    for trace in trace_rows:
+        reason = trace.get("finish_reason")
+        if reason:
+            finish_reasons[str(reason)] = finish_reasons.get(str(reason), 0) + 1
+        if trace.get("error"):
+            errors += 1
+
+    summary: dict[str, Any] = {
+        "count": len(trace_rows),
+        "finish_reasons": dict(sorted(finish_reasons.items())),
+        "errors": errors,
+    }
+    for key in (
+        "queue_time_s",
+        "prefill_time_s",
+        "first_token_latency_s",
+        "decode_time_s",
+        "total_latency_s",
+    ):
+        summary.update(timing_summary(key))
+    return summary
 
 
 def hf_boundary_summary(rows: list[dict[str, Any]], args) -> dict[str, Any]:
@@ -334,51 +389,6 @@ def benchmark_fatal_error(exc: BaseException, *, phase: str) -> dict[str, Any]:
         "message": str(exc).splitlines()[0],
         "phase": phase,
     }
-
-
-class SyntheticBenchTokenResult:
-    def __init__(self, input_ids: list[int]) -> None:
-        self.input_ids = input_ids
-
-
-class SyntheticBenchTokenizer:
-    """Small deterministic token source for tokenizer-free throughput runs."""
-
-    def __init__(
-        self,
-        *,
-        vocab_size: int = 262_144,
-        bos_token_id: int | None = 2,
-        break_period: int = 31,
-    ) -> None:
-        vocab_size = int(vocab_size)
-        if vocab_size < 16:
-            raise ValueError("synthetic vocab size must be >= 16")
-        self.vocab_size = vocab_size
-        self.bos_token_id = bos_token_id
-        self.break_period = max(2, int(break_period))
-
-    def __call__(
-        self,
-        text: str,
-        *,
-        add_special_tokens: bool = False,
-    ) -> SyntheticBenchTokenResult:
-        text = str(text)
-        token_count = max(1, (len(text) + 3) // 4)
-        usable = self.vocab_size - 4
-        seed = 0x345678
-        ids: list[int] = []
-        for i in range(token_count):
-            ch = ord(text[i % len(text)]) if text else 0
-            seed = (seed * 1_103_515_245 + ch + i + 12_345) & 0x7FFF_FFFF
-            ids.append(4 + (seed % usable))
-        if add_special_tokens and self.bos_token_id is not None:
-            ids = [int(self.bos_token_id), *ids]
-        return SyntheticBenchTokenResult(ids)
-
-    def decode(self, token_ids: Iterable[int]) -> str:
-        return "." if any(int(tid) % self.break_period == 0 for tid in token_ids) else "x"
 
 
 def prompt_token_source(args) -> str:
@@ -676,6 +686,14 @@ def run_row(model, tok, cfg, B: int, args, usable_gib: float | None) -> dict[str
     try:
         lengths = bench_prompt_lengths(args.ctx, B, args.prompt_lengths)
         prompts = [build_prompt(tok, n, i) for i, n in enumerate(lengths)]
+        row.update(
+            prompt_fingerprint_row_fields(
+                prompt_set_fingerprint(
+                    prompts,
+                    prompt_token_source=prompt_token_source(args),
+                )
+            )
+        )
         engine = make_engine(model, cfg, prompts, args)
         reqs = [
             Request(prompt_token_ids=prompt, max_new_tokens=args.out, req_id=f"bench-{B}-{i}")
@@ -722,6 +740,12 @@ def run_row(model, tok, cfg, B: int, args, usable_gib: float | None) -> dict[str
             decode_s = max(finish_times) - min(decode_starts)
         peak_reserved = cuda_peak_reserved_gib()
         engine_stats = engine.stats()
+        trace_summary = summarize_request_traces(traces.values())
+        request_traces = {
+            req.req_id: traces[req.req_id].as_dict()
+            for req in reqs
+            if req.req_id in traces
+        }
         row.update(
             {
                 "success_count": len(successes),
@@ -740,6 +764,21 @@ def run_row(model, tok, cfg, B: int, args, usable_gib: float | None) -> dict[str
                 ),
                 "elapsed_s": round(elapsed, 3),
                 "prompt_lengths": [len(p) for p in prompts],
+                "request_trace_summary": trace_summary,
+                "request_traces": request_traces,
+                "queue_time_p50_s": trace_summary["queue_time_s_p50"],
+                "queue_time_p95_s": trace_summary["queue_time_s_p95"],
+                "prefill_time_p50_s": trace_summary["prefill_time_s_p50"],
+                "prefill_time_p95_s": trace_summary["prefill_time_s_p95"],
+                "first_token_latency_p50_s": trace_summary[
+                    "first_token_latency_s_p50"
+                ],
+                "first_token_latency_p95_s": trace_summary[
+                    "first_token_latency_s_p95"
+                ],
+                "decode_time_p50_s": trace_summary["decode_time_s_p50"],
+                "decode_time_p95_s": trace_summary["decode_time_s_p95"],
+                "finish_reasons": trace_summary["finish_reasons"],
                 "model_forward_backend": engine_stats["model_forward_backend"],
                 "uses_hf_transformer_forward": engine_stats["uses_hf_transformer_forward"],
                 "uses_hf_model_construction": engine_stats[
@@ -816,6 +855,12 @@ def run_row(model, tok, cfg, B: int, args, usable_gib: float | None) -> dict[str
                     engine.metrics.token_pool_slot_high_watermark
                 ),
                 "steps": engine.metrics.steps,
+                "max_waiting": engine.metrics.max_waiting,
+                "max_running": engine.metrics.max_running,
+                "max_runnable_rows": engine.metrics.max_runnable_rows,
+                "backpressure_events": engine.metrics.backpressure_events,
+                "retraction_events": engine.metrics.retraction_events,
+                "backpressure_reasons": dict(engine.metrics.backpressure_reasons),
                 "max_decode_batch_rows": engine.metrics.max_decode_batch_rows,
                 "max_decode_model_batch_rows": engine.metrics.max_decode_model_batch_rows,
                 "max_decode_model_batch_bytes": engine.metrics.max_decode_model_batch_bytes,
@@ -1179,9 +1224,10 @@ def main() -> None:
         "--native-gemma-checkpoint-loader",
         action="store_true",
         help=(
-            "Load Gemma4 text tensors directly from safetensors into wkvm's native "
-            "forward bridge instead of constructing transformers.Gemma4ForCausalLM. "
-            "Still uses Transformers for config/tokenizer metadata."
+            "Load Gemma4 text tensors and local config.json directly into wkvm's "
+            "native forward bridge instead of constructing "
+            "transformers.Gemma4ForCausalLM or AutoConfig. Tokenizer loading is "
+            "controlled separately by --synthetic-prompts."
         ),
     )
     ap.add_argument(
@@ -1290,8 +1336,9 @@ def main() -> None:
         action="store_true",
         help=(
             "After writing the benchmark payload, fail unless every successful "
-            "row proves no HF model construction, no HF transformer forward, "
-            "and use of the native Gemma checkpoint loader."
+            "row and setup boundary prove no HF tokenizer/config, no HF model "
+            "construction, no HF transformer forward, and use of the native "
+            "Gemma checkpoint/config loaders."
         ),
     )
     ap.add_argument("--stop-on-failure", action="store_true")

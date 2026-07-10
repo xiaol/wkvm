@@ -48,6 +48,11 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 from native_gemma_engine_smoke import build_prompt, prompt_lengths
 from native_gemma_smoke import resolve_model_path
+from bench_prompt_utils import (
+    SyntheticBenchTokenizer,
+    prompt_fingerprint_row_fields,
+    prompt_set_fingerprint,
+)
 
 
 def atomic_write_json(path: Path, obj: Any) -> None:
@@ -99,6 +104,14 @@ def round_or_none(x: float | None, ndigits: int = 3) -> float | None:
     if x is None or not math.isfinite(x):
         return None
     return round(x, ndigits)
+
+
+def prompt_token_source(args) -> str:
+    return "synthetic" if getattr(args, "synthetic_prompts", False) else "hf_tokenizer"
+
+
+def uses_hf_tokenizer(args) -> bool:
+    return prompt_token_source(args) == "hf_tokenizer"
 
 
 def git_commit() -> str | None:
@@ -351,6 +364,12 @@ def run_vllm(
     rows: list[dict[str, Any]] = []
     reset_torch_peak()
     for B, prompts in prompts_by_b.items():
+        fingerprint_fields = prompt_fingerprint_row_fields(
+            prompt_set_fingerprint(
+                prompts,
+                prompt_token_source=prompt_token_source(args),
+            )
+        )
         try:
             reqs = [{"prompt_token_ids": p} for p in prompts]
             synchronize_cuda()
@@ -388,6 +407,7 @@ def run_vllm(
                 "peak_alloc_gib": round_or_none(torch_peak_alloc_gib()),
                 "peak_reserved_gib": round_or_none(torch_peak_reserved_gib()),
             }
+        row.update(fingerprint_fields)
         row["green"] = row_green(row, args)
         rows.append(row)
         print_row(args.engine, args, row)
@@ -448,6 +468,12 @@ def run_sglang(
 
     rows: list[dict[str, Any]] = []
     for B, prompts in prompts_by_b.items():
+        fingerprint_fields = prompt_fingerprint_row_fields(
+            prompt_set_fingerprint(
+                prompts,
+                prompt_token_source=prompt_token_source(args),
+            )
+        )
         try:
             synchronize_cuda()
             t0 = time.perf_counter()
@@ -478,6 +504,7 @@ def run_sglang(
                 "error": str(exc).splitlines()[0],
                 "prompt_lengths": [len(p) for p in prompts],
             }
+        row.update(fingerprint_fields)
         row["green"] = row_green(row, args)
         rows.append(row)
         print_row(args.engine, args, row)
@@ -529,6 +556,8 @@ def build_payload(args, rows: list[dict[str, Any]], engine_info: dict[str, Any],
         "mem_cap_gib": args.mem_cap_gib,
         "headroom_gib": args.headroom_gib,
         "model_path": args.model_path,
+        "prompt_token_source": prompt_token_source(args),
+        "uses_hf_tokenizer": uses_hf_tokenizer(args),
         "dtype": "bfloat16",
         "git_commit": git_commit(),
         "launch_command": shlex.join([sys.executable, *sys.argv]),
@@ -560,10 +589,13 @@ def build_payload(args, rows: list[dict[str, Any]], engine_info: dict[str, Any],
 
 
 def run(args) -> dict[str, Any]:
-    from transformers import AutoTokenizer
-
     args.model_path = resolve_model_path(args.model_path)
-    tok = AutoTokenizer.from_pretrained(args.model_path)
+    if getattr(args, "synthetic_prompts", False):
+        tok = SyntheticBenchTokenizer(vocab_size=args.synthetic_vocab_size)
+    else:
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(args.model_path)
     prompts_by_b = {
         B: [
             build_prompt(tok, n, row)
@@ -594,6 +626,21 @@ def main() -> None:
     ap.add_argument("--out", type=int, default=128)
     ap.add_argument("--concurrency", type=parse_concurrency, default=parse_concurrency("1,2,4,8"))
     ap.add_argument("--prompt-lengths", choices=["staggered", "uniform"], default="staggered")
+    ap.add_argument(
+        "--synthetic-prompts",
+        action="store_true",
+        help=(
+            "Generate deterministic prompt token IDs locally instead of loading "
+            "a Hugging Face tokenizer. The prompt IDs are passed directly to "
+            "the incumbent engine."
+        ),
+    )
+    ap.add_argument(
+        "--synthetic-vocab-size",
+        type=int,
+        default=262_144,
+        help="Vocabulary size used by --synthetic-prompts.",
+    )
     ap.add_argument("--mem-cap-gib", type=float, default=float(os.environ.get("WKVM_MEM_CAP_GIB", 19)))
     ap.add_argument("--headroom-gib", type=float, default=1.0)
     ap.add_argument("--mem-sample-interval-s", type=float, default=0.1)

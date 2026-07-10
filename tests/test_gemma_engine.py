@@ -311,6 +311,46 @@ class TestGemmaSchedulerAssumptions(unittest.TestCase):
         self.assertEqual(prompt_token_source(args), "synthetic")
         self.assertFalse(uses_hf_tokenizer(args))
 
+    def test_prompt_fingerprint_is_stable_and_order_sensitive(self) -> None:
+        from experiments.bench_prompt_utils import (
+            SyntheticBenchTokenizer,
+            prompt_fingerprint_row_fields,
+            prompt_set_fingerprint,
+        )
+
+        tok = SyntheticBenchTokenizer(vocab_size=128)
+        prompts = [
+            tok("alpha", add_special_tokens=True).input_ids,
+            tok("beta", add_special_tokens=True).input_ids,
+        ]
+
+        first = prompt_set_fingerprint(
+            prompts,
+            prompt_token_source="synthetic",
+        )
+        second = prompt_set_fingerprint(
+            [list(prompt) for prompt in prompts],
+            prompt_token_source="synthetic",
+        )
+        reversed_fingerprint = prompt_set_fingerprint(
+            list(reversed(prompts)),
+            prompt_token_source="synthetic",
+        )
+        fields = prompt_fingerprint_row_fields(first)
+
+        self.assertEqual(first, second)
+        self.assertNotEqual(
+            first["prompt_token_ids_sha256"],
+            reversed_fingerprint["prompt_token_ids_sha256"],
+        )
+        self.assertEqual(first["prompt_count"], 2)
+        self.assertEqual(first["prompt_lengths"], [len(prompt) for prompt in prompts])
+        self.assertEqual(fields["prompt_token_source"], "synthetic")
+        self.assertEqual(
+            fields["prompt_token_ids_sha256"],
+            first["prompt_token_ids_sha256"],
+        )
+
     def test_native_bench_no_hf_preflight_runs_before_tokenizer_load(self) -> None:
         import json
         import tempfile

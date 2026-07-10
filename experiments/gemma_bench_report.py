@@ -79,6 +79,81 @@ def validate_same_shape(payloads: list[tuple[Path, dict[str, Any]]]) -> None:
     )
 
 
+def row_prompt_fingerprint(row: dict[str, Any]) -> dict[str, Any] | None:
+    fingerprint = row.get("prompt_fingerprint")
+    if isinstance(fingerprint, dict):
+        return fingerprint
+    if row.get("prompt_token_ids_sha256") is None:
+        return None
+    return {
+        "schema": row.get("prompt_fingerprint_schema")
+        or "wkvm.prompt_token_ids.sha256.v1",
+        "prompt_token_source": row.get("prompt_token_source"),
+        "prompt_count": row.get("prompt_count"),
+        "prompt_total_tokens": row.get("prompt_total_tokens"),
+        "prompt_lengths": row.get("prompt_lengths"),
+        "prompt_token_ids_sha256": row.get("prompt_token_ids_sha256"),
+    }
+
+
+def fingerprint_compare_key(fingerprint: dict[str, Any]) -> tuple[Any, ...]:
+    lengths = fingerprint.get("prompt_lengths")
+    if isinstance(lengths, list):
+        lengths_key = tuple(lengths)
+    else:
+        lengths_key = lengths
+    return (
+        fingerprint.get("schema"),
+        fingerprint.get("prompt_count"),
+        fingerprint.get("prompt_total_tokens"),
+        lengths_key,
+        fingerprint.get("prompt_token_ids_sha256"),
+    )
+
+
+def validate_same_prompt_fingerprint(
+    payloads: list[tuple[Path, dict[str, Any]]],
+) -> None:
+    violations = []
+    groups: dict[tuple[Any, Any, Any, Any], list[tuple[Path, dict[str, Any], int]]] = {}
+    for path, data in payloads:
+        for index, row in enumerate(data.get("rows", [])):
+            B = row.get("B")
+            if B is None:
+                continue
+            fingerprint = row_prompt_fingerprint(row)
+            if fingerprint is None:
+                violations.append(
+                    f"{path.as_posix()} row={index} B={fmt(B)} missing prompt fingerprint"
+                )
+                continue
+            groups.setdefault((*shape_key(data), B), []).append((path, fingerprint, index))
+    for group_key, entries in groups.items():
+        keys = {fingerprint_compare_key(fingerprint) for _path, fingerprint, _index in entries}
+        if len(keys) <= 1:
+            continue
+        ctx, out, prompt_mode, B = group_key
+        parts = []
+        for path, fingerprint, index in entries:
+            digest = fingerprint.get("prompt_token_ids_sha256")
+            digest = "-" if digest is None else str(digest)[:12]
+            source = fingerprint.get("prompt_token_source") or "-"
+            parts.append(
+                f"{path.as_posix()} row={index} source={source} hash={digest}"
+            )
+        violations.append(
+            "shape="
+            f"{fmt_shape((ctx, out, prompt_mode))} B={fmt(B)} "
+            "prompt fingerprints differ: "
+            + ", ".join(parts)
+        )
+    if violations:
+        raise ValueError(
+            "same-prompt-fingerprint requirement failed; "
+            + "; ".join(violations)
+        )
+
+
 def row_has_full_success(row: dict[str, Any]) -> bool:
     return row.get("success_count") == row.get("B")
 
@@ -236,6 +311,100 @@ def decode_timing_summary(row: dict[str, Any]) -> str:
     return " / ".join(f"{label} {fmt(row.get(key))}" for label, key in keys)
 
 
+def prompt_fingerprint_summary(row: dict[str, Any]) -> str:
+    fingerprint = row_prompt_fingerprint(row)
+    if fingerprint is None:
+        return "-"
+    source = fingerprint.get("prompt_token_source") or row.get("prompt_token_source") or "-"
+    digest = fingerprint.get("prompt_token_ids_sha256")
+    digest = "-" if digest is None else str(digest)[:12]
+    count = fingerprint.get("prompt_count")
+    total = fingerprint.get("prompt_total_tokens")
+    return f"{source} {digest} ({fmt(count)} prompts / {fmt(total)} tok)"
+
+
+def _summary_value(
+    row: dict[str, Any],
+    summary: dict[str, Any],
+    row_key: str,
+    summary_key: str,
+) -> Any:
+    if row.get(row_key) is not None:
+        return row.get(row_key)
+    return summary.get(summary_key)
+
+
+def request_timing_summary(row: dict[str, Any]) -> str:
+    summary = row.get("request_trace_summary")
+    if not isinstance(summary, dict):
+        summary = {}
+    q50 = _summary_value(row, summary, "queue_time_p50_s", "queue_time_s_p50")
+    q95 = _summary_value(row, summary, "queue_time_p95_s", "queue_time_s_p95")
+    ttft50 = _summary_value(
+        row,
+        summary,
+        "first_token_latency_p50_s",
+        "first_token_latency_s_p50",
+    )
+    ttft95 = _summary_value(
+        row,
+        summary,
+        "first_token_latency_p95_s",
+        "first_token_latency_s_p95",
+    )
+    decode50 = _summary_value(row, summary, "decode_time_p50_s", "decode_time_s_p50")
+    decode95 = _summary_value(row, summary, "decode_time_p95_s", "decode_time_s_p95")
+    if all(
+        value is None
+        for value in (q50, q95, ttft50, ttft95, decode50, decode95)
+    ):
+        return "-"
+    return (
+        f"q {fmt(q50)}/{fmt(q95)}; "
+        f"ttft {fmt(ttft50)}/{fmt(ttft95)}; "
+        f"dec {fmt(decode50)}/{fmt(decode95)}"
+    )
+
+
+def scheduler_summary(row: dict[str, Any]) -> str:
+    keys = (
+        ("wait", "max_waiting"),
+        ("run", "max_running"),
+        ("runnable", "max_runnable_rows"),
+        ("resident", "max_resident_state_slots"),
+        ("bp", "backpressure_events"),
+        ("ret", "retraction_events"),
+    )
+    if all(row.get(key) is None for _label, key in keys):
+        return "-"
+    return " / ".join(f"{label} {fmt(row.get(key))}" for label, key in keys)
+
+
+def graph_summary(row: dict[str, Any]) -> str:
+    cuda_keys = (
+        "persistent_padded_decode_cuda_graph_captures",
+        "persistent_padded_decode_cuda_graph_replays",
+        "persistent_padded_decode_cuda_graph_skips",
+    )
+    pool_keys = (
+        "token_pool_decode_graph_static_shape_starts",
+        "token_pool_decode_graph_static_shape_reuses",
+        "token_pool_decode_graph_shape_mismatches",
+    )
+    if all(row.get(key) is None for key in (*cuda_keys, *pool_keys)):
+        return "-"
+    return (
+        "cuda cap "
+        f"{fmt(row.get('persistent_padded_decode_cuda_graph_captures'))} / "
+        f"replay {fmt(row.get('persistent_padded_decode_cuda_graph_replays'))} / "
+        f"skip {fmt(row.get('persistent_padded_decode_cuda_graph_skips'))}; "
+        "pool start "
+        f"{fmt(row.get('token_pool_decode_graph_static_shape_starts'))} / "
+        f"reuse {fmt(row.get('token_pool_decode_graph_static_shape_reuses'))} / "
+        f"mismatch {fmt(row.get('token_pool_decode_graph_shape_mismatches'))}"
+    )
+
+
 def fatal_error_row(data: dict[str, Any]) -> dict[str, Any] | None:
     fatal = data.get("fatal_error")
     if not isinstance(fatal, dict):
@@ -285,6 +454,7 @@ def load_rows(path: Path, data: dict[str, Any]) -> list[dict[str, Any]]:
                 "ctx": data.get("context_tokens_per_session"),
                 "out": data.get("decode_tokens_per_session"),
                 "prompt_mode": data.get("prompt_lengths_mode"),
+                "prompt_fingerprint": prompt_fingerprint_summary(row),
                 "model_forward_backend": row_or_payload_value(
                     data, row, "model_forward_backend"
                 ),
@@ -312,6 +482,9 @@ def load_rows(path: Path, data: dict[str, Any]) -> list[dict[str, Any]]:
                 "green": row.get("green"),
                 "agg_decode": agg_decode,
                 "decode_timing": decode_timing_summary(row),
+                "request_timing": request_timing_summary(row),
+                "scheduler": scheduler_summary(row),
+                "graph": graph_summary(row),
                 "e2e_output": row.get("e2e_output_tok_s"),
                 "p50": p50,
                 "p95": p95,
@@ -330,11 +503,14 @@ def render(
     paths: list[Path],
     *,
     require_same_shape: bool = False,
+    require_same_prompt_fingerprint: bool = False,
     require_native_no_hf: bool = False,
 ) -> str:
     payloads = load_payloads(paths)
     if require_same_shape:
         validate_same_shape(payloads)
+    if require_same_prompt_fingerprint:
+        validate_same_prompt_fingerprint(payloads)
     if require_native_no_hf:
         validate_native_no_hf(payloads)
     rows: list[dict[str, Any]] = []
@@ -355,10 +531,12 @@ def render(
         "Rows are normalized across wkvm-native, HF Transformers, vLLM, and SGLang JSON schemas. "
         "Serving rows use HTTP stream output throughput in the `agg decode tok/s` column. "
         "Only rows with the same `ctx`, `out`, prompt mode, and benchmark path should be treated as same-shape comparisons. "
-        "The native no-HF columns are applicable to wkvm-native rows and are `n/a` for incumbent engines.",
+        "When present, `prompt fingerprint` is a SHA-256 over the exact prompt token IDs for the row. "
+        "The native no-HF columns are applicable to wkvm-native rows and are `n/a` for incumbent engines. "
+        "`request timing s` reports p50/p95 queue, first-token, and decode timings when present.",
         "",
-        "| engine | shape | B | success | green | agg decode tok/s | forward backend | HF fwd | HF construct | HF tok | HF cfg | native cfg | native ckpt | no-HF guard | decode timing s | e2e output tok/s | p50 s | p95 s | memory | max model batch | padded temp | persistent padded | error | source |",
-        "|---|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---|---|---:|---:|---:|---|---|---|---|---|---|",
+        "| engine | shape | B | success | green | agg decode tok/s | prompt fingerprint | forward backend | HF fwd | HF construct | HF tok | HF cfg | native cfg | native ckpt | no-HF guard | decode timing s | request timing s | scheduler | graph | e2e output tok/s | p50 s | p95 s | memory | max model batch | padded temp | persistent padded | error | source |",
+        "|---|---|---:|---:|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---|---|---|---|---|---:|---:|---:|---|---|---|---|---|---|",
     ]
     for row in rows:
         path = row["path"]
@@ -378,6 +556,7 @@ def render(
                     str(row["success"]),
                     fmt(row["green"]),
                     fmt(row["agg_decode"]),
+                    row["prompt_fingerprint"],
                     str(row["model_forward_backend"] or "-"),
                     fmt(row["uses_hf_transformer_forward"]),
                     fmt(row["uses_hf_model_construction"]),
@@ -387,6 +566,9 @@ def render(
                     fmt(row["native_gemma_checkpoint_loader"]),
                     row["no_hf_guard"],
                     row["decode_timing"],
+                    row["request_timing"],
+                    row["scheduler"],
+                    row["graph"],
                     fmt(row["e2e_output"]),
                     fmt(row["p50"]),
                     fmt(row["p95"]),
@@ -413,17 +595,27 @@ def main() -> None:
         help="fail if the input JSON files do not share one ctx/out/prompt-mode shape",
     )
     ap.add_argument(
+        "--require-same-prompt-fingerprint",
+        action="store_true",
+        help=(
+            "fail unless every benchmark row has a prompt-token fingerprint and "
+            "rows with matching ctx/out/prompt-mode/B have the same prompt tokens"
+        ),
+    )
+    ap.add_argument(
         "--require-native-no-hf",
         action="store_true",
         help=(
             "fail unless every fully successful wkvm-native row proves no HF "
-            "Transformer forward, no HF model construction, and native checkpoint loading"
+            "tokenizer/config setup, no HF Transformer forward, no HF model "
+            "construction, and native checkpoint/config loading"
         ),
     )
     args = ap.parse_args()
     text = render(
         args.json_files,
         require_same_shape=args.require_same_shape,
+        require_same_prompt_fingerprint=args.require_same_prompt_fingerprint,
         require_native_no_hf=args.require_native_no_hf,
     )
     if args.out:

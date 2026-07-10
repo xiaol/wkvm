@@ -19,6 +19,7 @@ class TestGemmaBenchReport(unittest.TestCase):
         out: int = 8,
         prompt_mode: str = "uniform",
         row: dict | None = None,
+        prompt_hash: str | None = "a" * 64,
     ) -> dict:
         native_row = {
             "B": 2,
@@ -31,6 +32,15 @@ class TestGemmaBenchReport(unittest.TestCase):
             "uses_hf_model_construction": False,
             "native_gemma_checkpoint_loader": True,
         }
+        if prompt_hash is not None:
+            native_row["prompt_fingerprint"] = {
+                "schema": "wkvm.prompt_token_ids.sha256.v1",
+                "prompt_token_source": "synthetic",
+                "prompt_count": 2,
+                "prompt_total_tokens": 1024,
+                "prompt_lengths": [512, 512],
+                "prompt_token_ids_sha256": prompt_hash,
+            }
         if row is not None:
             native_row = row
         return {
@@ -59,22 +69,31 @@ class TestGemmaBenchReport(unittest.TestCase):
         ctx: int = 512,
         out: int = 8,
         prompt_mode: str = "uniform",
+        prompt_hash: str | None = None,
     ) -> dict:
+        row = {
+            "B": 2,
+            "success_count": 2,
+            "green": True,
+            "agg_decode_tok_s": 21.5,
+            "peak_engine_delta_gib": 12.0,
+        }
+        if prompt_hash is not None:
+            row["prompt_fingerprint"] = {
+                "schema": "wkvm.prompt_token_ids.sha256.v1",
+                "prompt_token_source": "synthetic",
+                "prompt_count": 2,
+                "prompt_total_tokens": 1024,
+                "prompt_lengths": [512, 512],
+                "prompt_token_ids_sha256": prompt_hash,
+            }
         return {
             "schema": "wkvm.incumbent_gemma_bench.v1",
             "engine": engine,
             "context_tokens_per_session": ctx,
             "decode_tokens_per_session": out,
             "prompt_lengths_mode": prompt_mode,
-            "rows": [
-                {
-                    "B": 2,
-                    "success_count": 2,
-                    "green": True,
-                    "agg_decode_tok_s": 21.5,
-                    "peak_engine_delta_gib": 12.0,
-                }
-            ],
+            "rows": [row],
         }
 
     def test_render_exposes_native_no_hf_columns(self) -> None:
@@ -95,6 +114,8 @@ class TestGemmaBenchReport(unittest.TestCase):
             "forward backend | HF fwd | HF construct | HF tok | HF cfg | native cfg | native ckpt",
             text,
         )
+        self.assertIn("prompt fingerprint", text)
+        self.assertIn("synthetic aaaaaaaaaaaa (2 prompts / 1024 tok)", text)
         self.assertIn(
             "wkvm_native_gemma_forward_bridge | no | no | no | no | yes | yes",
             text,
@@ -115,6 +136,60 @@ class TestGemmaBenchReport(unittest.TestCase):
                 gemma_bench_report.render(
                     [native, incumbent],
                     require_same_shape=True,
+                )
+
+    def test_require_same_prompt_fingerprint_accepts_matching_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            native = self.write_payload(tmp, "native.json", self.native_payload())
+            incumbent = self.write_payload(
+                tmp,
+                "vllm.json",
+                self.incumbent_payload(prompt_hash="a" * 64),
+            )
+
+            text = gemma_bench_report.render(
+                [native, incumbent],
+                require_same_shape=True,
+                require_same_prompt_fingerprint=True,
+            )
+
+        self.assertIn("synthetic aaaaaaaaaaaa", text)
+
+    def test_require_same_prompt_fingerprint_rejects_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            native = self.write_payload(tmp, "native.json", self.native_payload())
+            incumbent = self.write_payload(
+                tmp,
+                "vllm.json",
+                self.incumbent_payload(prompt_hash="b" * 64),
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "prompt fingerprints differ",
+            ):
+                gemma_bench_report.render(
+                    [native, incumbent],
+                    require_same_shape=True,
+                    require_same_prompt_fingerprint=True,
+                )
+
+    def test_require_same_prompt_fingerprint_rejects_missing_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            native = self.write_payload(tmp, "native.json", self.native_payload())
+            incumbent = self.write_payload(tmp, "vllm.json", self.incumbent_payload())
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "missing prompt fingerprint",
+            ):
+                gemma_bench_report.render(
+                    [native, incumbent],
+                    require_same_shape=True,
+                    require_same_prompt_fingerprint=True,
                 )
 
     def test_require_native_no_hf_rejects_missing_row_evidence(self) -> None:
