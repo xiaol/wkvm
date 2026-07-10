@@ -1569,22 +1569,12 @@ def _attention_forward(
             current_key_states,
             current_value_states,
         )
-    plan_kwargs = token_pool_attention_call.attention_kwargs
-    decode_metadata = plan_kwargs.get("decode_metadata")
-    paged_decode_metadata = plan_kwargs.get("paged_decode_metadata")
-    token_kv_pool = plan_kwargs.get("token_kv_pool")
-    layer_idx = plan_kwargs.get("layer_idx")
     if token_pool_attention_call.decode_attention_enabled:
+        token_pool_kwargs = token_pool_attention_call.backend_decode_kwargs()
         return _attention_forward_token_pool_gqa(
             attn,
             query_states,
-            decode_metadata=decode_metadata,
-            paged_decode_metadata=paged_decode_metadata,
-            token_kv_pool=token_kv_pool,
-            layer_idx=int(layer_idx),
-            token_pool_plan=token_pool_attention_call.plan,
-            current_key_states=token_pool_attention_call.key_states_for_write,
-            current_value_states=token_pool_attention_call.value_states_for_write,
+            **token_pool_kwargs,
         )
     if backend == "manual_gqa" or (
         backend == "sdpa_single_gqa"

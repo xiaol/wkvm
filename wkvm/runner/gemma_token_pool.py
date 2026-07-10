@@ -1206,6 +1206,20 @@ class TokenPoolAttentionCall:
             ),
         )
 
+    def backend_decode_kwargs(self) -> dict[str, Any]:
+        layer_idx = self.attention_kwargs.get("layer_idx")
+        return {
+            "decode_metadata": self.attention_kwargs.get("decode_metadata"),
+            "paged_decode_metadata": self.attention_kwargs.get(
+                "paged_decode_metadata"
+            ),
+            "token_kv_pool": self.attention_kwargs.get("token_kv_pool"),
+            "layer_idx": None if layer_idx is None else int(layer_idx),
+            "token_pool_plan": self.plan,
+            "current_key_states": self.key_states_for_write,
+            "current_value_states": self.value_states_for_write,
+        }
+
 
 def token_pool_attention_plan_kwargs(token_pool_plan: Any) -> dict[str, Any]:
     attention_kwargs = getattr(token_pool_plan, "attention_kwargs", None)

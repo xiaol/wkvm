@@ -2828,6 +2828,18 @@ class TestGemmaTokenPool(unittest.TestCase):
         call_with_kv = call.with_current_kv("key", "value")
         self.assertEqual(call_with_kv.key_states_for_write, "key")
         self.assertEqual(call_with_kv.value_states_for_write, "value")
+        self.assertEqual(
+            call_with_kv.backend_decode_kwargs(),
+            {
+                "decode_metadata": "metadata",
+                "paged_decode_metadata": "paged_metadata",
+                "token_kv_pool": "pool",
+                "layer_idx": 7,
+                "token_pool_plan": plan,
+                "current_key_states": "key",
+                "current_value_states": "value",
+            },
+        )
         shared_call = call.with_current_kv(
             "key",
             "value",
