@@ -2254,6 +2254,26 @@ class GemmaNativeEngine:
             )
             return
 
+        return self._token_pool_commit_prefill_tokens_legacy(
+            req,
+            n,
+            cache=cache,
+            final_prefill=final_prefill,
+        )
+
+    def _token_pool_commit_prefill_tokens_legacy(
+        self,
+        req: Request,
+        n: int,
+        *,
+        cache=None,
+        final_prefill: bool = False,
+    ) -> None:
+        table = self._token_table
+        allocator = self._token_slot_allocator
+        if table is None or allocator is None:
+            return
+        backend = self._token_pool_decode_backend
         self._token_pool_admit_request(req)
         req_slot = self._token_pool_request_slot(req.req_id)
         current = self._token_pool_request_length(req_slot)
