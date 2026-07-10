@@ -615,6 +615,148 @@ class _CheckpointGemma4MLP:
         return self
 
 
+class _NativeGemma4TextConfig:
+    def __init__(self, values: dict[str, Any]) -> None:
+        self._values = dict(values)
+        for key, value in values.items():
+            setattr(self, key, value)
+
+    def get_text_config(self, decoder: bool = True):
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        return dict(self._values)
+
+    def standardize_rope_params(self) -> None:
+        return None
+
+
+def _load_native_gemma4_text_config(model_path: str | Path) -> _NativeGemma4TextConfig:
+    config_path = Path(model_path) / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"checkpoint-native Gemma4 loader requires local config.json under {model_path!s}"
+        )
+    with config_path.open("r", encoding="utf-8") as f:
+        raw_config = json.load(f)
+    text_config = raw_config.get("text_config", raw_config)
+    if not isinstance(text_config, dict):
+        raise TypeError(
+            f"Gemma4 config.json under {model_path!s} does not contain a text config"
+        )
+    return _NativeGemma4TextConfig(text_config)
+
+
+class _NativeGemma4TextRotaryEmbedding:
+    def __init__(self, config, device=None) -> None:
+        self.config = config
+        self.max_seq_len_cached = config.max_position_embeddings
+        self.original_max_seq_len = config.max_position_embeddings
+        self.layer_types = set(config.layer_types)
+        self.rope_type: dict[str, str] = {}
+        self._buffer_names: list[str] = []
+        for layer_type in self.layer_types:
+            rope_params = config.rope_parameters[layer_type]
+            if rope_params is None:
+                continue
+            rope_type = rope_params.get("rope_type", "default")
+            self.rope_type[layer_type] = rope_type
+            inv_freq, attention_scaling = self._init_inv_freq(
+                config,
+                rope_params,
+                layer_type=layer_type,
+                rope_type=rope_type,
+                device=device,
+            )
+            name = f"{layer_type}_inv_freq"
+            setattr(self, name, inv_freq)
+            setattr(self, f"{layer_type}_attention_scaling", attention_scaling)
+            self._buffer_names.append(name)
+
+    @staticmethod
+    def _init_inv_freq(
+        config,
+        rope_params: dict[str, Any],
+        *,
+        layer_type: str,
+        rope_type: str,
+        device=None,
+    ):
+        torch = _torch()
+        base = rope_params["rope_theta"]
+        attention_factor = 1.0
+        if rope_type == "default":
+            dim = getattr(config, "head_dim", None) or (
+                config.hidden_size // config.num_attention_heads
+            )
+            inv_freq = 1.0 / (
+                base
+                ** (
+                    torch.arange(0, dim, 2, dtype=torch.int64).to(
+                        device=device,
+                        dtype=torch.float,
+                    )
+                    / dim
+                )
+            )
+            return inv_freq, attention_factor
+        if rope_type == "proportional":
+            head_dim_key = (
+                "global_head_dim" if layer_type == "full_attention" else "head_dim"
+            )
+            dim = getattr(config, head_dim_key, None) or (
+                config.hidden_size // config.num_attention_heads
+            )
+            rope_proportion = rope_params.get("partial_rotary_factor", 1.0)
+            rope_angles = int(rope_proportion * dim // 2)
+            inv_freq_rotated = 1.0 / (
+                base
+                ** (
+                    torch.arange(0, 2 * rope_angles, 2, dtype=torch.int64).to(
+                        device=device,
+                        dtype=torch.float,
+                    )
+                    / dim
+                )
+            )
+            nope_angles = dim // 2 - rope_angles
+            if nope_angles > 0:
+                inv_freq = torch.cat(
+                    (
+                        inv_freq_rotated,
+                        torch.zeros(nope_angles, dtype=torch.float32, device=device),
+                    ),
+                    dim=0,
+                )
+            else:
+                inv_freq = inv_freq_rotated
+            inv_freq = inv_freq / rope_params.get("factor", 1.0)
+            return inv_freq, attention_factor
+        raise NotImplementedError(f"unsupported Gemma4 RoPE type: {rope_type}")
+
+    def to(self, *args, **kwargs):
+        for name in self._buffer_names:
+            setattr(self, name, getattr(self, name).to(*args, **kwargs))
+        return self
+
+    def __call__(self, x, position_ids, layer_type=None):
+        torch = _torch()
+        inv_freq = getattr(self, f"{layer_type}_inv_freq")
+        attention_scaling = getattr(self, f"{layer_type}_attention_scaling")
+        inv_freq_expanded = (
+            inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+        )
+        position_ids_expanded = position_ids[:, None, :].float()
+        with torch.no_grad():
+            freqs = (
+                inv_freq_expanded.float() @ position_ids_expanded.float()
+            ).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos() * attention_scaling
+            sin = emb.sin() * attention_scaling
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
 class _CheckpointGemma4Attention:
     def __init__(
         self,
@@ -887,9 +1029,7 @@ class _CheckpointGemma4TextModel:
             device=device,
             dtype=dtype,
         )
-        from transformers.models.gemma4.modeling_gemma4 import Gemma4TextRotaryEmbedding
-
-        self.rotary_emb = Gemma4TextRotaryEmbedding(config, device=device)
+        self.rotary_emb = _NativeGemma4TextRotaryEmbedding(config, device=device)
         self.unique_layer_types = set(config.layer_types)
         if self.hidden_size_per_layer_input:
             self.embed_tokens_per_layer = _TensorEmbedding(
@@ -2677,22 +2817,15 @@ def load_native_gemma4_from_checkpoint(
 ) -> NativeGemma4ForCausalLM:
     """Load Gemma4 text weights from safetensors into the WKVM native bridge.
 
-    This still uses Transformers for config parsing and tokenizer-compatible
-    metadata, but it bypasses `Gemma4ForCausalLM.from_pretrained` and does not
-    build HF decoder-layer modules.
+    This reads the local Gemma config.json directly, bypasses
+    `Gemma4ForCausalLM.from_pretrained`, and does not build HF decoder-layer
+    modules.
     """
 
     torch = _torch()
     if dtype is not None and isinstance(dtype, str):
         dtype = getattr(torch, dtype)
-    from transformers import AutoConfig
-
-    full_cfg = AutoConfig.from_pretrained(model_path)
-    text_cfg = (
-        full_cfg.get_text_config(decoder=True)
-        if hasattr(full_cfg, "get_text_config")
-        else full_cfg
-    )
+    text_cfg = _load_native_gemma4_text_config(model_path)
     state_dict = _load_checkpoint_state_dict(
         model_path,
         prefix=prefix,

@@ -108,6 +108,187 @@ def _token_pool_backend_decode(
 
 
 class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
+    def test_native_checkpoint_config_loader_reads_local_text_config(self) -> None:
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from wkvm.runner.gemma_native_forward import _load_native_gemma4_text_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            model_dir = Path(tmp)
+            (model_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "gemma4",
+                        "text_config": {
+                            "model_type": "gemma4_text",
+                            "vocab_size": 128,
+                            "hidden_size": 16,
+                            "num_hidden_layers": 2,
+                            "num_attention_heads": 2,
+                            "num_key_value_heads": 1,
+                            "head_dim": 8,
+                            "global_head_dim": 8,
+                            "layer_types": [
+                                "sliding_attention",
+                                "full_attention",
+                            ],
+                            "sliding_window": 16,
+                            "num_kv_shared_layers": 0,
+                            "attention_dropout": 0.0,
+                            "attention_bias": False,
+                            "rms_norm_eps": 1e-6,
+                            "hidden_size_per_layer_input": 4,
+                            "hidden_activation": "gelu_pytorch_tanh",
+                            "final_logit_softcapping": 30.0,
+                            "pad_token_id": 0,
+                            "max_position_embeddings": 1024,
+                            "rope_parameters": {
+                                "sliding_attention": {
+                                    "rope_type": "default",
+                                    "rope_theta": 10000.0,
+                                },
+                                "full_attention": {
+                                    "rope_type": "proportional",
+                                    "rope_theta": 1000000.0,
+                                    "partial_rotary_factor": 0.25,
+                                },
+                            },
+                        },
+                    }
+                )
+            )
+
+            cfg = _load_native_gemma4_text_config(model_dir)
+
+        self.assertEqual(cfg.model_type, "gemma4_text")
+        self.assertEqual(cfg.vocab_size, 128)
+        self.assertEqual(cfg.layer_types, ["sliding_attention", "full_attention"])
+        self.assertEqual(cfg.rope_parameters["full_attention"]["rope_type"], "proportional")
+        self.assertIs(cfg.get_text_config(decoder=True), cfg)
+        self.assertEqual(cfg.to_dict()["hidden_size"], 16)
+        self.assertIsNone(cfg.standardize_rope_params())
+
+    def test_native_rotary_embedding_supports_gemma4_rope_variants(self) -> None:
+        import torch
+        from wkvm.runner.gemma_native_forward import (
+            _NativeGemma4TextConfig,
+            _NativeGemma4TextRotaryEmbedding,
+        )
+
+        cfg = _NativeGemma4TextConfig(
+            {
+                "max_position_embeddings": 1024,
+                "hidden_size": 16,
+                "num_attention_heads": 2,
+                "head_dim": 8,
+                "global_head_dim": 8,
+                "layer_types": ["sliding_attention", "full_attention"],
+                "rope_parameters": {
+                    "sliding_attention": {
+                        "rope_type": "default",
+                        "rope_theta": 10000.0,
+                    },
+                    "full_attention": {
+                        "rope_type": "proportional",
+                        "rope_theta": 1000000.0,
+                        "partial_rotary_factor": 0.5,
+                    },
+                },
+            }
+        )
+        rotary = _NativeGemma4TextRotaryEmbedding(cfg)
+        x = torch.zeros(1, 3, 8, dtype=torch.bfloat16)
+        position_ids = torch.arange(3).unsqueeze(0)
+
+        sliding_cos, sliding_sin = rotary(x, position_ids, "sliding_attention")
+        full_cos, full_sin = rotary(x, position_ids, "full_attention")
+
+        self.assertEqual(sliding_cos.shape, (1, 3, 8))
+        self.assertEqual(sliding_sin.shape, (1, 3, 8))
+        self.assertEqual(full_cos.shape, (1, 3, 8))
+        self.assertEqual(full_sin.shape, (1, 3, 8))
+        self.assertTrue(
+            torch.allclose(
+                full_cos[:, :, 2:4],
+                torch.ones(1, 3, 2, dtype=full_cos.dtype),
+            )
+        )
+        self.assertTrue(
+            torch.allclose(
+                full_sin[:, :, 2:4],
+                torch.zeros(1, 3, 2, dtype=full_sin.dtype),
+            )
+        )
+
+    def test_checkpoint_path_loader_avoids_transformers_config_import(self) -> None:
+        import builtins
+        import json
+        import tempfile
+        from pathlib import Path
+
+        import wkvm.runner.gemma_native_forward as native_forward
+
+        class DummyModel:
+            pass
+
+        captured = {}
+
+        def fake_load_state_dict(model_path, **kwargs):
+            captured["state_model_path"] = str(model_path)
+            captured["state_kwargs"] = kwargs
+            return {"dummy": object()}
+
+        def fake_from_state_dict(config, state_dict, **kwargs):
+            captured["config"] = config
+            captured["state_dict"] = state_dict
+            captured["build_kwargs"] = kwargs
+            return DummyModel()
+
+        def guarded_import(name, *args, **kwargs):
+            if name == "transformers" or name.startswith("transformers."):
+                raise AssertionError(f"unexpected transformers import: {name}")
+            return old_import(name, *args, **kwargs)
+
+        old_load_state_dict = native_forward._load_checkpoint_state_dict
+        old_from_state_dict = native_forward.native_gemma4_from_checkpoint_state_dict
+        old_import = builtins.__import__
+        try:
+            native_forward._load_checkpoint_state_dict = fake_load_state_dict
+            native_forward.native_gemma4_from_checkpoint_state_dict = fake_from_state_dict
+            builtins.__import__ = guarded_import
+            with tempfile.TemporaryDirectory() as tmp:
+                model_dir = Path(tmp)
+                (model_dir / "config.json").write_text(
+                    json.dumps(
+                        {
+                            "text_config": {
+                                "model_type": "gemma4_text",
+                                "vocab_size": 64,
+                            }
+                        }
+                    )
+                )
+                model = native_forward.load_native_gemma4_from_checkpoint(
+                    model_dir,
+                    device="cpu",
+                    dtype="float32",
+                    native_attention_backend="sdpa_single_gqa",
+                    native_projection_backend="separate",
+                )
+        finally:
+            native_forward._load_checkpoint_state_dict = old_load_state_dict
+            native_forward.native_gemma4_from_checkpoint_state_dict = old_from_state_dict
+            builtins.__import__ = old_import
+
+        self.assertIsInstance(model, DummyModel)
+        self.assertEqual(model.checkpoint_path, captured["state_model_path"])
+        self.assertEqual(captured["config"].model_type, "gemma4_text")
+        self.assertEqual(captured["config"].vocab_size, 64)
+        self.assertEqual(captured["state_kwargs"]["device"], "cpu")
+        self.assertEqual(captured["build_kwargs"]["native_attention_backend"], "sdpa_single_gqa")
+
     def test_decoder_layer_exposes_native_attention_boundary(self) -> None:
         from transformers.models.gemma4.modeling_gemma4 import Gemma4TextDecoderLayer
         from wkvm.runner.gemma_native_forward import (
