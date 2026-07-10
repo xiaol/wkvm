@@ -2549,7 +2549,7 @@ class GemmaNativeEngine:
         full_attention_kv_indices_padding_steps: int = 0,
         sliding_attention_kv_indices_padding_steps: int = 0,
         persistent_full_attention_rows: bool = False,
-    ) -> list[_TokenPoolDecodeReservation]:
+    ) -> TokenPoolPreparedDecodeBatch | list[_TokenPoolDecodeReservation]:
         table = self._token_table
         allocator = self._token_slot_allocator
         backend = self._token_pool_decode_backend
@@ -2614,7 +2614,7 @@ class GemmaNativeEngine:
             self.metrics.token_pool_slot_high_watermark,
             allocator.high_watermark,
         )
-        return list(prepared_batch.reservations)
+        return prepared_batch
 
     def _token_pool_prepare_decode_model_batch(
         self,
