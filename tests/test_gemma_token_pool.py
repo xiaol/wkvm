@@ -898,6 +898,45 @@ class TestGemmaTokenPool(unittest.TestCase):
             },
         )
 
+    def test_token_pool_decode_backend_builds_layer_type_metadata(self) -> None:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenPoolDecodeBackendState,
+        )
+
+        table = ReqToTokenTable(max_requests=2, max_context_len=8)
+        a = table.allocate("a")
+        b = table.allocate("b")
+        table.append_slots(a, [0, 1, 2, 3, 4])
+        table.append_slots(b, [8, 9, 10])
+        backend = TokenPoolDecodeBackendState(table=table)
+
+        metadata_by_type = backend.build_decode_metadata_by_layer_type(
+            req_slots=[a, b],
+            out_cache_loc=[4, 10],
+            sliding_window=2,
+        )
+
+        self.assertEqual(set(metadata_by_type), {"full_attention", "sliding_attention"})
+        full = metadata_by_type["full_attention"]
+        sliding = metadata_by_type["sliding_attention"]
+        self.assertEqual(full.req_pool_indices.tolist(), [a, b])
+        self.assertEqual(full.logical_seq_lens.tolist(), [5, 3])
+        self.assertEqual(full.seq_lens.tolist(), [5, 3])
+        self.assertEqual(full.kv_indptr.tolist(), [0, 5, 8])
+        self.assertEqual(full.kv_indices.tolist(), [0, 1, 2, 3, 4, 8, 9, 10])
+        self.assertEqual(full.out_cache_loc.tolist(), [4, 10])
+        self.assertEqual(sliding.logical_seq_lens.tolist(), [5, 3])
+        self.assertEqual(sliding.seq_lens.tolist(), [2, 2])
+        self.assertEqual(sliding.kv_indptr.tolist(), [0, 2, 4])
+        self.assertEqual(sliding.kv_indices.tolist(), [3, 4, 9, 10])
+        self.assertEqual(sliding.out_cache_loc.tolist(), [4, 10])
+
     def test_token_pool_decode_backend_builds_sliding_metadata_from_block_tables(self) -> None:
         try:
             import torch  # noqa: F401

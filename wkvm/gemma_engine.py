@@ -2411,17 +2411,16 @@ class GemmaNativeEngine:
                 req_slots.append(req_slot)
                 out_cache_loc.append(token_slot)
             if self._token_kv_pool is None:
-                self.last_token_pool_decode_metadata = {
-                    "full_attention": table.build_decode_metadata(
-                        req_slots,
-                        out_cache_loc=out_cache_loc,
-                    ),
-                    "sliding_attention": table.build_decode_metadata(
-                        req_slots,
+                backend = self._token_pool_decode_backend
+                if backend is None:
+                    raise RuntimeError("token-pool decode backend is not initialized")
+                self.last_token_pool_decode_metadata = (
+                    backend.build_decode_metadata_by_layer_type(
+                        req_slots=req_slots,
                         out_cache_loc=out_cache_loc,
                         sliding_window=self.config.sliding_window,
-                    ),
-                }
+                    )
+                )
             else:
                 backend = self._token_pool_decode_backend
                 if backend is None:

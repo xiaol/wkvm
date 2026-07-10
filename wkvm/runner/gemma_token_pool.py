@@ -5260,6 +5260,26 @@ class TokenPoolDecodeBackendState:
             sliding_window + self.block_size - 1 + self.block_size - 1
         ) // self.block_size
 
+    def build_decode_metadata_by_layer_type(
+        self,
+        *,
+        req_slots: Iterable[int],
+        out_cache_loc: Iterable[int] | Any,
+        sliding_window: int,
+    ) -> dict[str, DecodeBatchMetadata]:
+        req_slots_list = [int(slot) for slot in req_slots]
+        return {
+            "full_attention": self.table.build_decode_metadata(
+                req_slots_list,
+                out_cache_loc=out_cache_loc,
+            ),
+            "sliding_attention": self.table.build_decode_metadata(
+                req_slots_list,
+                out_cache_loc=out_cache_loc,
+                sliding_window=sliding_window,
+            ),
+        }
+
     def build_sliding_decode_metadata(
         self,
         *,
