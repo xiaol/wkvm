@@ -4697,6 +4697,10 @@ class ReqToTokenTable:
                             "request token table contains padding inside metadata slice"
                         )
                     slots = slots[~padding_mask]
+                if bool((slots < 0).any().item()):
+                    raise ValueError("token-slot rows must not contain negative slots")
+                if int(torch.unique(slots).numel()) != int(slots.numel()):
+                    raise ValueError("token-slot rows must not contain duplicate slots")
             chunks.append(slots)
             selected_lens.append(int(slots.numel()))
             indptr.append(indptr[-1] + int(slots.numel()))

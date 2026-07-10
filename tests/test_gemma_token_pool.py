@@ -2786,6 +2786,18 @@ class TestGemmaTokenPool(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "out_cache_loc must be unique"):
             table.build_decode_metadata([a, b], out_cache_loc=[1, 1])
 
+        duplicate = ReqToTokenTable(max_requests=1, max_context_len=2)
+        duplicate_slot = duplicate.allocate("dup")
+        duplicate.append_slots(duplicate_slot, [4, 4])
+        with self.assertRaisesRegex(ValueError, "duplicate slots"):
+            duplicate.build_decode_metadata([duplicate_slot])
+
+        negative = ReqToTokenTable(max_requests=1, max_context_len=2)
+        negative_slot = negative.allocate("neg")
+        negative.append_slots(negative_slot, [4, -2])
+        with self.assertRaisesRegex(ValueError, "negative slots"):
+            negative.build_decode_metadata([negative_slot])
+
     def test_req_to_token_table_rejects_padding_in_paged_metadata(self) -> None:
         try:
             import torch  # noqa: F401
