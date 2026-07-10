@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+import time
 from typing import Any
 
 
@@ -15,6 +16,13 @@ class TokenPoolTritonDecodeResult:
 
 
 @dataclass(frozen=True)
+class TokenPoolAttentionDecodeResult:
+    output: Any
+    weights: Any | None = None
+    kind: str = "reference"
+
+
+@dataclass(frozen=True)
 class TokenPoolTritonAttentionBackendHooks:
     decode_fn: Callable[[], Callable[..., Any]]
     split_decode_fn: Callable[[], Callable[..., Any]]
@@ -23,6 +31,128 @@ class TokenPoolTritonAttentionBackendHooks:
     block_groups: Callable[[int, Any], int]
     record_fallback: Callable[[str], None]
     is_recoverable_runtime_error: Callable[[RuntimeError], bool]
+
+
+@dataclass(frozen=True)
+class TokenPoolAttentionBackendHooks:
+    triton: TokenPoolTritonAttentionBackendHooks
+    reference_decode: Callable[..., tuple[Any, Any | None]]
+    slot_count: Callable[[Any], int]
+    record_kv_write_timing: Callable[..., None]
+    record_triton_attempt_timing: Callable[[float], None]
+    record_attention_timing: Callable[[str, int, float], None]
+    now: Callable[[], float] = time.perf_counter
+
+
+class TokenPoolAttentionBackend:
+    """Owns decode-side token-pool attention ordering and fallback."""
+
+    def __init__(
+        self,
+        *,
+        stats: dict[str, int],
+        disabled_shapes: set[tuple[Any, ...]],
+        hooks: TokenPoolAttentionBackendHooks,
+    ) -> None:
+        self._stats = stats
+        self._hooks = hooks
+        self._triton = TokenPoolTritonAttentionBackend(
+            stats=stats,
+            disabled_shapes=disabled_shapes,
+            hooks=hooks.triton,
+        )
+
+    def decode(
+        self,
+        attn: Any,
+        query_states: Any,
+        *,
+        dispatch_context: Any,
+        dispatch_plan: Any,
+        current_key_states: Any | None = None,
+        current_value_states: Any | None = None,
+        timing_enabled: bool = False,
+    ) -> TokenPoolAttentionDecodeResult:
+        attention_start = self._hooks.now() if timing_enabled else 0.0
+        attention_rows = int(query_states.shape[0])
+        self._record_dispatch_plan_call(dispatch_plan)
+
+        if current_key_states is not None and current_value_states is not None:
+            kv_write_start = self._hooks.now() if timing_enabled else 0.0
+            out_cache_loc = dispatch_context.store_current_kv(
+                current_key_states,
+                current_value_states,
+            )
+            if timing_enabled and out_cache_loc is not None:
+                self._hooks.record_kv_write_timing(
+                    tokens=self._hooks.slot_count(out_cache_loc),
+                    elapsed=self._hooks.now() - kv_write_start,
+                )
+
+        triton_attempt_start = self._hooks.now() if timing_enabled else 0.0
+        triton_result = self._triton.decode(
+            attn,
+            query_states,
+            dispatch_context=dispatch_context,
+            dispatch_plan=dispatch_plan,
+        )
+        if triton_result.attempted and timing_enabled:
+            self._hooks.record_triton_attempt_timing(
+                self._hooks.now() - triton_attempt_start
+            )
+        if triton_result.succeeded:
+            if timing_enabled:
+                self._hooks.record_attention_timing(
+                    "triton",
+                    attention_rows,
+                    self._hooks.now() - attention_start,
+                )
+            return TokenPoolAttentionDecodeResult(
+                output=triton_result.output,
+                weights=None,
+                kind="triton",
+            )
+
+        reference_metadata, reference_kv_pool, reference_layer_idx = (
+            dispatch_context.reference_decode_inputs()
+        )
+        output, weights = self._hooks.reference_decode(
+            attn,
+            query_states,
+            decode_metadata=reference_metadata,
+            token_kv_pool=reference_kv_pool,
+            layer_idx=reference_layer_idx,
+        )
+        if timing_enabled:
+            self._hooks.record_attention_timing(
+                "reference",
+                attention_rows,
+                self._hooks.now() - attention_start,
+            )
+        return TokenPoolAttentionDecodeResult(
+            output=output,
+            weights=weights,
+            kind="reference",
+        )
+
+    def _record_dispatch_plan_call(self, dispatch_plan: Any) -> None:
+        self._stats["calls"] += 1
+        if dispatch_plan.env_enabled:
+            self._stats["env_enabled_calls"] += 1
+        if dispatch_plan.env_forced_off or dispatch_plan.env_disabled:
+            self._stats["env_disabled_calls"] += 1
+        if dispatch_plan.effective_enabled:
+            self._stats["effective_enabled_calls"] += 1
+        else:
+            self._stats["effective_disabled_calls"] += 1
+        if dispatch_plan.auto_default_enabled:
+            self._stats["auto_enabled_calls"] += 1
+        if dispatch_plan.paged_enabled:
+            self._stats["paged_enabled_calls"] += 1
+        if dispatch_plan.split_enabled:
+            self._stats["split_enabled_calls"] += 1
+        if dispatch_plan.paged_split_enabled:
+            self._stats["paged_split_enabled_calls"] += 1
 
 
 class TokenPoolTritonAttentionBackend:

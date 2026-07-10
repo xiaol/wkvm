@@ -16,7 +16,7 @@ _TOKEN_POOL_TRITON_DECODE_FN = None
 _TOKEN_POOL_TRITON_SPLIT_DECODE_FN = None
 _TOKEN_POOL_TRITON_PAGED_DECODE_FN = None
 _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN = None
-_TOKEN_POOL_TRITON_ATTENTION_BACKEND = None
+_TOKEN_POOL_ATTENTION_BACKEND = None
 _TOKEN_POOL_TRITON_DISPATCH_ENV_NAMES = (
     "WKVM_ENABLE_TOKEN_POOL_TRITON",
     "WKVM_DISABLE_TOKEN_POOL_TRITON",
@@ -374,15 +374,33 @@ def _token_pool_triton_paged_split_decode_fn():
     return _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN
 
 
-def _token_pool_triton_attention_backend():
-    global _TOKEN_POOL_TRITON_ATTENTION_BACKEND
-    if _TOKEN_POOL_TRITON_ATTENTION_BACKEND is None:
+def _record_token_pool_triton_attempt_timing(elapsed: float) -> None:
+    _record_native_count("token_pool_attention_triton_attempts")
+    _record_native_timing("token_pool_attention_triton_attempt_wall_s", elapsed)
+
+
+def _record_token_pool_attention_backend_timing(
+    kind: str,
+    rows: int,
+    elapsed: float,
+) -> None:
+    _record_token_pool_attention_timing(kind, rows=rows, elapsed=elapsed)
+
+
+def _attention_forward_token_pool_gqa_reference_hook(*args, **kwargs):
+    return _attention_forward_token_pool_gqa_reference(*args, **kwargs)
+
+
+def _token_pool_attention_backend():
+    global _TOKEN_POOL_ATTENTION_BACKEND
+    if _TOKEN_POOL_ATTENTION_BACKEND is None:
         from wkvm.runner.gemma_token_pool_attention import (
-            TokenPoolTritonAttentionBackend,
+            TokenPoolAttentionBackend,
+            TokenPoolAttentionBackendHooks,
             TokenPoolTritonAttentionBackendHooks,
         )
 
-        hooks = TokenPoolTritonAttentionBackendHooks(
+        triton_hooks = TokenPoolTritonAttentionBackendHooks(
             decode_fn=_token_pool_triton_decode_fn,
             split_decode_fn=_token_pool_triton_split_decode_fn,
             paged_decode_fn=_token_pool_triton_paged_decode_fn,
@@ -391,12 +409,21 @@ def _token_pool_triton_attention_backend():
             record_fallback=_record_token_pool_triton_fallback,
             is_recoverable_runtime_error=_is_recoverable_token_pool_triton_error,
         )
-        _TOKEN_POOL_TRITON_ATTENTION_BACKEND = TokenPoolTritonAttentionBackend(
+        hooks = TokenPoolAttentionBackendHooks(
+            triton=triton_hooks,
+            reference_decode=_attention_forward_token_pool_gqa_reference_hook,
+            slot_count=_slot_count,
+            record_kv_write_timing=_record_token_pool_kv_write_timing,
+            record_triton_attempt_timing=_record_token_pool_triton_attempt_timing,
+            record_attention_timing=_record_token_pool_attention_backend_timing,
+            now=time.perf_counter,
+        )
+        _TOKEN_POOL_ATTENTION_BACKEND = TokenPoolAttentionBackend(
             stats=_TOKEN_POOL_TRITON_STATS,
             disabled_shapes=_TOKEN_POOL_TRITON_DISABLED_SHAPES,
             hooks=hooks,
         )
-    return _TOKEN_POOL_TRITON_ATTENTION_BACKEND
+    return _TOKEN_POOL_ATTENTION_BACKEND
 
 
 def token_pool_triton_stats() -> dict[str, Any]:
@@ -421,7 +448,7 @@ def reset_token_pool_triton_stats(*, clear_disabled_shapes: bool = False) -> Non
     global _TOKEN_POOL_TRITON_DECODE_FN, _TOKEN_POOL_TRITON_SPLIT_DECODE_FN
     global _TOKEN_POOL_TRITON_PAGED_DECODE_FN, _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN
     global _TOKEN_POOL_TRITON_DISPATCH_ENV_KEY, _TOKEN_POOL_TRITON_DISPATCH_PLAN
-    global _TOKEN_POOL_TRITON_ATTENTION_BACKEND
+    global _TOKEN_POOL_ATTENTION_BACKEND
     for key in _TOKEN_POOL_TRITON_STATS:
         _TOKEN_POOL_TRITON_STATS[key] = 0
     _TOKEN_POOL_TRITON_FALLBACK_REASONS.clear()
@@ -429,7 +456,7 @@ def reset_token_pool_triton_stats(*, clear_disabled_shapes: bool = False) -> Non
     _TOKEN_POOL_TRITON_SPLIT_DECODE_FN = None
     _TOKEN_POOL_TRITON_PAGED_DECODE_FN = None
     _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN = None
-    _TOKEN_POOL_TRITON_ATTENTION_BACKEND = None
+    _TOKEN_POOL_ATTENTION_BACKEND = None
     _TOKEN_POOL_TRITON_DISPATCH_ENV_KEY = None
     _TOKEN_POOL_TRITON_DISPATCH_PLAN = None
     if clear_disabled_shapes:
@@ -1535,9 +1562,6 @@ def _attention_forward_token_pool_gqa(
     current_value_states=None,
 ):
     timing_enabled = _native_forward_timing_enabled()
-    attention_start = time.perf_counter() if timing_enabled else 0.0
-    attention_rows = int(query_states.shape[0])
-    _TOKEN_POOL_TRITON_STATS["calls"] += 1
     dispatch_plan = _token_pool_triton_dispatch_plan()
     from wkvm.runner.gemma_token_pool import build_token_pool_attention_dispatch_context
 
@@ -1548,74 +1572,16 @@ def _attention_forward_token_pool_gqa(
         token_kv_pool=token_kv_pool,
         layer_idx=layer_idx,
     )
-    if dispatch_plan.env_enabled:
-        _TOKEN_POOL_TRITON_STATS["env_enabled_calls"] += 1
-    if dispatch_plan.env_forced_off or dispatch_plan.env_disabled:
-        _TOKEN_POOL_TRITON_STATS["env_disabled_calls"] += 1
-    if dispatch_plan.effective_enabled:
-        _TOKEN_POOL_TRITON_STATS["effective_enabled_calls"] += 1
-    else:
-        _TOKEN_POOL_TRITON_STATS["effective_disabled_calls"] += 1
-    if dispatch_plan.auto_default_enabled:
-        _TOKEN_POOL_TRITON_STATS["auto_enabled_calls"] += 1
-    paged_triton_enabled = dispatch_plan.paged_enabled
-    split_triton_enabled = dispatch_plan.split_enabled
-    paged_split_triton_enabled = dispatch_plan.paged_split_enabled
-    if paged_triton_enabled:
-        _TOKEN_POOL_TRITON_STATS["paged_enabled_calls"] += 1
-    if split_triton_enabled:
-        _TOKEN_POOL_TRITON_STATS["split_enabled_calls"] += 1
-    if paged_split_triton_enabled:
-        _TOKEN_POOL_TRITON_STATS["paged_split_enabled_calls"] += 1
-    if current_key_states is not None and current_value_states is not None:
-        kv_write_start = time.perf_counter() if timing_enabled else 0.0
-        out_cache_loc = dispatch_context.store_current_kv(
-            current_key_states,
-            current_value_states,
-        )
-        if timing_enabled and out_cache_loc is not None:
-            _record_token_pool_kv_write_timing(
-                tokens=_slot_count(out_cache_loc),
-                elapsed=time.perf_counter() - kv_write_start,
-            )
-    triton_attempt_start = time.perf_counter() if timing_enabled else 0.0
-    triton_result = _token_pool_triton_attention_backend().decode(
+    result = _token_pool_attention_backend().decode(
         attn,
         query_states,
         dispatch_context=dispatch_context,
         dispatch_plan=dispatch_plan,
+        current_key_states=current_key_states,
+        current_value_states=current_value_states,
+        timing_enabled=timing_enabled,
     )
-    if triton_result.attempted and timing_enabled:
-        _record_native_count("token_pool_attention_triton_attempts")
-        _record_native_timing(
-            "token_pool_attention_triton_attempt_wall_s",
-            time.perf_counter() - triton_attempt_start,
-        )
-    if triton_result.succeeded:
-        if timing_enabled:
-            _record_token_pool_attention_timing(
-                "triton",
-                rows=attention_rows,
-                elapsed=time.perf_counter() - attention_start,
-            )
-        return triton_result.output, None
-    reference_metadata, reference_kv_pool, reference_layer_idx = (
-        dispatch_context.reference_decode_inputs()
-    )
-    result = _attention_forward_token_pool_gqa_reference(
-        attn,
-        query_states,
-        decode_metadata=reference_metadata,
-        token_kv_pool=reference_kv_pool,
-        layer_idx=reference_layer_idx,
-    )
-    if timing_enabled:
-        _record_token_pool_attention_timing(
-            "reference",
-            rows=attention_rows,
-            elapsed=time.perf_counter() - attention_start,
-        )
-    return result
+    return result.output, result.weights
 
 
 def _is_recoverable_token_pool_triton_error(exc: RuntimeError) -> bool:

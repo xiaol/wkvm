@@ -3156,6 +3156,134 @@ class TestGemmaTokenPool(unittest.TestCase):
             base_metadata,
         )
 
+    def test_attention_backend_owns_reference_fallback_ordering(self) -> None:
+        from types import SimpleNamespace
+        from wkvm.runner.gemma_token_pool_attention import (
+            TokenPoolAttentionBackend,
+            TokenPoolAttentionBackendHooks,
+            TokenPoolTritonAttentionBackendHooks,
+        )
+
+        stats = {
+            "calls": 0,
+            "env_enabled_calls": 0,
+            "env_disabled_calls": 0,
+            "effective_enabled_calls": 0,
+            "effective_disabled_calls": 0,
+            "auto_enabled_calls": 0,
+            "paged_enabled_calls": 0,
+            "split_enabled_calls": 0,
+            "paged_split_enabled_calls": 0,
+        }
+        events = []
+        kv_timings = []
+        triton_attempt_timings = []
+        attention_timings = []
+
+        class QueryStates:
+            is_cuda = False
+            shape = (2, 4, 1, 8)
+
+        class DispatchContext:
+            def store_current_kv(self, key_states, value_states):
+                events.append(("store", key_states, value_states))
+                return ("slot0", "slot1")
+
+            def reference_decode_inputs(self):
+                events.append(("reference_inputs",))
+                return "metadata", "pool", 7
+
+        query_states = QueryStates()
+        attn = object()
+        dispatch_context = DispatchContext()
+        dispatch_plan = SimpleNamespace(
+            env_enabled=True,
+            env_forced_off=False,
+            env_disabled=False,
+            effective_enabled=True,
+            auto_default_enabled=True,
+            paged_enabled=True,
+            split_enabled=True,
+            paged_split_enabled=True,
+        )
+        now_values = iter([10.0, 10.25, 10.5, 10.75, 11.0])
+
+        def reference_decode(actual_attn, actual_query_states, **kwargs):
+            events.append(("reference_decode", actual_attn, actual_query_states, kwargs))
+            return "reference_output", "weights"
+
+        backend = TokenPoolAttentionBackend(
+            stats=stats,
+            disabled_shapes=set(),
+            hooks=TokenPoolAttentionBackendHooks(
+                triton=TokenPoolTritonAttentionBackendHooks(
+                    decode_fn=lambda: None,
+                    split_decode_fn=lambda: None,
+                    paged_decode_fn=lambda: None,
+                    paged_split_decode_fn=lambda: None,
+                    block_groups=lambda groups, dtype: groups,
+                    record_fallback=lambda reason: events.append(("fallback", reason)),
+                    is_recoverable_runtime_error=lambda exc: True,
+                ),
+                reference_decode=reference_decode,
+                slot_count=len,
+                record_kv_write_timing=lambda **kwargs: kv_timings.append(kwargs),
+                record_triton_attempt_timing=triton_attempt_timings.append,
+                record_attention_timing=lambda kind, rows, elapsed: (
+                    attention_timings.append((kind, rows, elapsed))
+                ),
+                now=lambda: next(now_values),
+            ),
+        )
+
+        result = backend.decode(
+            attn,
+            query_states,
+            dispatch_context=dispatch_context,
+            dispatch_plan=dispatch_plan,
+            current_key_states="key_states",
+            current_value_states="value_states",
+            timing_enabled=True,
+        )
+
+        self.assertEqual(result.output, "reference_output")
+        self.assertEqual(result.weights, "weights")
+        self.assertEqual(result.kind, "reference")
+        self.assertEqual(
+            events,
+            [
+                ("store", "key_states", "value_states"),
+                ("reference_inputs",),
+                (
+                    "reference_decode",
+                    attn,
+                    query_states,
+                    {
+                        "decode_metadata": "metadata",
+                        "token_kv_pool": "pool",
+                        "layer_idx": 7,
+                    },
+                ),
+            ],
+        )
+        self.assertEqual(
+            stats,
+            {
+                "calls": 1,
+                "env_enabled_calls": 1,
+                "env_disabled_calls": 0,
+                "effective_enabled_calls": 1,
+                "effective_disabled_calls": 0,
+                "auto_enabled_calls": 1,
+                "paged_enabled_calls": 1,
+                "split_enabled_calls": 1,
+                "paged_split_enabled_calls": 1,
+            },
+        )
+        self.assertEqual(kv_timings, [{"tokens": 2, "elapsed": 0.25}])
+        self.assertEqual(triton_attempt_timings, [])
+        self.assertEqual(attention_timings, [("reference", 2, 1.0)])
+
     def test_decode_backend_owns_attention_workspace(self) -> None:
         try:
             import torch
