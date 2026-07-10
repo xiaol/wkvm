@@ -2217,6 +2217,55 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertIsNone(plan.metadata)
         self.assertIs(plan.paged_metadata, paged)
 
+    def test_strict_paged_only_sliding_metadata_requires_request_block_tables(
+        self,
+    ) -> None:
+        import os
+
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenPoolDecodeBackendState,
+        )
+
+        env_names = (
+            "WKVM_TOKEN_POOL_TRITON_STRICT",
+            "WKVM_TOKEN_POOL_SLIDING_PAGED_METADATA_ONLY",
+        )
+        old_env = {name: os.environ.get(name) for name in env_names}
+        try:
+            os.environ["WKVM_TOKEN_POOL_TRITON_STRICT"] = "1"
+            os.environ["WKVM_TOKEN_POOL_SLIDING_PAGED_METADATA_ONLY"] = "1"
+
+            table = ReqToTokenTable(max_requests=1, max_context_len=16)
+            req_slot = table.allocate("req")
+            table.append_slots(req_slot, [0, 1, 2, 3, 4, 5])
+            backend = TokenPoolDecodeBackendState(
+                table=table,
+                block_size=4,
+                page_table_metadata_max_rows=1,
+                token_pool_capacity=32,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "request block table tensor"):
+                backend.build_sliding_decode_metadata(
+                    req_slots=[req_slot],
+                    logical_seq_lens=[6],
+                    out_cache_loc=[5],
+                    sliding_window=5,
+                    page_tables=[{0: 0, 1: 1}],
+                )
+        finally:
+            for name, value in old_env.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
     def test_token_pool_decode_backend_falls_back_to_dict_page_tables_and_pads(self) -> None:
         try:
             import torch  # noqa: F401

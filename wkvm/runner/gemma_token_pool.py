@@ -2147,6 +2147,13 @@ def _token_pool_sliding_paged_metadata_only_requested() -> bool:
     )
 
 
+def _token_pool_require_sliding_request_block_tables() -> bool:
+    return bool(
+        _env_flag("WKVM_TOKEN_POOL_TRITON_STRICT")
+        and _token_pool_sliding_paged_metadata_only_requested()
+    )
+
+
 def _token_pool_timing_enabled() -> bool:
     return _env_flag("WKVM_TOKEN_POOL_TIMING") or _env_flag("WKVM_NATIVE_FORWARD_TIMING")
 
@@ -7228,6 +7235,10 @@ class TokenPoolDecodeBackendState:
         if paged_only:
             should_build_paged = True
         compact_paged_block_tables = not paged_only
+        require_request_block_tables = (
+            bool(paged_only)
+            and _token_pool_require_sliding_request_block_tables()
+        )
 
         paged_metadata = None
         if should_build_paged:
@@ -7238,6 +7249,7 @@ class TokenPoolDecodeBackendState:
                 sliding_window=sliding_window,
                 page_tables=page_tables,
                 compact_block_tables=compact_paged_block_tables,
+                require_request_block_tables=require_request_block_tables,
             )
         if paged_only:
             if paged_metadata is None:
@@ -7272,6 +7284,7 @@ class TokenPoolDecodeBackendState:
         sliding_window: int,
         page_tables: Iterable[dict[int, int]] | None = None,
         compact_block_tables: bool = True,
+        require_request_block_tables: bool = False,
     ) -> PagedDecodeBatchMetadata | None:
         req_slots_list = [int(slot) for slot in req_slots]
         logical_lens = [int(length) for length in logical_seq_lens]
@@ -7287,6 +7300,11 @@ class TokenPoolDecodeBackendState:
 
         block_table_width = self.sliding_block_table_width(sliding_window)
         page_table_tensor = self.page_table_tensor
+        require_request_block_tables = bool(require_request_block_tables)
+        if require_request_block_tables and page_table_tensor is None:
+            raise RuntimeError(
+                "strict sliding paged metadata requires a request block table tensor"
+            )
         if page_table_tensor is not None:
             try:
                 return self.table.build_paged_decode_metadata_from_page_table_tensor(
@@ -7302,7 +7320,12 @@ class TokenPoolDecodeBackendState:
                     validate=False,
                     compact_block_tables=compact_block_tables,
                 )
-            except (RuntimeError, ValueError, KeyError):
+            except (RuntimeError, ValueError, KeyError) as exc:
+                if require_request_block_tables:
+                    raise RuntimeError(
+                        "strict sliding paged metadata could not be built from "
+                        "request block tables"
+                    ) from exc
                 pass
 
         page_table_list = (
