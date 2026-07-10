@@ -36,6 +36,7 @@ from wkvm.runner.gemma_token_pool import (
     TokenPoolBlockTables,
     TokenPoolDecodeBackendState,
     TokenPoolDecodeContext,
+    TokenPoolDecodeGraphSignatureUpdate,
     TokenPoolDecodeGraphSignatureTracker,
     TokenPoolFullAttentionRow,
     TokenSlotAllocator,
@@ -755,7 +756,7 @@ class GemmaNativeEngine:
     def fail_unfinished(self, error: str) -> list[Request]:
         self._persistent_exact_decode_groups.clear()
         self._persistent_padded_decode_groups.clear()
-        self._token_pool_decode_graph_signature_tracker().clear()
+        self._token_pool_clear_graph_decode_signatures()
         self._token_pool_clear_full_attention_rows(list(self._token_pool_full_attention_rows))
         failed: list[Request] = []
         for req_id in list(self.scheduler.requests):
@@ -1661,7 +1662,7 @@ class GemmaNativeEngine:
         for key in list(self._persistent_padded_decode_groups):
             if any(req_id in req_ids for req_id in key):
                 self._persistent_padded_decode_groups.pop(key, None)
-                self._token_pool_decode_graph_signature_tracker().discard(key)
+                self._token_pool_discard_graph_decode_signature(key)
         self._token_pool_invalidate_full_attention_rows(req_ids)
 
     def _flush_exact_decode_group(self, key: tuple[str, ...]) -> None:
@@ -1682,7 +1683,7 @@ class GemmaNativeEngine:
 
     def _flush_padded_decode_group(self, key: tuple[str, ...]) -> None:
         merged_cache = self._persistent_padded_decode_groups.pop(key, None)
-        self._token_pool_decode_graph_signature_tracker().discard(key)
+        self._token_pool_discard_graph_decode_signature(key)
         if merged_cache is None:
             self._token_pool_clear_full_attention_rows(key)
             return
@@ -1839,19 +1840,51 @@ class GemmaNativeEngine:
             ),
         )
 
-    def _token_pool_decode_graph_signature_tracker(
-        self,
-    ) -> TokenPoolDecodeGraphSignatureTracker:
+    def _token_pool_clear_graph_decode_signatures(self) -> None:
         backend = self._token_pool_decode_backend
         if backend is not None:
-            return backend.graph_signature_tracker
-        return self._token_pool_decode_graph_signature_fallback
+            backend.clear_graph_decode_signatures()
+            return
+        self._token_pool_decode_graph_signature_fallback.clear()
+
+    def _token_pool_discard_graph_decode_signature(
+        self,
+        key: tuple[str, ...],
+    ) -> None:
+        backend = self._token_pool_decode_backend
+        if backend is not None:
+            backend.discard_graph_decode_signature(key)
+            return
+        self._token_pool_decode_graph_signature_fallback.discard(key)
+
+    def _token_pool_record_graph_decode_signature(
+        self,
+        key: tuple[str, ...],
+        token_pool_decode: TokenPoolDecodeContext | None,
+        *,
+        started_new: bool,
+    ) -> TokenPoolDecodeGraphSignatureUpdate:
+        backend = self._token_pool_decode_backend
+        if backend is not None:
+            return backend.record_graph_decode_signature(
+                key,
+                token_pool_decode,
+                started_new=started_new,
+            )
+        return self._token_pool_decode_graph_signature_fallback.record(
+            key,
+            token_pool_decode,
+            started_new=started_new,
+        )
 
     @property
     def _persistent_padded_token_pool_decode_signatures(
         self,
     ) -> dict[tuple[str, ...], dict[str, Any]]:
-        return self._token_pool_decode_graph_signature_tracker().signatures
+        backend = self._token_pool_decode_backend
+        if backend is not None:
+            return backend.graph_decode_signatures
+        return self._token_pool_decode_graph_signature_fallback.signatures
 
     def _token_pool_ensure_page_table_width(self, context_len: int) -> None:
         block_tables = self._token_pool_block_tables
@@ -2518,7 +2551,7 @@ class GemmaNativeEngine:
         *,
         started_new: bool,
     ) -> None:
-        update = self._token_pool_decode_graph_signature_tracker().record(
+        update = self._token_pool_record_graph_decode_signature(
             key,
             token_pool_decode,
             started_new=started_new,
@@ -2544,14 +2577,16 @@ class GemmaNativeEngine:
         cls,
         token_pool_decode: TokenPoolDecodeContext,
     ) -> dict[str, Any]:
-        return TokenPoolDecodeGraphSignatureTracker.shape_signature(token_pool_decode)
+        return TokenPoolDecodeBackendState.graph_decode_shape_signature(
+            token_pool_decode
+        )
 
     @classmethod
     def _decode_metadata_shape_signature(
         cls,
         metadata: DecodeBatchMetadata,
     ) -> dict[str, Any]:
-        return TokenPoolDecodeGraphSignatureTracker.decode_metadata_shape_signature(
+        return TokenPoolDecodeBackendState.graph_decode_metadata_shape_signature(
             metadata
         )
 
@@ -2560,17 +2595,17 @@ class GemmaNativeEngine:
         cls,
         metadata: PagedDecodeBatchMetadata,
     ) -> dict[str, Any]:
-        return TokenPoolDecodeGraphSignatureTracker.paged_decode_metadata_shape_signature(
+        return TokenPoolDecodeBackendState.graph_paged_decode_metadata_shape_signature(
             metadata
         )
 
     @staticmethod
     def _triton_decode_plan_signature(plan: Any) -> dict[str, Any] | None:
-        return TokenPoolDecodeGraphSignatureTracker.triton_decode_plan_signature(plan)
+        return TokenPoolDecodeBackendState.graph_triton_decode_plan_signature(plan)
 
     @staticmethod
     def _tensor_shape_signature(value: Any) -> dict[str, Any] | None:
-        return TokenPoolDecodeGraphSignatureTracker.tensor_shape_signature(value)
+        return TokenPoolDecodeBackendState.graph_tensor_shape_signature(value)
 
     @classmethod
     def _token_pool_decode_shape_mismatch_reasons(
@@ -2578,7 +2613,7 @@ class GemmaNativeEngine:
         expected: dict[str, Any],
         actual: dict[str, Any],
     ) -> list[str]:
-        return TokenPoolDecodeGraphSignatureTracker.shape_mismatch_reasons(
+        return TokenPoolDecodeBackendState.graph_decode_shape_mismatch_reasons(
             expected,
             actual,
         )
@@ -2589,7 +2624,7 @@ class GemmaNativeEngine:
         expected: dict[Any, Any],
         actual: dict[Any, Any],
     ) -> list[str]:
-        return TokenPoolDecodeGraphSignatureTracker.metadata_shape_mismatch_reasons(
+        return TokenPoolDecodeBackendState.graph_metadata_shape_mismatch_reasons(
             prefix,
             expected,
             actual,

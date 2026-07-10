@@ -4125,6 +4125,76 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(tracker.discard_touching({"a"}), 1)
         self.assertFalse(tracker.signatures)
 
+    def test_decode_backend_state_owns_graph_signature_records(self) -> None:
+        from wkvm.runner.gemma_token_pool import (
+            DecodeBatchMetadata,
+            TokenPoolDecodeBackendState,
+            TokenPoolDecodeContext,
+        )
+
+        class FakeTensorShape:
+            dtype = "torch.int32"
+            device = "cuda:0"
+
+            def __init__(self, shape: tuple[int, ...]) -> None:
+                self.shape = shape
+
+            def numel(self) -> int:
+                total = 1
+                for dim in self.shape:
+                    total *= int(dim)
+                return total
+
+        def context(*, kv_indices: int) -> TokenPoolDecodeContext:
+            metadata = DecodeBatchMetadata(
+                req_pool_indices=FakeTensorShape((2,)),
+                seq_lens=FakeTensorShape((2,)),
+                logical_seq_lens=FakeTensorShape((2,)),
+                out_cache_loc=FakeTensorShape((2,)),
+                kv_indptr=FakeTensorShape((3,)),
+                kv_indices=FakeTensorShape((kv_indices,)),
+            )
+            return TokenPoolDecodeContext(
+                metadata_by_layer_type={"sliding_attention": metadata},
+                kv_pool=object(),
+                metadata_by_layer_id={0: metadata},
+                covered_layer_types=frozenset({"sliding_attention"}),
+            )
+
+        backend = TokenPoolDecodeBackendState(table=object())
+        started = backend.record_graph_decode_signature(
+            ("a", "b"),
+            context(kv_indices=4),
+            started_new=True,
+        )
+        reused = backend.record_graph_decode_signature(
+            ("a", "b"),
+            context(kv_indices=4),
+            started_new=False,
+        )
+        mismatched = backend.record_graph_decode_signature(
+            ("a", "b"),
+            context(kv_indices=5),
+            started_new=False,
+        )
+
+        self.assertEqual(started.static_shape_starts, 1)
+        self.assertEqual(reused.static_shape_reuses, 1)
+        self.assertEqual(mismatched.shape_mismatches, 1)
+        self.assertIn(("a", "b"), backend.graph_decode_signatures)
+        self.assertEqual(
+            backend.discard_graph_decode_signatures_touching({"a"}),
+            1,
+        )
+        self.assertFalse(backend.graph_decode_signatures)
+        backend.record_graph_decode_signature(
+            ("c",),
+            context(kv_indices=4),
+            started_new=True,
+        )
+        backend.clear_graph_decode_signatures()
+        self.assertFalse(backend.graph_decode_signatures)
+
     def test_graph_decode_context_graphable_requires_cuda_metadata(self) -> None:
         from wkvm.runner.gemma_token_pool import (
             DecodeBatchMetadata,

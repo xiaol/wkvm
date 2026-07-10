@@ -4873,6 +4873,84 @@ class TokenPoolDecodeBackendState:
             )
         )
 
+    @property
+    def graph_decode_signatures(self) -> dict[tuple[str, ...], dict[str, Any]]:
+        return self.graph_signature_tracker.signatures
+
+    def clear_graph_decode_signatures(self) -> None:
+        self.graph_signature_tracker.clear()
+
+    def discard_graph_decode_signature(self, key: tuple[str, ...]) -> None:
+        self.graph_signature_tracker.discard(key)
+
+    def discard_graph_decode_signatures_touching(self, req_ids: Iterable[Any]) -> int:
+        return self.graph_signature_tracker.discard_touching(req_ids)
+
+    def record_graph_decode_signature(
+        self,
+        key: tuple[str, ...],
+        token_pool_decode: TokenPoolDecodeContext | None,
+        *,
+        started_new: bool,
+    ) -> TokenPoolDecodeGraphSignatureUpdate:
+        return self.graph_signature_tracker.record(
+            key,
+            token_pool_decode,
+            started_new=started_new,
+        )
+
+    @staticmethod
+    def graph_decode_shape_signature(
+        token_pool_decode: TokenPoolDecodeContext,
+    ) -> dict[str, Any]:
+        return TokenPoolDecodeGraphSignatureTracker.shape_signature(token_pool_decode)
+
+    @staticmethod
+    def graph_decode_metadata_shape_signature(
+        metadata: DecodeBatchMetadata,
+    ) -> dict[str, Any]:
+        return TokenPoolDecodeGraphSignatureTracker.decode_metadata_shape_signature(
+            metadata
+        )
+
+    @staticmethod
+    def graph_paged_decode_metadata_shape_signature(
+        metadata: PagedDecodeBatchMetadata,
+    ) -> dict[str, Any]:
+        return TokenPoolDecodeGraphSignatureTracker.paged_decode_metadata_shape_signature(
+            metadata
+        )
+
+    @staticmethod
+    def graph_triton_decode_plan_signature(plan: Any) -> dict[str, Any] | None:
+        return TokenPoolDecodeGraphSignatureTracker.triton_decode_plan_signature(plan)
+
+    @staticmethod
+    def graph_tensor_shape_signature(value: Any) -> dict[str, Any] | None:
+        return TokenPoolDecodeGraphSignatureTracker.tensor_shape_signature(value)
+
+    @staticmethod
+    def graph_decode_shape_mismatch_reasons(
+        expected: dict[str, Any],
+        actual: dict[str, Any],
+    ) -> list[str]:
+        return TokenPoolDecodeGraphSignatureTracker.shape_mismatch_reasons(
+            expected,
+            actual,
+        )
+
+    @staticmethod
+    def graph_metadata_shape_mismatch_reasons(
+        prefix: str,
+        expected: dict[Any, Any],
+        actual: dict[Any, Any],
+    ) -> list[str]:
+        return TokenPoolDecodeGraphSignatureTracker.metadata_shape_mismatch_reasons(
+            prefix,
+            expected,
+            actual,
+        )
+
     def capture_graph_metadata(
         self,
         token_pool_decode: TokenPoolDecodeContext | None,
