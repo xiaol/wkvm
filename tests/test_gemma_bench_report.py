@@ -192,6 +192,27 @@ class TestGemmaBenchReport(unittest.TestCase):
                     require_same_prompt_fingerprint=True,
                 )
 
+    def test_require_same_prompt_fingerprint_rejects_rowless_payload(self) -> None:
+        payload = self.native_payload()
+        payload["rows"] = []
+        payload["fatal_error"] = {
+            "type": "OutOfMemoryError",
+            "phase": "model_load",
+            "message": "CUDA out of memory",
+        }
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            native = self.write_payload(tmp, "native.json", payload)
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "no benchmark rows",
+            ):
+                gemma_bench_report.render(
+                    [native],
+                    require_same_prompt_fingerprint=True,
+                )
+
     def test_require_native_no_hf_rejects_missing_row_evidence(self) -> None:
         stale_native_row = {
             "B": 2,

@@ -117,10 +117,12 @@ def validate_same_prompt_fingerprint(
     violations = []
     groups: dict[tuple[Any, Any, Any, Any], list[tuple[Path, dict[str, Any], int]]] = {}
     for path, data in payloads:
+        payload_rows = 0
         for index, row in enumerate(data.get("rows", [])):
             B = row.get("B")
             if B is None:
                 continue
+            payload_rows += 1
             fingerprint = row_prompt_fingerprint(row)
             if fingerprint is None:
                 violations.append(
@@ -128,6 +130,8 @@ def validate_same_prompt_fingerprint(
                 )
                 continue
             groups.setdefault((*shape_key(data), B), []).append((path, fingerprint, index))
+        if payload_rows == 0:
+            violations.append(f"{path.as_posix()} has no benchmark rows to check")
     for group_key, entries in groups.items():
         keys = {fingerprint_compare_key(fingerprint) for _path, fingerprint, _index in entries}
         if len(keys) <= 1:
