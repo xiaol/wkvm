@@ -1173,6 +1173,18 @@ class TokenPoolAttentionCall:
             return value_states
         return None
 
+    def should_update_dense_cache(
+        self,
+        *,
+        has_past_key_values: bool,
+        is_kv_shared_layer: bool = False,
+    ) -> bool:
+        return (
+            bool(has_past_key_values)
+            and not bool(is_kv_shared_layer)
+            and not self.decode_attention_enabled
+        )
+
 
 def token_pool_attention_plan_kwargs(token_pool_plan: Any) -> dict[str, Any]:
     attention_kwargs = getattr(token_pool_plan, "attention_kwargs", None)

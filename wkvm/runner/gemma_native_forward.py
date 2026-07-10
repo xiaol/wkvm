@@ -2043,10 +2043,9 @@ class NativeGemma4TextDecoderLayer:
             value_states,
             is_kv_shared_layer=attn.is_kv_shared_layer,
         )
-        if (
-            past_key_values is not None
-            and not attn.is_kv_shared_layer
-            and not token_pool_decode_attention
+        if token_pool_attention_call.should_update_dense_cache(
+            has_past_key_values=past_key_values is not None,
+            is_kv_shared_layer=attn.is_kv_shared_layer,
         ):
             phase_start = time.perf_counter() if timing_enabled else 0.0
             key_states, value_states = past_key_values.update(

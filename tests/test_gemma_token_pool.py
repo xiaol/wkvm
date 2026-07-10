@@ -2825,6 +2825,12 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(call.current_value_states("value"), "value")
         self.assertIsNone(call.current_key_states("key", is_kv_shared_layer=True))
         self.assertIsNone(call.current_value_states("value", is_kv_shared_layer=True))
+        self.assertFalse(
+            call.should_update_dense_cache(
+                has_past_key_values=True,
+                is_kv_shared_layer=False,
+            )
+        )
 
         direct_call = build_token_pool_attention_call(
             decode_metadata=object(),
@@ -2846,6 +2852,18 @@ class TestGemmaTokenPool(unittest.TestCase):
         )
         self.assertFalse(masked_call.decode_attention_enabled)
         self.assertIsNone(masked_call.current_key_states("key"))
+        self.assertTrue(
+            masked_call.should_update_dense_cache(
+                has_past_key_values=True,
+                is_kv_shared_layer=False,
+            )
+        )
+        self.assertFalse(
+            masked_call.should_update_dense_cache(
+                has_past_key_values=True,
+                is_kv_shared_layer=True,
+            )
+        )
 
     def test_attention_plan_owns_attention_workspaces(self) -> None:
         try:
