@@ -104,13 +104,6 @@ def _env_bool(name: str) -> bool | None:
     return _coerce_env_bool(os.environ.get(name))
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return int(default)
-    return int(raw.strip())
-
-
 def _native_forward_timing_enabled() -> bool:
     return _env_bool("WKVM_NATIVE_FORWARD_TIMING") is True
 
@@ -174,20 +167,6 @@ def _record_token_pool_kv_write_timing(*, tokens: int, elapsed: float) -> None:
     _record_native_count("token_pool_kv_write_calls")
     _record_native_count("token_pool_kv_write_tokens", tokens)
     _record_native_timing("token_pool_kv_write_wall_s", elapsed)
-
-
-def _token_pool_triton_split_size() -> int:
-    split_size = _env_int("WKVM_TOKEN_POOL_TRITON_SPLIT_SIZE", 512)
-    if split_size < 1:
-        raise ValueError("WKVM_TOKEN_POOL_TRITON_SPLIT_SIZE must be >= 1")
-    return split_size
-
-
-def _token_pool_triton_min_splits() -> int:
-    min_splits = _env_int("WKVM_TOKEN_POOL_TRITON_MIN_SPLITS", 4)
-    if min_splits < 2:
-        raise ValueError("WKVM_TOKEN_POOL_TRITON_MIN_SPLITS must be >= 2")
-    return min_splits
 
 
 def _token_pool_triton_input_precision_policy() -> str:
@@ -378,14 +357,15 @@ def _token_pool_attention_backend():
 def token_pool_triton_stats() -> dict[str, Any]:
     stats = dict(_TOKEN_POOL_TRITON_STATS)
     plan = _token_pool_triton_dispatch_plan()
+    split_plan = _token_pool_triton_split_plan(None)
     stats["fallback_reasons"] = dict(_TOKEN_POOL_TRITON_FALLBACK_REASONS)
     stats["disabled_shape_count"] = len(_TOKEN_POOL_TRITON_DISABLED_SHAPES)
     stats["env_enabled"] = plan.env_enabled
     stats["env_disabled"] = plan.env_disabled
     stats["split_enabled"] = plan.split_enabled
     stats["paged_split_enabled"] = plan.paged_split_enabled
-    stats["split_size"] = _token_pool_triton_split_size()
-    stats["split_min_splits"] = _token_pool_triton_min_splits()
+    stats["split_size"] = split_plan[1]
+    stats["split_min_splits"] = split_plan[2]
     stats["input_precision_policy"] = plan.input_precision_policy
     stats["dot_dtype_policy"] = plan.dot_dtype_policy
     stats["effective_enabled"] = plan.effective_enabled
