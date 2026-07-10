@@ -4676,6 +4676,8 @@ class ReqToTokenTable:
             raise ValueError("seq_lens length must match req_slots")
         if sliding_window is not None and int(sliding_window) < 1:
             raise ValueError("sliding_window must be >= 1 or None")
+        if len(set(req_slots_list)) != len(req_slots_list):
+            raise ValueError("req_slots must be unique")
 
         chunks = []
         selected_lens: list[int] = []
@@ -4701,6 +4703,21 @@ class ReqToTokenTable:
 
         out = None
         out_long = None
+        out_src = None
+        out_src_long = None
+        if out_cache_loc is not None:
+            out_src = torch.as_tensor(
+                out_cache_loc,
+                dtype=torch.int32,
+                device=self.req_to_token.device,
+            ).reshape(-1)
+            if int(out_src.numel()) != len(req_slots_list):
+                raise ValueError("out_cache_loc length must match req_slots")
+            if bool((out_src < 0).any().item()):
+                raise ValueError("out_cache_loc must be non-negative")
+            if int(torch.unique(out_src).numel()) != int(out_src.numel()):
+                raise ValueError("out_cache_loc must be unique")
+            out_src_long = out_src.to(dtype=torch.long)
         if workspace_key is not None:
             total_kv = int(indptr[-1])
             workspace = self._ensure_decode_metadata_workspace(
@@ -4750,18 +4767,11 @@ class ReqToTokenTable:
                         dim=0,
                         out=kv_indices,
                     )
-            if out_cache_loc is not None:
-                out_src = torch.as_tensor(
-                    out_cache_loc,
-                    dtype=torch.int32,
-                    device=self.req_to_token.device,
-                ).reshape(-1)
-                if int(out_src.numel()) != len(req_slots_list):
-                    raise ValueError("out_cache_loc length must match req_slots")
+            if out_src is not None:
                 out = workspace["out_cache_loc"][: len(req_slots_list)]
                 out.copy_(out_src)
                 out_long = workspace["out_cache_loc_long"][: len(req_slots_list)]
-                out_long.copy_(out_src.to(dtype=torch.long))
+                out_long.copy_(out_src_long)
             return DecodeBatchMetadata(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens_tensor,
@@ -4782,15 +4792,9 @@ class ReqToTokenTable:
             kv_indices = torch.cat(chunks).to(dtype=torch.int32)
         else:
             kv_indices = torch.empty(0, dtype=torch.int32, device=self.req_to_token.device)
-        if out_cache_loc is not None:
-            out = torch.as_tensor(
-                out_cache_loc,
-                dtype=torch.int32,
-                device=self.req_to_token.device,
-            ).reshape(-1)
-            if int(out.numel()) != len(req_slots_list):
-                raise ValueError("out_cache_loc length must match req_slots")
-            out_long = out.to(dtype=torch.long)
+        if out_src is not None:
+            out = out_src
+            out_long = out_src_long
         return DecodeBatchMetadata(
             req_pool_indices=torch.as_tensor(
                 req_slots_list,

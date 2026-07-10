@@ -2763,6 +2763,29 @@ class TestGemmaTokenPool(unittest.TestCase):
         with self.assertRaisesRegex(KeyError, "not allocated"):
             table.build_decode_metadata([table.padding_req_slot])
 
+    def test_req_to_token_table_rejects_bad_flat_metadata_layouts(self) -> None:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import ReqToTokenTable
+
+        table = ReqToTokenTable(max_requests=2, max_context_len=3)
+        a = table.allocate("a")
+        b = table.allocate("b")
+        table.append_slots(a, [0, 1])
+        table.append_slots(b, [2, 3])
+
+        with self.assertRaisesRegex(ValueError, "req_slots must be unique"):
+            table.build_decode_metadata([a, a])
+        with self.assertRaisesRegex(ValueError, "req_slots must be unique"):
+            table.build_decode_metadata([a, a], workspace_key="flat")
+        with self.assertRaisesRegex(ValueError, "out_cache_loc must be non-negative"):
+            table.build_decode_metadata([a], out_cache_loc=[-1])
+        with self.assertRaisesRegex(ValueError, "out_cache_loc must be unique"):
+            table.build_decode_metadata([a, b], out_cache_loc=[1, 1])
+
     def test_req_to_token_table_rejects_padding_in_paged_metadata(self) -> None:
         try:
             import torch  # noqa: F401
