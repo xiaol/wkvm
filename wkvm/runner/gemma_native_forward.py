@@ -12,10 +12,6 @@ from typing import Any
 
 
 _TOKEN_POOL_TRITON_DISABLED_SHAPES: set[tuple[Any, ...]] = set()
-_TOKEN_POOL_TRITON_DECODE_FN = None
-_TOKEN_POOL_TRITON_SPLIT_DECODE_FN = None
-_TOKEN_POOL_TRITON_PAGED_DECODE_FN = None
-_TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN = None
 _TOKEN_POOL_ATTENTION_BACKEND = None
 _TOKEN_POOL_TRITON_STATS: dict[str, int] = {
     "calls": 0,
@@ -264,44 +260,6 @@ def _token_pool_triton_effective_enabled_from_values(
     return token_pool_triton_effective_enabled_from_values(enabled, disabled)
 
 
-def _token_pool_triton_decode_fn():
-    global _TOKEN_POOL_TRITON_DECODE_FN
-    if _TOKEN_POOL_TRITON_DECODE_FN is None:
-        from wkvm.runner.gemma_token_pool_triton import token_pool_gqa_decode
-
-        _TOKEN_POOL_TRITON_DECODE_FN = token_pool_gqa_decode
-    return _TOKEN_POOL_TRITON_DECODE_FN
-
-
-def _token_pool_triton_split_decode_fn():
-    global _TOKEN_POOL_TRITON_SPLIT_DECODE_FN
-    if _TOKEN_POOL_TRITON_SPLIT_DECODE_FN is None:
-        from wkvm.runner.gemma_token_pool_triton import token_pool_gqa_decode_split_kv
-
-        _TOKEN_POOL_TRITON_SPLIT_DECODE_FN = token_pool_gqa_decode_split_kv
-    return _TOKEN_POOL_TRITON_SPLIT_DECODE_FN
-
-
-def _token_pool_triton_paged_decode_fn():
-    global _TOKEN_POOL_TRITON_PAGED_DECODE_FN
-    if _TOKEN_POOL_TRITON_PAGED_DECODE_FN is None:
-        from wkvm.runner.gemma_token_pool_triton import token_pool_paged_gqa_decode
-
-        _TOKEN_POOL_TRITON_PAGED_DECODE_FN = token_pool_paged_gqa_decode
-    return _TOKEN_POOL_TRITON_PAGED_DECODE_FN
-
-
-def _token_pool_triton_paged_split_decode_fn():
-    global _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN
-    if _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN is None:
-        from wkvm.runner.gemma_token_pool_triton import (
-            token_pool_paged_gqa_decode_split_kv,
-        )
-
-        _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN = token_pool_paged_gqa_decode_split_kv
-    return _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN
-
-
 def _record_token_pool_triton_attempt_timing(elapsed: float) -> None:
     _record_native_count("token_pool_attention_triton_attempts")
     _record_native_timing("token_pool_attention_triton_attempt_wall_s", elapsed)
@@ -326,13 +284,17 @@ def _token_pool_attention_backend():
             TokenPoolAttentionBackend,
             TokenPoolAttentionBackendHooks,
             TokenPoolTritonAttentionBackendHooks,
+            token_pool_triton_decode_fn,
+            token_pool_triton_paged_decode_fn,
+            token_pool_triton_paged_split_decode_fn,
+            token_pool_triton_split_decode_fn,
         )
 
         triton_hooks = TokenPoolTritonAttentionBackendHooks(
-            decode_fn=_token_pool_triton_decode_fn,
-            split_decode_fn=_token_pool_triton_split_decode_fn,
-            paged_decode_fn=_token_pool_triton_paged_decode_fn,
-            paged_split_decode_fn=_token_pool_triton_paged_split_decode_fn,
+            decode_fn=token_pool_triton_decode_fn,
+            split_decode_fn=token_pool_triton_split_decode_fn,
+            paged_decode_fn=token_pool_triton_paged_decode_fn,
+            paged_split_decode_fn=token_pool_triton_paged_split_decode_fn,
             block_groups=_token_pool_triton_block_groups,
             record_fallback=_record_token_pool_triton_fallback,
             is_recoverable_runtime_error=_is_recoverable_token_pool_triton_error,
@@ -374,21 +336,17 @@ def token_pool_triton_stats() -> dict[str, Any]:
 
 
 def reset_token_pool_triton_stats(*, clear_disabled_shapes: bool = False) -> None:
-    global _TOKEN_POOL_TRITON_DECODE_FN, _TOKEN_POOL_TRITON_SPLIT_DECODE_FN
-    global _TOKEN_POOL_TRITON_PAGED_DECODE_FN, _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN
     global _TOKEN_POOL_ATTENTION_BACKEND
     from wkvm.runner.gemma_token_pool_attention import (
+        reset_token_pool_triton_decode_fn_cache,
         reset_token_pool_triton_dispatch_plan_cache,
     )
 
     for key in _TOKEN_POOL_TRITON_STATS:
         _TOKEN_POOL_TRITON_STATS[key] = 0
     _TOKEN_POOL_TRITON_FALLBACK_REASONS.clear()
-    _TOKEN_POOL_TRITON_DECODE_FN = None
-    _TOKEN_POOL_TRITON_SPLIT_DECODE_FN = None
-    _TOKEN_POOL_TRITON_PAGED_DECODE_FN = None
-    _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN = None
     _TOKEN_POOL_ATTENTION_BACKEND = None
+    reset_token_pool_triton_decode_fn_cache()
     reset_token_pool_triton_dispatch_plan_cache()
     if clear_disabled_shapes:
         _TOKEN_POOL_TRITON_DISABLED_SHAPES.clear()

@@ -40,6 +40,10 @@ class TokenPoolTritonDispatchPlan:
 
 _TOKEN_POOL_TRITON_DISPATCH_ENV_KEY: tuple[str | None, ...] | None = None
 _TOKEN_POOL_TRITON_DISPATCH_PLAN: TokenPoolTritonDispatchPlan | None = None
+_TOKEN_POOL_TRITON_DECODE_FN = None
+_TOKEN_POOL_TRITON_SPLIT_DECODE_FN = None
+_TOKEN_POOL_TRITON_PAGED_DECODE_FN = None
+_TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN = None
 
 
 @dataclass(frozen=True)
@@ -172,6 +176,55 @@ def reset_token_pool_triton_dispatch_plan_cache() -> None:
     global _TOKEN_POOL_TRITON_DISPATCH_ENV_KEY, _TOKEN_POOL_TRITON_DISPATCH_PLAN
     _TOKEN_POOL_TRITON_DISPATCH_ENV_KEY = None
     _TOKEN_POOL_TRITON_DISPATCH_PLAN = None
+
+
+def token_pool_triton_decode_fn():
+    global _TOKEN_POOL_TRITON_DECODE_FN
+    if _TOKEN_POOL_TRITON_DECODE_FN is None:
+        from wkvm.runner.gemma_token_pool_triton import token_pool_gqa_decode
+
+        _TOKEN_POOL_TRITON_DECODE_FN = token_pool_gqa_decode
+    return _TOKEN_POOL_TRITON_DECODE_FN
+
+
+def token_pool_triton_split_decode_fn():
+    global _TOKEN_POOL_TRITON_SPLIT_DECODE_FN
+    if _TOKEN_POOL_TRITON_SPLIT_DECODE_FN is None:
+        from wkvm.runner.gemma_token_pool_triton import token_pool_gqa_decode_split_kv
+
+        _TOKEN_POOL_TRITON_SPLIT_DECODE_FN = token_pool_gqa_decode_split_kv
+    return _TOKEN_POOL_TRITON_SPLIT_DECODE_FN
+
+
+def token_pool_triton_paged_decode_fn():
+    global _TOKEN_POOL_TRITON_PAGED_DECODE_FN
+    if _TOKEN_POOL_TRITON_PAGED_DECODE_FN is None:
+        from wkvm.runner.gemma_token_pool_triton import token_pool_paged_gqa_decode
+
+        _TOKEN_POOL_TRITON_PAGED_DECODE_FN = token_pool_paged_gqa_decode
+    return _TOKEN_POOL_TRITON_PAGED_DECODE_FN
+
+
+def token_pool_triton_paged_split_decode_fn():
+    global _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN
+    if _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN is None:
+        from wkvm.runner.gemma_token_pool_triton import (
+            token_pool_paged_gqa_decode_split_kv,
+        )
+
+        _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN = (
+            token_pool_paged_gqa_decode_split_kv
+        )
+    return _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN
+
+
+def reset_token_pool_triton_decode_fn_cache() -> None:
+    global _TOKEN_POOL_TRITON_DECODE_FN, _TOKEN_POOL_TRITON_SPLIT_DECODE_FN
+    global _TOKEN_POOL_TRITON_PAGED_DECODE_FN, _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN
+    _TOKEN_POOL_TRITON_DECODE_FN = None
+    _TOKEN_POOL_TRITON_SPLIT_DECODE_FN = None
+    _TOKEN_POOL_TRITON_PAGED_DECODE_FN = None
+    _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN = None
 
 
 class TokenPoolAttentionBackend:
