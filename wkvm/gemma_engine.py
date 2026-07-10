@@ -2570,14 +2570,11 @@ class GemmaNativeEngine:
                     )
                 )
                 (
-                    layer_metadata,
                     full_metadata,
-                    paged_layer_metadata,
                     full_paged_metadata,
                 ) = self._token_pool_prepare_layer_decode_metadata(
                     reqs,
                     reservations,
-                    sliding_metadata,
                     full_attention_kv_indices_padding_steps=(
                         full_attention_kv_indices_padding_steps
                     ),
@@ -2599,32 +2596,10 @@ class GemmaNativeEngine:
                     if paged_metadata_by_type is None:
                         paged_metadata_by_type = {}
                     paged_metadata_by_type["full_attention"] = full_paged_metadata
-                covered_layer_types = {"sliding_attention"}
-                if full_metadata is not None:
-                    covered_layer_types.add("full_attention")
-                metadata_by_layer_id = layer_metadata if layer_metadata else None
-                paged_metadata_by_layer_id = None
-                if sliding_paged_metadata is not None or paged_layer_metadata:
-                    paged_by_layer_id = {}
-                    if sliding_paged_metadata is not None:
-                        paged_by_layer_id.update(
-                            {
-                                int(layer_id): sliding_paged_metadata
-                                for layer_id in sorted(self._token_kv_pool.layer_specs)
-                                if self._token_pool_layer_type(int(layer_id))
-                                == "sliding_attention"
-                            }
-                        )
-                    paged_by_layer_id.update(paged_layer_metadata)
-                    paged_metadata_by_layer_id = (
-                        paged_by_layer_id if paged_by_layer_id else None
-                    )
-                backend.set_decode_batch_state(
+                backend.set_decode_batch_state_by_layer_type(
                     metadata_by_layer_type=metadata_by_type,
-                    metadata_by_layer_id=metadata_by_layer_id,
                     paged_metadata_by_layer_type=paged_metadata_by_type,
-                    paged_metadata_by_layer_id=paged_metadata_by_layer_id,
-                    covered_layer_types=frozenset(covered_layer_types),
+                    layer_type_by_layer_id=self._token_pool_layer_type_by_layer_id(),
                 )
             self.metrics.token_pool_decode_metadata_batches += 1
             self.metrics.token_pool_decode_metadata_rows += len(reqs)
@@ -2859,24 +2834,13 @@ class GemmaNativeEngine:
         self,
         reqs: list[Request],
         reservations: list[_TokenPoolDecodeReservation],
-        sliding_metadata: DecodeBatchMetadata,
         *,
         full_attention_kv_indices_padding_steps: int = 0,
         persistent_full_attention_rows: bool = False,
-    ) -> tuple[
-        dict[int, DecodeBatchMetadata],
-        DecodeBatchMetadata | None,
-        dict[int, PagedDecodeBatchMetadata],
-        PagedDecodeBatchMetadata | None,
-    ]:
+    ) -> tuple[DecodeBatchMetadata | None, PagedDecodeBatchMetadata | None]:
         pool = self._token_kv_pool
         if pool is None:
-            return {}, None, {}, None
-        metadata_by_layer_id: dict[int, DecodeBatchMetadata] = {}
-        paged_metadata_by_layer_id: dict[int, PagedDecodeBatchMetadata] = {}
-        for layer_id in sorted(pool.layer_specs):
-            if self._token_pool_layer_type(layer_id) == "sliding_attention":
-                metadata_by_layer_id[int(layer_id)] = sliding_metadata
+            return None, None
 
         (
             full_metadata,
@@ -2887,18 +2851,7 @@ class GemmaNativeEngine:
             kv_indices_padding_steps=full_attention_kv_indices_padding_steps,
             persistent_rows=persistent_full_attention_rows,
         )
-        if full_metadata is not None:
-            for layer_id in sorted(pool.layer_specs):
-                if self._token_pool_layer_type(layer_id) == "full_attention":
-                    metadata_by_layer_id[int(layer_id)] = full_metadata
-                    if full_paged_metadata is not None:
-                        paged_metadata_by_layer_id[int(layer_id)] = full_paged_metadata
-        return (
-            metadata_by_layer_id,
-            full_metadata,
-            paged_metadata_by_layer_id,
-            full_paged_metadata,
-        )
+        return full_metadata, full_paged_metadata
 
     def _token_pool_prepare_full_attention_decode_metadata(
         self,
@@ -2982,6 +2935,17 @@ class GemmaNativeEngine:
                 if self._token_pool_layer_type(int(layer.layer_idx)) == "full_attention"
             ]
         return [int(layer_id) for layer_id in self.config.full_kv_layers]
+
+    def _token_pool_layer_type_by_layer_id(self) -> dict[int, str]:
+        pool = self._token_kv_pool
+        if pool is None:
+            return {}
+        result: dict[int, str] = {}
+        for layer_id in sorted(pool.layer_specs):
+            layer_type = self._token_pool_layer_type(int(layer_id))
+            if layer_type is not None:
+                result[int(layer_id)] = str(layer_type)
+        return result
 
     def _token_pool_layer_type(self, layer_id: int) -> str | None:
         layer_id = int(layer_id)

@@ -1189,6 +1189,46 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(backend.current_covered_layer_types, frozenset())
         self.assertIsNone(backend.build_current_decode_context())
 
+        typed_state = backend.set_decode_batch_state_by_layer_type(
+            metadata_by_layer_type={
+                "sliding_attention": by_type,
+                "full_attention": by_layer,
+            },
+            paged_metadata_by_layer_type={
+                "sliding_attention": paged_by_type,
+                "full_attention": paged_by_layer,
+            },
+            layer_type_by_layer_id={
+                6: "sliding_attention",
+                7: "full_attention",
+                8: "unknown",
+            },
+        )
+        typed_context = backend.build_current_decode_context(
+            layer_id_metadata_only_types=frozenset({"full_attention"}),
+        )
+        self.assertIs(backend.current_decode_batch_state, typed_state)
+        self.assertEqual(
+            backend.current_covered_layer_types,
+            frozenset({"full_attention", "sliding_attention"}),
+        )
+        self.assertIs(typed_state.metadata_by_layer_id[6], by_type)
+        self.assertIs(typed_state.metadata_by_layer_id[7], by_layer)
+        self.assertNotIn(8, typed_state.metadata_by_layer_id)
+        self.assertIs(typed_state.paged_metadata_by_layer_id[6], paged_by_type)
+        self.assertIs(typed_state.paged_metadata_by_layer_id[7], paged_by_layer)
+        self.assertIsNotNone(typed_context)
+        assert typed_context is not None
+        self.assertIs(
+            typed_context.metadata_for_layer(6, "sliding_attention"),
+            by_type,
+        )
+        self.assertIs(
+            typed_context.metadata_for_layer(7, "full_attention"),
+            by_layer,
+        )
+        self.assertIsNone(typed_context.metadata_for_layer(8, "unknown"))
+
     def test_token_pool_decode_backend_builds_sliding_metadata_from_block_tables(self) -> None:
         try:
             import torch  # noqa: F401

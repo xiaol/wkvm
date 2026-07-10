@@ -4987,6 +4987,51 @@ class TokenPoolDecodeBackendState:
         self.current_decode_batch_state = state
         return state
 
+    def set_decode_batch_state_by_layer_type(
+        self,
+        *,
+        metadata_by_layer_type: dict[str, DecodeBatchMetadata],
+        layer_type_by_layer_id: dict[int, str],
+        paged_metadata_by_layer_type: (
+            dict[str, PagedDecodeBatchMetadata] | None
+        ) = None,
+        covered_layer_types: Iterable[str] | None = None,
+    ) -> TokenPoolDecodeBatchState:
+        metadata_by_layer_id: dict[int, DecodeBatchMetadata] = {}
+        paged_metadata_by_layer_id: dict[int, PagedDecodeBatchMetadata] = {}
+        typed_metadata = {
+            str(layer_type): metadata
+            for layer_type, metadata in metadata_by_layer_type.items()
+            if metadata is not None
+        }
+        typed_paged_metadata = {
+            str(layer_type): metadata
+            for layer_type, metadata in (paged_metadata_by_layer_type or {}).items()
+            if metadata is not None
+        }
+        for layer_id, layer_type in sorted(layer_type_by_layer_id.items()):
+            layer_id = int(layer_id)
+            layer_type = str(layer_type)
+            metadata = typed_metadata.get(layer_type)
+            if metadata is not None:
+                metadata_by_layer_id[layer_id] = metadata
+            paged_metadata = typed_paged_metadata.get(layer_type)
+            if paged_metadata is not None:
+                paged_metadata_by_layer_id[layer_id] = paged_metadata
+        return self.set_decode_batch_state(
+            metadata_by_layer_type=typed_metadata,
+            metadata_by_layer_id=(
+                metadata_by_layer_id if metadata_by_layer_id else None
+            ),
+            paged_metadata_by_layer_type=(
+                typed_paged_metadata if typed_paged_metadata else None
+            ),
+            paged_metadata_by_layer_id=(
+                paged_metadata_by_layer_id if paged_metadata_by_layer_id else None
+            ),
+            covered_layer_types=covered_layer_types,
+        )
+
     @property
     def current_covered_layer_types(self) -> frozenset[str]:
         state = self.current_decode_batch_state
