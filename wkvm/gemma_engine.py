@@ -2918,8 +2918,7 @@ class GemmaNativeEngine:
         backend = self._token_pool_decode_backend
         if backend is None or backend.current_decode_batch_state is None:
             return
-        metadata_by_type = backend.current_decode_batch_state.metadata_by_layer_type
-        if "full_attention" not in metadata_by_type:
+        if "full_attention" not in backend.current_covered_layer_types:
             return
         owner_layer_ids = self._token_pool_full_attention_owner_layer_ids()
         if not owner_layer_ids:
