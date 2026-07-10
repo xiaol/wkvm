@@ -1147,6 +1147,92 @@ class TokenPoolAttentionPlan:
         )
 
 
+@dataclass(frozen=True)
+class TokenPoolAttentionCall:
+    plan: Any | None = None
+    attention_kwargs: dict[str, Any] = field(default_factory=dict)
+    decode_attention_enabled: bool = False
+
+    def current_key_states(
+        self,
+        key_states: Any,
+        *,
+        is_kv_shared_layer: bool = False,
+    ) -> Any | None:
+        if self.decode_attention_enabled and not bool(is_kv_shared_layer):
+            return key_states
+        return None
+
+    def current_value_states(
+        self,
+        value_states: Any,
+        *,
+        is_kv_shared_layer: bool = False,
+    ) -> Any | None:
+        if self.decode_attention_enabled and not bool(is_kv_shared_layer):
+            return value_states
+        return None
+
+
+def token_pool_attention_plan_kwargs(token_pool_plan: Any) -> dict[str, Any]:
+    attention_kwargs = getattr(token_pool_plan, "attention_kwargs", None)
+    if attention_kwargs is not None:
+        return dict(attention_kwargs())
+    return {
+        "decode_metadata": getattr(token_pool_plan, "metadata", None),
+        "paged_decode_metadata": getattr(token_pool_plan, "paged_metadata", None),
+        "token_kv_pool": getattr(token_pool_plan, "kv_pool", None),
+        "layer_idx": getattr(token_pool_plan, "layer_idx", None),
+    }
+
+
+def token_pool_attention_plan_decode_enabled(token_pool_plan: Any) -> bool:
+    decode_attention_enabled = getattr(
+        token_pool_plan,
+        "decode_attention_enabled",
+        None,
+    )
+    if decode_attention_enabled is not None:
+        return bool(decode_attention_enabled())
+    return bool(getattr(token_pool_plan, "use_decode_attention", False))
+
+
+def build_token_pool_attention_call(
+    *,
+    token_pool_plan: Any | None = None,
+    decode_metadata: Any | None = None,
+    paged_decode_metadata: Any | None = None,
+    token_kv_pool: Any | None = None,
+    layer_idx: int | None = None,
+    attention_mask_present: bool = False,
+    query_seq_len: int | None = None,
+) -> TokenPoolAttentionCall:
+    if token_pool_plan is not None:
+        return TokenPoolAttentionCall(
+            plan=token_pool_plan,
+            attention_kwargs=token_pool_attention_plan_kwargs(token_pool_plan),
+            decode_attention_enabled=token_pool_attention_plan_decode_enabled(
+                token_pool_plan
+            ),
+        )
+    return TokenPoolAttentionCall(
+        plan=None,
+        attention_kwargs={
+            "decode_metadata": decode_metadata,
+            "paged_decode_metadata": paged_decode_metadata,
+            "token_kv_pool": token_kv_pool,
+            "layer_idx": layer_idx,
+        },
+        decode_attention_enabled=(
+            decode_metadata is not None
+            and token_kv_pool is not None
+            and layer_idx is not None
+            and not bool(attention_mask_present)
+            and _query_seq_len_is_one(query_seq_len)
+        ),
+    )
+
+
 def build_token_pool_attention_dispatch_context(
     *,
     token_pool_plan: Any | None = None,
@@ -1241,6 +1327,13 @@ def _binding_out_cache_loc_for_write(binding: Any | None, metadata: Any | None) 
     return _metadata_out_cache_loc_for_write(metadata)
 
 
+def _query_seq_len_is_one(query_seq_len: int | None) -> bool:
+    try:
+        return int(query_seq_len) == 1
+    except (TypeError, ValueError):
+        return False
+
+
 def _token_pool_decode_attention_enabled(
     *,
     layer_idx: int | None,
@@ -1258,10 +1351,7 @@ def _token_pool_decode_attention_enabled(
         out_cache_loc = getattr(metadata, "out_cache_loc", None)
     if out_cache_loc is None:
         return False
-    try:
-        return int(query_seq_len) == 1
-    except (TypeError, ValueError):
-        return False
+    return _query_seq_len_is_one(query_seq_len)
 
 
 def _null_attention_binding() -> TokenPoolAttentionBinding:
@@ -1382,6 +1472,26 @@ def resolve_token_pool_attention_plan(
         attention_mask_present=attention_mask_present,
         query_seq_len=query_seq_len,
     )
+
+
+def resolve_token_pool_attention_call(
+    token_pool_decode: Any | None,
+    layer_idx: int | None,
+    layer_type: str | None,
+    *,
+    attention_mask_present: bool = False,
+    query_seq_len: int | None = None,
+) -> TokenPoolAttentionCall:
+    if token_pool_decode is None or layer_idx is None or layer_type is None:
+        return TokenPoolAttentionCall()
+    plan = resolve_token_pool_attention_plan(
+        token_pool_decode,
+        layer_idx,
+        layer_type,
+        attention_mask_present=attention_mask_present,
+        query_seq_len=query_seq_len,
+    )
+    return build_token_pool_attention_call(token_pool_plan=plan)
 
 
 @dataclass(frozen=True)

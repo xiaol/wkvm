@@ -2788,6 +2788,65 @@ class TestGemmaTokenPool(unittest.TestCase):
             [{"attention_mask_present": False, "query_seq_len": 1}],
         )
 
+    def test_attention_call_owns_plan_kwargs_and_current_kv_routing(self) -> None:
+        from wkvm.runner.gemma_token_pool import build_token_pool_attention_call
+
+        events = []
+
+        class MethodOnlyPlan:
+            def attention_kwargs(self):
+                events.append("kwargs")
+                return {
+                    "decode_metadata": "metadata",
+                    "paged_decode_metadata": "paged_metadata",
+                    "token_kv_pool": "pool",
+                    "layer_idx": 7,
+                }
+
+            def decode_attention_enabled(self):
+                events.append("enabled")
+                return True
+
+        plan = MethodOnlyPlan()
+        call = build_token_pool_attention_call(token_pool_plan=plan)
+        self.assertIs(call.plan, plan)
+        self.assertEqual(events, ["kwargs", "enabled"])
+        self.assertTrue(call.decode_attention_enabled)
+        self.assertEqual(
+            call.attention_kwargs,
+            {
+                "decode_metadata": "metadata",
+                "paged_decode_metadata": "paged_metadata",
+                "token_kv_pool": "pool",
+                "layer_idx": 7,
+            },
+        )
+        self.assertEqual(call.current_key_states("key"), "key")
+        self.assertEqual(call.current_value_states("value"), "value")
+        self.assertIsNone(call.current_key_states("key", is_kv_shared_layer=True))
+        self.assertIsNone(call.current_value_states("value", is_kv_shared_layer=True))
+
+        direct_call = build_token_pool_attention_call(
+            decode_metadata=object(),
+            token_kv_pool=object(),
+            layer_idx=3,
+            attention_mask_present=False,
+            query_seq_len=1,
+        )
+        self.assertTrue(direct_call.decode_attention_enabled)
+        self.assertIsNone(direct_call.plan)
+        self.assertEqual(direct_call.attention_kwargs["layer_idx"], 3)
+
+        masked_call = build_token_pool_attention_call(
+            decode_metadata=object(),
+            token_kv_pool=object(),
+            layer_idx=3,
+            attention_mask_present=True,
+            query_seq_len=1,
+        )
+        self.assertFalse(masked_call.decode_attention_enabled)
+        self.assertIsNone(masked_call.current_key_states("key"))
+
     def test_attention_plan_owns_attention_workspaces(self) -> None:
         try:
             import torch  # noqa: F401
