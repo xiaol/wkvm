@@ -43,6 +43,7 @@ _TOKEN_POOL_TRITON_DISPATCH_PLAN: TokenPoolTritonDispatchPlan | None = None
 _TOKEN_POOL_TRITON_DECODE_FN = None
 _TOKEN_POOL_TRITON_SPLIT_DECODE_FN = None
 _TOKEN_POOL_TRITON_PAGED_DECODE_FN = None
+_TOKEN_POOL_TRITON_PAGED_REQUEST_TABLE_DECODE_FN = None
 _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN = None
 _TOKEN_POOL_TRITON_DISABLED_SHAPES: set[tuple[Any, ...]] = set()
 _TOKEN_POOL_TRITON_FALLBACK_REASONS: dict[str, int] = {}
@@ -63,6 +64,8 @@ _TOKEN_POOL_TRITON_STATS: dict[str, int] = {
     "paged_enabled_calls": 0,
     "paged_attempts": 0,
     "paged_successes": 0,
+    "paged_request_table_attempts": 0,
+    "paged_request_table_successes": 0,
     "paged_split_enabled_calls": 0,
     "paged_split_attempts": 0,
     "paged_split_successes": 0,
@@ -97,6 +100,7 @@ class TokenPoolTritonAttentionBackendHooks:
     block_groups: Callable[[int, Any], int]
     record_fallback: Callable[[str], None]
     is_recoverable_runtime_error: Callable[[RuntimeError], bool]
+    paged_request_table_decode_fn: Callable[[], Callable[..., Any]] | None = None
 
 
 @dataclass(frozen=True)
@@ -261,6 +265,19 @@ def token_pool_triton_paged_decode_fn():
     return _TOKEN_POOL_TRITON_PAGED_DECODE_FN
 
 
+def token_pool_triton_paged_request_table_decode_fn():
+    global _TOKEN_POOL_TRITON_PAGED_REQUEST_TABLE_DECODE_FN
+    if _TOKEN_POOL_TRITON_PAGED_REQUEST_TABLE_DECODE_FN is None:
+        from wkvm.runner.gemma_token_pool_triton import (
+            token_pool_paged_request_table_gqa_decode,
+        )
+
+        _TOKEN_POOL_TRITON_PAGED_REQUEST_TABLE_DECODE_FN = (
+            token_pool_paged_request_table_gqa_decode
+        )
+    return _TOKEN_POOL_TRITON_PAGED_REQUEST_TABLE_DECODE_FN
+
+
 def token_pool_triton_paged_split_decode_fn():
     global _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN
     if _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN is None:
@@ -277,9 +294,11 @@ def token_pool_triton_paged_split_decode_fn():
 def reset_token_pool_triton_decode_fn_cache() -> None:
     global _TOKEN_POOL_TRITON_DECODE_FN, _TOKEN_POOL_TRITON_SPLIT_DECODE_FN
     global _TOKEN_POOL_TRITON_PAGED_DECODE_FN, _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN
+    global _TOKEN_POOL_TRITON_PAGED_REQUEST_TABLE_DECODE_FN
     _TOKEN_POOL_TRITON_DECODE_FN = None
     _TOKEN_POOL_TRITON_SPLIT_DECODE_FN = None
     _TOKEN_POOL_TRITON_PAGED_DECODE_FN = None
+    _TOKEN_POOL_TRITON_PAGED_REQUEST_TABLE_DECODE_FN = None
     _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN = None
 
 
@@ -698,19 +717,46 @@ class TokenPoolTritonAttentionBackend:
             if kernel_dispatch.split_skipped_by_min_splits:
                 self._stats["paged_split_skips_by_min_splits"] += 1
                 self._stats["split_skips_by_min_splits"] += 1
-            output = self._hooks.paged_decode_fn()(
-                query_states,
-                key_buffer,
-                value_buffer,
-                metadata.block_tables,
-                metadata.block_table_lens,
-                metadata.selected_start_positions,
-                metadata.seq_lens,
-                block_size=metadata.block_size,
-                num_key_value_groups=attn.num_key_value_groups,
-                scaling=attn.scaling,
-                output=output_buffer,
-            )
+            request_block_tables = getattr(metadata, "request_block_tables", None)
+            if request_block_tables is not None:
+                self._stats["paged_request_table_attempts"] = (
+                    self._stats.get("paged_request_table_attempts", 0) + 1
+                )
+                paged_request_table_decode_fn = (
+                    self._hooks.paged_request_table_decode_fn
+                    or token_pool_triton_paged_request_table_decode_fn
+                )
+                output = paged_request_table_decode_fn()(
+                    query_states,
+                    key_buffer,
+                    value_buffer,
+                    metadata.req_pool_indices,
+                    request_block_tables,
+                    metadata.block_table_lens,
+                    metadata.selected_start_positions,
+                    metadata.seq_lens,
+                    block_size=metadata.block_size,
+                    num_key_value_groups=attn.num_key_value_groups,
+                    scaling=attn.scaling,
+                    output=output_buffer,
+                )
+                self._stats["paged_request_table_successes"] = (
+                    self._stats.get("paged_request_table_successes", 0) + 1
+                )
+            else:
+                output = self._hooks.paged_decode_fn()(
+                    query_states,
+                    key_buffer,
+                    value_buffer,
+                    metadata.block_tables,
+                    metadata.block_table_lens,
+                    metadata.selected_start_positions,
+                    metadata.seq_lens,
+                    block_size=metadata.block_size,
+                    num_key_value_groups=attn.num_key_value_groups,
+                    scaling=attn.scaling,
+                    output=output_buffer,
+                )
         self._stats["paged_successes"] += 1
         return output
 
@@ -791,6 +837,7 @@ def build_token_pool_attention_backend(
         block_groups=block_groups,
         record_fallback=record_token_pool_triton_fallback,
         is_recoverable_runtime_error=is_recoverable_runtime_error,
+        paged_request_table_decode_fn=token_pool_triton_paged_request_table_decode_fn,
     )
     hooks = TokenPoolAttentionBackendHooks(
         triton=triton_hooks,

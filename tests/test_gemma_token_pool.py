@@ -2700,6 +2700,7 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(dense_metadata.block_table_lens.tolist(), [2, 2])
         self.assertEqual(dense_metadata.out_cache_loc.tolist(), [9, 37])
         self.assertEqual(dense_metadata.slot_mapping.dtype, torch.long)
+        self.assertIs(dense_metadata.request_block_tables, dense_page_table)
         dense_block_ptr = int(dense_metadata.block_tables.data_ptr())
         dense_again = table.build_paged_decode_metadata_from_page_table_tensor(
             [a, b],
@@ -2713,6 +2714,7 @@ class TestGemmaTokenPool(unittest.TestCase):
             workspace_key="sliding_attention_paged_tensor",
         )
         self.assertEqual(int(dense_again.block_tables.data_ptr()), dense_block_ptr)
+        self.assertIs(dense_again.request_block_tables, dense_page_table)
         self.assertIs(
             table._paged_decode_metadata_workspaces["sliding_attention_paged_tensor"],
             table.decode_metadata_workspace.paged_workspace(
@@ -3525,6 +3527,91 @@ class TestGemmaTokenPool(unittest.TestCase):
                 row_outputs.append((probs.unsqueeze(0) @ row_values[:, kv_head, :]).squeeze(0))
             expected_rows.append(torch.stack(row_outputs, dim=0))
         expected = torch.stack(expected_rows, dim=0).unsqueeze(1)
+
+        self.assertLess((expected - actual).abs().max().item(), 1e-5)
+
+    def test_request_table_paged_triton_decode_matches_compact_paged_kernel(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA unavailable")
+
+        from wkvm.runner.gemma_token_pool_triton import (
+            token_pool_paged_gqa_decode,
+            token_pool_paged_request_table_gqa_decode,
+        )
+
+        torch.manual_seed(321)
+        device = torch.device("cuda")
+        batch = 2
+        query_heads = 4
+        kv_heads = 2
+        groups = query_heads // kv_heads
+        head_dim = 16
+        block_size = 4
+        scaling = head_dim ** -0.5
+
+        query = torch.randn(
+            batch,
+            query_heads,
+            1,
+            head_dim,
+            dtype=torch.float32,
+            device=device,
+        )
+        keys = torch.randn(
+            24,
+            kv_heads,
+            head_dim,
+            dtype=torch.float32,
+            device=device,
+        )
+        values = torch.randn_like(keys)
+        compact_block_tables = torch.tensor(
+            [[0, 2], [1, 2]],
+            dtype=torch.int32,
+            device=device,
+        )
+        req_pool_indices = torch.tensor([1, 3], dtype=torch.int32, device=device)
+        request_block_tables = torch.full((4, 3), -1, dtype=torch.int32, device=device)
+        request_block_tables[1, 0] = 0
+        request_block_tables[1, 1] = 2
+        request_block_tables[3, 1] = 1
+        request_block_tables[3, 2] = 2
+        block_table_lens = torch.tensor([2, 2], dtype=torch.int32, device=device)
+        selected_start_positions = torch.tensor([0, 6], dtype=torch.int32, device=device)
+        seq_lens = torch.tensor([6, 4], dtype=torch.int32, device=device)
+
+        expected = token_pool_paged_gqa_decode(
+            query,
+            keys,
+            values,
+            compact_block_tables,
+            block_table_lens,
+            selected_start_positions,
+            seq_lens,
+            block_size=block_size,
+            num_key_value_groups=groups,
+            scaling=scaling,
+            block_n=16,
+        )
+        actual = token_pool_paged_request_table_gqa_decode(
+            query,
+            keys,
+            values,
+            req_pool_indices,
+            request_block_tables,
+            block_table_lens,
+            selected_start_positions,
+            seq_lens,
+            block_size=block_size,
+            num_key_value_groups=groups,
+            scaling=scaling,
+            block_n=16,
+        )
+        torch.cuda.synchronize()
 
         self.assertLess((expected - actual).abs().max().item(), 1e-5)
 
@@ -5089,6 +5176,114 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(stats["calls"], 0)
         self.assertEqual(stats["effective_enabled_calls"], 0)
 
+    def test_triton_backend_dispatches_request_table_paged_decode(self) -> None:
+        from types import SimpleNamespace
+        from wkvm.runner.gemma_token_pool_attention import (
+            TokenPoolTritonAttentionBackend,
+            TokenPoolTritonAttentionBackendHooks,
+        )
+
+        stats = {
+            "attempts": 0,
+            "successes": 0,
+            "disabled_shape_skips": 0,
+            "import_error_fallbacks": 0,
+            "runtime_errors": 0,
+            "recoverable_runtime_fallbacks": 0,
+            "nonrecoverable_runtime_errors": 0,
+            "paged_attempts": 0,
+            "paged_successes": 0,
+            "paged_request_table_attempts": 0,
+            "paged_request_table_successes": 0,
+            "paged_split_attempts": 0,
+            "paged_split_successes": 0,
+            "paged_split_skips_by_min_splits": 0,
+            "split_attempts": 0,
+            "split_successes": 0,
+            "split_skips_by_min_splits": 0,
+        }
+        events = []
+
+        class QueryStates:
+            is_cuda = True
+            shape = (2, 8, 1, 16)
+            dtype = "fake_dtype"
+            device = "cuda:0"
+
+        class DispatchContext:
+            has_flat_metadata = False
+
+            def kv_buffers_for_attention(self):
+                return "key_buffer", "value_buffer"
+
+            def attention_output_buffer(self, **kwargs):
+                events.append(("output_buffer", kwargs))
+                return "output_buffer"
+
+            def select_triton_dispatch(self, **kwargs):
+                events.append(("select", kwargs))
+                return SimpleNamespace(
+                    is_paged=True,
+                    is_split=False,
+                    split_skipped_by_min_splits=False,
+                    metadata=SimpleNamespace(
+                        req_pool_indices="reqs",
+                        request_block_tables="request_tables",
+                        block_tables="compact_tables",
+                        block_table_lens="block_lens",
+                        selected_start_positions="starts",
+                        seq_lens="seq_lens",
+                        block_size=16,
+                    ),
+                )
+
+        def compact_decode(*args, **kwargs):
+            raise AssertionError("compact paged decode should not run")
+
+        def request_table_decode(*args, **kwargs):
+            events.append(("request_table_decode", args, kwargs))
+            return "direct_output"
+
+        backend = TokenPoolTritonAttentionBackend(
+            stats=stats,
+            disabled_shapes=set(),
+            hooks=TokenPoolTritonAttentionBackendHooks(
+                decode_fn=lambda: None,
+                split_decode_fn=lambda: None,
+                paged_decode_fn=lambda: compact_decode,
+                paged_split_decode_fn=lambda: None,
+                block_groups=lambda groups, dtype: groups,
+                record_fallback=lambda reason: events.append(("fallback", reason)),
+                is_recoverable_runtime_error=lambda exc: True,
+                paged_request_table_decode_fn=lambda: request_table_decode,
+            ),
+        )
+        result = backend.decode(
+            SimpleNamespace(num_key_value_groups=4, scaling=0.5),
+            QueryStates(),
+            dispatch_context=DispatchContext(),
+            dispatch_plan=SimpleNamespace(
+                effective_enabled=True,
+                paged_enabled=True,
+                split_enabled=False,
+                paged_split_enabled=False,
+                input_precision_policy="ieee",
+                dot_dtype_policy="native",
+                strict=True,
+            ),
+        )
+
+        self.assertTrue(result.succeeded)
+        self.assertEqual(result.output, "direct_output")
+        self.assertEqual(stats["paged_attempts"], 1)
+        self.assertEqual(stats["paged_successes"], 1)
+        self.assertEqual(stats["paged_request_table_attempts"], 1)
+        self.assertEqual(stats["paged_request_table_successes"], 1)
+        decode_event = events[-1]
+        self.assertEqual(decode_event[0], "request_table_decode")
+        self.assertEqual(decode_event[1][3:8], ("reqs", "request_tables", "block_lens", "starts", "seq_lens"))
+        self.assertEqual(decode_event[2]["block_size"], 16)
+
     def test_attention_backend_factory_owns_default_triton_state(self) -> None:
         from types import SimpleNamespace
         from wkvm.runner.gemma_token_pool_attention import (
@@ -5501,6 +5696,76 @@ class TestGemmaTokenPool(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "block_size changed"):
             graph_metadata.copy_from(mismatched_context)
+
+    def test_backend_graph_metadata_copy_handles_request_block_tables(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenPoolDecodeBackendState,
+            TokenPoolDecodeContext,
+        )
+
+        table = ReqToTokenTable(max_requests=1, max_context_len=8)
+        slot = table.allocate("a")
+        table.append_slots(slot, [0, 1, 2, 3])
+        page_table = torch.full((1, 2), -1, dtype=torch.int32)
+        page_table[slot, 0] = 0
+        page_table[slot, 1] = 1
+        paged = table.build_paged_decode_metadata_from_page_table_tensor(
+            [slot],
+            page_table,
+            block_size=2,
+            block_table_width=2,
+            out_cache_loc=[3],
+            workspace_key="graph_request_tables",
+            validate=False,
+        )
+        context = TokenPoolDecodeContext(
+            metadata_by_layer_type={},
+            paged_metadata_by_layer_type={"sliding_attention": paged},
+            paged_metadata_by_layer_id={0: paged},
+            kv_pool=object(),
+            covered_layer_types=frozenset({"sliding_attention"}),
+        )
+
+        graph_metadata = TokenPoolDecodeBackendState.capture_graph_decode_metadata(
+            context,
+            clone_tensors=True,
+        )
+        cloned = graph_metadata.context.paged_metadata_by_layer_type[
+            "sliding_attention"
+        ]
+        self.assertIsNot(cloned.request_block_tables, page_table)
+        self.assertEqual(cloned.request_block_tables.tolist(), [[0, 1]])
+
+        updated_page_table = torch.full((1, 2), -1, dtype=torch.int32)
+        updated_page_table[slot, 0] = 4
+        updated_page_table[slot, 1] = 5
+        updated_paged = table.build_paged_decode_metadata_from_page_table_tensor(
+            [slot],
+            updated_page_table,
+            block_size=2,
+            block_table_width=2,
+            out_cache_loc=[11],
+            workspace_key="graph_request_tables_updated",
+            validate=False,
+        )
+        updated_context = TokenPoolDecodeContext(
+            metadata_by_layer_type={},
+            paged_metadata_by_layer_type={"sliding_attention": updated_paged},
+            paged_metadata_by_layer_id={0: updated_paged},
+            kv_pool=context.kv_pool,
+            covered_layer_types=context.covered_layer_types,
+        )
+
+        stats = graph_metadata.copy_from(updated_context)
+        self.assertGreater(stats["cuda_graph_metadata_tensor_copies"], 0)
+        self.assertEqual(cloned.request_block_tables.tolist(), [[4, 5]])
+        self.assertEqual(cloned.block_tables.tolist(), [[4, 5]])
 
     def test_graph_metadata_replay_compatibility_reports_shape_mismatch(self) -> None:
         try:

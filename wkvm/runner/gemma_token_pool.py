@@ -74,6 +74,7 @@ class PagedDecodeBatchMetadata:
     max_seq_len: int | None = None
     triton_decode_plan: TokenPoolTritonDecodePlan | None = None
     workspace_signature: Any | None = None
+    request_block_tables: Any | None = None
 
     def __post_init__(self) -> None:
         if self.triton_decode_plan is None:
@@ -2424,6 +2425,11 @@ class TokenPoolDecodeGraphBuffer:
                 max_seq_len=getattr(metadata, "max_seq_len", None),
                 triton_decode_plan=getattr(metadata, "triton_decode_plan", None),
                 workspace_signature=getattr(metadata, "workspace_signature", None),
+                request_block_tables=(
+                    None
+                    if getattr(metadata, "request_block_tables", None) is None
+                    else metadata.request_block_tables.clone()
+                ),
             )
         return DecodeBatchMetadata(
             req_pool_indices=metadata.req_pool_indices.clone(),
@@ -2508,6 +2514,7 @@ class TokenPoolDecodeGraphBuffer:
             "kv_indptr",
             "kv_indices",
             "block_tables",
+            "request_block_tables",
             "block_table_lens",
             "selected_start_positions",
             "slot_mapping",
@@ -2643,6 +2650,28 @@ class TokenPoolDecodeGraphBuffer:
             int(getattr(metadata, "block_size", -1)),
             getattr(metadata, "max_seq_len", None),
             getattr(metadata, "triton_decode_plan", None),
+            TokenPoolDecodeGraphBuffer._tensor_alias_key(
+                getattr(metadata, "request_block_tables", None)
+            ),
+        )
+
+    @staticmethod
+    def _tensor_alias_key(value: Any) -> tuple[Any, ...] | None:
+        if value is None:
+            return None
+        try:
+            data_ptr = int(value.data_ptr())
+        except Exception:
+            data_ptr = id(value)
+        try:
+            shape = tuple(int(dim) for dim in value.shape)
+        except Exception:
+            shape = ()
+        return (
+            data_ptr,
+            shape,
+            str(getattr(value, "dtype", "")),
+            str(getattr(value, "device", "")),
         )
 
     @classmethod
@@ -2671,6 +2700,7 @@ class TokenPoolDecodeGraphBuffer:
             "kv_indptr",
             "kv_indices",
             "block_tables",
+            "request_block_tables",
             "block_table_lens",
             "selected_start_positions",
             "slot_mapping",
@@ -2695,6 +2725,7 @@ class TokenPoolDecodeGraphBuffer:
             "kv_indptr",
             "kv_indices",
             "block_tables",
+            "request_block_tables",
             "block_table_lens",
             "selected_start_positions",
             "slot_mapping",
@@ -2980,6 +3011,9 @@ class TokenPoolDecodeGraphSignatureTracker:
             "logical_seq_lens": cls.tensor_shape_signature(metadata.logical_seq_lens),
             "out_cache_loc": cls.tensor_shape_signature(metadata.out_cache_loc),
             "block_tables": cls.tensor_shape_signature(metadata.block_tables),
+            "request_block_tables": cls.tensor_shape_signature(
+                getattr(metadata, "request_block_tables", None)
+            ),
             "block_table_lens": cls.tensor_shape_signature(metadata.block_table_lens),
             "selected_start_positions": cls.tensor_shape_signature(
                 metadata.selected_start_positions
@@ -3115,6 +3149,7 @@ class TokenPoolDecodeGraphSignatureTracker:
                 "kv_indptr",
                 "kv_indices",
                 "block_tables",
+                "request_block_tables",
                 "block_table_lens",
                 "selected_start_positions",
                 "slot_mapping",
@@ -5365,6 +5400,7 @@ class ReqToTokenTable:
                     key=workspace_key,
                     workspace=workspace,
                 ),
+                request_block_tables=page_table,
             )
 
         return PagedDecodeBatchMetadata(
@@ -5379,6 +5415,7 @@ class ReqToTokenTable:
             slot_mapping=out_long,
             out_cache_loc_long=out_long,
             max_seq_len=max(selected_lens),
+            request_block_tables=page_table,
         )
 
     def _ensure_paged_decode_metadata_workspace(
