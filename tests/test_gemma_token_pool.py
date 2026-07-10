@@ -4999,6 +4999,77 @@ class TestGemmaTokenPool(unittest.TestCase):
             [5],
         )
 
+    def test_graph_metadata_copy_compatible_uses_alias_fastpath(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from unittest.mock import patch
+
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenPoolDecodeBackendState,
+            TokenPoolDecodeContext,
+            TokenPoolDecodeGraphBuffer,
+        )
+
+        table = ReqToTokenTable(max_requests=1, max_context_len=8)
+        slot = table.allocate("a")
+        table.append_slots(slot, [0, 1])
+        flat = table.build_decode_metadata(
+            [slot],
+            out_cache_loc=[1],
+            workspace_key="graph_flat",
+        )
+        context = TokenPoolDecodeContext(
+            metadata_by_layer_type={"sliding_attention": flat},
+            metadata_by_layer_id={0: flat, 1: flat},
+            kv_pool=object(),
+            covered_layer_types=frozenset({"sliding_attention"}),
+        )
+        graph_metadata = TokenPoolDecodeBackendState.capture_graph_decode_metadata(
+            context,
+            clone_tensors=False,
+        )
+
+        table.req_to_token[slot, :2] = torch.tensor([4, 5], dtype=torch.int32)
+        updated_flat = table.build_decode_metadata(
+            [slot],
+            out_cache_loc=[5],
+            workspace_key="graph_flat",
+        )
+        updated = TokenPoolDecodeContext(
+            metadata_by_layer_type={"sliding_attention": updated_flat},
+            metadata_by_layer_id={0: updated_flat, 1: updated_flat},
+            kv_pool=context.kv_pool,
+            covered_layer_types=context.covered_layer_types,
+        )
+
+        with patch.object(
+            TokenPoolDecodeGraphBuffer,
+            "replay_compatibility_error",
+            side_effect=AssertionError("slow compatibility path used"),
+        ), patch.object(
+            TokenPoolDecodeGraphBuffer,
+            "_copy_decode_metadata_tensor",
+            side_effect=AssertionError("slow metadata copy path used"),
+        ):
+            stats = graph_metadata.copy_compatible_from(updated)
+
+        self.assertEqual(stats["cuda_graph_metadata_tensor_copies"], 0)
+        self.assertGreater(stats["cuda_graph_metadata_tensor_copy_skips"], 0)
+        self.assertGreater(
+            stats["cuda_graph_metadata_alias_fastpath_metadata_skips"],
+            0,
+        )
+        self.assertEqual(
+            graph_metadata.context.metadata_by_layer_type[
+                "sliding_attention"
+            ].kv_indices.tolist(),
+            [4, 5],
+        )
+
     def test_graph_signature_tracker_records_reuse_and_mismatch(self) -> None:
         from wkvm.runner.gemma_token_pool import (
             DecodeBatchMetadata,

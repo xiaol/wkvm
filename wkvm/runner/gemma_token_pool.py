@@ -2137,6 +2137,69 @@ class TokenPoolDecodeGraphBuffer:
         )
         return stats
 
+    def copy_compatible_from(
+        self,
+        token_pool_decode: TokenPoolDecodeContext | None,
+    ) -> dict[str, int]:
+        alias_stats = self._copy_aliasing_workspace_compatible(token_pool_decode)
+        if alias_stats is not None:
+            return alias_stats
+        compatibility_error = self.replay_compatibility_error(token_pool_decode)
+        if compatibility_error is not None:
+            raise ValueError(
+                "token-pool cuda graph metadata incompatible: "
+                f"{compatibility_error}"
+            )
+        return self.copy_from(token_pool_decode)
+
+    def _copy_aliasing_workspace_compatible(
+        self,
+        token_pool_decode: TokenPoolDecodeContext | None,
+    ) -> dict[str, int] | None:
+        if self.context is None or token_pool_decode is None:
+            return None
+        if self.context.kv_pool is not token_pool_decode.kv_pool:
+            return None
+        if self.context.covered_layer_types != token_pool_decode.covered_layer_types:
+            return None
+        if (
+            self.context.layer_id_metadata_only_types
+            != token_pool_decode.layer_id_metadata_only_types
+        ):
+            return None
+        stats = {
+            "cuda_graph_metadata_tensor_copies": 0,
+            "cuda_graph_metadata_tensor_copy_skips": 0,
+            "cuda_graph_metadata_alias_fastpath_metadata_skips": 0,
+        }
+        checked_metadata: set[tuple[int, int]] = set()
+        for dst_group, src_group in (
+            (
+                self.context.metadata_by_layer_type,
+                token_pool_decode.metadata_by_layer_type,
+            ),
+            (
+                self.context.metadata_by_layer_id or {},
+                token_pool_decode.metadata_by_layer_id or {},
+            ),
+            (
+                self.context.paged_metadata_by_layer_type or {},
+                token_pool_decode.paged_metadata_by_layer_type or {},
+            ),
+            (
+                self.context.paged_metadata_by_layer_id or {},
+                token_pool_decode.paged_metadata_by_layer_id or {},
+            ),
+        ):
+            if not self._metadata_group_aliases_same_workspace(
+                dst_group,
+                src_group,
+                checked_metadata=checked_metadata,
+                stats=stats,
+            ):
+                return None
+        return stats
+
     def replay_compatibility_error(
         self,
         token_pool_decode: TokenPoolDecodeContext | None,
@@ -2293,6 +2356,73 @@ class TokenPoolDecodeGraphBuffer:
         if copied_metadata is not None and metadata_pair is not None:
             copied_metadata.add(metadata_pair)
 
+    @classmethod
+    def _metadata_group_aliases_same_workspace(
+        cls,
+        dst_group: dict[Any, Any],
+        src_group: dict[Any, Any],
+        *,
+        checked_metadata: set[tuple[int, int]],
+        stats: dict[str, int],
+    ) -> bool:
+        if set(dst_group) != set(src_group):
+            return False
+        for key in dst_group:
+            metadata_pair = (id(dst_group[key]), id(src_group[key]))
+            if metadata_pair in checked_metadata:
+                stats["cuda_graph_metadata_alias_fastpath_metadata_skips"] = (
+                    stats.get("cuda_graph_metadata_alias_fastpath_metadata_skips", 0)
+                    + 1
+                )
+                continue
+            if not cls._decode_metadata_aliases_same_workspace(
+                dst_group[key],
+                src_group[key],
+                stats=stats,
+            ):
+                return False
+            checked_metadata.add(metadata_pair)
+        return True
+
+    @classmethod
+    def _decode_metadata_aliases_same_workspace(
+        cls,
+        dst,
+        src,
+        *,
+        stats: dict[str, int],
+    ) -> bool:
+        if int(getattr(dst, "block_size", -1)) != int(getattr(src, "block_size", -1)):
+            return False
+        if getattr(dst, "max_seq_len", None) != getattr(src, "max_seq_len", None):
+            return False
+        if getattr(dst, "triton_decode_plan", None) != getattr(
+            src,
+            "triton_decode_plan",
+            None,
+        ):
+            return False
+        for name in (
+            "req_pool_indices",
+            "seq_lens",
+            "logical_seq_lens",
+            "out_cache_loc",
+            "kv_indptr",
+            "kv_indices",
+            "block_tables",
+            "block_table_lens",
+            "selected_start_positions",
+            "slot_mapping",
+            "out_cache_loc_long",
+        ):
+            if not cls._decode_metadata_tensor_aliases_same_workspace(
+                getattr(dst, name, None),
+                getattr(src, name, None),
+                stats=stats,
+            ):
+                return False
+        return True
+
     @staticmethod
     def _decode_metadata_tensor_pair_count(dst, src) -> int:
         count = 0
@@ -2312,6 +2442,36 @@ class TokenPoolDecodeGraphBuffer:
             if getattr(dst, name, None) is not None and getattr(src, name, None) is not None:
                 count += 1
         return count
+
+    @staticmethod
+    def _decode_metadata_tensor_aliases_same_workspace(
+        dst,
+        src,
+        *,
+        stats: dict[str, int],
+    ) -> bool:
+        if dst is None or src is None:
+            return dst is src
+        if tuple(dst.shape) != tuple(src.shape):
+            return False
+        if dst.dtype != src.dtype:
+            return False
+        try:
+            same_storage = (
+                dst is src
+                or (
+                    dst.device == src.device
+                    and int(dst.data_ptr()) == int(src.data_ptr())
+                )
+            )
+        except Exception:
+            same_storage = dst is src
+        if not same_storage:
+            return False
+        stats["cuda_graph_metadata_tensor_copy_skips"] = (
+            stats.get("cuda_graph_metadata_tensor_copy_skips", 0) + 1
+        )
+        return True
 
     @staticmethod
     def _copy_decode_metadata_tensor(
@@ -2401,13 +2561,7 @@ class TokenPoolDecodeGraphMetadata:
         self,
         token_pool_decode: TokenPoolDecodeContext | None,
     ) -> dict[str, int]:
-        compatibility_error = self.replay_compatibility_error(token_pool_decode)
-        if compatibility_error is not None:
-            raise ValueError(
-                "token-pool cuda graph metadata incompatible: "
-                f"{compatibility_error}"
-            )
-        return self.copy_from(token_pool_decode)
+        return self._buffer.copy_compatible_from(token_pool_decode)
 
     def replay_compatibility_error(
         self,

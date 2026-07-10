@@ -197,6 +197,7 @@ class GemmaEngineMetrics:
     )
     token_pool_decode_graph_metadata_tensor_copies: int = 0
     token_pool_decode_graph_metadata_tensor_copy_skips: int = 0
+    token_pool_decode_graph_metadata_alias_fastpath_metadata_skips: int = 0
     token_pool_full_attention_row_rebuilds: int = 0
     token_pool_full_attention_row_reuses: int = 0
     token_pool_full_attention_row_appends: int = 0
@@ -316,6 +317,9 @@ class GemmaEngineMetrics:
             ),
             "token_pool_decode_graph_metadata_tensor_copy_skips": (
                 self.token_pool_decode_graph_metadata_tensor_copy_skips
+            ),
+            "token_pool_decode_graph_metadata_alias_fastpath_metadata_skips": (
+                self.token_pool_decode_graph_metadata_alias_fastpath_metadata_skips
             ),
             "token_pool_full_attention_row_rebuilds": (
                 self.token_pool_full_attention_row_rebuilds
@@ -1531,6 +1535,10 @@ class GemmaNativeEngine:
             (
                 "cuda_graph_metadata_tensor_copy_skips",
                 "token_pool_decode_graph_metadata_tensor_copy_skips",
+            ),
+            (
+                "cuda_graph_metadata_alias_fastpath_metadata_skips",
+                "token_pool_decode_graph_metadata_alias_fastpath_metadata_skips",
             ),
         ):
             try:

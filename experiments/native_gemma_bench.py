@@ -587,6 +587,9 @@ def run_row(model, tok, cfg, B: int, args, usable_gib: float | None) -> dict[str
                 "token_pool_decode_graph_metadata_tensor_copy_skips": (
                     engine.metrics.token_pool_decode_graph_metadata_tensor_copy_skips
                 ),
+                "token_pool_decode_graph_metadata_alias_fastpath_metadata_skips": (
+                    engine.metrics.token_pool_decode_graph_metadata_alias_fastpath_metadata_skips
+                ),
                 "exact_decode_batch_rows": engine.metrics.exact_decode_batch_rows,
                 "padded_decode_batch_rows": engine.metrics.padded_decode_batch_rows,
                 "padded_decode_temp_bytes": engine.metrics.padded_decode_temp_bytes,

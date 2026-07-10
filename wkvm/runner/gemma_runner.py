@@ -741,8 +741,7 @@ class NativeGemmaRoutedCache:
         self.slot_state = slot_state
         self.static_padded_decode = False
         self._static_padded_decode_layers = None
-        self._shared_kv_by_layer: dict[int, tuple[Any, Any]] = {}
-        self._shared_kv_by_type: dict[str, tuple[Any, Any]] = {}
+        self._init_shared_kv_store()
         n_owned = decoder.num_hidden_layers - getattr(decoder, "num_kv_shared_layers", 0)
         layer_types = list(decoder.layer_types[:n_owned])
         coord: list | None = []
@@ -769,6 +768,16 @@ class NativeGemmaRoutedCache:
                     )
                 )
 
+    def _init_shared_kv_store(self) -> None:
+        self._shared_kv_by_layer: dict[int, tuple[Any, Any]] = {}
+        self._shared_kv_by_type: dict[str, tuple[Any, Any]] = {}
+
+    def _ensure_shared_kv_store(self) -> None:
+        if not hasattr(self, "_shared_kv_by_layer"):
+            self._shared_kv_by_layer = {}
+        if not hasattr(self, "_shared_kv_by_type"):
+            self._shared_kv_by_type = {}
+
     @property
     def is_sliding(self) -> list[bool]:
         return [layer.is_sliding for layer in self.layers]
@@ -784,6 +793,7 @@ class NativeGemmaRoutedCache:
         key_states,
         value_states,
     ) -> None:
+        self._ensure_shared_kv_store()
         shared_kv = (key_states, value_states)
         self._shared_kv_by_layer[int(layer_idx)] = shared_kv
         if layer_type is not None:
@@ -795,6 +805,7 @@ class NativeGemmaRoutedCache:
         layer_idx: int | None = None,
         layer_type: str | None = None,
     ):
+        self._ensure_shared_kv_store()
         if layer_idx is not None:
             shared_kv = self._shared_kv_by_layer.get(int(layer_idx))
             if shared_kv is not None:
@@ -823,6 +834,7 @@ class NativeGemmaRoutedCache:
     def batch_repeat_interleave(self, repeats: int) -> None:
         for layer in self.layers:
             layer.batch_repeat_interleave(repeats)
+        self._ensure_shared_kv_store()
         repeated: dict[int, tuple[Any, Any]] = {}
 
         def repeat_shared(kv: tuple[Any, Any]) -> tuple[Any, Any]:
@@ -844,6 +856,7 @@ class NativeGemmaRoutedCache:
         }
 
     def state_bytes(self) -> int:
+        self._ensure_shared_kv_store()
         total = 0
         seen: set[int] = set()
 
@@ -867,6 +880,7 @@ class NativeGemmaRoutedCache:
         return total
 
     def release_tensor_storage(self) -> None:
+        self._ensure_shared_kv_store()
         self._shared_kv_by_layer.clear()
         self._shared_kv_by_type.clear()
         for layer in self.layers:
@@ -1013,6 +1027,7 @@ class NativeGemmaRoutedCache:
         merged.slot_state = None
         merged.static_padded_decode = bool(graph_static)
         merged._static_padded_decode_layers = None
+        merged._init_shared_kv_store()
         merged.layers = []
         layer_infos: list[dict[str, Any]] = []
         covered_layer_types = set(token_pool_covered_layer_types or ())
@@ -1630,6 +1645,7 @@ class GemmaRoutedSpanRunner:
             "cuda_graph_decode_wall_s_total",
             "cuda_graph_metadata_tensor_copies",
             "cuda_graph_metadata_tensor_copy_skips",
+            "cuda_graph_metadata_alias_fastpath_metadata_skips",
         ):
             if key in decode_info:
                 info[key] = decode_info[key]
@@ -1672,6 +1688,7 @@ class GemmaRoutedSpanRunner:
             "cuda_graph_decode_wall_s_total",
             "cuda_graph_metadata_tensor_copies",
             "cuda_graph_metadata_tensor_copy_skips",
+            "cuda_graph_metadata_alias_fastpath_metadata_skips",
         ):
             if key in decode_info:
                 self.last_decode_batch_info[key] = decode_info[key]

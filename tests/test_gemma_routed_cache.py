@@ -208,6 +208,18 @@ class TestGemmaRoutedCache(unittest.TestCase):
         self.assertEqual(tuple(mask.shape), (2, 1, 1, 6))
         self.assertLess(float(mask[0, 0, 0, 3]), 0.0)
         self.assertEqual(float(mask[0, 0, 0, 5]), 0.0)
+        shared_key = torch.full((2, 1, 1, 2), 3.0)
+        shared_value = torch.full((2, 1, 1, 2), 13.0)
+        merged.store_shared_kv(
+            layer_idx=0,
+            layer_type="sliding_attention",
+            key_states=shared_key,
+            value_states=shared_value,
+        )
+        self.assertIs(
+            merged.get_shared_kv(layer_idx=0, layer_type="sliding_attention")[0],
+            shared_key,
+        )
 
         merged.update(torch.full((2, 1, 1, 2), 7.0), torch.full((2, 1, 1, 2), 17.0), layer_idx=0)
         merged.commit_padded_decode_into(caches)
