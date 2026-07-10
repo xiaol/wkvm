@@ -1909,6 +1909,47 @@ class TokenPoolDecodeDiscardResult:
     restored_page_slots: tuple[int, ...] = ()
 
 
+@dataclass(frozen=True)
+class TokenPoolLayerPlan:
+    """Backend-owned layer routing policy for token-pool decode metadata."""
+
+    layer_type_by_layer_id: dict[int, str]
+    full_attention_owner_layer_ids: tuple[int, ...] = ()
+    full_attention_layer_ids: tuple[int, ...] = ()
+    pool_full_attention_layer_ids: tuple[int, ...] = ()
+    expected_full_attention_owner_layer_ids: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        layer_type_by_layer_id = {
+            int(layer_id): str(layer_type)
+            for layer_id, layer_type in self.layer_type_by_layer_id.items()
+        }
+        object.__setattr__(self, "layer_type_by_layer_id", layer_type_by_layer_id)
+        for name in (
+            "full_attention_owner_layer_ids",
+            "full_attention_layer_ids",
+            "pool_full_attention_layer_ids",
+            "expected_full_attention_owner_layer_ids",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                tuple(int(layer_id) for layer_id in getattr(self, name)),
+            )
+
+    @property
+    def supports_full_attention_decode_metadata(self) -> bool:
+        full_layer_ids = set(self.full_attention_layer_ids)
+        owner_layer_ids = set(self.full_attention_owner_layer_ids)
+        expected_owner_layer_ids = set(self.expected_full_attention_owner_layer_ids)
+        return (
+            bool(owner_layer_ids)
+            and bool(full_layer_ids)
+            and full_layer_ids.issubset(set(self.pool_full_attention_layer_ids))
+            and expected_owner_layer_ids.issubset(owner_layer_ids)
+        )
+
+
 def token_pool_decode_covered_layer_types(
     token_pool_decode: Any | None,
 ) -> frozenset[str]:
@@ -5207,6 +5248,8 @@ class TokenPoolDecodeBackendState:
         self.request_page_tables: dict[str, dict[int, int]] = {}
         self.request_page_owned_slots: dict[str, set[int]] = {}
         self.current_decode_batch_state: TokenPoolDecodeBatchState | None = None
+        self._layer_plan_cache_key: tuple[Any, ...] | None = None
+        self._layer_plan_cache: TokenPoolLayerPlan | None = None
 
     def clear_decode_batch_state(self) -> None:
         self.current_decode_batch_state = None
@@ -5294,6 +5337,98 @@ class TokenPoolDecodeBackendState:
         if state is None:
             return frozenset()
         return state.covered_layer_types
+
+    @staticmethod
+    def layer_type_for_layer_id(
+        layer_id: int,
+        layer_types: Iterable[Any] | None,
+    ) -> str | None:
+        if layer_types is None:
+            return None
+        layer_type_list = list(layer_types)
+        layer_id = int(layer_id)
+        if layer_id < 0 or layer_id >= len(layer_type_list):
+            return None
+        layer_type = layer_type_list[layer_id]
+        if layer_type is None:
+            return None
+        return str(layer_type)
+
+    def build_layer_plan(
+        self,
+        *,
+        layer_types: Iterable[Any] | None = None,
+        model_layer_ids: Iterable[int] = (),
+        fallback_full_attention_layer_ids: Iterable[int] = (),
+        expected_full_attention_owner_layer_ids: Iterable[int] = (),
+    ) -> TokenPoolLayerPlan:
+        pool = self.kv_pool
+        if pool is None:
+            return TokenPoolLayerPlan(layer_type_by_layer_id={})
+        layer_type_tuple = tuple(() if layer_types is None else layer_types)
+        model_layer_id_tuple = tuple(int(layer_id) for layer_id in model_layer_ids)
+        fallback_full_attention_layer_id_tuple = tuple(
+            int(layer_id) for layer_id in fallback_full_attention_layer_ids
+        )
+        expected_full_attention_owner_layer_id_tuple = tuple(
+            int(layer_id) for layer_id in expected_full_attention_owner_layer_ids
+        )
+        cache_key = (
+            layer_type_tuple,
+            model_layer_id_tuple,
+            fallback_full_attention_layer_id_tuple,
+            expected_full_attention_owner_layer_id_tuple,
+        )
+        if (
+            self._layer_plan_cache_key == cache_key
+            and self._layer_plan_cache is not None
+        ):
+            return self._layer_plan_cache
+
+        layer_type_by_layer_id: dict[int, str] = {}
+        for layer_id in sorted(getattr(pool, "layer_specs", {})):
+            layer_type = self.layer_type_for_layer_id(layer_id, layer_type_tuple)
+            if layer_type is not None:
+                layer_type_by_layer_id[int(layer_id)] = layer_type
+
+        target_layer = getattr(pool, "target_layer", None)
+        full_attention_owner_layer_ids: list[int] = []
+        for layer_id in sorted(getattr(pool, "layer_specs", {})):
+            layer_id = int(layer_id)
+            target = layer_id if target_layer is None else int(target_layer(layer_id))
+            if (
+                target == layer_id
+                and layer_type_by_layer_id.get(layer_id) == "full_attention"
+            ):
+                full_attention_owner_layer_ids.append(layer_id)
+
+        if model_layer_id_tuple:
+            full_attention_layer_ids = [
+                layer_id
+                for layer_id in model_layer_id_tuple
+                if self.layer_type_for_layer_id(layer_id, layer_type_tuple)
+                == "full_attention"
+            ]
+        else:
+            full_attention_layer_ids = list(fallback_full_attention_layer_id_tuple)
+
+        pool_full_attention_layer_ids = [
+            layer_id
+            for layer_id, layer_type in sorted(layer_type_by_layer_id.items())
+            if layer_type == "full_attention"
+        ]
+        plan = TokenPoolLayerPlan(
+            layer_type_by_layer_id=layer_type_by_layer_id,
+            full_attention_owner_layer_ids=tuple(full_attention_owner_layer_ids),
+            full_attention_layer_ids=tuple(full_attention_layer_ids),
+            pool_full_attention_layer_ids=tuple(pool_full_attention_layer_ids),
+            expected_full_attention_owner_layer_ids=(
+                expected_full_attention_owner_layer_id_tuple
+            ),
+        )
+        self._layer_plan_cache_key = cache_key
+        self._layer_plan_cache = plan
+        return plan
 
     def build_current_decode_context(
         self,

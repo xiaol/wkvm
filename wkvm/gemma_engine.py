@@ -41,6 +41,7 @@ from wkvm.runner.gemma_token_pool import (
     TokenPoolDecodeGraphSignatureUpdate,
     TokenPoolDecodeGraphSignatureTracker,
     TokenPoolFullAttentionRow,
+    TokenPoolLayerPlan,
     TokenPoolPreparedDecodeBatch,
     TokenSlotAllocator,
 )
@@ -552,6 +553,7 @@ class GemmaNativeEngine:
             )
         if enable_token_pool_attention and not enable_token_pool_metadata:
             raise ValueError("enable_token_pool_attention requires token-pool metadata")
+        self.model = model
         self.config = config
         self.bank = GemmaRoutedStateBank(config, num_slots=num_slots)
         self.arena = StateArena(config.state_spec(), num_slots=num_slots)
@@ -2819,20 +2821,10 @@ class GemmaNativeEngine:
             return None, None
         if not backend.has_full_attention_rows():
             return None, None
-        owner_layer_ids = self._token_pool_full_attention_owner_layer_ids()
-        if not owner_layer_ids:
+        layer_plan = self._token_pool_layer_plan()
+        if not layer_plan.supports_full_attention_decode_metadata:
             return None, None
-        full_layer_ids = set(self._token_pool_full_attention_layer_ids())
-        pool_full_layer_ids = {
-            int(layer_id)
-            for layer_id in pool.layer_specs
-            if self._token_pool_layer_type(int(layer_id)) == "full_attention"
-        }
-        if not full_layer_ids or not full_layer_ids.issubset(pool_full_layer_ids):
-            return None, None
-        expected_owner_layer_ids = set(self.config.full_kv_layers)
-        if not expected_owner_layer_ids.issubset(set(owner_layer_ids)):
-            return None, None
+        owner_layer_ids = list(layer_plan.full_attention_owner_layer_ids)
         req_ids = [req.req_id for req in reqs]
         if not persistent_rows:
             self._token_pool_clear_full_attention_rows(req_ids)
@@ -2866,49 +2858,51 @@ class GemmaNativeEngine:
             self._token_pool_clear_full_attention_rows(req_ids)
             return None, None
 
+    def _token_pool_effective_layer_types(self) -> tuple[Any, ...]:
+        runner_model = getattr(self.runner, "model", None)
+        model = runner_model if runner_model is not None else getattr(self, "model", None)
+        model_cfg = getattr(model, "config", None)
+        layer_types = getattr(model_cfg, "layer_types", None)
+        if layer_types is not None:
+            return tuple(layer_types)
+        return tuple(getattr(self.config, "_effective_layer_types", ()))
+
+    def _token_pool_model_layer_ids(self) -> list[int]:
+        runner_model = getattr(self.runner, "model", None)
+        model = runner_model if runner_model is not None else getattr(self, "model", None)
+        text_prefix = getattr(model, "text_prefix", None)
+        layers = list(getattr(text_prefix, "layers", ()) or ())
+        return [int(layer.layer_idx) for layer in layers]
+
+    def _token_pool_layer_plan(self) -> TokenPoolLayerPlan:
+        backend = self._token_pool_decode_backend
+        if backend is None:
+            return TokenPoolLayerPlan(layer_type_by_layer_id={})
+        return backend.build_layer_plan(
+            layer_types=self._token_pool_effective_layer_types(),
+            model_layer_ids=self._token_pool_model_layer_ids(),
+            fallback_full_attention_layer_ids=self.config.full_kv_layers,
+            expected_full_attention_owner_layer_ids=self.config.full_kv_layers,
+        )
+
     def _token_pool_full_attention_owner_layer_ids(self) -> list[int]:
-        pool = self._token_kv_pool
-        if pool is None:
-            return []
-        return [
-            int(layer_id)
-            for layer_id in sorted(pool.layer_specs)
-            if pool.target_layer(int(layer_id)) == int(layer_id)
-            and self._token_pool_layer_type(int(layer_id)) == "full_attention"
-        ]
+        return list(self._token_pool_layer_plan().full_attention_owner_layer_ids)
 
     def _token_pool_full_attention_layer_ids(self) -> list[int]:
-        text_prefix = getattr(self.runner.model, "text_prefix", None)
-        layers = list(getattr(text_prefix, "layers", ()) or ())
-        if layers:
-            return [
-                int(layer.layer_idx)
-                for layer in layers
-                if self._token_pool_layer_type(int(layer.layer_idx)) == "full_attention"
-            ]
-        return [int(layer_id) for layer_id in self.config.full_kv_layers]
+        return list(self._token_pool_layer_plan().full_attention_layer_ids)
 
     def _token_pool_layer_type_by_layer_id(self) -> dict[int, str]:
-        pool = self._token_kv_pool
-        if pool is None:
-            return {}
-        result: dict[int, str] = {}
-        for layer_id in sorted(pool.layer_specs):
-            layer_type = self._token_pool_layer_type(int(layer_id))
-            if layer_type is not None:
-                result[int(layer_id)] = str(layer_type)
-        return result
+        return dict(self._token_pool_layer_plan().layer_type_by_layer_id)
 
     def _token_pool_layer_type(self, layer_id: int) -> str | None:
-        layer_id = int(layer_id)
-        model_cfg = getattr(self.runner.model, "config", None)
-        layer_types = getattr(model_cfg, "layer_types", None)
-        if layer_types is not None and layer_id < len(layer_types):
-            return str(layer_types[layer_id])
-        effective = getattr(self.config, "_effective_layer_types", ())
-        if layer_id < len(effective):
-            return str(effective[layer_id])
-        return None
+        backend = self._token_pool_decode_backend
+        layer_types = self._token_pool_effective_layer_types()
+        if backend is None:
+            return TokenPoolDecodeBackendState.layer_type_for_layer_id(
+                int(layer_id),
+                layer_types,
+            )
+        return backend.layer_type_for_layer_id(int(layer_id), layer_types)
 
     def _token_pool_commit_decode_to_full_attention_caches(
         self,

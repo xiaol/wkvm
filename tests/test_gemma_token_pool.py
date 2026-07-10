@@ -1380,6 +1380,57 @@ class TestGemmaTokenPool(unittest.TestCase):
         )
         self.assertIsNone(typed_context.metadata_for_layer(8, "unknown"))
 
+    def test_token_pool_decode_backend_builds_layer_plan(self) -> None:
+        from types import SimpleNamespace
+
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenPoolDecodeBackendState,
+        )
+
+        pool = SimpleNamespace(
+            layer_specs={0: object(), 1: object(), 2: object()},
+            target_layer=lambda layer_id: 1 if int(layer_id) == 2 else int(layer_id),
+        )
+        backend = TokenPoolDecodeBackendState(
+            table=ReqToTokenTable(max_requests=1, max_context_len=8),
+            kv_pool=pool,
+        )
+
+        plan = backend.build_layer_plan(
+            layer_types=(
+                "sliding_attention",
+                "full_attention",
+                "full_attention",
+            ),
+            model_layer_ids=[0, 1, 2],
+            expected_full_attention_owner_layer_ids=[1],
+        )
+
+        self.assertEqual(
+            plan.layer_type_by_layer_id,
+            {
+                0: "sliding_attention",
+                1: "full_attention",
+                2: "full_attention",
+            },
+        )
+        self.assertEqual(plan.full_attention_owner_layer_ids, (1,))
+        self.assertEqual(plan.full_attention_layer_ids, (1, 2))
+        self.assertEqual(plan.pool_full_attention_layer_ids, (1, 2))
+        self.assertTrue(plan.supports_full_attention_decode_metadata)
+
+        unsupported = backend.build_layer_plan(
+            layer_types=(
+                "sliding_attention",
+                "full_attention",
+                "full_attention",
+            ),
+            model_layer_ids=[0, 1, 2],
+            expected_full_attention_owner_layer_ids=[2],
+        )
+        self.assertFalse(unsupported.supports_full_attention_decode_metadata)
+
     def test_token_pool_decode_backend_commits_decode_transaction_prefix(self) -> None:
         try:
             import torch  # noqa: F401
