@@ -138,6 +138,40 @@ class TestGemmaBenchReport(unittest.TestCase):
                     require_native_no_hf=True,
                 )
 
+    def test_require_native_no_hf_rejects_setup_boundary_violations(self) -> None:
+        payload = self.native_payload()
+        payload["uses_hf_tokenizer"] = True
+        payload["uses_hf_config"] = True
+        payload["native_gemma_config_loader"] = False
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            native = self.write_payload(tmp, "native.json", payload)
+
+            with self.assertRaisesRegex(
+                ValueError, "uses_hf_tokenizer_not_false"
+            ):
+                gemma_bench_report.render(
+                    [native],
+                    require_native_no_hf=True,
+                )
+
+    def test_require_native_no_hf_rejects_missing_setup_evidence(self) -> None:
+        payload = self.native_payload()
+        payload.pop("uses_hf_tokenizer")
+        payload.pop("uses_hf_config")
+        payload.pop("native_gemma_config_loader")
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            native = self.write_payload(tmp, "native.json", payload)
+
+            with self.assertRaisesRegex(
+                ValueError, "native_gemma_config_loader_not_true"
+            ):
+                gemma_bench_report.render(
+                    [native],
+                    require_native_no_hf=True,
+                )
+
     def test_require_native_no_hf_skips_failed_native_rows(self) -> None:
         payload = self.native_payload()
         payload["rows"].append(

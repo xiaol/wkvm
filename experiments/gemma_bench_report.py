@@ -94,6 +94,17 @@ def native_no_hf_row_problems(row: dict[str, Any]) -> list[str]:
     return problems
 
 
+def native_no_hf_setup_problems(data: dict[str, Any]) -> list[str]:
+    problems = []
+    if data.get("uses_hf_tokenizer") is not False:
+        problems.append("uses_hf_tokenizer_not_false")
+    if data.get("uses_hf_config") is not False:
+        problems.append("uses_hf_config_not_false")
+    if data.get("native_gemma_config_loader") is not True:
+        problems.append("native_gemma_config_loader_not_true")
+    return problems
+
+
 def validate_native_no_hf(payloads: list[tuple[Path, dict[str, Any]]]) -> None:
     violations = []
     checked_rows = 0
@@ -101,6 +112,9 @@ def validate_native_no_hf(payloads: list[tuple[Path, dict[str, Any]]]) -> None:
         (path, data) for path, data in payloads if data.get("engine") == "wkvm-native"
     ]
     for path, data in native_payloads:
+        setup_problems = native_no_hf_setup_problems(data)
+        if setup_problems:
+            violations.append((path, "setup", setup_problems))
         payload_checked_rows = 0
         for row in data.get("rows", []):
             if not row_has_full_success(row):
@@ -122,7 +136,8 @@ def validate_native_no_hf(payloads: list[tuple[Path, dict[str, Any]]]) -> None:
         parts.append(f"{source} B={fmt(B)} problems={','.join(problems)}")
     raise ValueError(
         "native no-HF requirement failed; "
-        "successful wkvm-native rows must prove no HF model construction/forward: "
+        "wkvm-native payloads must prove no HF tokenizer/config, no HF model "
+        "construction/forward, and native checkpoint/config loading: "
         + "; ".join(parts)
     )
 

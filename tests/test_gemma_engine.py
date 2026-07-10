@@ -201,6 +201,27 @@ class TestGemmaSchedulerAssumptions(unittest.TestCase):
             empty["violations"],
             [{"B": None, "problems": ["no_successful_rows_to_check"]}],
         )
+        setup_report = native_no_hf_requirement_report(
+            [good],
+            required=True,
+            setup_problems=["uses_hf_tokenizer_not_false"],
+        )
+        self.assertFalse(setup_report["passed"])
+        self.assertTrue(setup_report["checked_setup_boundary"])
+        self.assertEqual(
+            setup_report["setup_problems"],
+            ["uses_hf_tokenizer_not_false"],
+        )
+        self.assertEqual(
+            setup_report["violations"],
+            [
+                {
+                    "B": None,
+                    "phase": "setup",
+                    "problems": ["uses_hf_tokenizer_not_false"],
+                }
+            ],
+        )
 
     def test_native_bench_payload_records_setup_failure_without_rows(self) -> None:
         from experiments.native_gemma_bench import build_benchmark_payload
@@ -243,7 +264,14 @@ class TestGemmaSchedulerAssumptions(unittest.TestCase):
         )
         self.assertEqual(
             payload["native_no_hf_requirement"]["violations"],
-            [{"B": None, "problems": ["no_successful_rows_to_check"]}],
+            [
+                {
+                    "B": None,
+                    "phase": "setup",
+                    "problems": ["uses_hf_tokenizer_not_false"],
+                },
+                {"B": None, "problems": ["no_successful_rows_to_check"]},
+            ],
         )
         self.assertFalse(payload["native_no_hf_requirement"]["passed"])
 
@@ -303,6 +331,7 @@ class TestGemmaSchedulerAssumptions(unittest.TestCase):
         self.assertFalse(payload["uses_hf_tokenizer"])
         self.assertFalse(payload["uses_hf_config"])
         self.assertTrue(payload["native_gemma_config_loader"])
+        self.assertEqual(payload["native_no_hf_requirement"]["setup_problems"], [])
         self.assertTrue(payload["config"]["synthetic_prompts"])
         self.assertEqual(payload["config"]["synthetic_vocab_size"], 128)
         self.assertFalse(payload["config"]["uses_hf_config"])
@@ -328,6 +357,14 @@ class TestGemmaSchedulerAssumptions(unittest.TestCase):
         self.assertFalse(payload["native_gemma_config_loader"])
         self.assertTrue(payload["config"]["uses_hf_config"])
         self.assertFalse(payload["config"]["native_gemma_config_loader"])
+        self.assertEqual(
+            payload["native_no_hf_requirement"]["setup_problems"],
+            [
+                "uses_hf_tokenizer_not_false",
+                "uses_hf_config_not_false",
+                "native_gemma_config_loader_not_true",
+            ],
+        )
 
     def test_native_bench_applies_token_pool_triton_env_flags(self) -> None:
         from experiments.native_gemma_bench import (

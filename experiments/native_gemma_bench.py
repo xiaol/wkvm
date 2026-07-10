@@ -143,9 +143,19 @@ def native_no_hf_requirement_report(
     rows: list[dict[str, Any]],
     *,
     required: bool,
+    setup_problems: list[str] | None = None,
 ) -> dict[str, Any]:
     checked_rows = 0
     violations: list[dict[str, Any]] = []
+    setup_problems = list(setup_problems or [])
+    if setup_problems:
+        violations.append(
+            {
+                "B": None,
+                "phase": "setup",
+                "problems": setup_problems,
+            }
+        )
     for row in rows:
         if row.get("success_count") != row.get("B"):
             continue
@@ -163,6 +173,8 @@ def native_no_hf_requirement_report(
         violations.append({"B": None, "problems": ["no_successful_rows_to_check"]})
     return {
         "required": bool(required),
+        "checked_setup_boundary": True,
+        "setup_problems": setup_problems,
         "checked_successful_rows": checked_rows,
         "passed": not violations,
         "violations": violations,
@@ -385,6 +397,17 @@ def native_gemma_config_loader(args) -> bool:
     return not uses_hf_config(args)
 
 
+def native_no_hf_setup_problems(args) -> list[str]:
+    problems = []
+    if uses_hf_tokenizer(args) is not False:
+        problems.append("uses_hf_tokenizer_not_false")
+    if uses_hf_config(args) is not False:
+        problems.append("uses_hf_config_not_false")
+    if native_gemma_config_loader(args) is not True:
+        problems.append("native_gemma_config_loader_not_true")
+    return problems
+
+
 def load_bench_tokenizer(path: str, args):
     if getattr(args, "synthetic_prompts", False):
         return SyntheticBenchTokenizer(
@@ -408,6 +431,7 @@ def build_benchmark_payload(
     native_no_hf_requirement = native_no_hf_requirement_report(
         rows,
         required=args.require_native_no_hf,
+        setup_problems=native_no_hf_setup_problems(args),
     )
     payload: dict[str, Any] = {
         "schema": "wkvm.native_gemma_bench.v1",
