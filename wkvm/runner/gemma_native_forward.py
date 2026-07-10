@@ -1538,134 +1538,64 @@ class NativeGemma4CausalLMOutput:
     shared_kv_states: dict[str, tuple[Any, Any]] | UserDict
 
 
-class NativeGemma4TextDecoderLayer:
-    """Explicit Gemma4 decoder-layer math backed by an already-loaded HF layer.
-
-    The first production target is KV-owning sliding layers. The implementation is
-    intentionally a parity bridge: it reads checkpoint weights from the HF layer,
-    but does not call `Gemma4TextDecoderLayer.forward` or
-    `Gemma4TextAttention.forward`.
-    """
+class NativeGemma4Attention:
+    """Native Gemma4 attention math and token-pool backend dispatch."""
 
     def __init__(
         self,
-        hf_layer,
+        hf_attn,
+        layer_idx: int,
         *,
-        native_attention_backend: str = "manual",
-        native_projection_backend: str = "separate",
-        native_weight_backend: str = "hf_live",
+        native_attention_backend: str,
+        native_projection_backend: str,
+        owned: bool,
+        snapshot_device=None,
     ) -> None:
-        self.config = hf_layer.config
-        self.layer_idx = int(hf_layer.layer_idx)
-        self.hidden_size = int(hf_layer.hidden_size)
-        self.hidden_size_per_layer_input = bool(hf_layer.hidden_size_per_layer_input)
+        self.layer_idx = int(layer_idx)
         self.native_attention_backend = _normalize_attention_backend(native_attention_backend)
-        self.native_projection_backend = _normalize_projection_backend(native_projection_backend)
-        self.native_weight_backend = _normalize_weight_backend(native_weight_backend)
-        self._owns_weight_tensors = self.native_weight_backend in {"owned", "owned_cpu"}
-        self._weight_snapshot_device = (
-            "cpu" if self.native_weight_backend == "owned_cpu" else None
+        self.native_projection_backend = _normalize_projection_backend(
+            native_projection_backend
         )
-        self._qkv_proj = None
-        self._gate_up_proj = None
-        if getattr(hf_layer, "enable_moe_block", False):
-            raise NotImplementedError("native Gemma4 layer does not support MoE blocks yet")
-        attn = hf_layer.self_attn
         self.attn_meta = _NativeAttentionMeta(
-            head_dim=int(attn.head_dim),
-            num_key_value_groups=int(attn.num_key_value_groups),
-            attention_dropout=float(attn.attention_dropout),
-            training=bool(attn.training),
-            scaling=float(attn.scaling),
-            is_kv_shared_layer=bool(getattr(attn, "is_kv_shared_layer", False)),
-            layer_type=getattr(attn, "layer_type", None),
-            store_full_length_kv=bool(getattr(attn, "store_full_length_kv", False)),
+            head_dim=int(hf_attn.head_dim),
+            num_key_value_groups=int(hf_attn.num_key_value_groups),
+            attention_dropout=float(hf_attn.attention_dropout),
+            training=bool(hf_attn.training),
+            scaling=float(hf_attn.scaling),
+            is_kv_shared_layer=bool(getattr(hf_attn, "is_kv_shared_layer", False)),
+            layer_type=getattr(hf_attn, "layer_type", None),
+            store_full_length_kv=bool(
+                getattr(hf_attn, "store_full_length_kv", False)
+            ),
         )
-        self.mlp_activation = hf_layer.mlp.config.hidden_activation
-        owned = self._owns_weight_tensors
-        snapshot_device = self._weight_snapshot_device
-        self.input_layernorm = _snapshot_norm(
-            hf_layer.input_layernorm,
-            owned=owned,
-            device=snapshot_device,
-        )
-        self.post_attention_layernorm = _snapshot_norm(
-            hf_layer.post_attention_layernorm,
-            owned=owned,
-            device=snapshot_device,
-        )
-        self.pre_feedforward_layernorm = _snapshot_norm(
-            hf_layer.pre_feedforward_layernorm,
-            owned=owned,
-            device=snapshot_device,
-        )
-        self.post_feedforward_layernorm = _snapshot_norm(
-            hf_layer.post_feedforward_layernorm,
-            owned=owned,
-            device=snapshot_device,
-        )
-        self.q_proj = _snapshot_linear(attn.q_proj, owned=owned, device=snapshot_device)
+        self.q_proj = _snapshot_linear(hf_attn.q_proj, owned=owned, device=snapshot_device)
         self.k_proj = _snapshot_linear(
-            getattr(attn, "k_proj", None),
+            getattr(hf_attn, "k_proj", None),
             owned=owned,
             device=snapshot_device,
         )
         self.v_proj = _snapshot_linear(
-            getattr(attn, "v_proj", None),
+            getattr(hf_attn, "v_proj", None),
             owned=owned,
             device=snapshot_device,
         )
-        self.o_proj = _snapshot_linear(attn.o_proj, owned=owned, device=snapshot_device)
-        self.q_norm = _snapshot_norm(attn.q_norm, owned=owned, device=snapshot_device)
+        self.o_proj = _snapshot_linear(hf_attn.o_proj, owned=owned, device=snapshot_device)
+        self.q_norm = _snapshot_norm(hf_attn.q_norm, owned=owned, device=snapshot_device)
         self.k_norm = _snapshot_norm(
-            getattr(attn, "k_norm", None),
+            getattr(hf_attn, "k_norm", None),
             owned=owned,
             device=snapshot_device,
         )
         self.v_norm = _snapshot_norm(
-            getattr(attn, "v_norm", None),
+            getattr(hf_attn, "v_norm", None),
             owned=owned,
             device=snapshot_device,
         )
-        self.mlp_gate_proj = _snapshot_linear(
-            hf_layer.mlp.gate_proj,
-            owned=owned,
-            device=snapshot_device,
-        )
-        self.mlp_up_proj = _snapshot_linear(
-            hf_layer.mlp.up_proj,
-            owned=owned,
-            device=snapshot_device,
-        )
-        self.mlp_down_proj = _snapshot_linear(
-            hf_layer.mlp.down_proj,
-            owned=owned,
-            device=snapshot_device,
-        )
-        self.per_layer_input_gate = _snapshot_linear(
-            getattr(hf_layer, "per_layer_input_gate", None),
-            owned=owned,
-            device=snapshot_device,
-        )
-        self.per_layer_projection = _snapshot_linear(
-            getattr(hf_layer, "per_layer_projection", None),
-            owned=owned,
-            device=snapshot_device,
-        )
-        self.post_per_layer_input_norm = _snapshot_norm(
-            getattr(hf_layer, "post_per_layer_input_norm", None),
-            owned=owned,
-            device=snapshot_device,
-        )
-        self.layer_scalar = (
-            _clone_weight(hf_layer.layer_scalar, device=snapshot_device)
-            if owned
-            else hf_layer.layer_scalar
-        )
+        self._qkv_proj = None
         if (
             _packs_qkv(self.native_projection_backend)
-            and not getattr(attn, "is_kv_shared_layer", False)
-            and getattr(attn, "v_proj", None) is not None
+            and not getattr(hf_attn, "is_kv_shared_layer", False)
+            and getattr(hf_attn, "v_proj", None) is not None
         ):
             if owned:
                 self._qkv_proj = _OwnedPackedLinear(
@@ -1678,125 +1608,17 @@ class NativeGemma4TextDecoderLayer:
                 self.k_proj = None
                 self.v_proj = None
             else:
-                self._qkv_proj = _PackedLinear(attn.q_proj, attn.k_proj, attn.v_proj)
-        if _packs_gate_up(self.native_projection_backend):
-            if owned:
-                self._gate_up_proj = _OwnedPackedLinear(
-                    self.mlp_gate_proj,
-                    self.mlp_up_proj,
-                    device=snapshot_device,
+                self._qkv_proj = _PackedLinear(
+                    hf_attn.q_proj,
+                    hf_attn.k_proj,
+                    hf_attn.v_proj,
                 )
-                self.mlp_gate_proj = None
-                self.mlp_up_proj = None
-            else:
-                self._gate_up_proj = _PackedLinear(
-                    hf_layer.mlp.gate_proj,
-                    hf_layer.mlp.up_proj,
-                    cache=False,
-                )
-        self.hf_layer = None if owned else hf_layer
-
-    @property
-    def layer_type(self) -> str | None:
-        return self.attn_meta.layer_type
+        self.hf_attn = None if owned else hf_attn
 
     def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)
 
     def forward(
-        self,
-        hidden_states,
-        per_layer_input=None,
-        *,
-        shared_kv_states: dict[str, tuple[Any, Any]] | UserDict | None = None,
-        position_embeddings=None,
-        attention_mask=None,
-        position_ids=None,
-        past_key_values=None,
-        wkvm_token_pool_decode=None,
-        **_kwargs,
-    ):
-        if position_embeddings is None:
-            raise ValueError("position_embeddings are required for native Gemma4 layer")
-        shared_kv_states = shared_kv_states if shared_kv_states is not None else UserDict()
-
-        timing_enabled = _native_forward_timing_enabled()
-        layer_start = time.perf_counter() if timing_enabled else 0.0
-        if timing_enabled:
-            _record_native_count("layer_forward_calls")
-
-        residual = hidden_states
-        phase_start = time.perf_counter() if timing_enabled else 0.0
-        hidden_states = _rms_norm(hidden_states, self.input_layernorm)
-        if timing_enabled:
-            _record_native_timing(
-                "layer_input_norm_wall_s",
-                time.perf_counter() - phase_start,
-            )
-            phase_start = time.perf_counter()
-        hidden_states, _attn_weights = self._self_attention(
-            hidden_states,
-            position_embeddings=position_embeddings,
-            attention_mask=attention_mask,
-            shared_kv_states=shared_kv_states,
-            past_key_values=past_key_values,
-            wkvm_token_pool_decode=wkvm_token_pool_decode,
-        )
-        if timing_enabled:
-            _record_native_timing(
-                "layer_self_attention_wall_s",
-                time.perf_counter() - phase_start,
-            )
-            phase_start = time.perf_counter()
-        hidden_states = _rms_norm(hidden_states, self.post_attention_layernorm)
-        if timing_enabled:
-            _record_native_timing(
-                "layer_post_attention_norm_wall_s",
-                time.perf_counter() - phase_start,
-            )
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        phase_start = time.perf_counter() if timing_enabled else 0.0
-        hidden_states = _rms_norm(hidden_states, self.pre_feedforward_layernorm)
-        if timing_enabled:
-            _record_native_timing(
-                "layer_pre_feedforward_norm_wall_s",
-                time.perf_counter() - phase_start,
-            )
-            phase_start = time.perf_counter()
-        hidden_states = self._mlp(hidden_states)
-        if timing_enabled:
-            _record_native_timing("layer_mlp_wall_s", time.perf_counter() - phase_start)
-            phase_start = time.perf_counter()
-        hidden_states = _rms_norm(hidden_states, self.post_feedforward_layernorm)
-        if timing_enabled:
-            _record_native_timing(
-                "layer_post_feedforward_norm_wall_s",
-                time.perf_counter() - phase_start,
-            )
-        hidden_states = residual + hidden_states
-
-        if self.hidden_size_per_layer_input:
-            if per_layer_input is None:
-                raise ValueError("per_layer_input is required for Gemma4 PLE layers")
-            phase_start = time.perf_counter() if timing_enabled else 0.0
-            residual = hidden_states
-            hidden_states = _linear(hidden_states, self.per_layer_input_gate)
-            hidden_states = _activation(self.config.hidden_activation, hidden_states)
-            hidden_states = hidden_states * per_layer_input
-            hidden_states = _linear(hidden_states, self.per_layer_projection)
-            hidden_states = _rms_norm(hidden_states, self.post_per_layer_input_norm)
-            hidden_states = residual + hidden_states
-            if timing_enabled:
-                _record_native_timing("layer_ple_wall_s", time.perf_counter() - phase_start)
-
-        result = hidden_states * _tensor_on_device(self.layer_scalar, hidden_states)
-        if timing_enabled:
-            _record_native_timing("layer_forward_wall_s", time.perf_counter() - layer_start)
-        return result
-
-    def _self_attention(
         self,
         hidden_states,
         *,
@@ -1948,6 +1770,293 @@ class NativeGemma4TextDecoderLayer:
             )
         return attn_output, attn_weights
 
+    def to(self, *args, **kwargs):
+        for obj in (
+            self.q_proj,
+            self.k_proj,
+            self.v_proj,
+            self.o_proj,
+            self.q_norm,
+            self.k_norm,
+            self.v_norm,
+            self._qkv_proj,
+        ):
+            to = getattr(obj, "to", None)
+            if to is not None:
+                to(*args, **kwargs)
+        return self
+
+
+class NativeGemma4TextDecoderLayer:
+    """Explicit Gemma4 decoder-layer math backed by an already-loaded HF layer.
+
+    The first production target is KV-owning sliding layers. The implementation is
+    intentionally a parity bridge: it reads checkpoint weights from the HF layer,
+    but does not call `Gemma4TextDecoderLayer.forward` or
+    `Gemma4TextAttention.forward`.
+    """
+
+    def __init__(
+        self,
+        hf_layer,
+        *,
+        native_attention_backend: str = "manual",
+        native_projection_backend: str = "separate",
+        native_weight_backend: str = "hf_live",
+    ) -> None:
+        self.config = hf_layer.config
+        self.layer_idx = int(hf_layer.layer_idx)
+        self.hidden_size = int(hf_layer.hidden_size)
+        self.hidden_size_per_layer_input = bool(hf_layer.hidden_size_per_layer_input)
+        self.native_attention_backend = _normalize_attention_backend(native_attention_backend)
+        self.native_projection_backend = _normalize_projection_backend(native_projection_backend)
+        self.native_weight_backend = _normalize_weight_backend(native_weight_backend)
+        self._owns_weight_tensors = self.native_weight_backend in {"owned", "owned_cpu"}
+        self._weight_snapshot_device = (
+            "cpu" if self.native_weight_backend == "owned_cpu" else None
+        )
+        self._gate_up_proj = None
+        owned = self._owns_weight_tensors
+        snapshot_device = self._weight_snapshot_device
+        if getattr(hf_layer, "enable_moe_block", False):
+            raise NotImplementedError("native Gemma4 layer does not support MoE blocks yet")
+        attn = hf_layer.self_attn
+        self.self_attn = NativeGemma4Attention(
+            attn,
+            self.layer_idx,
+            native_attention_backend=self.native_attention_backend,
+            native_projection_backend=self.native_projection_backend,
+            owned=owned,
+            snapshot_device=snapshot_device,
+        )
+        self.mlp_activation = hf_layer.mlp.config.hidden_activation
+        self.input_layernorm = _snapshot_norm(
+            hf_layer.input_layernorm,
+            owned=owned,
+            device=snapshot_device,
+        )
+        self.post_attention_layernorm = _snapshot_norm(
+            hf_layer.post_attention_layernorm,
+            owned=owned,
+            device=snapshot_device,
+        )
+        self.pre_feedforward_layernorm = _snapshot_norm(
+            hf_layer.pre_feedforward_layernorm,
+            owned=owned,
+            device=snapshot_device,
+        )
+        self.post_feedforward_layernorm = _snapshot_norm(
+            hf_layer.post_feedforward_layernorm,
+            owned=owned,
+            device=snapshot_device,
+        )
+        self.mlp_gate_proj = _snapshot_linear(
+            hf_layer.mlp.gate_proj,
+            owned=owned,
+            device=snapshot_device,
+        )
+        self.mlp_up_proj = _snapshot_linear(
+            hf_layer.mlp.up_proj,
+            owned=owned,
+            device=snapshot_device,
+        )
+        self.mlp_down_proj = _snapshot_linear(
+            hf_layer.mlp.down_proj,
+            owned=owned,
+            device=snapshot_device,
+        )
+        self.per_layer_input_gate = _snapshot_linear(
+            getattr(hf_layer, "per_layer_input_gate", None),
+            owned=owned,
+            device=snapshot_device,
+        )
+        self.per_layer_projection = _snapshot_linear(
+            getattr(hf_layer, "per_layer_projection", None),
+            owned=owned,
+            device=snapshot_device,
+        )
+        self.post_per_layer_input_norm = _snapshot_norm(
+            getattr(hf_layer, "post_per_layer_input_norm", None),
+            owned=owned,
+            device=snapshot_device,
+        )
+        self.layer_scalar = (
+            _clone_weight(hf_layer.layer_scalar, device=snapshot_device)
+            if owned
+            else hf_layer.layer_scalar
+        )
+        if _packs_gate_up(self.native_projection_backend):
+            if owned:
+                self._gate_up_proj = _OwnedPackedLinear(
+                    self.mlp_gate_proj,
+                    self.mlp_up_proj,
+                    device=snapshot_device,
+                )
+                self.mlp_gate_proj = None
+                self.mlp_up_proj = None
+            else:
+                self._gate_up_proj = _PackedLinear(
+                    hf_layer.mlp.gate_proj,
+                    hf_layer.mlp.up_proj,
+                    cache=False,
+                )
+        self.hf_layer = None if owned else hf_layer
+
+    @property
+    def attn_meta(self) -> _NativeAttentionMeta:
+        return self.self_attn.attn_meta
+
+    @property
+    def layer_type(self) -> str | None:
+        return self.attn_meta.layer_type
+
+    @property
+    def q_proj(self):
+        return self.self_attn.q_proj
+
+    @property
+    def k_proj(self):
+        return self.self_attn.k_proj
+
+    @property
+    def v_proj(self):
+        return self.self_attn.v_proj
+
+    @property
+    def o_proj(self):
+        return self.self_attn.o_proj
+
+    @property
+    def q_norm(self):
+        return self.self_attn.q_norm
+
+    @property
+    def k_norm(self):
+        return self.self_attn.k_norm
+
+    @property
+    def v_norm(self):
+        return self.self_attn.v_norm
+
+    @property
+    def _qkv_proj(self):
+        return self.self_attn._qkv_proj
+
+    def __call__(self, *args, **kwargs):
+        return self.forward(*args, **kwargs)
+
+    def forward(
+        self,
+        hidden_states,
+        per_layer_input=None,
+        *,
+        shared_kv_states: dict[str, tuple[Any, Any]] | UserDict | None = None,
+        position_embeddings=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        wkvm_token_pool_decode=None,
+        **_kwargs,
+    ):
+        if position_embeddings is None:
+            raise ValueError("position_embeddings are required for native Gemma4 layer")
+        shared_kv_states = shared_kv_states if shared_kv_states is not None else UserDict()
+
+        timing_enabled = _native_forward_timing_enabled()
+        layer_start = time.perf_counter() if timing_enabled else 0.0
+        if timing_enabled:
+            _record_native_count("layer_forward_calls")
+
+        residual = hidden_states
+        phase_start = time.perf_counter() if timing_enabled else 0.0
+        hidden_states = _rms_norm(hidden_states, self.input_layernorm)
+        if timing_enabled:
+            _record_native_timing(
+                "layer_input_norm_wall_s",
+                time.perf_counter() - phase_start,
+            )
+            phase_start = time.perf_counter()
+        hidden_states, _attn_weights = self.self_attn(
+            hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            shared_kv_states=shared_kv_states,
+            past_key_values=past_key_values,
+            wkvm_token_pool_decode=wkvm_token_pool_decode,
+        )
+        if timing_enabled:
+            _record_native_timing(
+                "layer_self_attention_wall_s",
+                time.perf_counter() - phase_start,
+            )
+            phase_start = time.perf_counter()
+        hidden_states = _rms_norm(hidden_states, self.post_attention_layernorm)
+        if timing_enabled:
+            _record_native_timing(
+                "layer_post_attention_norm_wall_s",
+                time.perf_counter() - phase_start,
+            )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        phase_start = time.perf_counter() if timing_enabled else 0.0
+        hidden_states = _rms_norm(hidden_states, self.pre_feedforward_layernorm)
+        if timing_enabled:
+            _record_native_timing(
+                "layer_pre_feedforward_norm_wall_s",
+                time.perf_counter() - phase_start,
+            )
+            phase_start = time.perf_counter()
+        hidden_states = self._mlp(hidden_states)
+        if timing_enabled:
+            _record_native_timing("layer_mlp_wall_s", time.perf_counter() - phase_start)
+            phase_start = time.perf_counter()
+        hidden_states = _rms_norm(hidden_states, self.post_feedforward_layernorm)
+        if timing_enabled:
+            _record_native_timing(
+                "layer_post_feedforward_norm_wall_s",
+                time.perf_counter() - phase_start,
+            )
+        hidden_states = residual + hidden_states
+
+        if self.hidden_size_per_layer_input:
+            if per_layer_input is None:
+                raise ValueError("per_layer_input is required for Gemma4 PLE layers")
+            phase_start = time.perf_counter() if timing_enabled else 0.0
+            residual = hidden_states
+            hidden_states = _linear(hidden_states, self.per_layer_input_gate)
+            hidden_states = _activation(self.config.hidden_activation, hidden_states)
+            hidden_states = hidden_states * per_layer_input
+            hidden_states = _linear(hidden_states, self.per_layer_projection)
+            hidden_states = _rms_norm(hidden_states, self.post_per_layer_input_norm)
+            hidden_states = residual + hidden_states
+            if timing_enabled:
+                _record_native_timing("layer_ple_wall_s", time.perf_counter() - phase_start)
+
+        result = hidden_states * _tensor_on_device(self.layer_scalar, hidden_states)
+        if timing_enabled:
+            _record_native_timing("layer_forward_wall_s", time.perf_counter() - layer_start)
+        return result
+
+    def _self_attention(
+        self,
+        hidden_states,
+        *,
+        position_embeddings,
+        attention_mask,
+        shared_kv_states,
+        past_key_values,
+        wkvm_token_pool_decode,
+    ):
+        return self.self_attn(
+            hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            shared_kv_states=shared_kv_states,
+            past_key_values=past_key_values,
+            wkvm_token_pool_decode=wkvm_token_pool_decode,
+        )
+
     def _mlp(self, x):
         timing_enabled = _native_forward_timing_enabled()
         phase_start = time.perf_counter() if timing_enabled else 0.0
@@ -1972,24 +2081,17 @@ class NativeGemma4TextDecoderLayer:
 
     def to(self, *args, **kwargs):
         for obj in (
+            self.self_attn,
             self.input_layernorm,
             self.post_attention_layernorm,
             self.pre_feedforward_layernorm,
             self.post_feedforward_layernorm,
-            self.q_proj,
-            self.k_proj,
-            self.v_proj,
-            self.o_proj,
-            self.q_norm,
-            self.k_norm,
-            self.v_norm,
             self.mlp_gate_proj,
             self.mlp_up_proj,
             self.mlp_down_proj,
             self.per_layer_input_gate,
             self.per_layer_projection,
             self.post_per_layer_input_norm,
-            self._qkv_proj,
             self._gate_up_proj,
         ):
             to = getattr(obj, "to", None)

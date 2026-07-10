@@ -108,6 +108,23 @@ def _token_pool_backend_decode(
 
 
 class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
+    def test_decoder_layer_exposes_native_attention_boundary(self) -> None:
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4TextDecoderLayer
+        from wkvm.runner.gemma_native_forward import (
+            NativeGemma4Attention,
+            NativeGemma4TextDecoderLayer,
+        )
+
+        cfg = _tiny_config()
+        hf_layer = Gemma4TextDecoderLayer(cfg, layer_idx=0).eval()
+        native_layer = NativeGemma4TextDecoderLayer(hf_layer)
+
+        self.assertIsInstance(native_layer.self_attn, NativeGemma4Attention)
+        self.assertIs(native_layer.attn_meta, native_layer.self_attn.attn_meta)
+        self.assertIs(native_layer.q_proj, native_layer.self_attn.q_proj)
+        self.assertIs(native_layer.o_proj, native_layer.self_attn.o_proj)
+        self.assertEqual(native_layer.layer_type, native_layer.attn_meta.layer_type)
+
     def test_prefill_layer_matches_hf_decoder_layer(self) -> None:
         import torch
         from transformers.models.gemma4.modeling_gemma4 import (
