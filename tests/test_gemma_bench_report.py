@@ -40,6 +40,9 @@ class TestGemmaBenchReport(unittest.TestCase):
             "context_tokens_per_session": ctx,
             "decode_tokens_per_session": out,
             "prompt_lengths_mode": prompt_mode,
+            "uses_hf_tokenizer": False,
+            "uses_hf_config": False,
+            "native_gemma_config_loader": True,
             "native_no_hf_requirement": {
                 "checked_successful_rows": 1,
                 "passed": True,
@@ -88,11 +91,17 @@ class TestGemmaBenchReport(unittest.TestCase):
                 require_native_no_hf=True,
             )
 
-        self.assertIn("forward backend | HF fwd | HF construct | native ckpt", text)
-        self.assertIn("wkvm_native_gemma_forward_bridge | no | no | yes", text)
+        self.assertIn(
+            "forward backend | HF fwd | HF construct | HF tok | HF cfg | native cfg | native ckpt",
+            text,
+        )
+        self.assertIn(
+            "wkvm_native_gemma_forward_bridge | no | no | no | no | yes | yes",
+            text,
+        )
         self.assertIn("pass (1 rows, required)", text)
         self.assertIn("| vllm | ctx=512 out=8 prompt=uniform", text)
-        self.assertIn("- | - | - | n/a", text)
+        self.assertIn("- | - | - | - | - | - | n/a", text)
 
     def test_require_same_shape_rejects_mixed_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:

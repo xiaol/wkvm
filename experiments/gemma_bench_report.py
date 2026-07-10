@@ -279,6 +279,15 @@ def load_rows(path: Path, data: dict[str, Any]) -> list[dict[str, Any]]:
                 "uses_hf_model_construction": row_or_payload_value(
                     data, row, "uses_hf_model_construction"
                 ),
+                "uses_hf_tokenizer": row_or_payload_value(
+                    data, row, "uses_hf_tokenizer"
+                ),
+                "uses_hf_config": row_or_payload_value(
+                    data, row, "uses_hf_config"
+                ),
+                "native_gemma_config_loader": row_or_payload_value(
+                    data, row, "native_gemma_config_loader"
+                ),
                 "native_gemma_checkpoint_loader": row_or_payload_value(
                     data, row, "native_gemma_checkpoint_loader"
                 ),
@@ -333,8 +342,8 @@ def render(
         "Only rows with the same `ctx`, `out`, prompt mode, and benchmark path should be treated as same-shape comparisons. "
         "The native no-HF columns are applicable to wkvm-native rows and are `n/a` for incumbent engines.",
         "",
-        "| engine | shape | B | success | green | agg decode tok/s | forward backend | HF fwd | HF construct | native ckpt | no-HF guard | decode timing s | e2e output tok/s | p50 s | p95 s | memory | max model batch | padded temp | persistent padded | error | source |",
-        "|---|---|---:|---:|---:|---:|---|---:|---:|---:|---|---|---:|---:|---:|---|---|---|---|---|---|",
+        "| engine | shape | B | success | green | agg decode tok/s | forward backend | HF fwd | HF construct | HF tok | HF cfg | native cfg | native ckpt | no-HF guard | decode timing s | e2e output tok/s | p50 s | p95 s | memory | max model batch | padded temp | persistent padded | error | source |",
+        "|---|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---|---|---:|---:|---:|---|---|---|---|---|---|",
     ]
     for row in rows:
         path = row["path"]
@@ -357,6 +366,9 @@ def render(
                     str(row["model_forward_backend"] or "-"),
                     fmt(row["uses_hf_transformer_forward"]),
                     fmt(row["uses_hf_model_construction"]),
+                    fmt(row["uses_hf_tokenizer"]),
+                    fmt(row["uses_hf_config"]),
+                    fmt(row["native_gemma_config_loader"]),
                     fmt(row["native_gemma_checkpoint_loader"]),
                     row["no_hf_guard"],
                     row["decode_timing"],
