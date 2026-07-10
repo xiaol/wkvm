@@ -2962,49 +2962,17 @@ class GemmaNativeEngine:
         self,
         reservations: list[_TokenPoolDecodeReservation],
     ) -> None:
-        pool = self._token_kv_pool
-        if pool is None:
-            return
         backend = self._token_pool_decode_backend
-        if backend is None or backend.current_decode_batch_state is None:
-            return
-        if "full_attention" not in backend.current_covered_layer_types:
+        if backend is None:
             return
         owner_layer_ids = self._token_pool_full_attention_owner_layer_ids()
         if not owner_layer_ids:
             return
-        invalidate_req_ids: set[str] = set()
-        for reservation in reservations:
-            cache = self._caches.get(reservation.req_id)
-            if cache is None:
-                continue
-            cache_layers = getattr(cache, "layers", None)
-            if cache_layers is None:
-                continue
-            decode_token_slot = (
-                reservation.full_attention_token_slot
-                if reservation.full_attention_token_slot is not None
-                else reservation.token_slot
-            )
-            for layer_id in owner_layer_ids:
-                if layer_id >= len(cache_layers):
-                    continue
-                layer = cache_layers[layer_id]
-                key_rows, value_rows = pool.gather_kv(
-                    layer_id,
-                    [decode_token_slot],
-                )
-                key_states = key_rows.permute(1, 0, 2).unsqueeze(0).contiguous()
-                value_states = value_rows.permute(1, 0, 2).unsqueeze(0).contiguous()
-                commit_decode_token = getattr(layer, "commit_decode_token", None)
-                if commit_decode_token is not None and commit_decode_token(
-                    key_states,
-                    value_states,
-                ):
-                    continue
-                layer.update(key_states, value_states)
-                if reservation.persistent_full_attention_row:
-                    invalidate_req_ids.add(reservation.req_id)
+        invalidate_req_ids = backend.commit_full_attention_decode_to_caches(
+            reservations=reservations,
+            caches_by_req_id=self._caches,
+            owner_layer_ids=owner_layer_ids,
+        )
         if invalidate_req_ids:
             self._token_pool_invalidate_full_attention_rows(invalidate_req_ids)
 

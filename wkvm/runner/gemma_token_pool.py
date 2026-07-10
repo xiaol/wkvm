@@ -6079,6 +6079,63 @@ class TokenPoolDecodeBackendState:
             logical_seq_lens=tuple(logical_lens),
         )
 
+    def commit_full_attention_decode_to_caches(
+        self,
+        *,
+        reservations: Iterable[Any],
+        caches_by_req_id: Any,
+        owner_layer_ids: Iterable[int],
+    ) -> tuple[str, ...]:
+        pool = self.kv_pool
+        if pool is None or self.current_decode_batch_state is None:
+            return ()
+        if "full_attention" not in self.current_covered_layer_types:
+            return ()
+        owner_layer_id_list = [int(layer_id) for layer_id in owner_layer_ids]
+        if not owner_layer_id_list:
+            return ()
+
+        invalidate_req_ids: set[str] = set()
+        for reservation in reservations:
+            req_id = str(getattr(reservation, "req_id"))
+            if hasattr(caches_by_req_id, "get"):
+                cache = caches_by_req_id.get(req_id)
+            else:
+                cache = caches_by_req_id[req_id]
+            if cache is None:
+                continue
+            cache_layers = getattr(cache, "layers", None)
+            if cache_layers is None:
+                continue
+            decode_token_slot = getattr(
+                reservation,
+                "full_attention_token_slot",
+                None,
+            )
+            if decode_token_slot is None:
+                decode_token_slot = getattr(reservation, "token_slot")
+            decode_token_slot = int(decode_token_slot)
+            for layer_id in owner_layer_id_list:
+                if layer_id >= len(cache_layers):
+                    continue
+                layer = cache_layers[layer_id]
+                key_rows, value_rows = pool.gather_kv(
+                    layer_id,
+                    [decode_token_slot],
+                )
+                key_states = key_rows.permute(1, 0, 2).unsqueeze(0).contiguous()
+                value_states = value_rows.permute(1, 0, 2).unsqueeze(0).contiguous()
+                commit_decode_token = getattr(layer, "commit_decode_token", None)
+                if commit_decode_token is not None and commit_decode_token(
+                    key_states,
+                    value_states,
+                ):
+                    continue
+                layer.update(key_states, value_states)
+                if bool(getattr(reservation, "persistent_full_attention_row", False)):
+                    invalidate_req_ids.add(req_id)
+        return tuple(sorted(invalidate_req_ids))
+
     def build_decode_context(
         self,
         *,
