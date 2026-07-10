@@ -109,6 +109,14 @@ class TokenPoolRequestPageStateSnapshot:
     block_table_snapshot: Any | None = None
 
 
+@dataclass(frozen=True)
+class TokenPoolRequestPrefixClearResult:
+    dropped_slots: tuple[int, ...] = ()
+    released_slots: tuple[int, ...] = ()
+    expired_page_slots: tuple[int, ...] = ()
+    invalidated_full_attention_rows: int = 0
+
+
 class TokenPoolAttentionWorkspace:
     """Backend-owned reusable scratch buffers for token-pool attention."""
 
@@ -5536,6 +5544,25 @@ class TokenPoolDecodeBackendState:
             allocator.free_slots(releasable)
         self.prune_request_token_slots(req_id, dropped)
         return releasable
+
+    def clear_request_prefix(
+        self,
+        req_id: str,
+        req_slot: int,
+        length: int,
+    ) -> TokenPoolRequestPrefixClearResult:
+        dropped = self.clear_table_before(req_slot, int(length))
+        invalidated = (
+            self.invalidate_full_attention_rows_containing(dropped) if dropped else 0
+        )
+        released = self.release_dropped_table_slots(req_id, dropped) if dropped else []
+        expired = self.release_expired_page_blocks(req_id, req_slot, int(length))
+        return TokenPoolRequestPrefixClearResult(
+            dropped_slots=tuple(int(slot) for slot in dropped),
+            released_slots=tuple(int(slot) for slot in released),
+            expired_page_slots=tuple(int(slot) for slot in expired),
+            invalidated_full_attention_rows=int(invalidated),
+        )
 
     def admit_request_page_state(self, req_id: str, req_slot: int | None = None) -> None:
         req_id = str(req_id)

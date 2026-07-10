@@ -2763,6 +2763,14 @@ class GemmaNativeEngine:
         )
 
     def _token_pool_clear_prefix(self, req_id: str, req_slot: int, length: int) -> None:
+        backend = self._token_pool_decode_backend
+        if backend is not None:
+            result = backend.clear_request_prefix(req_id, req_slot, int(length))
+            if result.invalidated_full_attention_rows:
+                self.metrics.token_pool_full_attention_row_invalidations += (
+                    result.invalidated_full_attention_rows
+                )
+            return
         table = self._token_table
         allocator = self._token_slot_allocator
         if table is None or allocator is None:
@@ -2770,20 +2778,16 @@ class GemmaNativeEngine:
         dropped = self._token_pool_clear_table_before(req_slot, int(length))
         if dropped:
             self._token_pool_invalidate_full_attention_rows_containing(dropped)
-            backend = self._token_pool_decode_backend
-            if backend is not None:
-                backend.release_dropped_table_slots(req_id, dropped)
-            else:
-                page_owned = self._token_pool_page_owned_slots.get(req_id, set())
-                releasable = [slot for slot in dropped if slot not in page_owned]
-                if releasable:
-                    allocator.free_slots(releasable)
-                active = self._token_pool_token_slots.get(req_id)
-                if active is not None:
-                    dropped_set = set(dropped)
-                    self._token_pool_token_slots[req_id] = [
-                        slot for slot in active if slot not in dropped_set
-                    ]
+            page_owned = self._token_pool_page_owned_slots.get(req_id, set())
+            releasable = [slot for slot in dropped if slot not in page_owned]
+            if releasable:
+                allocator.free_slots(releasable)
+            active = self._token_pool_token_slots.get(req_id)
+            if active is not None:
+                dropped_set = set(dropped)
+                self._token_pool_token_slots[req_id] = [
+                    slot for slot in active if slot not in dropped_set
+                ]
         self._token_pool_release_expired_page_blocks(req_id, req_slot, length)
 
     def _token_pool_release_expired_page_blocks(
