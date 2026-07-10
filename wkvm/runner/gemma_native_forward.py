@@ -11,32 +11,6 @@ import time
 from typing import Any
 
 _TOKEN_POOL_ATTENTION_BACKEND = None
-_TOKEN_POOL_TRITON_STATS: dict[str, int] = {
-    "calls": 0,
-    "env_enabled_calls": 0,
-    "env_disabled_calls": 0,
-    "effective_enabled_calls": 0,
-    "effective_disabled_calls": 0,
-    "auto_enabled_calls": 0,
-    "disabled_shape_skips": 0,
-    "attempts": 0,
-    "successes": 0,
-    "import_error_fallbacks": 0,
-    "runtime_errors": 0,
-    "recoverable_runtime_fallbacks": 0,
-    "nonrecoverable_runtime_errors": 0,
-    "paged_enabled_calls": 0,
-    "paged_attempts": 0,
-    "paged_successes": 0,
-    "paged_split_enabled_calls": 0,
-    "paged_split_attempts": 0,
-    "paged_split_successes": 0,
-    "paged_split_skips_by_min_splits": 0,
-    "split_enabled_calls": 0,
-    "split_attempts": 0,
-    "split_successes": 0,
-    "split_skips_by_min_splits": 0,
-}
 
 
 _NATIVE_FORWARD_TIMING_STATS: dict[str, float | int] = {
@@ -287,6 +261,7 @@ def _token_pool_attention_backend():
             token_pool_triton_paged_decode_fn,
             token_pool_triton_paged_split_decode_fn,
             token_pool_triton_split_decode_fn,
+            token_pool_triton_stats_storage,
         )
 
         triton_hooks = TokenPoolTritonAttentionBackendHooks(
@@ -308,7 +283,7 @@ def _token_pool_attention_backend():
             now=time.perf_counter,
         )
         _TOKEN_POOL_ATTENTION_BACKEND = TokenPoolAttentionBackend(
-            stats=_TOKEN_POOL_TRITON_STATS,
+            stats=token_pool_triton_stats_storage(),
             disabled_shapes=token_pool_triton_disabled_shapes(),
             hooks=hooks,
         )
@@ -319,9 +294,10 @@ def token_pool_triton_stats() -> dict[str, Any]:
     from wkvm.runner.gemma_token_pool_attention import (
         token_pool_triton_disabled_shape_count,
         token_pool_triton_fallback_reasons,
+        token_pool_triton_stats_snapshot,
     )
 
-    stats = dict(_TOKEN_POOL_TRITON_STATS)
+    stats = token_pool_triton_stats_snapshot()
     plan = _token_pool_triton_dispatch_plan()
     split_plan = _token_pool_triton_split_plan(None)
     stats["fallback_reasons"] = token_pool_triton_fallback_reasons()
@@ -346,10 +322,10 @@ def reset_token_pool_triton_stats(*, clear_disabled_shapes: bool = False) -> Non
         reset_token_pool_triton_decode_fn_cache,
         reset_token_pool_triton_dispatch_plan_cache,
         reset_token_pool_triton_fallback_reasons,
+        reset_token_pool_triton_stats_counts,
     )
 
-    for key in _TOKEN_POOL_TRITON_STATS:
-        _TOKEN_POOL_TRITON_STATS[key] = 0
+    reset_token_pool_triton_stats_counts()
     reset_token_pool_triton_fallback_reasons()
     _TOKEN_POOL_ATTENTION_BACKEND = None
     reset_token_pool_triton_decode_fn_cache()

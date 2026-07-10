@@ -46,6 +46,32 @@ _TOKEN_POOL_TRITON_PAGED_DECODE_FN = None
 _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN = None
 _TOKEN_POOL_TRITON_DISABLED_SHAPES: set[tuple[Any, ...]] = set()
 _TOKEN_POOL_TRITON_FALLBACK_REASONS: dict[str, int] = {}
+_TOKEN_POOL_TRITON_STATS: dict[str, int] = {
+    "calls": 0,
+    "env_enabled_calls": 0,
+    "env_disabled_calls": 0,
+    "effective_enabled_calls": 0,
+    "effective_disabled_calls": 0,
+    "auto_enabled_calls": 0,
+    "disabled_shape_skips": 0,
+    "attempts": 0,
+    "successes": 0,
+    "import_error_fallbacks": 0,
+    "runtime_errors": 0,
+    "recoverable_runtime_fallbacks": 0,
+    "nonrecoverable_runtime_errors": 0,
+    "paged_enabled_calls": 0,
+    "paged_attempts": 0,
+    "paged_successes": 0,
+    "paged_split_enabled_calls": 0,
+    "paged_split_attempts": 0,
+    "paged_split_successes": 0,
+    "paged_split_skips_by_min_splits": 0,
+    "split_enabled_calls": 0,
+    "split_attempts": 0,
+    "split_successes": 0,
+    "split_skips_by_min_splits": 0,
+}
 
 
 @dataclass(frozen=True)
@@ -253,6 +279,19 @@ def token_pool_triton_fallback_reasons() -> dict[str, int]:
 
 def reset_token_pool_triton_fallback_reasons() -> None:
     _TOKEN_POOL_TRITON_FALLBACK_REASONS.clear()
+
+
+def token_pool_triton_stats_storage() -> dict[str, int]:
+    return _TOKEN_POOL_TRITON_STATS
+
+
+def token_pool_triton_stats_snapshot() -> dict[str, int]:
+    return dict(_TOKEN_POOL_TRITON_STATS)
+
+
+def reset_token_pool_triton_stats_counts() -> None:
+    for key in _TOKEN_POOL_TRITON_STATS:
+        _TOKEN_POOL_TRITON_STATS[key] = 0
 
 
 class TokenPoolAttentionBackend:
