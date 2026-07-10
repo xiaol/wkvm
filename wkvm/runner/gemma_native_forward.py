@@ -1493,7 +1493,6 @@ def _attention_forward_token_pool_gqa(
     current_value_states=None,
 ):
     timing_enabled = _native_forward_timing_enabled()
-    dispatch_plan = _token_pool_triton_dispatch_plan()
     from wkvm.runner.gemma_token_pool import build_token_pool_attention_call
 
     attention_call = build_token_pool_attention_call(
@@ -1512,7 +1511,6 @@ def _attention_forward_token_pool_gqa(
         attn,
         query_states,
         attention_call=attention_call,
-        dispatch_plan=dispatch_plan,
         timing_enabled=timing_enabled,
     )
     return result.output, result.weights
