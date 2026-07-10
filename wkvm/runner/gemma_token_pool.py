@@ -4273,6 +4273,49 @@ def _slot_values_source_and_count(slots: Iterable[int] | Any) -> tuple[Any, int]
         return values, len(values)
 
 
+def _pop_aligned_free_slot_block(
+    free_slots: list[int],
+    block_size: int,
+) -> tuple[int, list[int]] | None:
+    """Remove and return the first aligned contiguous free block, if present."""
+
+    block_size = int(block_size)
+    if block_size < 1:
+        raise ValueError("block_size must be >= 1")
+    if len(free_slots) < block_size:
+        return None
+
+    run_start_index: int | None = None
+    run_start_slot: int | None = None
+    run_len = 0
+    prev_slot: int | None = None
+    for index, raw_slot in enumerate(free_slots):
+        slot = int(raw_slot)
+        if (
+            run_start_index is not None
+            and prev_slot is not None
+            and slot == prev_slot + 1
+        ):
+            run_len += 1
+        elif slot % block_size == 0:
+            run_start_index = index
+            run_start_slot = slot
+            run_len = 1
+        else:
+            run_start_index = None
+            run_start_slot = None
+            run_len = 0
+
+        if run_start_index is not None and run_len == block_size:
+            end_index = index + 1
+            slots = [int(value) for value in free_slots[run_start_index:end_index]]
+            del free_slots[run_start_index:end_index]
+            assert run_start_slot is not None
+            return int(run_start_slot) // block_size, slots
+        prev_slot = slot
+    return None
+
+
 class ReqToTokenTable:
     """Request-slot to token-slot table for decode metadata construction."""
 
@@ -7440,37 +7483,28 @@ class TokenSlotAllocator:
         block_size = int(block_size)
         if block_size < 1:
             raise ValueError("block_size must be >= 1")
-        if self.capacity is None:
-            start = self._next_slot
-            offset = start % block_size
-            if offset:
-                padding = block_size - offset
-                self._free_slots.extend(range(start, start + padding))
-                self._free_slots.sort()
-                start += padding
-                self._next_slot = start
-            slots = list(range(start, start + block_size))
-            self._next_slot += block_size
-        else:
-            start = 0
-            free = set(self._free_slots)
-            while start + block_size <= self.capacity:
-                slots = list(range(start, start + block_size))
-                if all(
-                    slot not in self._allocated_slots
-                    and (slot >= self._next_slot or slot in free)
-                    for slot in slots
-                ):
-                    break
-                start += block_size
-            else:
+        reused = _pop_aligned_free_slot_block(self._free_slots, block_size)
+        if reused is not None:
+            block, slots = reused
+            self._allocated_slots.update(slots)
+            self.high_watermark = max(self.high_watermark, len(self._allocated_slots))
+            return block, slots
+
+        start = self._next_slot
+        offset = start % block_size
+        if offset:
+            padding = block_size - offset
+            padding_slots = list(range(start, start + padding))
+            if self.capacity is not None and start + padding > self.capacity:
                 raise RuntimeError("token slot allocator page capacity exceeded")
-            if start > self._next_slot:
-                self._free_slots.extend(range(self._next_slot, start))
-            self._next_slot = max(self._next_slot, start + block_size)
-            slot_set = set(slots)
-            self._free_slots = [slot for slot in self._free_slots if slot not in slot_set]
+            self._free_slots.extend(padding_slots)
             self._free_slots.sort()
+            start += padding
+            self._next_slot = start
+        if self.capacity is not None and start + block_size > self.capacity:
+            raise RuntimeError("token slot allocator page capacity exceeded")
+        slots = list(range(start, start + block_size))
+        self._next_slot = start + block_size
         self._allocated_slots.update(slots)
         self.high_watermark = max(self.high_watermark, len(self._allocated_slots))
         return start // block_size, slots
@@ -7578,20 +7612,13 @@ class TokenKVPool:
         block_size = int(block_size)
         if block_size < 1:
             raise ValueError("block_size must be >= 1")
-        free = set(self._free_slots)
-        start = 0
-        while start + block_size <= self.capacity:
-            slots = list(range(start, start + block_size))
-            if all(slot in free for slot in slots):
-                break
-            start += block_size
-        else:
+        reused = _pop_aligned_free_slot_block(self._free_slots, block_size)
+        if reused is None:
             raise RuntimeError("token KV pool page capacity exceeded")
-        slot_set = set(slots)
-        self._free_slots = [slot for slot in self._free_slots if slot not in slot_set]
+        start_block, slots = reused
         self._allocated_slots.update(slots)
         self.high_watermark = max(self.high_watermark, len(self._allocated_slots))
-        return start // block_size, slots
+        return start_block, slots
 
     def free_slots(self, slots: Iterable[int] | Any) -> None:
         values = _slot_values_to_list(slots)

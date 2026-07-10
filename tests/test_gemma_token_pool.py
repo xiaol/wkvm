@@ -6261,6 +6261,34 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(second_block, 2)
         self.assertEqual(second_slots, [8, 9, 10, 11])
 
+    def test_token_slot_allocator_reuses_whole_free_page_blocks(self) -> None:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import TokenSlotAllocator
+
+        alloc = TokenSlotAllocator(capacity=16)
+        first_block, first_slots = alloc.alloc_page_block_with_ids(4)
+        second_block, second_slots = alloc.alloc_page_block_with_ids(4)
+        self.assertEqual((first_block, second_block), (0, 1))
+
+        alloc.free_slots(first_slots)
+        reused_block, reused_slots = alloc.alloc_page_block_with_ids(4)
+        self.assertEqual(reused_block, 0)
+        self.assertEqual(reused_slots, first_slots)
+
+        alloc.free_slots(reused_slots[:3])
+        fresh_block, fresh_slots = alloc.alloc_page_block_with_ids(4)
+        self.assertEqual(fresh_block, 2)
+        self.assertEqual(fresh_slots, [8, 9, 10, 11])
+
+        alloc.free_slots(second_slots)
+        reused_second_block, reused_second_slots = alloc.alloc_page_block_with_ids(4)
+        self.assertEqual(reused_second_block, 1)
+        self.assertEqual(reused_second_slots, second_slots)
+
     def test_token_kv_pool_alloc_write_gather_and_free(self) -> None:
         try:
             import torch
@@ -6292,6 +6320,40 @@ class TestGemmaTokenPool(unittest.TestCase):
         pool.free_slots(slots)
         reused = pool.alloc_slots(2)
         self.assertEqual(reused.tolist(), [0, 1])
+
+    def test_token_kv_pool_reuses_whole_free_page_blocks(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import TokenKVLayerSpec, TokenKVPool
+
+        pool = TokenKVPool(
+            capacity=12,
+            layer_specs=[
+                TokenKVLayerSpec(layer_id=0, num_kv_heads=1, head_dim=2),
+            ],
+            defer_buffer_allocation=True,
+        )
+        first_block, first_slots = pool.alloc_page_block_with_ids(4)
+        second_block, second_slots = pool.alloc_page_block_with_ids(4)
+        self.assertEqual((first_block, second_block), (0, 1))
+
+        pool.free_slots(first_slots)
+        reused_block, reused_slots = pool.alloc_page_block_with_ids(4)
+        self.assertEqual(reused_block, 0)
+        self.assertEqual(reused_slots, first_slots)
+
+        pool.free_slots(reused_slots[:3])
+        fresh_block, fresh_slots = pool.alloc_page_block_with_ids(4)
+        self.assertEqual(fresh_block, 2)
+        self.assertEqual(fresh_slots, [8, 9, 10, 11])
+
+        pool.free_slots(second_slots)
+        reused_second_block, reused_second_slots = pool.alloc_page_block_with_ids(4)
+        self.assertEqual(reused_second_block, 1)
+        self.assertEqual(reused_second_slots, second_slots)
 
     def test_token_kv_pool_can_defer_layer_buffer_allocation(self) -> None:
         try:
