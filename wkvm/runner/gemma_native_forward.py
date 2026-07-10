@@ -16,6 +16,7 @@ _TOKEN_POOL_TRITON_DECODE_FN = None
 _TOKEN_POOL_TRITON_SPLIT_DECODE_FN = None
 _TOKEN_POOL_TRITON_PAGED_DECODE_FN = None
 _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN = None
+_TOKEN_POOL_TRITON_ATTENTION_BACKEND = None
 _TOKEN_POOL_TRITON_DISPATCH_ENV_NAMES = (
     "WKVM_ENABLE_TOKEN_POOL_TRITON",
     "WKVM_DISABLE_TOKEN_POOL_TRITON",
@@ -72,6 +73,13 @@ class TokenPoolTritonDispatchPlan:
     input_precision_policy: str
     dot_dtype_policy: str
     strict: bool
+
+
+@dataclass(frozen=True)
+class _TokenPoolTritonDecodeResult:
+    output: Any | None = None
+    attempted: bool = False
+    succeeded: bool = False
 
 
 _NATIVE_FORWARD_TIMING_STATS: dict[str, float | int] = {
@@ -373,6 +381,264 @@ def _token_pool_triton_paged_split_decode_fn():
     return _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN
 
 
+class _TokenPoolTritonAttentionBackend:
+    """Owns token-pool Triton decode launch and fallback accounting."""
+
+    def __init__(
+        self,
+        *,
+        stats: dict[str, int],
+        disabled_shapes: set[tuple[Any, ...]],
+    ) -> None:
+        self._stats = stats
+        self._disabled_shapes = disabled_shapes
+
+    def decode(
+        self,
+        attn,
+        query_states,
+        *,
+        dispatch_context,
+        dispatch_plan: TokenPoolTritonDispatchPlan,
+    ) -> _TokenPoolTritonDecodeResult:
+        if not query_states.is_cuda or not dispatch_plan.effective_enabled:
+            return _TokenPoolTritonDecodeResult()
+
+        shape_key = self._shape_key(attn, query_states, dispatch_plan)
+        if shape_key in self._disabled_shapes:
+            self._stats["disabled_shape_skips"] += 1
+            _record_token_pool_triton_fallback("disabled_shape")
+            return _TokenPoolTritonDecodeResult()
+
+        self._stats["attempts"] += 1
+        try:
+            output = self._launch(attn, query_states, dispatch_context, dispatch_plan)
+        except ImportError:
+            self._stats["import_error_fallbacks"] += 1
+            _record_token_pool_triton_fallback("import_error")
+            return _TokenPoolTritonDecodeResult(attempted=True)
+        except RuntimeError as exc:
+            self._stats["runtime_errors"] += 1
+            if dispatch_plan.strict:
+                self._stats["nonrecoverable_runtime_errors"] += 1
+                raise
+            if not dispatch_context.has_flat_metadata:
+                self._stats["nonrecoverable_runtime_errors"] += 1
+                raise
+            if not _is_recoverable_token_pool_triton_error(exc):
+                self._stats["nonrecoverable_runtime_errors"] += 1
+                raise
+            self._stats["recoverable_runtime_fallbacks"] += 1
+            _record_token_pool_triton_fallback("recoverable_runtime_error")
+            self._disabled_shapes.add(shape_key)
+            return _TokenPoolTritonDecodeResult(attempted=True)
+
+        self._stats["successes"] += 1
+        return _TokenPoolTritonDecodeResult(
+            output=output,
+            attempted=True,
+            succeeded=True,
+        )
+
+    def _shape_key(
+        self,
+        attn,
+        query_states,
+        dispatch_plan: TokenPoolTritonDispatchPlan,
+    ) -> tuple[Any, ...]:
+        return (
+            int(query_states.shape[1]),
+            int(query_states.shape[3]),
+            int(attn.num_key_value_groups),
+            query_states.dtype,
+            query_states.device,
+            dispatch_plan.input_precision_policy,
+            dispatch_plan.dot_dtype_policy,
+        )
+
+    def _launch(self, attn, query_states, dispatch_context, dispatch_plan):
+        kv_buffers = dispatch_context.kv_buffers_for_attention()
+        if kv_buffers is None:
+            raise RuntimeError("token-pool KV buffers are required for Triton attention")
+        key_buffer, value_buffer = kv_buffers
+        output_buffer = dispatch_context.attention_output_buffer(
+            batch=int(query_states.shape[0]),
+            query_heads=int(query_states.shape[1]),
+            head_dim=int(query_states.shape[3]),
+            dtype=query_states.dtype,
+            device=query_states.device,
+        )
+        kernel_dispatch = dispatch_context.select_triton_dispatch(
+            paged_enabled=dispatch_plan.paged_enabled,
+            split_enabled=dispatch_plan.split_enabled,
+            paged_split_enabled=dispatch_plan.paged_split_enabled,
+        )
+        if kernel_dispatch.is_paged:
+            return self._launch_paged(
+                attn,
+                query_states,
+                key_buffer,
+                value_buffer,
+                output_buffer,
+                dispatch_context,
+                kernel_dispatch,
+            )
+        return self._launch_flat(
+            attn,
+            query_states,
+            key_buffer,
+            value_buffer,
+            output_buffer,
+            dispatch_context,
+            kernel_dispatch,
+        )
+
+    def _split_workspace(
+        self,
+        *,
+        dispatch_context,
+        query_states,
+        key_buffer,
+        max_splits: int | None,
+        num_key_value_groups: int,
+    ):
+        if max_splits is None:
+            return None
+        return dispatch_context.attention_split_workspace(
+            batch=int(query_states.shape[0]),
+            kv_heads=int(key_buffer.shape[1]),
+            max_splits=max_splits,
+            block_groups=_token_pool_triton_block_groups(
+                int(num_key_value_groups),
+                query_states.dtype,
+            ),
+            head_dim=int(query_states.shape[3]),
+            device=query_states.device,
+        )
+
+    def _launch_paged(
+        self,
+        attn,
+        query_states,
+        key_buffer,
+        value_buffer,
+        output_buffer,
+        dispatch_context,
+        kernel_dispatch,
+    ):
+        metadata = kernel_dispatch.metadata
+        self._stats["paged_attempts"] += 1
+        if kernel_dispatch.is_split:
+            self._stats["paged_split_attempts"] += 1
+            self._stats["split_attempts"] += 1
+            split_workspace = self._split_workspace(
+                dispatch_context=dispatch_context,
+                query_states=query_states,
+                key_buffer=key_buffer,
+                max_splits=kernel_dispatch.max_splits,
+                num_key_value_groups=attn.num_key_value_groups,
+            )
+            output = _token_pool_triton_paged_split_decode_fn()(
+                query_states,
+                key_buffer,
+                value_buffer,
+                metadata.block_tables,
+                metadata.block_table_lens,
+                metadata.selected_start_positions,
+                metadata.seq_lens,
+                block_size=metadata.block_size,
+                num_key_value_groups=attn.num_key_value_groups,
+                scaling=attn.scaling,
+                max_seq_len=kernel_dispatch.max_seq_len,
+                split_size=kernel_dispatch.split_size,
+                min_splits=kernel_dispatch.min_splits,
+                workspace=split_workspace,
+                output=output_buffer,
+            )
+            self._stats["paged_split_successes"] += 1
+            self._stats["split_successes"] += 1
+        else:
+            if kernel_dispatch.split_skipped_by_min_splits:
+                self._stats["paged_split_skips_by_min_splits"] += 1
+                self._stats["split_skips_by_min_splits"] += 1
+            output = _token_pool_triton_paged_decode_fn()(
+                query_states,
+                key_buffer,
+                value_buffer,
+                metadata.block_tables,
+                metadata.block_table_lens,
+                metadata.selected_start_positions,
+                metadata.seq_lens,
+                block_size=metadata.block_size,
+                num_key_value_groups=attn.num_key_value_groups,
+                scaling=attn.scaling,
+                output=output_buffer,
+            )
+        self._stats["paged_successes"] += 1
+        return output
+
+    def _launch_flat(
+        self,
+        attn,
+        query_states,
+        key_buffer,
+        value_buffer,
+        output_buffer,
+        dispatch_context,
+        kernel_dispatch,
+    ):
+        metadata = kernel_dispatch.metadata
+        if kernel_dispatch.is_split:
+            self._stats["split_attempts"] += 1
+            split_workspace = self._split_workspace(
+                dispatch_context=dispatch_context,
+                query_states=query_states,
+                key_buffer=key_buffer,
+                max_splits=kernel_dispatch.max_splits,
+                num_key_value_groups=attn.num_key_value_groups,
+            )
+            output = _token_pool_triton_split_decode_fn()(
+                query_states,
+                key_buffer,
+                value_buffer,
+                metadata.kv_indptr,
+                metadata.kv_indices,
+                num_key_value_groups=attn.num_key_value_groups,
+                scaling=attn.scaling,
+                max_seq_len=kernel_dispatch.max_seq_len,
+                split_size=kernel_dispatch.split_size,
+                min_splits=kernel_dispatch.min_splits,
+                seq_lens=metadata.seq_lens,
+                workspace=split_workspace,
+                output=output_buffer,
+            )
+            self._stats["split_successes"] += 1
+            return output
+
+        if kernel_dispatch.split_skipped_by_min_splits:
+            self._stats["split_skips_by_min_splits"] += 1
+        return _token_pool_triton_decode_fn()(
+            query_states,
+            key_buffer,
+            value_buffer,
+            metadata.kv_indptr,
+            metadata.kv_indices,
+            num_key_value_groups=attn.num_key_value_groups,
+            scaling=attn.scaling,
+            output=output_buffer,
+        )
+
+
+def _token_pool_triton_attention_backend() -> _TokenPoolTritonAttentionBackend:
+    global _TOKEN_POOL_TRITON_ATTENTION_BACKEND
+    if _TOKEN_POOL_TRITON_ATTENTION_BACKEND is None:
+        _TOKEN_POOL_TRITON_ATTENTION_BACKEND = _TokenPoolTritonAttentionBackend(
+            stats=_TOKEN_POOL_TRITON_STATS,
+            disabled_shapes=_TOKEN_POOL_TRITON_DISABLED_SHAPES,
+        )
+    return _TOKEN_POOL_TRITON_ATTENTION_BACKEND
+
+
 def token_pool_triton_stats() -> dict[str, Any]:
     stats = dict(_TOKEN_POOL_TRITON_STATS)
     plan = _token_pool_triton_dispatch_plan()
@@ -395,6 +661,7 @@ def reset_token_pool_triton_stats(*, clear_disabled_shapes: bool = False) -> Non
     global _TOKEN_POOL_TRITON_DECODE_FN, _TOKEN_POOL_TRITON_SPLIT_DECODE_FN
     global _TOKEN_POOL_TRITON_PAGED_DECODE_FN, _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN
     global _TOKEN_POOL_TRITON_DISPATCH_ENV_KEY, _TOKEN_POOL_TRITON_DISPATCH_PLAN
+    global _TOKEN_POOL_TRITON_ATTENTION_BACKEND
     for key in _TOKEN_POOL_TRITON_STATS:
         _TOKEN_POOL_TRITON_STATS[key] = 0
     _TOKEN_POOL_TRITON_FALLBACK_REASONS.clear()
@@ -402,6 +669,7 @@ def reset_token_pool_triton_stats(*, clear_disabled_shapes: bool = False) -> Non
     _TOKEN_POOL_TRITON_SPLIT_DECODE_FN = None
     _TOKEN_POOL_TRITON_PAGED_DECODE_FN = None
     _TOKEN_POOL_TRITON_PAGED_SPLIT_DECODE_FN = None
+    _TOKEN_POOL_TRITON_ATTENTION_BACKEND = None
     _TOKEN_POOL_TRITON_DISPATCH_ENV_KEY = None
     _TOKEN_POOL_TRITON_DISPATCH_PLAN = None
     if clear_disabled_shapes:
@@ -1533,7 +1801,6 @@ def _attention_forward_token_pool_gqa(
     paged_triton_enabled = dispatch_plan.paged_enabled
     split_triton_enabled = dispatch_plan.split_enabled
     paged_split_triton_enabled = dispatch_plan.paged_split_enabled
-    has_flat_metadata = dispatch_context.has_flat_metadata
     if paged_triton_enabled:
         _TOKEN_POOL_TRITON_STATS["paged_enabled_calls"] += 1
     if split_triton_enabled:
@@ -1551,186 +1818,27 @@ def _attention_forward_token_pool_gqa(
                 tokens=_slot_count(out_cache_loc),
                 elapsed=time.perf_counter() - kv_write_start,
             )
-    if query_states.is_cuda and dispatch_plan.effective_enabled:
-        triton_shape_key = (
-            int(query_states.shape[1]),
-            int(query_states.shape[3]),
-            int(attn.num_key_value_groups),
-            query_states.dtype,
-            query_states.device,
-            dispatch_plan.input_precision_policy,
-            dispatch_plan.dot_dtype_policy,
+    triton_attempt_start = time.perf_counter() if timing_enabled else 0.0
+    triton_result = _token_pool_triton_attention_backend().decode(
+        attn,
+        query_states,
+        dispatch_context=dispatch_context,
+        dispatch_plan=dispatch_plan,
+    )
+    if triton_result.attempted and timing_enabled:
+        _record_native_count("token_pool_attention_triton_attempts")
+        _record_native_timing(
+            "token_pool_attention_triton_attempt_wall_s",
+            time.perf_counter() - triton_attempt_start,
         )
-        if triton_shape_key in _TOKEN_POOL_TRITON_DISABLED_SHAPES:
-            _TOKEN_POOL_TRITON_STATS["disabled_shape_skips"] += 1
-            _record_token_pool_triton_fallback("disabled_shape")
-        else:
-            _TOKEN_POOL_TRITON_STATS["attempts"] += 1
-            triton_attempt_start = time.perf_counter() if timing_enabled else 0.0
-            try:
-                kv_buffers = dispatch_context.kv_buffers_for_attention()
-                if kv_buffers is None:
-                    raise RuntimeError(
-                        "token-pool KV buffers are required for Triton attention"
-                    )
-                key_buffer, value_buffer = kv_buffers
-                output_buffer = dispatch_context.attention_output_buffer(
-                    batch=int(query_states.shape[0]),
-                    query_heads=int(query_states.shape[1]),
-                    head_dim=int(query_states.shape[3]),
-                    dtype=query_states.dtype,
-                    device=query_states.device,
-                )
-                kernel_dispatch = dispatch_context.select_triton_dispatch(
-                    paged_enabled=paged_triton_enabled,
-                    split_enabled=split_triton_enabled,
-                    paged_split_enabled=paged_split_triton_enabled,
-                )
-                metadata = kernel_dispatch.metadata
-                if kernel_dispatch.is_paged:
-                    _TOKEN_POOL_TRITON_STATS["paged_attempts"] += 1
-                    if kernel_dispatch.is_split:
-                        split_workspace = None
-                        _TOKEN_POOL_TRITON_STATS["paged_split_attempts"] += 1
-                        _TOKEN_POOL_TRITON_STATS["split_attempts"] += 1
-                        if kernel_dispatch.max_splits is not None:
-                            split_workspace = dispatch_context.attention_split_workspace(
-                                batch=int(query_states.shape[0]),
-                                kv_heads=int(key_buffer.shape[1]),
-                                max_splits=kernel_dispatch.max_splits,
-                                block_groups=_token_pool_triton_block_groups(
-                                    int(attn.num_key_value_groups),
-                                    query_states.dtype,
-                                ),
-                                head_dim=int(query_states.shape[3]),
-                                device=query_states.device,
-                            )
-                        output = _token_pool_triton_paged_split_decode_fn()(
-                            query_states,
-                            key_buffer,
-                            value_buffer,
-                            metadata.block_tables,
-                            metadata.block_table_lens,
-                            metadata.selected_start_positions,
-                            metadata.seq_lens,
-                            block_size=metadata.block_size,
-                            num_key_value_groups=attn.num_key_value_groups,
-                            scaling=attn.scaling,
-                            max_seq_len=kernel_dispatch.max_seq_len,
-                            split_size=kernel_dispatch.split_size,
-                            min_splits=kernel_dispatch.min_splits,
-                            workspace=split_workspace,
-                            output=output_buffer,
-                        )
-                        _TOKEN_POOL_TRITON_STATS["paged_split_successes"] += 1
-                        _TOKEN_POOL_TRITON_STATS["split_successes"] += 1
-                    else:
-                        if kernel_dispatch.split_skipped_by_min_splits:
-                            _TOKEN_POOL_TRITON_STATS[
-                                "paged_split_skips_by_min_splits"
-                            ] += 1
-                            _TOKEN_POOL_TRITON_STATS["split_skips_by_min_splits"] += 1
-                        output = _token_pool_triton_paged_decode_fn()(
-                            query_states,
-                            key_buffer,
-                            value_buffer,
-                            metadata.block_tables,
-                            metadata.block_table_lens,
-                            metadata.selected_start_positions,
-                            metadata.seq_lens,
-                            block_size=metadata.block_size,
-                            num_key_value_groups=attn.num_key_value_groups,
-                            scaling=attn.scaling,
-                            output=output_buffer,
-                        )
-                    _TOKEN_POOL_TRITON_STATS["paged_successes"] += 1
-                else:
-                    if kernel_dispatch.is_split:
-                        split_workspace = None
-                        _TOKEN_POOL_TRITON_STATS["split_attempts"] += 1
-                        if kernel_dispatch.max_splits is not None:
-                            split_workspace = dispatch_context.attention_split_workspace(
-                                batch=int(query_states.shape[0]),
-                                kv_heads=int(key_buffer.shape[1]),
-                                max_splits=kernel_dispatch.max_splits,
-                                block_groups=_token_pool_triton_block_groups(
-                                    int(attn.num_key_value_groups),
-                                    query_states.dtype,
-                                ),
-                                head_dim=int(query_states.shape[3]),
-                                device=query_states.device,
-                            )
-                        output = _token_pool_triton_split_decode_fn()(
-                            query_states,
-                            key_buffer,
-                            value_buffer,
-                            metadata.kv_indptr,
-                            metadata.kv_indices,
-                            num_key_value_groups=attn.num_key_value_groups,
-                            scaling=attn.scaling,
-                            max_seq_len=kernel_dispatch.max_seq_len,
-                            split_size=kernel_dispatch.split_size,
-                            min_splits=kernel_dispatch.min_splits,
-                            seq_lens=metadata.seq_lens,
-                            workspace=split_workspace,
-                            output=output_buffer,
-                        )
-                        _TOKEN_POOL_TRITON_STATS["split_successes"] += 1
-                    else:
-                        if kernel_dispatch.split_skipped_by_min_splits:
-                            _TOKEN_POOL_TRITON_STATS["split_skips_by_min_splits"] += 1
-                        output = _token_pool_triton_decode_fn()(
-                            query_states,
-                            key_buffer,
-                            value_buffer,
-                            metadata.kv_indptr,
-                            metadata.kv_indices,
-                            num_key_value_groups=attn.num_key_value_groups,
-                            scaling=attn.scaling,
-                            output=output_buffer,
-                        )
-                _TOKEN_POOL_TRITON_STATS["successes"] += 1
-                if timing_enabled:
-                    _record_native_count("token_pool_attention_triton_attempts")
-                    _record_native_timing(
-                        "token_pool_attention_triton_attempt_wall_s",
-                        time.perf_counter() - triton_attempt_start,
-                    )
-                    _record_token_pool_attention_timing(
-                        "triton",
-                        rows=attention_rows,
-                        elapsed=time.perf_counter() - attention_start,
-                    )
-                return output, None
-            except ImportError:
-                if timing_enabled:
-                    _record_native_count("token_pool_attention_triton_attempts")
-                    _record_native_timing(
-                        "token_pool_attention_triton_attempt_wall_s",
-                        time.perf_counter() - triton_attempt_start,
-                    )
-                _TOKEN_POOL_TRITON_STATS["import_error_fallbacks"] += 1
-                _record_token_pool_triton_fallback("import_error")
-            except RuntimeError as exc:
-                if timing_enabled:
-                    _record_native_count("token_pool_attention_triton_attempts")
-                    _record_native_timing(
-                        "token_pool_attention_triton_attempt_wall_s",
-                        time.perf_counter() - triton_attempt_start,
-                    )
-                _TOKEN_POOL_TRITON_STATS["runtime_errors"] += 1
-                if dispatch_plan.strict:
-                    _TOKEN_POOL_TRITON_STATS["nonrecoverable_runtime_errors"] += 1
-                    raise
-                if not has_flat_metadata:
-                    _TOKEN_POOL_TRITON_STATS["nonrecoverable_runtime_errors"] += 1
-                    raise
-                if not _is_recoverable_token_pool_triton_error(exc):
-                    _TOKEN_POOL_TRITON_STATS["nonrecoverable_runtime_errors"] += 1
-                    raise
-                _TOKEN_POOL_TRITON_STATS["recoverable_runtime_fallbacks"] += 1
-                _record_token_pool_triton_fallback("recoverable_runtime_error")
-                _TOKEN_POOL_TRITON_DISABLED_SHAPES.add(triton_shape_key)
+    if triton_result.succeeded:
+        if timing_enabled:
+            _record_token_pool_attention_timing(
+                "triton",
+                rows=attention_rows,
+                elapsed=time.perf_counter() - attention_start,
+            )
+        return triton_result.output, None
     reference_metadata, reference_kv_pool, reference_layer_idx = (
         dispatch_context.reference_decode_inputs()
     )
