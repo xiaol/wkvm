@@ -150,6 +150,33 @@ class TestGemmaBenchReport(unittest.TestCase):
 
         self.assertIn("CUDA out of memory", text)
 
+    def test_render_shows_rowless_native_setup_failure(self) -> None:
+        payload = self.native_payload()
+        payload["rows"] = []
+        payload["fatal_error"] = {
+            "type": "OutOfMemoryError",
+            "phase": "model_load",
+            "message": "CUDA out of memory",
+        }
+        payload["native_no_hf_requirement"] = {
+            "checked_successful_rows": 0,
+            "passed": False,
+            "required": True,
+            "violations": [
+                {"B": None, "problems": ["no_successful_rows_to_check"]}
+            ],
+        }
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            native = self.write_payload(tmp, "native.json", payload)
+
+            text = gemma_bench_report.render([native])
+
+        self.assertIn("fail (0 rows, required)", text)
+        self.assertIn("model_load: OutOfMemoryError: CUDA out of memory", text)
+        self.assertIn("| wkvm-native row-cap 16 | ctx=512 out=8 prompt=uniform", text)
+        self.assertIn(" | - | 0/- | no | ", text)
+
     def test_require_native_no_hf_requires_a_native_payload(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)

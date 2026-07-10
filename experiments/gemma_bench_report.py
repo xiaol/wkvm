@@ -221,9 +221,36 @@ def decode_timing_summary(row: dict[str, Any]) -> str:
     return " / ".join(f"{label} {fmt(row.get(key))}" for label, key in keys)
 
 
+def fatal_error_row(data: dict[str, Any]) -> dict[str, Any] | None:
+    fatal = data.get("fatal_error")
+    if not isinstance(fatal, dict):
+        return None
+    parts = []
+    phase = fatal.get("phase")
+    if phase:
+        parts.append(str(phase))
+    error_type = fatal.get("type")
+    if error_type:
+        parts.append(str(error_type))
+    message = fatal.get("message")
+    if message:
+        parts.append(str(message))
+    return {
+        "B": None,
+        "success_count": 0,
+        "green": False,
+        "error": ": ".join(parts) if parts else "fatal setup error",
+    }
+
+
 def load_rows(path: Path, data: dict[str, Any]) -> list[dict[str, Any]]:
     rows = []
-    for row in data.get("rows", []):
+    source_rows = list(data.get("rows", []))
+    if not source_rows:
+        fatal_row = fatal_error_row(data)
+        if fatal_row is not None:
+            source_rows = [fatal_row]
+    for row in source_rows:
         mem_kind, mem_value = row_memory(row)
         agg_decode = row.get("agg_decode_tok_s")
         if agg_decode is None:
@@ -257,7 +284,7 @@ def load_rows(path: Path, data: dict[str, Any]) -> list[dict[str, Any]]:
                 ),
                 "no_hf_guard": no_hf_guard_summary(data, row),
                 "B": row.get("B"),
-                "success": f"{row.get('success_count', 0)}/{row.get('B', '?')}",
+                "success": f"{row.get('success_count', 0)}/{fmt(row.get('B'))}",
                 "green": row.get("green"),
                 "agg_decode": agg_decode,
                 "decode_timing": decode_timing_summary(row),
