@@ -650,6 +650,116 @@ class TestGemmaTokenPool(unittest.TestCase):
         backend.reset_page_table_row(0)
         self.assertEqual(block_tables.tensor[0, :3].tolist(), [-1, -1, -1])
 
+    def test_decode_backend_owns_request_page_state_rollback_and_release(self) -> None:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenPoolBlockTables,
+            TokenPoolDecodeBackendState,
+            TokenSlotAllocator,
+        )
+
+        table = ReqToTokenTable(max_requests=1, max_context_len=8)
+        req_slot = table.allocate("req")
+        block_tables = TokenPoolBlockTables(
+            max_requests=1,
+            max_context_len=8,
+            block_size=4,
+        )
+        allocator = TokenSlotAllocator(capacity=16)
+        backend = TokenPoolDecodeBackendState(
+            table=table,
+            allocator=allocator,
+            block_tables=block_tables,
+            block_size=4,
+        )
+        backend.admit_request_page_state("req", req_slot)
+
+        snapshot = backend.snapshot_request_page_state("req", req_slot)
+        token_slots, token_slot_ids = backend.allocate_page_aligned_slots(
+            "req",
+            2,
+            4,
+            req_slot=req_slot,
+        )
+        self.assertEqual(token_slots.tolist(), [2, 3, 4, 5])
+        self.assertEqual(token_slot_ids, [2, 3, 4, 5])
+        self.assertEqual(allocator.allocated_count, 8)
+        self.assertEqual(backend.page_table_for_request("req"), {0: 0, 1: 1})
+        self.assertEqual(block_tables.tensor.tolist(), [[0, 1]])
+
+        restored = backend.restore_request_page_state(snapshot)
+        self.assertEqual(restored, list(range(8)))
+        self.assertEqual(allocator.allocated_count, 0)
+        self.assertEqual(backend.page_table_for_request("req"), {})
+        self.assertEqual(backend.page_owned_slots_for_request("req"), set())
+        self.assertEqual(block_tables.tensor.tolist(), [[-1, -1]])
+
+        token_slots, token_slot_ids = backend.allocate_page_aligned_slots(
+            "req",
+            0,
+            1,
+            req_slot=req_slot,
+        )
+        self.assertEqual(token_slots.tolist(), [0])
+        self.assertEqual(token_slot_ids, [0])
+        self.assertEqual(allocator.allocated_count, 4)
+        released = backend.release_request_page_state("req", req_slot)
+        self.assertEqual(released, {0, 1, 2, 3})
+        self.assertEqual(allocator.allocated_count, 0)
+        self.assertEqual(block_tables.tensor.tolist(), [[-1, -1]])
+
+    def test_decode_backend_releases_expired_page_blocks(self) -> None:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenKVLayerSpec,
+            TokenKVPool,
+            TokenPoolBlockTables,
+            TokenPoolDecodeBackendState,
+        )
+
+        table = ReqToTokenTable(max_requests=1, max_context_len=8)
+        req_slot = table.allocate("req")
+        block_tables = TokenPoolBlockTables(
+            max_requests=1,
+            max_context_len=8,
+            block_size=4,
+        )
+        pool = TokenKVPool(
+            capacity=16,
+            layer_specs=[TokenKVLayerSpec(layer_id=0, num_kv_heads=1, head_dim=2)],
+            defer_buffer_allocation=True,
+        )
+        backend = TokenPoolDecodeBackendState(
+            table=table,
+            allocator=pool,
+            kv_pool=pool,
+            block_tables=block_tables,
+            block_size=4,
+        )
+        backend.admit_request_page_state("req", req_slot)
+        backend.allocate_page_aligned_slots("req", 0, 8, req_slot=req_slot)
+
+        freed = backend.release_expired_page_blocks("req", req_slot, 4)
+
+        self.assertEqual(freed, [0, 1, 2, 3])
+        self.assertEqual(pool.allocated_count, 4)
+        self.assertEqual(backend.page_table_for_request("req"), {1: 1})
+        self.assertEqual(backend.page_owned_slots_for_request("req"), {4, 5, 6, 7})
+        self.assertEqual(block_tables.tensor.tolist(), [[-1, 1]])
+
+        backend.release_request_page_state("req", req_slot)
+        self.assertEqual(pool.allocated_count, 0)
+
     def test_full_attention_row_manager_reuses_and_frees_slots(self) -> None:
         try:
             import torch  # noqa: F401

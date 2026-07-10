@@ -100,6 +100,15 @@ class TokenPoolLayerDecodeBinding:
     paged_metadata: PagedDecodeBatchMetadata | None
 
 
+@dataclass(frozen=True)
+class TokenPoolRequestPageStateSnapshot:
+    req_id: str
+    req_slot: int | None
+    page_table: dict[int, int]
+    owned_slots: frozenset[int]
+    block_table_snapshot: Any | None = None
+
+
 class TokenPoolAttentionWorkspace:
     """Backend-owned reusable scratch buffers for token-pool attention."""
 
@@ -4872,6 +4881,8 @@ class TokenPoolDecodeBackendState:
                 block_size=block_size,
             )
         )
+        self.request_page_tables: dict[str, dict[int, int]] = {}
+        self.request_page_owned_slots: dict[str, set[int]] = {}
 
     @property
     def full_attention_transient_slots(self) -> dict[str, list[int]] | None:
@@ -5243,6 +5254,185 @@ class TokenPoolDecodeBackendState:
         if block_tables is None:
             return
         block_tables.clear_block(req_slot, logical_block)
+
+    def admit_request_page_state(self, req_id: str, req_slot: int | None = None) -> None:
+        req_id = str(req_id)
+        self.request_page_tables[req_id] = {}
+        self.request_page_owned_slots[req_id] = set()
+        if req_slot is not None:
+            self.reset_page_table_row(int(req_slot))
+
+    def snapshot_request_page_state(
+        self,
+        req_id: str,
+        req_slot: int | None = None,
+    ) -> TokenPoolRequestPageStateSnapshot:
+        req_id = str(req_id)
+        block_table_snapshot = (
+            None
+            if req_slot is None
+            else self.snapshot_page_table_row(int(req_slot))
+        )
+        return TokenPoolRequestPageStateSnapshot(
+            req_id=req_id,
+            req_slot=None if req_slot is None else int(req_slot),
+            page_table={
+                int(logical_block): int(physical_block)
+                for logical_block, physical_block in self.request_page_tables.get(
+                    req_id,
+                    {},
+                ).items()
+            },
+            owned_slots=frozenset(
+                int(slot) for slot in self.request_page_owned_slots.get(req_id, set())
+            ),
+            block_table_snapshot=block_table_snapshot,
+        )
+
+    def restore_request_page_state(
+        self,
+        snapshot: TokenPoolRequestPageStateSnapshot | None,
+        *,
+        free_added: bool = True,
+    ) -> list[int]:
+        if snapshot is None:
+            return []
+        req_id = str(snapshot.req_id)
+        snapshot_owned = {int(slot) for slot in snapshot.owned_slots}
+        current_owned = self.request_page_owned_slots.get(req_id, set())
+        added_slots = sorted(int(slot) for slot in current_owned - snapshot_owned)
+        if added_slots and free_added:
+            allocator = self.allocator
+            if allocator is None:
+                raise RuntimeError("token-pool allocator is not initialized")
+            allocator.free_slots(added_slots)
+        self.request_page_tables[req_id] = {
+            int(logical_block): int(physical_block)
+            for logical_block, physical_block in snapshot.page_table.items()
+        }
+        self.request_page_owned_slots[req_id] = snapshot_owned
+        if snapshot.req_slot is not None:
+            self.restore_page_table_row(
+                int(snapshot.req_slot),
+                snapshot.block_table_snapshot,
+            )
+        return added_slots
+
+    def release_request_page_state(
+        self,
+        req_id: str,
+        req_slot: int | None = None,
+        *,
+        free_owned: bool = True,
+    ) -> set[int]:
+        req_id = str(req_id)
+        if req_slot is not None:
+            self.reset_page_table_row(int(req_slot))
+        owned_slots = {
+            int(slot) for slot in self.request_page_owned_slots.pop(req_id, set())
+        }
+        self.request_page_tables.pop(req_id, None)
+        if owned_slots and free_owned:
+            allocator = self.allocator
+            if allocator is None:
+                raise RuntimeError("token-pool allocator is not initialized")
+            allocator.free_slots(sorted(owned_slots))
+        return owned_slots
+
+    def page_table_for_request(self, req_id: str) -> dict[int, int]:
+        return self.request_page_tables.get(str(req_id), {})
+
+    def page_tables_for_requests(self, req_ids: Iterable[Any]) -> list[dict[int, int]]:
+        return [self.page_table_for_request(str(req_id)) for req_id in req_ids]
+
+    def page_owned_slots_for_request(self, req_id: str) -> set[int]:
+        return self.request_page_owned_slots.get(str(req_id), set())
+
+    def allocate_page_aligned_slots(
+        self,
+        req_id: str,
+        start_position: int,
+        n: int,
+        *,
+        req_slot: int | None = None,
+    ) -> tuple[Any, list[int]]:
+        allocator = self.allocator
+        if allocator is None:
+            raise RuntimeError("token-pool allocator is not initialized")
+        alloc_page = getattr(allocator, "alloc_page_block_with_ids", None)
+        if alloc_page is None:
+            return allocator.alloc_slots_with_ids(n)
+
+        import torch
+
+        req_id = str(req_id)
+        block_size = self.block_size
+        start_position = int(start_position)
+        n = int(n)
+        if n < 1:
+            raise ValueError("n must be >= 1")
+        page_table = self.request_page_tables.setdefault(req_id, {})
+        owned_slots = self.request_page_owned_slots.setdefault(req_id, set())
+        if req_slot is not None:
+            self.ensure_page_table_width(start_position + n)
+        slots: list[int] = []
+        for logical_pos in range(start_position, start_position + n):
+            logical_block = logical_pos // block_size
+            physical_block = page_table.get(logical_block)
+            if physical_block is None:
+                physical_block, block_slots = alloc_page(block_size)
+                physical_block = int(physical_block)
+                page_table[logical_block] = physical_block
+                owned_slots.update(int(slot) for slot in block_slots)
+            if req_slot is not None:
+                self.set_page_table_block(
+                    int(req_slot),
+                    logical_block,
+                    int(physical_block),
+                )
+            slot = int(physical_block) * block_size + (logical_pos % block_size)
+            if slot not in owned_slots:
+                raise RuntimeError("page-aligned token slot is not owned by request")
+            slots.append(slot)
+        return torch.as_tensor(slots, dtype=torch.int32, device=self.device), slots
+
+    def release_expired_page_blocks(
+        self,
+        req_id: str,
+        req_slot: int,
+        clear_before_len: int,
+    ) -> list[int]:
+        allocator = self.allocator
+        if allocator is None or self.kv_pool is None:
+            return []
+        req_id = str(req_id)
+        block_size = self.block_size
+        clear_before_len = max(0, int(clear_before_len))
+        page_table = self.request_page_tables.get(req_id)
+        owned_slots = self.request_page_owned_slots.get(req_id)
+        if not page_table or owned_slots is None:
+            return []
+        expired_logical_blocks = [
+            int(logical_block)
+            for logical_block in page_table
+            if (int(logical_block) + 1) * block_size <= clear_before_len
+        ]
+        if not expired_logical_blocks:
+            return []
+        slots_to_free: list[int] = []
+        for logical_block in sorted(expired_logical_blocks):
+            physical_block = page_table.pop(logical_block, None)
+            if physical_block is None:
+                continue
+            self.clear_page_table_block(int(req_slot), logical_block)
+            start_slot = int(physical_block) * block_size
+            for slot in range(start_slot, start_slot + block_size):
+                if slot in owned_slots:
+                    owned_slots.remove(slot)
+                    slots_to_free.append(slot)
+        if slots_to_free:
+            allocator.free_slots(slots_to_free)
+        return slots_to_free
 
     def should_build_sliding_paged_metadata(self) -> bool:
         if _token_pool_paged_metadata_requested():
