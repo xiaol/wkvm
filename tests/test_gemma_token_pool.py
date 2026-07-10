@@ -3839,6 +3839,76 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertIn("metadata_by_layer_type.sliding_attention.kv_indices", error)
         self.assertIn("metadata_by_layer_id.0.kv_indices", error)
 
+    def test_graph_metadata_copy_compatible_from_validates_before_copy(self) -> None:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            build_decode_metadata_from_token_slot_rows,
+            TokenPoolDecodeBackendState,
+            TokenPoolDecodeContext,
+        )
+
+        kv_pool = object()
+        captured_metadata = build_decode_metadata_from_token_slot_rows(
+            [[0, 1]],
+            out_cache_loc=[1],
+        )
+        captured_context = TokenPoolDecodeContext(
+            metadata_by_layer_type={"sliding_attention": captured_metadata},
+            metadata_by_layer_id={0: captured_metadata},
+            kv_pool=kv_pool,
+            covered_layer_types=frozenset({"sliding_attention"}),
+        )
+        graph_metadata = TokenPoolDecodeBackendState.capture_graph_decode_metadata(
+            captured_context,
+            clone_tensors=True,
+        )
+
+        compatible_metadata = build_decode_metadata_from_token_slot_rows(
+            [[2, 3]],
+            out_cache_loc=[3],
+        )
+        compatible_context = TokenPoolDecodeContext(
+            metadata_by_layer_type={"sliding_attention": compatible_metadata},
+            metadata_by_layer_id={0: compatible_metadata},
+            kv_pool=kv_pool,
+            covered_layer_types=frozenset({"sliding_attention"}),
+        )
+        stats = graph_metadata.copy_compatible_from(compatible_context)
+        self.assertGreater(stats["cuda_graph_metadata_tensor_copies"], 0)
+        self.assertEqual(
+            graph_metadata.context.metadata_by_layer_type[
+                "sliding_attention"
+            ].kv_indices.tolist(),
+            [2, 3],
+        )
+
+        mismatched_metadata = build_decode_metadata_from_token_slot_rows(
+            [[4, 5, 6]],
+            out_cache_loc=[6],
+        )
+        mismatched_context = TokenPoolDecodeContext(
+            metadata_by_layer_type={"sliding_attention": mismatched_metadata},
+            metadata_by_layer_id={0: mismatched_metadata},
+            kv_pool=kv_pool,
+            covered_layer_types=frozenset({"sliding_attention"}),
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "token-pool cuda graph metadata incompatible: "
+            ".*metadata_by_layer_type.sliding_attention.kv_indices",
+        ):
+            graph_metadata.copy_compatible_from(mismatched_context)
+        self.assertEqual(
+            graph_metadata.context.metadata_by_layer_type[
+                "sliding_attention"
+            ].kv_indices.tolist(),
+            [2, 3],
+        )
+
     def test_graphed_decode_step_rejects_incompatible_token_pool_metadata(self) -> None:
         try:
             import torch  # noqa: F401

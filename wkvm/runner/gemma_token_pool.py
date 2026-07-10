@@ -2276,6 +2276,18 @@ class TokenPoolDecodeGraphMetadata:
     ) -> dict[str, int]:
         return self._buffer.copy_from(token_pool_decode)
 
+    def copy_compatible_from(
+        self,
+        token_pool_decode: TokenPoolDecodeContext | None,
+    ) -> dict[str, int]:
+        compatibility_error = self.replay_compatibility_error(token_pool_decode)
+        if compatibility_error is not None:
+            raise ValueError(
+                "token-pool cuda graph metadata incompatible: "
+                f"{compatibility_error}"
+            )
+        return self.copy_from(token_pool_decode)
+
     def replay_compatibility_error(
         self,
         token_pool_decode: TokenPoolDecodeContext | None,

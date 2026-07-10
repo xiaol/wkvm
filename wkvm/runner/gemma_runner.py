@@ -1942,15 +1942,10 @@ class _GraphedPaddedDecodeStep:
         return self.logits
 
     def _copy_token_pool_decode_context(self, token_pool_decode) -> dict[str, int]:
-        compatibility_error = self._token_pool_metadata.replay_compatibility_error(
-            token_pool_decode
-        )
-        if compatibility_error is not None:
-            raise DistinctCacheBatchError(
-                "token-pool cuda graph metadata incompatible: "
-                f"{compatibility_error}"
-            )
-        return self._token_pool_metadata.copy_from(token_pool_decode)
+        try:
+            return self._token_pool_metadata.copy_compatible_from(token_pool_decode)
+        except ValueError as exc:
+            raise DistinctCacheBatchError(str(exc)) from exc
 
 
 def config_from_hf(hf_config) -> GemmaRoutedSpanConfig:
