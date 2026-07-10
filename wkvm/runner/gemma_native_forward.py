@@ -252,40 +252,18 @@ def _token_pool_attention_backend():
     global _TOKEN_POOL_ATTENTION_BACKEND
     if _TOKEN_POOL_ATTENTION_BACKEND is None:
         from wkvm.runner.gemma_token_pool_attention import (
-            TokenPoolAttentionBackend,
-            TokenPoolAttentionBackendHooks,
-            TokenPoolTritonAttentionBackendHooks,
-            record_token_pool_triton_fallback,
-            token_pool_triton_decode_fn,
-            token_pool_triton_disabled_shapes,
-            token_pool_triton_paged_decode_fn,
-            token_pool_triton_paged_split_decode_fn,
-            token_pool_triton_split_decode_fn,
-            token_pool_triton_stats_storage,
+            build_token_pool_attention_backend,
         )
 
-        triton_hooks = TokenPoolTritonAttentionBackendHooks(
-            decode_fn=token_pool_triton_decode_fn,
-            split_decode_fn=token_pool_triton_split_decode_fn,
-            paged_decode_fn=token_pool_triton_paged_decode_fn,
-            paged_split_decode_fn=token_pool_triton_paged_split_decode_fn,
-            block_groups=_token_pool_triton_block_groups,
-            record_fallback=record_token_pool_triton_fallback,
-            is_recoverable_runtime_error=_is_recoverable_token_pool_triton_error,
-        )
-        hooks = TokenPoolAttentionBackendHooks(
-            triton=triton_hooks,
+        _TOKEN_POOL_ATTENTION_BACKEND = build_token_pool_attention_backend(
             reference_decode=_attention_forward_token_pool_gqa_reference_hook,
             slot_count=_slot_count,
             record_kv_write_timing=_record_token_pool_kv_write_timing,
             record_triton_attempt_timing=_record_token_pool_triton_attempt_timing,
             record_attention_timing=_record_token_pool_attention_backend_timing,
+            block_groups=_token_pool_triton_block_groups,
+            is_recoverable_runtime_error=_is_recoverable_token_pool_triton_error,
             now=time.perf_counter,
-        )
-        _TOKEN_POOL_ATTENTION_BACKEND = TokenPoolAttentionBackend(
-            stats=token_pool_triton_stats_storage(),
-            disabled_shapes=token_pool_triton_disabled_shapes(),
-            hooks=hooks,
         )
     return _TOKEN_POOL_ATTENTION_BACKEND
 

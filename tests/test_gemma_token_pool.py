@@ -3576,6 +3576,110 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(stats["auto_enabled_calls"], 1)
         self.assertEqual(stats["effective_enabled_calls"], 1)
 
+    def test_attention_backend_factory_owns_default_triton_state(self) -> None:
+        from types import SimpleNamespace
+        from wkvm.runner.gemma_token_pool_attention import (
+            build_token_pool_attention_backend,
+            clear_token_pool_triton_disabled_shapes,
+            reset_token_pool_triton_fallback_reasons,
+            reset_token_pool_triton_stats_counts,
+            token_pool_triton_disabled_shapes,
+            token_pool_triton_fallback_reasons,
+            token_pool_triton_stats_snapshot,
+        )
+
+        class QueryStates:
+            is_cuda = True
+            shape = (1, 4, 1, 8)
+            dtype = "fake_dtype"
+            device = "cuda:0"
+
+        class DispatchContext:
+            has_flat_metadata = True
+
+            def reference_decode_inputs(self):
+                return "metadata", "pool", 3
+
+        query_states = QueryStates()
+        attn = SimpleNamespace(num_key_value_groups=2, scaling=1.0)
+        dispatch_plan = SimpleNamespace(
+            env_enabled=True,
+            env_forced_off=False,
+            env_disabled=False,
+            effective_enabled=True,
+            auto_default_enabled=False,
+            paged_enabled=False,
+            split_enabled=False,
+            paged_split_enabled=False,
+            input_precision_policy="ieee",
+            dot_dtype_policy="native",
+            strict=False,
+        )
+        shape_key = (
+            4,
+            8,
+            2,
+            query_states.dtype,
+            query_states.device,
+            "ieee",
+            "native",
+        )
+        reference_calls = []
+
+        def reference_decode(actual_attn, actual_query_states, **kwargs):
+            reference_calls.append((actual_attn, actual_query_states, kwargs))
+            return "reference", None
+
+        reset_token_pool_triton_stats_counts()
+        reset_token_pool_triton_fallback_reasons()
+        clear_token_pool_triton_disabled_shapes()
+        try:
+            token_pool_triton_disabled_shapes().add(shape_key)
+            backend = build_token_pool_attention_backend(
+                reference_decode=reference_decode,
+                slot_count=len,
+                record_kv_write_timing=lambda **kwargs: None,
+                record_triton_attempt_timing=lambda elapsed: None,
+                record_attention_timing=lambda kind, rows, elapsed: None,
+                block_groups=lambda groups, dtype: groups,
+                is_recoverable_runtime_error=lambda exc: True,
+                now=lambda: 0.0,
+            )
+            result = backend.decode(
+                attn,
+                query_states,
+                dispatch_context=DispatchContext(),
+                dispatch_plan=dispatch_plan,
+                timing_enabled=False,
+            )
+
+            stats = token_pool_triton_stats_snapshot()
+            self.assertEqual(result.output, "reference")
+            self.assertEqual(stats["calls"], 1)
+            self.assertEqual(stats["disabled_shape_skips"], 1)
+            self.assertEqual(
+                token_pool_triton_fallback_reasons(),
+                {"disabled_shape": 1},
+            )
+            self.assertEqual(
+                reference_calls,
+                [
+                    (
+                        attn,
+                        query_states,
+                        {
+                            "decode_metadata": "metadata",
+                            "token_kv_pool": "pool",
+                            "layer_idx": 3,
+                        },
+                    )
+                ],
+            )
+        finally:
+            clear_token_pool_triton_disabled_shapes()
+            reset_token_pool_triton_fallback_reasons()
+            reset_token_pool_triton_stats_counts()
+
     def test_decode_backend_owns_attention_workspace(self) -> None:
         try:
             import torch

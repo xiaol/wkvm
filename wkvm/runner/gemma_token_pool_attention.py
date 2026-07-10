@@ -684,3 +684,45 @@ class TokenPoolTritonAttentionBackend:
             scaling=attn.scaling,
             output=output_buffer,
         )
+
+
+def build_token_pool_attention_backend(
+    *,
+    reference_decode: Callable[..., tuple[Any, Any | None]],
+    slot_count: Callable[[Any], int],
+    record_kv_write_timing: Callable[..., None],
+    record_triton_attempt_timing: Callable[[float], None],
+    record_attention_timing: Callable[[str, int, float], None],
+    block_groups: Callable[[int, Any], int],
+    is_recoverable_runtime_error: Callable[[RuntimeError], bool],
+    now: Callable[[], float] = time.perf_counter,
+    stats: dict[str, int] | None = None,
+    disabled_shapes: set[tuple[Any, ...]] | None = None,
+) -> TokenPoolAttentionBackend:
+    triton_hooks = TokenPoolTritonAttentionBackendHooks(
+        decode_fn=token_pool_triton_decode_fn,
+        split_decode_fn=token_pool_triton_split_decode_fn,
+        paged_decode_fn=token_pool_triton_paged_decode_fn,
+        paged_split_decode_fn=token_pool_triton_paged_split_decode_fn,
+        block_groups=block_groups,
+        record_fallback=record_token_pool_triton_fallback,
+        is_recoverable_runtime_error=is_recoverable_runtime_error,
+    )
+    hooks = TokenPoolAttentionBackendHooks(
+        triton=triton_hooks,
+        reference_decode=reference_decode,
+        slot_count=slot_count,
+        record_kv_write_timing=record_kv_write_timing,
+        record_triton_attempt_timing=record_triton_attempt_timing,
+        record_attention_timing=record_attention_timing,
+        now=now,
+    )
+    return TokenPoolAttentionBackend(
+        stats=token_pool_triton_stats_storage() if stats is None else stats,
+        disabled_shapes=(
+            token_pool_triton_disabled_shapes()
+            if disabled_shapes is None
+            else disabled_shapes
+        ),
+        hooks=hooks,
+    )
