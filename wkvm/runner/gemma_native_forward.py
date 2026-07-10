@@ -1454,6 +1454,8 @@ def _attention_forward(
     )
     if result is not None:
         return result.output, result.weights
+    if key_states is None or value_states is None:
+        raise RuntimeError("dense attention fallback requires key/value states")
     if backend == "manual_gqa" or (
         backend == "sdpa_single_gqa"
         and query_states.shape[0] == 1
@@ -1608,6 +1610,40 @@ class NativeGemma4AttentionBackend:
     def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)
 
+    def resolve_attention_call(
+        self,
+        attn: _NativeAttentionMeta,
+        *,
+        layer_idx: int,
+        query_states,
+        attention_mask,
+        wkvm_token_pool_decode,
+        timing_enabled: bool,
+    ):
+        phase_start = time.perf_counter() if timing_enabled else 0.0
+        from wkvm.runner.gemma_token_pool import resolve_token_pool_attention_call
+
+        token_pool_layer_idx = layer_idx
+        if (
+            wkvm_token_pool_decode is not None
+            and attn.is_kv_shared_layer
+            and attn.kv_shared_layer_index is not None
+        ):
+            token_pool_layer_idx = int(attn.kv_shared_layer_index)
+        token_pool_attention_call = resolve_token_pool_attention_call(
+            wkvm_token_pool_decode,
+            token_pool_layer_idx,
+            attn.layer_type,
+            attention_mask_present=attention_mask is not None,
+            query_seq_len=query_states.shape[2],
+        )
+        if timing_enabled:
+            _record_native_timing(
+                "self_attention_metadata_wall_s",
+                time.perf_counter() - phase_start,
+            )
+        return token_pool_attention_call
+
     def forward(
         self,
         attn: _NativeAttentionMeta,
@@ -1619,22 +1655,17 @@ class NativeGemma4AttentionBackend:
         attention_mask,
         past_key_values,
         wkvm_token_pool_decode,
+        token_pool_attention_call=None,
         timing_enabled: bool,
     ):
-        phase_start = time.perf_counter() if timing_enabled else 0.0
-        from wkvm.runner.gemma_token_pool import resolve_token_pool_attention_call
-
-        token_pool_attention_call = resolve_token_pool_attention_call(
-            wkvm_token_pool_decode,
-            layer_idx,
-            attn.layer_type,
-            attention_mask_present=attention_mask is not None,
-            query_seq_len=query_states.shape[2],
-        )
-        if timing_enabled:
-            _record_native_timing(
-                "self_attention_metadata_wall_s",
-                time.perf_counter() - phase_start,
+        if token_pool_attention_call is None:
+            token_pool_attention_call = self.resolve_attention_call(
+                attn,
+                layer_idx=layer_idx,
+                query_states=query_states,
+                attention_mask=attention_mask,
+                wkvm_token_pool_decode=wkvm_token_pool_decode,
+                timing_enabled=timing_enabled,
             )
         token_pool_kv_binding = token_pool_attention_call.bind_layer_kv(
             key_states,
@@ -1811,15 +1842,33 @@ class NativeGemma4Attention:
                 time.perf_counter() - phase_start,
             )
 
-        shared_kv = self.shared_kv_state.load_shared_kv(
+        token_pool_attention_call = self.attention_backend.resolve_attention_call(
             attn,
-            shared_kv_states,
-            query_device=query_states.device,
+            layer_idx=self.layer_idx,
+            query_states=query_states,
+            attention_mask=attention_mask,
+            wkvm_token_pool_decode=wkvm_token_pool_decode,
             timing_enabled=timing_enabled,
         )
-        if shared_kv is not None:
-            key_states, value_states = shared_kv
+        use_token_pool_shared_kv = bool(
+            attn.is_kv_shared_layer
+            and token_pool_attention_call.decode_attention_enabled
+        )
+        shared_kv = None
+        if use_token_pool_shared_kv:
+            key_states = None
+            value_states = None
         else:
+            shared_kv = self.shared_kv_state.load_shared_kv(
+                attn,
+                shared_kv_states,
+                query_device=query_states.device,
+                timing_enabled=timing_enabled,
+            )
+
+        if not use_token_pool_shared_kv and shared_kv is not None:
+            key_states, value_states = shared_kv
+        elif not use_token_pool_shared_kv:
             if key_raw is None:
                 phase_start = time.perf_counter() if timing_enabled else 0.0
                 key_raw = _linear(hidden_states, self.k_proj)
@@ -1864,6 +1913,7 @@ class NativeGemma4Attention:
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             wkvm_token_pool_decode=wkvm_token_pool_decode,
+            token_pool_attention_call=token_pool_attention_call,
             timing_enabled=timing_enabled,
         )
         self.shared_kv_state.store_shared_kv(

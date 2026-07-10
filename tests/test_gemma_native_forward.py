@@ -228,6 +228,74 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
         self.assertIs(stored["sliding_attention"][0], key_states)
         self.assertIs(stored["sliding_attention"][1], value_states)
 
+    def test_attention_backend_resolves_shared_kv_source_layer(self) -> None:
+        from types import SimpleNamespace
+        from wkvm.runner.gemma_native_forward import (
+            NativeGemma4AttentionBackend,
+            _NativeAttentionMeta,
+        )
+
+        events = []
+
+        class QueryStates:
+            shape = (1, 2, 1, 4)
+
+        class DecodeContext:
+            def attention_plan_for_layer(
+                self,
+                layer_idx,
+                layer_type,
+                *,
+                attention_mask_present: bool = False,
+                query_seq_len=None,
+            ):
+                events.append(
+                    (layer_idx, layer_type, attention_mask_present, query_seq_len)
+                )
+                return SimpleNamespace(
+                    attention_kwargs=lambda: {
+                        "decode_metadata": "metadata",
+                        "paged_decode_metadata": None,
+                        "token_kv_pool": "pool",
+                        "layer_idx": layer_idx,
+                    },
+                    decode_attention_enabled=lambda: True,
+                )
+
+        meta = _NativeAttentionMeta(
+            head_dim=4,
+            num_key_value_groups=1,
+            attention_dropout=0.0,
+            training=False,
+            scaling=1.0,
+            is_kv_shared_layer=True,
+            layer_type="sliding_attention",
+            kv_shared_layer_index=0,
+            store_full_length_kv=False,
+        )
+        backend = NativeGemma4AttentionBackend("manual_gqa")
+
+        attention_call = backend.resolve_attention_call(
+            meta,
+            layer_idx=2,
+            query_states=QueryStates(),
+            attention_mask=None,
+            wkvm_token_pool_decode=DecodeContext(),
+            timing_enabled=False,
+        )
+        binding = attention_call.bind_layer_kv(
+            "key",
+            "value",
+            has_past_key_values=True,
+            is_kv_shared_layer=True,
+        )
+
+        self.assertEqual(events, [(0, "sliding_attention", False, 1)])
+        self.assertEqual(attention_call.backend_decode_kwargs()["layer_idx"], 0)
+        self.assertIsNone(binding.attention_call.current_kv_for_backend()[0])
+        self.assertIsNone(binding.attention_call.current_kv_for_backend()[1])
+        self.assertFalse(binding.should_update_dense_cache)
+
     def test_prefill_layer_matches_hf_decoder_layer(self) -> None:
         import torch
         from transformers.models.gemma4.modeling_gemma4 import (
@@ -1830,17 +1898,24 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
             capacity=3,
             layer_specs=[
                 TokenKVLayerSpec(
+                    layer_id=0,
+                    num_kv_heads=cfg.num_key_value_heads,
+                    head_dim=cfg.head_dim,
+                    dtype=torch.float32,
+                ),
+                TokenKVLayerSpec(
                     layer_id=2,
                     num_kv_heads=cfg.num_key_value_heads,
                     head_dim=cfg.head_dim,
                     dtype=torch.float32,
+                    kv_share_target_layer=0,
                 )
             ],
             dtype=torch.float32,
         )
         slots = pool.alloc_slots(3)
         pool.set_kv(
-            2,
+            0,
             slots,
             shared_keys[0].permute(1, 0, 2).contiguous(),
             shared_values[0].permute(1, 0, 2).contiguous(),
@@ -1895,8 +1970,126 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
             )
 
         self.assertEqual(tuple(actual.shape), tuple(hidden.shape))
-        self.assertEqual(context.last_request, (2, "sliding_attention", False))
+        self.assertEqual(pool.target_layer(2), 0)
+        self.assertEqual(context.last_request, (0, "sliding_attention", False))
         self.assertEqual(binding.store_calls, 0)
+
+    def test_shared_kv_token_pool_decode_uses_source_layer_alias(self) -> None:
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import (
+            Gemma4TextDecoderLayer,
+            Gemma4TextRotaryEmbedding,
+        )
+        from wkvm.runner.gemma_native_forward import NativeGemma4TextDecoderLayer
+        from wkvm.runner.gemma_token_pool import (
+            TokenKVLayerSpec,
+            TokenKVPool,
+            build_decode_metadata_from_token_slot_rows,
+        )
+
+        torch.manual_seed(25)
+        cfg = _tiny_shared_config()
+        hf_layer = Gemma4TextDecoderLayer(cfg, layer_idx=2).eval()
+        native_layer = NativeGemma4TextDecoderLayer(
+            hf_layer,
+            native_attention_backend="manual_gqa",
+        )
+        rotary = Gemma4TextRotaryEmbedding(cfg)
+        hidden = torch.randn(1, 1, cfg.hidden_size)
+        per_layer_input = torch.randn(1, 1, cfg.hidden_size_per_layer_input)
+        position_ids = torch.tensor([[3]])
+        position_embeddings = rotary(hidden, position_ids, "sliding_attention")
+        shared_keys = torch.randn(1, cfg.num_key_value_heads, 3, cfg.head_dim)
+        shared_values = torch.randn(1, cfg.num_key_value_heads, 3, cfg.head_dim)
+
+        pool = TokenKVPool(
+            capacity=3,
+            layer_specs=[
+                TokenKVLayerSpec(
+                    layer_id=0,
+                    num_kv_heads=cfg.num_key_value_heads,
+                    head_dim=cfg.head_dim,
+                    dtype=torch.float32,
+                ),
+                TokenKVLayerSpec(
+                    layer_id=2,
+                    num_kv_heads=cfg.num_key_value_heads,
+                    head_dim=cfg.head_dim,
+                    dtype=torch.float32,
+                    kv_share_target_layer=0,
+                ),
+            ],
+            dtype=torch.float32,
+        )
+        slots = pool.alloc_slots(3)
+        pool.set_kv(
+            0,
+            slots,
+            shared_keys[0].permute(1, 0, 2).contiguous(),
+            shared_values[0].permute(1, 0, 2).contiguous(),
+        )
+        metadata = build_decode_metadata_from_token_slot_rows(
+            [slots],
+            out_cache_loc=slots[-1:],
+        )
+
+        class NoStoreBinding:
+            def __init__(self) -> None:
+                self.metadata = metadata
+                self.paged_metadata = None
+                self.kv_pool = pool
+                self.store_calls = 0
+
+            def store_current_kv(self, *_args, **_kwargs):
+                self.store_calls += 1
+                raise AssertionError("shared-KV alias layer should not write KV")
+
+        binding = NoStoreBinding()
+
+        class BindingContext:
+            def attention_binding_for_layer(
+                self,
+                layer_idx,
+                layer_type,
+                *,
+                attention_mask_present: bool = False,
+            ):
+                self.last_request = (
+                    layer_idx,
+                    layer_type,
+                    attention_mask_present,
+                )
+                return binding
+
+        context = BindingContext()
+
+        with torch.inference_mode():
+            expected = native_layer(
+                hidden,
+                per_layer_input,
+                shared_kv_states=UserDict(
+                    {"sliding_attention": (shared_keys, shared_values)}
+                ),
+                position_embeddings=position_embeddings,
+                attention_mask=None,
+                position_ids=position_ids,
+                past_key_values=None,
+            )
+            actual = native_layer(
+                hidden,
+                per_layer_input,
+                shared_kv_states=UserDict(),
+                position_embeddings=position_embeddings,
+                attention_mask=None,
+                position_ids=position_ids,
+                past_key_values=None,
+                wkvm_token_pool_decode=context,
+            )
+
+        self.assertEqual(pool.target_layer(2), 0)
+        self.assertEqual(context.last_request, (0, "sliding_attention", False))
+        self.assertEqual(binding.store_calls, 0)
+        self.assertLess((expected - actual).abs().max().item(), 1e-6)
 
     def test_full_attention_token_pool_context_matches_routed_dense_cache(self) -> None:
         import torch
