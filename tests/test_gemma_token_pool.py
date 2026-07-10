@@ -3878,6 +3878,32 @@ class TestGemmaTokenPool(unittest.TestCase):
             reset_token_pool_triton_stats_counts()
             reset_token_pool_triton_dispatch_plan_cache()
 
+    def test_token_pool_triton_runtime_reset_clears_module_state(self) -> None:
+        from wkvm.runner.gemma_token_pool_attention import (
+            clear_token_pool_triton_disabled_shapes,
+            record_token_pool_triton_fallback,
+            reset_token_pool_triton_fallback_reasons,
+            reset_token_pool_triton_runtime_state,
+            reset_token_pool_triton_stats_counts,
+            token_pool_triton_disabled_shapes,
+            token_pool_triton_fallback_reasons,
+            token_pool_triton_stats_snapshot,
+            token_pool_triton_stats_storage,
+        )
+
+        reset_token_pool_triton_stats_counts()
+        reset_token_pool_triton_fallback_reasons()
+        clear_token_pool_triton_disabled_shapes()
+        token_pool_triton_stats_storage()["calls"] = 5
+        record_token_pool_triton_fallback("runtime")
+        token_pool_triton_disabled_shapes().add(("shape", 1))
+
+        reset_token_pool_triton_runtime_state(clear_disabled_shapes=True)
+
+        self.assertEqual(token_pool_triton_stats_snapshot()["calls"], 0)
+        self.assertEqual(token_pool_triton_fallback_reasons(), {})
+        self.assertEqual(token_pool_triton_disabled_shapes(), set())
+
     def test_decode_backend_owns_attention_workspace(self) -> None:
         try:
             import torch

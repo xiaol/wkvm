@@ -277,20 +277,13 @@ def token_pool_triton_stats() -> dict[str, Any]:
 def reset_token_pool_triton_stats(*, clear_disabled_shapes: bool = False) -> None:
     global _TOKEN_POOL_ATTENTION_BACKEND
     from wkvm.runner.gemma_token_pool_attention import (
-        clear_token_pool_triton_disabled_shapes,
-        reset_token_pool_triton_decode_fn_cache,
-        reset_token_pool_triton_dispatch_plan_cache,
-        reset_token_pool_triton_fallback_reasons,
-        reset_token_pool_triton_stats_counts,
+        reset_token_pool_triton_runtime_state,
     )
 
-    reset_token_pool_triton_stats_counts()
-    reset_token_pool_triton_fallback_reasons()
     _TOKEN_POOL_ATTENTION_BACKEND = None
-    reset_token_pool_triton_decode_fn_cache()
-    reset_token_pool_triton_dispatch_plan_cache()
-    if clear_disabled_shapes:
-        clear_token_pool_triton_disabled_shapes()
+    reset_token_pool_triton_runtime_state(
+        clear_disabled_shapes=clear_disabled_shapes,
+    )
 
 
 def _torch():

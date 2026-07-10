@@ -315,6 +315,18 @@ def reset_token_pool_triton_stats_counts() -> None:
         _TOKEN_POOL_TRITON_STATS[key] = 0
 
 
+def reset_token_pool_triton_runtime_state(
+    *,
+    clear_disabled_shapes: bool = False,
+) -> None:
+    reset_token_pool_triton_stats_counts()
+    reset_token_pool_triton_fallback_reasons()
+    reset_token_pool_triton_decode_fn_cache()
+    reset_token_pool_triton_dispatch_plan_cache()
+    if clear_disabled_shapes:
+        clear_token_pool_triton_disabled_shapes()
+
+
 class TokenPoolAttentionBackend:
     """Owns decode-side token-pool attention ordering and fallback."""
 
