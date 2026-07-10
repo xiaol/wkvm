@@ -1529,9 +1529,16 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         req.num_computed_tokens = 3
         req.output_token_ids.append(9)
         reservations = engine._token_pool_prepare_decode_batch([req])
+        self.assertIsInstance(reservations, TokenPoolPreparedDecodeBatch)
+
+        def fail_context_rewrap(*args, **kwargs):
+            raise AssertionError("prepared decode batch should build its own context")
+
+        engine._token_pool_decode_backend.build_decode_context_for_batch = (  # type: ignore[method-assign,union-attr]
+            fail_context_rewrap
+        )
         context = engine._token_pool_decode_context(reservations)
 
-        self.assertIsInstance(reservations, TokenPoolPreparedDecodeBatch)
         self.assertIsNotNone(context)
         self.assertIs(context.kv_pool, engine._token_kv_pool)
         self.assertIsNotNone(engine._token_kv_pool)

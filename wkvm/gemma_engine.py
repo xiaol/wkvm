@@ -2650,6 +2650,12 @@ class GemmaNativeEngine:
         backend = self._token_pool_decode_backend
         if backend is None:
             raise RuntimeError("token-pool decode backend is not initialized")
+        if isinstance(reservations, TokenPoolPreparedDecodeBatch):
+            return reservations.build_context(
+                kv_pool=self._token_kv_pool,
+                attention_workspace=backend.attention_workspace,
+                layer_id_metadata_only_types=frozenset({"full_attention"}),
+            )
         return backend.build_decode_context_for_batch(
             reservations,
             layer_id_metadata_only_types=frozenset({"full_attention"}),
