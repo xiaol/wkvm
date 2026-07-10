@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 from typing import Any
 
-
 def atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -45,6 +44,89 @@ def fmt_bytes(x: Any) -> str:
     return f"{value} B"
 
 
+def load_payloads(paths: list[Path]) -> list[tuple[Path, dict[str, Any]]]:
+    return [(path, json.loads(path.read_text())) for path in paths]
+
+
+def shape_key(data: dict[str, Any]) -> tuple[Any, Any, Any]:
+    return (
+        data.get("context_tokens_per_session"),
+        data.get("decode_tokens_per_session"),
+        data.get("prompt_lengths_mode"),
+    )
+
+
+def fmt_shape(shape: tuple[Any, Any, Any]) -> str:
+    ctx, out, prompt_mode = shape
+    return f"ctx={fmt(ctx)} out={fmt(out)} prompt={prompt_mode or '-'}"
+
+
+def validate_same_shape(payloads: list[tuple[Path, dict[str, Any]]]) -> None:
+    groups: dict[tuple[Any, Any, Any], list[Path]] = {}
+    for path, data in payloads:
+        groups.setdefault(shape_key(data), []).append(path)
+    if len(groups) <= 1:
+        return
+    parts = []
+    for shape, paths in sorted(groups.items(), key=lambda item: fmt_shape(item[0])):
+        parts.append(
+            f"{fmt_shape(shape)}: "
+            + ", ".join(path.as_posix() for path in sorted(paths))
+        )
+    raise ValueError(
+        "same-shape requirement failed; inputs contain multiple benchmark shapes: "
+        + "; ".join(parts)
+    )
+
+
+def row_has_full_success(row: dict[str, Any]) -> bool:
+    return row.get("success_count") == row.get("B")
+
+
+def native_no_hf_row_problems(row: dict[str, Any]) -> list[str]:
+    problems = []
+    if row.get("uses_hf_transformer_forward") is not False:
+        problems.append("uses_hf_transformer_forward_not_false")
+    if row.get("uses_hf_model_construction") is not False:
+        problems.append("uses_hf_model_construction_not_false")
+    if row.get("native_gemma_checkpoint_loader") is not True:
+        problems.append("native_gemma_checkpoint_loader_not_true")
+    return problems
+
+
+def validate_native_no_hf(payloads: list[tuple[Path, dict[str, Any]]]) -> None:
+    violations = []
+    checked_rows = 0
+    native_payloads = [
+        (path, data) for path, data in payloads if data.get("engine") == "wkvm-native"
+    ]
+    for path, data in native_payloads:
+        payload_checked_rows = 0
+        for row in data.get("rows", []):
+            if not row_has_full_success(row):
+                continue
+            checked_rows += 1
+            payload_checked_rows += 1
+            problems = native_no_hf_row_problems(row)
+            if problems:
+                violations.append((path, row.get("B"), problems))
+        if payload_checked_rows == 0:
+            violations.append((path, None, ["no_successful_rows_to_check"]))
+    if not native_payloads:
+        violations.append((None, None, ["no_wkvm_native_payloads_to_check"]))
+    if not violations and checked_rows > 0:
+        return
+    parts = []
+    for path, B, problems in violations:
+        source = path.as_posix() if path is not None else "<inputs>"
+        parts.append(f"{source} B={fmt(B)} problems={','.join(problems)}")
+    raise ValueError(
+        "native no-HF requirement failed; "
+        "successful wkvm-native rows must prove no HF model construction/forward: "
+        + "; ".join(parts)
+    )
+
+
 def engine_label(data: dict[str, Any]) -> str:
     engine = data.get("engine", "unknown")
     if engine == "hf-transformers":
@@ -68,6 +150,31 @@ def engine_label(data: dict[str, Any]) -> str:
     if engine == "sglang-http-stream":
         return "SGLang HTTP stream"
     return str(engine)
+
+
+def row_or_payload_value(
+    data: dict[str, Any], row: dict[str, Any], key: str
+) -> Any:
+    if key in row:
+        return row.get(key)
+    boundary = data.get("hf_boundary")
+    if isinstance(boundary, dict) and key in boundary:
+        return boundary.get(key)
+    return data.get(key)
+
+
+def no_hf_guard_summary(data: dict[str, Any], row: dict[str, Any]) -> str:
+    if data.get("engine") != "wkvm-native":
+        return "n/a"
+    report = data.get("native_no_hf_requirement")
+    if isinstance(report, dict):
+        status = "pass" if report.get("passed") is True else "fail"
+        checked = fmt(report.get("checked_successful_rows"))
+        required = ", required" if report.get("required") else ""
+        return f"{status} ({checked} rows{required})"
+    if row_has_full_success(row):
+        return "pass (row)" if not native_no_hf_row_problems(row) else "fail (row)"
+    return "-"
 
 
 def row_memory(row: dict[str, Any]) -> tuple[str, str]:
@@ -114,8 +221,7 @@ def decode_timing_summary(row: dict[str, Any]) -> str:
     return " / ".join(f"{label} {fmt(row.get(key))}" for label, key in keys)
 
 
-def load_rows(path: Path) -> list[dict[str, Any]]:
-    data = json.loads(path.read_text())
+def load_rows(path: Path, data: dict[str, Any]) -> list[dict[str, Any]]:
     rows = []
     for row in data.get("rows", []):
         mem_kind, mem_value = row_memory(row)
@@ -133,9 +239,23 @@ def load_rows(path: Path) -> list[dict[str, Any]]:
                 "path": path,
                 "schema": data.get("schema"),
                 "engine": engine_label(data),
+                "shape": fmt_shape(shape_key(data)),
                 "ctx": data.get("context_tokens_per_session"),
                 "out": data.get("decode_tokens_per_session"),
                 "prompt_mode": data.get("prompt_lengths_mode"),
+                "model_forward_backend": row_or_payload_value(
+                    data, row, "model_forward_backend"
+                ),
+                "uses_hf_transformer_forward": row_or_payload_value(
+                    data, row, "uses_hf_transformer_forward"
+                ),
+                "uses_hf_model_construction": row_or_payload_value(
+                    data, row, "uses_hf_model_construction"
+                ),
+                "native_gemma_checkpoint_loader": row_or_payload_value(
+                    data, row, "native_gemma_checkpoint_loader"
+                ),
+                "no_hf_guard": no_hf_guard_summary(data, row),
                 "B": row.get("B"),
                 "success": f"{row.get('success_count', 0)}/{row.get('B', '?')}",
                 "green": row.get("green"),
@@ -155,10 +275,20 @@ def load_rows(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def render(paths: list[Path]) -> str:
+def render(
+    paths: list[Path],
+    *,
+    require_same_shape: bool = False,
+    require_native_no_hf: bool = False,
+) -> str:
+    payloads = load_payloads(paths)
+    if require_same_shape:
+        validate_same_shape(payloads)
+    if require_native_no_hf:
+        validate_native_no_hf(payloads)
     rows: list[dict[str, Any]] = []
-    for path in paths:
-        rows.extend(load_rows(path))
+    for path, data in payloads:
+        rows.extend(load_rows(path, data))
     rows.sort(
         key=lambda r: (
             r["ctx"] or 0,
@@ -173,10 +303,11 @@ def render(paths: list[Path]) -> str:
         "",
         "Rows are normalized across wkvm-native, HF Transformers, vLLM, and SGLang JSON schemas. "
         "Serving rows use HTTP stream output throughput in the `agg decode tok/s` column. "
-        "Only rows with the same `ctx`, `out`, prompt mode, and benchmark path should be treated as same-shape comparisons.",
+        "Only rows with the same `ctx`, `out`, prompt mode, and benchmark path should be treated as same-shape comparisons. "
+        "The native no-HF columns are applicable to wkvm-native rows and are `n/a` for incumbent engines.",
         "",
-        "| engine | ctx | out | prompt mode | B | success | green | agg decode tok/s | decode timing s | e2e output tok/s | p50 s | p95 s | memory | max model batch | padded temp | persistent padded | error | source |",
-        "|---|---:|---:|---|---:|---:|---:|---:|---|---:|---:|---:|---|---|---|---|---|---|",
+        "| engine | shape | B | success | green | agg decode tok/s | forward backend | HF fwd | HF construct | native ckpt | no-HF guard | decode timing s | e2e output tok/s | p50 s | p95 s | memory | max model batch | padded temp | persistent padded | error | source |",
+        "|---|---|---:|---:|---:|---:|---|---:|---:|---:|---|---|---:|---:|---:|---|---|---|---|---|---|",
     ]
     for row in rows:
         path = row["path"]
@@ -191,13 +322,16 @@ def render(paths: list[Path]) -> str:
             + " | ".join(
                 [
                     str(row["engine"]),
-                    fmt(row["ctx"]),
-                    fmt(row["out"]),
-                    str(row["prompt_mode"] or "-"),
+                    row["shape"],
                     fmt(row["B"]),
                     str(row["success"]),
                     fmt(row["green"]),
                     fmt(row["agg_decode"]),
+                    str(row["model_forward_backend"] or "-"),
+                    fmt(row["uses_hf_transformer_forward"]),
+                    fmt(row["uses_hf_model_construction"]),
+                    fmt(row["native_gemma_checkpoint_loader"]),
+                    row["no_hf_guard"],
                     row["decode_timing"],
                     fmt(row["e2e_output"]),
                     fmt(row["p50"]),
@@ -219,8 +353,25 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("json_files", nargs="+", type=Path)
     ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument(
+        "--require-same-shape",
+        action="store_true",
+        help="fail if the input JSON files do not share one ctx/out/prompt-mode shape",
+    )
+    ap.add_argument(
+        "--require-native-no-hf",
+        action="store_true",
+        help=(
+            "fail unless every fully successful wkvm-native row proves no HF "
+            "Transformer forward, no HF model construction, and native checkpoint loading"
+        ),
+    )
     args = ap.parse_args()
-    text = render(args.json_files)
+    text = render(
+        args.json_files,
+        require_same_shape=args.require_same_shape,
+        require_native_no_hf=args.require_native_no_hf,
+    )
     if args.out:
         atomic_write_text(args.out, text)
         print(f"WROTE {args.out}")
