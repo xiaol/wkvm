@@ -85,6 +85,90 @@ def round_or_none(x: float | None, ndigits: int = 3) -> float | None:
     return round(x, ndigits)
 
 
+def hf_boundary_summary(rows: list[dict[str, Any]], args) -> dict[str, Any]:
+    evidence_rows = [
+        row
+        for row in rows
+        if "uses_hf_transformer_forward" in row
+        and "uses_hf_model_construction" in row
+        and "native_gemma_checkpoint_loader" in row
+    ]
+    if evidence_rows:
+        uses_hf_forward = any(
+            row.get("uses_hf_transformer_forward") is True
+            for row in evidence_rows
+        )
+        uses_hf_construction = any(
+            row.get("uses_hf_model_construction") is True
+            for row in evidence_rows
+        )
+        checkpoint_loader = all(
+            row.get("native_gemma_checkpoint_loader") is True
+            for row in evidence_rows
+        )
+        row_backends = [
+            row.get("model_forward_backend")
+            for row in evidence_rows
+            if isinstance(row.get("model_forward_backend"), str)
+        ]
+        if row_backends and all(backend == row_backends[0] for backend in row_backends):
+            model_forward_backend = row_backends[0]
+        else:
+            model_forward_backend = "mixed_or_unavailable"
+    else:
+        uses_hf_forward = not bool(args.use_native_gemma_forward)
+        uses_hf_construction = not bool(args.native_gemma_checkpoint_loader)
+        checkpoint_loader = bool(args.native_gemma_checkpoint_loader)
+        model_forward_backend = (
+            "wkvm_native_gemma_forward_bridge"
+            if args.use_native_gemma_forward
+            else "hf_transformers_gemma4_forward"
+        )
+    return {
+        "evidence_rows": len(evidence_rows),
+        "model_forward_backend": model_forward_backend,
+        "uses_hf_transformer_forward": uses_hf_forward,
+        "uses_hf_model_construction": uses_hf_construction,
+        "native_gemma_checkpoint_loader": checkpoint_loader,
+        "intent": {
+            "use_native_gemma_forward": bool(args.use_native_gemma_forward),
+            "native_gemma_checkpoint_loader": bool(
+                args.native_gemma_checkpoint_loader
+            ),
+        },
+    }
+
+
+def native_no_hf_requirement_report(
+    rows: list[dict[str, Any]],
+    *,
+    required: bool,
+) -> dict[str, Any]:
+    checked_rows = 0
+    violations: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get("success_count") != row.get("B"):
+            continue
+        checked_rows += 1
+        problems = []
+        if row.get("uses_hf_transformer_forward") is not False:
+            problems.append("uses_hf_transformer_forward_not_false")
+        if row.get("uses_hf_model_construction") is not False:
+            problems.append("uses_hf_model_construction_not_false")
+        if row.get("native_gemma_checkpoint_loader") is not True:
+            problems.append("native_gemma_checkpoint_loader_not_true")
+        if problems:
+            violations.append({"B": row.get("B"), "problems": problems})
+    if required and checked_rows == 0:
+        violations.append({"B": None, "problems": ["no_successful_rows_to_check"]})
+    return {
+        "required": bool(required),
+        "checked_successful_rows": checked_rows,
+        "passed": not violations,
+        "violations": violations,
+    }
+
+
 def env_flag(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -685,6 +769,11 @@ def run(args) -> dict[str, Any]:
         if row.get("error") and args.stop_on_failure:
             break
 
+    hf_boundary = hf_boundary_summary(rows, args)
+    native_no_hf_requirement = native_no_hf_requirement_report(
+        rows,
+        required=args.require_native_no_hf,
+    )
     payload: dict[str, Any] = {
         "schema": "wkvm.native_gemma_bench.v1",
         "engine": "wkvm-native",
@@ -698,14 +787,16 @@ def run(args) -> dict[str, Any]:
         "dtype": "bfloat16",
         "device": args.device,
         "attn": args.attn,
-        "model_forward_backend": (
-            "wkvm_native_gemma_forward_bridge"
-            if args.use_native_gemma_forward
-            else "hf_transformers_gemma4_forward"
-        ),
-        "uses_hf_transformer_forward": not args.use_native_gemma_forward,
-        "uses_hf_model_construction": not args.native_gemma_checkpoint_loader,
-        "native_gemma_checkpoint_loader": args.native_gemma_checkpoint_loader,
+        "model_forward_backend": hf_boundary["model_forward_backend"],
+        "uses_hf_transformer_forward": hf_boundary[
+            "uses_hf_transformer_forward"
+        ],
+        "uses_hf_model_construction": hf_boundary["uses_hf_model_construction"],
+        "native_gemma_checkpoint_loader": hf_boundary[
+            "native_gemma_checkpoint_loader"
+        ],
+        "hf_boundary": hf_boundary,
+        "native_no_hf_requirement": native_no_hf_requirement,
         "native_gemma_attention_backend": args.native_gemma_attention_backend,
         "native_gemma_projection_backend": args.native_gemma_projection_backend,
         "native_gemma_weight_backend": args.native_gemma_weight_backend,
@@ -777,6 +868,11 @@ def run(args) -> dict[str, Any]:
         print(json.dumps(payload, indent=2, sort_keys=True))
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    if args.require_native_no_hf and not native_no_hf_requirement["passed"]:
+        raise RuntimeError(
+            "native no-HF requirement failed: "
+            f"{native_no_hf_requirement['violations']}"
+        )
     return payload
 
 
@@ -911,6 +1007,15 @@ def main() -> None:
     ap.add_argument("--m-slots", type=int, default=64)
     ap.add_argument("--route-chunk", type=int, default=256)
     ap.add_argument("--max-steps", type=int, default=100_000)
+    ap.add_argument(
+        "--require-native-no-hf",
+        action="store_true",
+        help=(
+            "After writing the benchmark payload, fail unless every successful "
+            "row proves no HF model construction, no HF transformer forward, "
+            "and use of the native Gemma checkpoint loader."
+        ),
+    )
     ap.add_argument("--stop-on-failure", action="store_true")
     args = ap.parse_args()
     run(args)

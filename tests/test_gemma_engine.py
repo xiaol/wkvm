@@ -77,6 +77,78 @@ class TestGemmaEngineMetrics(unittest.TestCase):
 
 
 class TestGemmaSchedulerAssumptions(unittest.TestCase):
+    def test_native_bench_hf_boundary_summary_uses_row_evidence(self) -> None:
+        from experiments.native_gemma_bench import hf_boundary_summary
+
+        args = SimpleNamespace(
+            use_native_gemma_forward=False,
+            native_gemma_checkpoint_loader=False,
+        )
+        rows = [
+            {
+                "B": 2,
+                "success_count": 2,
+                "model_forward_backend": "wkvm_native_gemma_forward_bridge",
+                "uses_hf_transformer_forward": False,
+                "uses_hf_model_construction": False,
+                "native_gemma_checkpoint_loader": True,
+            }
+        ]
+
+        summary = hf_boundary_summary(rows, args)
+
+        self.assertEqual(summary["evidence_rows"], 1)
+        self.assertEqual(
+            summary["model_forward_backend"],
+            "wkvm_native_gemma_forward_bridge",
+        )
+        self.assertFalse(summary["uses_hf_transformer_forward"])
+        self.assertFalse(summary["uses_hf_model_construction"])
+        self.assertTrue(summary["native_gemma_checkpoint_loader"])
+
+    def test_native_bench_no_hf_requirement_reports_violations(self) -> None:
+        from experiments.native_gemma_bench import native_no_hf_requirement_report
+
+        good = {
+            "B": 1,
+            "success_count": 1,
+            "uses_hf_transformer_forward": False,
+            "uses_hf_model_construction": False,
+            "native_gemma_checkpoint_loader": True,
+        }
+        bad = {
+            "B": 2,
+            "success_count": 2,
+            "uses_hf_transformer_forward": False,
+            "uses_hf_model_construction": True,
+            "native_gemma_checkpoint_loader": False,
+        }
+
+        self.assertTrue(
+            native_no_hf_requirement_report([good], required=True)["passed"]
+        )
+        report = native_no_hf_requirement_report([good, bad], required=True)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["checked_successful_rows"], 2)
+        self.assertEqual(
+            report["violations"],
+            [
+                {
+                    "B": 2,
+                    "problems": [
+                        "uses_hf_model_construction_not_false",
+                        "native_gemma_checkpoint_loader_not_true",
+                    ],
+                }
+            ],
+        )
+        empty = native_no_hf_requirement_report([], required=True)
+        self.assertFalse(empty["passed"])
+        self.assertEqual(
+            empty["violations"],
+            [{"B": None, "problems": ["no_successful_rows_to_check"]}],
+        )
+
     def test_native_bench_engine_honors_prefill_chunk_cap(self) -> None:
         from experiments.native_gemma_bench import make_engine
         from wkvm.models.gemma import gemma4_e4b_routed_span_config
