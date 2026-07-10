@@ -5519,6 +5519,24 @@ class TokenPoolDecodeBackendState:
             slot for slot in token_slots if slot not in dropped
         ]
 
+    def release_dropped_table_slots(
+        self,
+        req_id: str,
+        dropped_slots: Iterable[int] | Any,
+    ) -> list[int]:
+        dropped = [int(slot) for slot in _slot_values_to_list(dropped_slots)]
+        if not dropped:
+            return []
+        page_owned = self.page_owned_slots_for_request(req_id)
+        releasable = [slot for slot in dropped if slot not in page_owned]
+        if releasable:
+            allocator = self.allocator
+            if allocator is None:
+                raise RuntimeError("token-pool allocator is not initialized")
+            allocator.free_slots(releasable)
+        self.prune_request_token_slots(req_id, dropped)
+        return releasable
+
     def admit_request_page_state(self, req_id: str, req_slot: int | None = None) -> None:
         req_id = str(req_id)
         self.request_page_tables[req_id] = {}

@@ -822,6 +822,55 @@ class TestGemmaTokenPool(unittest.TestCase):
         backend.release_request_page_state("req", req_slot)
         self.assertEqual(pool.allocated_count, 0)
 
+    def test_decode_backend_releases_dropped_table_slots_around_page_blocks(self) -> None:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenPoolBlockTables,
+            TokenPoolDecodeBackendState,
+            TokenSlotAllocator,
+        )
+
+        table = ReqToTokenTable(max_requests=1, max_context_len=8)
+        block_tables = TokenPoolBlockTables(
+            max_requests=1,
+            max_context_len=8,
+            block_size=4,
+        )
+        allocator = TokenSlotAllocator(capacity=16)
+        backend = TokenPoolDecodeBackendState(
+            table=table,
+            allocator=allocator,
+            block_tables=block_tables,
+            block_size=4,
+        )
+        req_slot = backend.admit_request("req")
+        _, normal_slots = allocator.alloc_slots_with_ids(2)
+        backend.append_request_token_slots("req", normal_slots)
+        _, page_slot_ids = backend.allocate_page_aligned_slots(
+            "req",
+            0,
+            1,
+            req_slot=req_slot,
+        )
+
+        released = backend.release_dropped_table_slots(
+            "req",
+            [normal_slots[0], page_slot_ids[0]],
+        )
+
+        self.assertEqual(released, [normal_slots[0]])
+        self.assertEqual(allocator.allocated_count, 5)
+        self.assertEqual(backend.request_token_slots["req"], [normal_slots[1]])
+        self.assertEqual(backend.page_owned_slots_for_request("req"), {4, 5, 6, 7})
+
+        backend.release_request("req")
+        self.assertEqual(allocator.allocated_count, 0)
+
     def test_full_attention_row_manager_reuses_and_frees_slots(self) -> None:
         try:
             import torch  # noqa: F401

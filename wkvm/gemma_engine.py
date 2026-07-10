@@ -2771,17 +2771,13 @@ class GemmaNativeEngine:
         if dropped:
             self._token_pool_invalidate_full_attention_rows_containing(dropped)
             backend = self._token_pool_decode_backend
-            page_owned = (
-                backend.page_owned_slots_for_request(req_id)
-                if backend is not None
-                else self._token_pool_page_owned_slots.get(req_id, set())
-            )
-            releasable = [slot for slot in dropped if slot not in page_owned]
-            if releasable:
-                allocator.free_slots(releasable)
             if backend is not None:
-                backend.prune_request_token_slots(req_id, dropped)
+                backend.release_dropped_table_slots(req_id, dropped)
             else:
+                page_owned = self._token_pool_page_owned_slots.get(req_id, set())
+                releasable = [slot for slot in dropped if slot not in page_owned]
+                if releasable:
+                    allocator.free_slots(releasable)
                 active = self._token_pool_token_slots.get(req_id)
                 if active is not None:
                     dropped_set = set(dropped)
