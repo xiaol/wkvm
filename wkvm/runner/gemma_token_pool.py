@@ -1220,6 +1220,19 @@ class TokenPoolAttentionCall:
             "current_value_states": self.value_states_for_write,
         }
 
+    def backend_dispatch_context(self) -> TokenPoolAttentionDispatchContext:
+        call_kwargs = self.backend_decode_kwargs()
+        return build_token_pool_attention_dispatch_context(
+            token_pool_plan=call_kwargs.get("token_pool_plan"),
+            decode_metadata=call_kwargs.get("decode_metadata"),
+            paged_decode_metadata=call_kwargs.get("paged_decode_metadata"),
+            token_kv_pool=call_kwargs.get("token_kv_pool"),
+            layer_idx=call_kwargs.get("layer_idx"),
+        )
+
+    def current_kv_for_backend(self) -> tuple[Any | None, Any | None]:
+        return self.key_states_for_write, self.value_states_for_write
+
 
 def token_pool_attention_plan_kwargs(token_pool_plan: Any) -> dict[str, Any]:
     attention_kwargs = getattr(token_pool_plan, "attention_kwargs", None)

@@ -2840,6 +2840,7 @@ class TestGemmaTokenPool(unittest.TestCase):
                 "current_value_states": "value",
             },
         )
+        self.assertEqual(call_with_kv.current_kv_for_backend(), ("key", "value"))
         shared_call = call.with_current_kv(
             "key",
             "value",
@@ -2854,9 +2855,11 @@ class TestGemmaTokenPool(unittest.TestCase):
             )
         )
 
+        direct_metadata = object()
+        direct_pool = object()
         direct_call = build_token_pool_attention_call(
-            decode_metadata=object(),
-            token_kv_pool=object(),
+            decode_metadata=direct_metadata,
+            token_kv_pool=direct_pool,
             layer_idx=3,
             attention_mask_present=False,
             query_seq_len=1,
@@ -2864,6 +2867,11 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertTrue(direct_call.decode_attention_enabled)
         self.assertIsNone(direct_call.plan)
         self.assertEqual(direct_call.attention_kwargs["layer_idx"], 3)
+        direct_context = direct_call.backend_dispatch_context()
+        self.assertIs(direct_context.flat_metadata, direct_metadata)
+        self.assertIs(direct_context.token_kv_pool, direct_pool)
+        self.assertEqual(direct_context.layer_idx, 3)
+        self.assertEqual(direct_call.current_kv_for_backend(), (None, None))
 
         masked_call = build_token_pool_attention_call(
             decode_metadata=object(),

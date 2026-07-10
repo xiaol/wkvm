@@ -274,27 +274,19 @@ class TokenPoolAttentionBackend:
         dispatch_plan: Any | None = None,
         timing_enabled: bool = False,
     ) -> TokenPoolAttentionDecodeResult:
-        from wkvm.runner.gemma_token_pool import (
-            build_token_pool_attention_dispatch_context,
-        )
-
         if dispatch_plan is None:
             dispatch_plan = token_pool_triton_dispatch_plan()
-        call_kwargs = attention_call.backend_decode_kwargs()
-        dispatch_context = build_token_pool_attention_dispatch_context(
-            token_pool_plan=call_kwargs.get("token_pool_plan"),
-            decode_metadata=call_kwargs.get("decode_metadata"),
-            paged_decode_metadata=call_kwargs.get("paged_decode_metadata"),
-            token_kv_pool=call_kwargs.get("token_kv_pool"),
-            layer_idx=call_kwargs.get("layer_idx"),
+        dispatch_context = attention_call.backend_dispatch_context()
+        current_key_states, current_value_states = (
+            attention_call.current_kv_for_backend()
         )
         return self.decode(
             attn,
             query_states,
             dispatch_context=dispatch_context,
             dispatch_plan=dispatch_plan,
-            current_key_states=call_kwargs.get("current_key_states"),
-            current_value_states=call_kwargs.get("current_value_states"),
+            current_key_states=current_key_states,
+            current_value_states=current_value_states,
             timing_enabled=timing_enabled,
         )
 
