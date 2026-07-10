@@ -1742,6 +1742,71 @@ class TokenPoolDecodeContext:
         )
 
 
+@dataclass(frozen=True)
+class TokenPoolDecodeBatchState:
+    """Backend-owned metadata for the current decode batch."""
+
+    metadata_by_layer_type: dict[str, DecodeBatchMetadata]
+    metadata_by_layer_id: dict[int, DecodeBatchMetadata] | None = None
+    paged_metadata_by_layer_type: dict[str, PagedDecodeBatchMetadata] | None = None
+    paged_metadata_by_layer_id: dict[int, PagedDecodeBatchMetadata] | None = None
+    covered_layer_types: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "metadata_by_layer_type",
+            {str(key): value for key, value in self.metadata_by_layer_type.items()},
+        )
+        if self.metadata_by_layer_id is not None:
+            object.__setattr__(
+                self,
+                "metadata_by_layer_id",
+                {int(key): value for key, value in self.metadata_by_layer_id.items()},
+            )
+        if self.paged_metadata_by_layer_type is not None:
+            object.__setattr__(
+                self,
+                "paged_metadata_by_layer_type",
+                {
+                    str(key): value
+                    for key, value in self.paged_metadata_by_layer_type.items()
+                },
+            )
+        if self.paged_metadata_by_layer_id is not None:
+            object.__setattr__(
+                self,
+                "paged_metadata_by_layer_id",
+                {
+                    int(key): value
+                    for key, value in self.paged_metadata_by_layer_id.items()
+                },
+            )
+        object.__setattr__(
+            self,
+            "covered_layer_types",
+            frozenset(str(layer_type) for layer_type in self.covered_layer_types),
+        )
+
+    def build_context(
+        self,
+        *,
+        kv_pool: Any | None,
+        attention_workspace: Any | None,
+        layer_id_metadata_only_types: frozenset[str] = frozenset(),
+    ) -> TokenPoolDecodeContext:
+        return TokenPoolDecodeContext(
+            metadata_by_layer_type=self.metadata_by_layer_type,
+            kv_pool=kv_pool,
+            attention_workspace=attention_workspace,
+            metadata_by_layer_id=self.metadata_by_layer_id,
+            paged_metadata_by_layer_type=self.paged_metadata_by_layer_type,
+            paged_metadata_by_layer_id=self.paged_metadata_by_layer_id,
+            covered_layer_types=self.covered_layer_types,
+            layer_id_metadata_only_types=layer_id_metadata_only_types,
+        )
+
+
 def token_pool_decode_covered_layer_types(
     token_pool_decode: Any | None,
 ) -> frozenset[str]:
@@ -4885,6 +4950,63 @@ class TokenPoolDecodeBackendState:
         self.request_token_slots: dict[str, list[int]] = {}
         self.request_page_tables: dict[str, dict[int, int]] = {}
         self.request_page_owned_slots: dict[str, set[int]] = {}
+        self.current_decode_batch_state: TokenPoolDecodeBatchState | None = None
+
+    def clear_decode_batch_state(self) -> None:
+        self.current_decode_batch_state = None
+
+    def set_decode_batch_state(
+        self,
+        *,
+        metadata_by_layer_type: dict[str, DecodeBatchMetadata],
+        metadata_by_layer_id: dict[int, DecodeBatchMetadata] | None = None,
+        paged_metadata_by_layer_type: (
+            dict[str, PagedDecodeBatchMetadata] | None
+        ) = None,
+        paged_metadata_by_layer_id: dict[int, PagedDecodeBatchMetadata] | None = None,
+        covered_layer_types: Iterable[str] | None = None,
+    ) -> TokenPoolDecodeBatchState:
+        if covered_layer_types is None:
+            covered_layer_types = (
+                ()
+                if self.kv_pool is None
+                else (
+                    layer_type
+                    for layer_type, metadata in metadata_by_layer_type.items()
+                    if metadata is not None
+                    and getattr(metadata, "out_cache_loc", None) is not None
+                )
+            )
+        state = TokenPoolDecodeBatchState(
+            metadata_by_layer_type=metadata_by_layer_type,
+            metadata_by_layer_id=metadata_by_layer_id,
+            paged_metadata_by_layer_type=paged_metadata_by_layer_type,
+            paged_metadata_by_layer_id=paged_metadata_by_layer_id,
+            covered_layer_types=frozenset(covered_layer_types),
+        )
+        self.current_decode_batch_state = state
+        return state
+
+    @property
+    def current_covered_layer_types(self) -> frozenset[str]:
+        state = self.current_decode_batch_state
+        if state is None:
+            return frozenset()
+        return state.covered_layer_types
+
+    def build_current_decode_context(
+        self,
+        *,
+        layer_id_metadata_only_types: frozenset[str] = frozenset(),
+    ) -> TokenPoolDecodeContext | None:
+        state = self.current_decode_batch_state
+        if state is None or self.kv_pool is None:
+            return None
+        return state.build_context(
+            kv_pool=self.kv_pool,
+            attention_workspace=self.attention_workspace,
+            layer_id_metadata_only_types=layer_id_metadata_only_types,
+        )
 
     @property
     def full_attention_transient_slots(self) -> dict[str, list[int]] | None:

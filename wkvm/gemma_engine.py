@@ -1857,6 +1857,24 @@ class GemmaNativeEngine:
             ),
         )
 
+    def _token_pool_sync_last_decode_batch_state(self) -> None:
+        backend = self._token_pool_decode_backend
+        state = None if backend is None else backend.current_decode_batch_state
+        if state is None:
+            self.last_token_pool_decode_metadata = None
+            self.last_token_pool_decode_metadata_by_layer_id = None
+            self.last_token_pool_paged_decode_metadata = None
+            self.last_token_pool_paged_decode_metadata_by_layer_id = None
+            self.last_token_pool_decode_covered_layer_types = frozenset()
+            return
+        self.last_token_pool_decode_metadata = state.metadata_by_layer_type
+        self.last_token_pool_decode_metadata_by_layer_id = state.metadata_by_layer_id
+        self.last_token_pool_paged_decode_metadata = state.paged_metadata_by_layer_type
+        self.last_token_pool_paged_decode_metadata_by_layer_id = (
+            state.paged_metadata_by_layer_id
+        )
+        self.last_token_pool_decode_covered_layer_types = state.covered_layer_types
+
     def _token_pool_clear_graph_decode_signatures(self) -> None:
         backend = self._token_pool_decode_backend
         if backend is not None:
@@ -2366,15 +2384,15 @@ class GemmaNativeEngine:
     ) -> list[_TokenPoolDecodeReservation]:
         table = self._token_table
         allocator = self._token_slot_allocator
+        backend = self._token_pool_decode_backend
+        if backend is not None:
+            backend.clear_decode_batch_state()
+        self._token_pool_sync_last_decode_batch_state()
         if table is None or allocator is None:
             return []
         reservations: list[_TokenPoolDecodeReservation] = []
         req_slots: list[int] = []
         out_cache_loc: list[int] = []
-        self.last_token_pool_decode_metadata_by_layer_id = None
-        self.last_token_pool_paged_decode_metadata = None
-        self.last_token_pool_paged_decode_metadata_by_layer_id = None
-        self.last_token_pool_decode_covered_layer_types = frozenset()
         try:
             for req in reqs:
                 self._token_pool_admit_request(req)
@@ -2431,18 +2449,18 @@ class GemmaNativeEngine:
                 req_slots.append(req_slot)
                 out_cache_loc.append(token_slot)
             if self._token_kv_pool is None:
-                backend = self._token_pool_decode_backend
                 if backend is None:
                     raise RuntimeError("token-pool decode backend is not initialized")
-                self.last_token_pool_decode_metadata = (
-                    backend.build_decode_metadata_by_layer_type(
-                        req_slots=req_slots,
-                        out_cache_loc=out_cache_loc,
-                        sliding_window=self.config.sliding_window,
-                    )
+                metadata_by_type = backend.build_decode_metadata_by_layer_type(
+                    req_slots=req_slots,
+                    out_cache_loc=out_cache_loc,
+                    sliding_window=self.config.sliding_window,
+                )
+                backend.set_decode_batch_state(
+                    metadata_by_layer_type=metadata_by_type,
+                    covered_layer_types=frozenset(),
                 )
             else:
-                backend = self._token_pool_decode_backend
                 if backend is None:
                     raise RuntimeError("token-pool decode backend is not initialized")
                 logical_lens = [
@@ -2479,30 +2497,25 @@ class GemmaNativeEngine:
                         persistent_full_attention_rows
                     ),
                 )
-                self.last_token_pool_decode_metadata = {
+                metadata_by_type = {
                     "sliding_attention": sliding_metadata,
                 }
+                paged_metadata_by_type = None
                 if sliding_paged_metadata is not None:
-                    self.last_token_pool_paged_decode_metadata = {
+                    paged_metadata_by_type = {
                         "sliding_attention": sliding_paged_metadata,
                     }
                 if full_metadata is not None:
-                    self.last_token_pool_decode_metadata["full_attention"] = full_metadata
+                    metadata_by_type["full_attention"] = full_metadata
                 if full_paged_metadata is not None:
-                    if self.last_token_pool_paged_decode_metadata is None:
-                        self.last_token_pool_paged_decode_metadata = {}
-                    self.last_token_pool_paged_decode_metadata[
-                        "full_attention"
-                    ] = full_paged_metadata
+                    if paged_metadata_by_type is None:
+                        paged_metadata_by_type = {}
+                    paged_metadata_by_type["full_attention"] = full_paged_metadata
                 covered_layer_types = {"sliding_attention"}
                 if full_metadata is not None:
                     covered_layer_types.add("full_attention")
-                self.last_token_pool_decode_covered_layer_types = frozenset(
-                    covered_layer_types
-                )
-                self.last_token_pool_decode_metadata_by_layer_id = (
-                    layer_metadata if layer_metadata else None
-                )
+                metadata_by_layer_id = layer_metadata if layer_metadata else None
+                paged_metadata_by_layer_id = None
                 if sliding_paged_metadata is not None or paged_layer_metadata:
                     paged_by_layer_id = {}
                     if sliding_paged_metadata is not None:
@@ -2515,9 +2528,17 @@ class GemmaNativeEngine:
                             }
                         )
                     paged_by_layer_id.update(paged_layer_metadata)
-                    self.last_token_pool_paged_decode_metadata_by_layer_id = (
+                    paged_metadata_by_layer_id = (
                         paged_by_layer_id if paged_by_layer_id else None
                     )
+                backend.set_decode_batch_state(
+                    metadata_by_layer_type=metadata_by_type,
+                    metadata_by_layer_id=metadata_by_layer_id,
+                    paged_metadata_by_layer_type=paged_metadata_by_type,
+                    paged_metadata_by_layer_id=paged_metadata_by_layer_id,
+                    covered_layer_types=frozenset(covered_layer_types),
+                )
+            self._token_pool_sync_last_decode_batch_state()
             self.metrics.token_pool_decode_metadata_batches += 1
             self.metrics.token_pool_decode_metadata_rows += len(reqs)
             for layer_type in self.last_token_pool_decode_covered_layer_types:
@@ -2541,29 +2562,21 @@ class GemmaNativeEngine:
             return reservations
         except Exception:
             self._token_pool_discard_decode_reservations(reservations)
+            if backend is not None:
+                backend.clear_decode_batch_state()
+            self._token_pool_sync_last_decode_batch_state()
             raise
 
     def _token_pool_decode_context(
         self,
         reservations: list[_TokenPoolDecodeReservation],
     ) -> TokenPoolDecodeContext | None:
-        if (
-            not reservations
-            or self.last_token_pool_decode_metadata is None
-            or self._token_kv_pool is None
-        ):
+        if not reservations or self._token_kv_pool is None:
             return None
         backend = self._token_pool_decode_backend
         if backend is None:
             raise RuntimeError("token-pool decode backend is not initialized")
-        return backend.build_decode_context(
-            metadata_by_layer_type=self.last_token_pool_decode_metadata,
-            metadata_by_layer_id=self.last_token_pool_decode_metadata_by_layer_id,
-            paged_metadata_by_layer_type=self.last_token_pool_paged_decode_metadata,
-            paged_metadata_by_layer_id=(
-                self.last_token_pool_paged_decode_metadata_by_layer_id
-            ),
-            covered_layer_types=self.last_token_pool_decode_covered_layer_types,
+        return backend.build_current_decode_context(
             layer_id_metadata_only_types=frozenset({"full_attention"}),
         )
 
@@ -2897,7 +2910,13 @@ class GemmaNativeEngine:
         pool = self._token_kv_pool
         if pool is None:
             return
-        metadata_by_type = self.last_token_pool_decode_metadata or {}
+        backend = self._token_pool_decode_backend
+        batch_state = None if backend is None else backend.current_decode_batch_state
+        metadata_by_type = (
+            batch_state.metadata_by_layer_type
+            if batch_state is not None
+            else self.last_token_pool_decode_metadata or {}
+        )
         if "full_attention" not in metadata_by_type:
             return
         owner_layer_ids = self._token_pool_full_attention_owner_layer_ids()

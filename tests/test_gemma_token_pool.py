@@ -1101,6 +1101,86 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(sliding.kv_indices.tolist(), [3, 4, 9, 10])
         self.assertEqual(sliding.out_cache_loc.tolist(), [4, 10])
 
+    def test_token_pool_decode_backend_owns_current_decode_batch_state(self) -> None:
+        from types import SimpleNamespace
+
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            build_decode_metadata_from_token_slot_rows,
+            build_paged_decode_metadata_from_token_slot_rows,
+            ReqToTokenTable,
+            TokenPoolDecodeBackendState,
+        )
+
+        pool = SimpleNamespace(layer_specs={7: object()}, capacity=16)
+        backend = TokenPoolDecodeBackendState(
+            table=ReqToTokenTable(max_requests=1, max_context_len=8),
+            kv_pool=pool,
+            block_size=4,
+            token_pool_capacity=16,
+        )
+        by_type = build_decode_metadata_from_token_slot_rows(
+            [[1, 2]],
+            out_cache_loc=[2],
+        )
+        by_layer = build_decode_metadata_from_token_slot_rows(
+            [[3, 4]],
+            out_cache_loc=[4],
+        )
+        paged_by_type = build_paged_decode_metadata_from_token_slot_rows(
+            [[0, 1]],
+            block_size=4,
+            out_cache_loc=[1],
+        )
+        paged_by_layer = build_paged_decode_metadata_from_token_slot_rows(
+            [[4, 5]],
+            block_size=4,
+            logical_seq_lens=[6],
+            selected_start_positions=[4],
+            out_cache_loc=[5],
+        )
+
+        state = backend.set_decode_batch_state(
+            metadata_by_layer_type={"full_attention": by_type},
+            metadata_by_layer_id={7: by_layer},
+            paged_metadata_by_layer_type={"full_attention": paged_by_type},
+            paged_metadata_by_layer_id={7: paged_by_layer},
+            covered_layer_types={"full_attention"},
+        )
+        context = backend.build_current_decode_context(
+            layer_id_metadata_only_types=frozenset({"full_attention"}),
+        )
+
+        self.assertIs(backend.current_decode_batch_state, state)
+        self.assertEqual(
+            backend.current_covered_layer_types,
+            frozenset({"full_attention"}),
+        )
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertIs(context.kv_pool, pool)
+        self.assertIs(context.attention_workspace, backend.attention_workspace)
+        self.assertIs(context.metadata_for_layer(7, "full_attention"), by_layer)
+        self.assertIsNone(context.metadata_for_layer(8, "full_attention"))
+        self.assertIs(
+            context.paged_metadata_for_layer(7, "full_attention"),
+            paged_by_layer,
+        )
+        self.assertIsNone(context.paged_metadata_for_layer(8, "full_attention"))
+        self.assertEqual(
+            context.covered_decode_layer_types(),
+            frozenset({"full_attention"}),
+        )
+
+        backend.clear_decode_batch_state()
+        self.assertIsNone(backend.current_decode_batch_state)
+        self.assertEqual(backend.current_covered_layer_types, frozenset())
+        self.assertIsNone(backend.build_current_decode_context())
+
     def test_token_pool_decode_backend_builds_sliding_metadata_from_block_tables(self) -> None:
         try:
             import torch  # noqa: F401
