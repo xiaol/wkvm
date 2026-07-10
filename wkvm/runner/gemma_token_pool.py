@@ -109,6 +109,18 @@ class TokenPoolRequestPageStateSnapshot:
     block_table_snapshot: Any | None = None
 
 
+@dataclass
+class TokenPoolDecodeReservation:
+    req_id: str
+    req_slot: int
+    token_slot: int
+    token_slot_tensor: Any
+    previous_length: int
+    full_attention_token_slot: int | None = None
+    persistent_full_attention_row: bool = False
+    page_state_snapshot: TokenPoolRequestPageStateSnapshot | None = None
+
+
 @dataclass(frozen=True)
 class TokenPoolRequestPrefixClearResult:
     dropped_slots: tuple[int, ...] = ()

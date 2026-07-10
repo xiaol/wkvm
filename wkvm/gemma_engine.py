@@ -37,10 +37,10 @@ from wkvm.runner.gemma_token_pool import (
     TokenPoolDecodeBackendState,
     TokenPoolDecodeBatchState,
     TokenPoolDecodeContext,
+    TokenPoolDecodeReservation,
     TokenPoolDecodeGraphSignatureUpdate,
     TokenPoolDecodeGraphSignatureTracker,
     TokenPoolFullAttentionRow,
-    TokenPoolRequestPageStateSnapshot,
     TokenSlotAllocator,
 )
 
@@ -417,16 +417,7 @@ class GemmaRequestTrace:
         }
 
 
-@dataclass
-class _TokenPoolDecodeReservation:
-    req_id: str
-    req_slot: int
-    token_slot: int
-    token_slot_tensor: Any
-    previous_length: int
-    full_attention_token_slot: int | None = None
-    persistent_full_attention_row: bool = False
-    page_state_snapshot: TokenPoolRequestPageStateSnapshot | None = None
+_TokenPoolDecodeReservation = TokenPoolDecodeReservation
 
 
 class GemmaNativeEngine:

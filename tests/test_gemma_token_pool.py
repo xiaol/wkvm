@@ -2,6 +2,38 @@ import unittest
 
 
 class TestGemmaTokenPool(unittest.TestCase):
+    def test_decode_reservation_is_token_pool_owned_state(self) -> None:
+        from wkvm.runner.gemma_token_pool import (
+            TokenPoolDecodeReservation,
+            TokenPoolRequestPageStateSnapshot,
+        )
+
+        snapshot = TokenPoolRequestPageStateSnapshot(
+            req_id="req",
+            req_slot=3,
+            page_table={0: 4},
+            owned_slots=frozenset({16, 17}),
+        )
+        reservation = TokenPoolDecodeReservation(
+            req_id="req",
+            req_slot=3,
+            token_slot=18,
+            token_slot_tensor="slot_tensor",
+            previous_length=7,
+            persistent_full_attention_row=True,
+            page_state_snapshot=snapshot,
+        )
+
+        reservation.full_attention_token_slot = 99
+
+        self.assertEqual(reservation.req_id, "req")
+        self.assertEqual(reservation.req_slot, 3)
+        self.assertEqual(reservation.token_slot, 18)
+        self.assertEqual(reservation.previous_length, 7)
+        self.assertTrue(reservation.persistent_full_attention_row)
+        self.assertIs(reservation.page_state_snapshot, snapshot)
+        self.assertEqual(reservation.full_attention_token_slot, 99)
+
     def test_dense_padded_triton_decode_matches_manual_gqa(self) -> None:
         try:
             import torch
