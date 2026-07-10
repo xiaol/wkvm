@@ -5689,6 +5689,22 @@ class TestGemmaTokenPool(unittest.TestCase):
             ].kv_indices.tolist(),
             [4, 5],
         )
+        refreshed_flat = table.build_decode_metadata(
+            [slot],
+            out_cache_loc=[5],
+            workspace_key="graph_flat",
+        )
+        self.assertIsNot(refreshed_flat, updated_flat)
+        self.assertEqual(
+            refreshed_flat.workspace_signature,
+            updated_flat.workspace_signature,
+        )
+        refreshed = TokenPoolDecodeContext(
+            metadata_by_layer_type={"sliding_attention": refreshed_flat},
+            metadata_by_layer_id={0: refreshed_flat, 1: refreshed_flat},
+            kv_pool=context.kv_pool,
+            covered_layer_types=context.covered_layer_types,
+        )
         with patch.object(
             TokenPoolDecodeGraphBuffer,
             "replay_compatibility_error",
@@ -5702,7 +5718,7 @@ class TestGemmaTokenPool(unittest.TestCase):
             "_decode_metadata_tensor_aliases_same_workspace",
             side_effect=AssertionError("tensor alias walk used"),
         ):
-            cached_stats = graph_metadata.copy_compatible_from(updated)
+            cached_stats = graph_metadata.copy_compatible_from(refreshed)
 
         self.assertEqual(cached_stats["cuda_graph_metadata_tensor_copies"], 0)
         self.assertEqual(cached_stats["cuda_graph_metadata_tensor_copy_skips"], 0)

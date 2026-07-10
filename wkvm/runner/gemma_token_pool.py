@@ -42,6 +42,7 @@ class DecodeBatchMetadata:
     out_cache_loc_long: Any | None = None
     max_seq_len: int | None = None
     triton_decode_plan: TokenPoolTritonDecodePlan | None = None
+    workspace_signature: Any | None = None
 
     def __post_init__(self) -> None:
         if self.triton_decode_plan is None:
@@ -72,6 +73,7 @@ class PagedDecodeBatchMetadata:
     out_cache_loc_long: Any | None = None
     max_seq_len: int | None = None
     triton_decode_plan: TokenPoolTritonDecodePlan | None = None
+    workspace_signature: Any | None = None
 
     def __post_init__(self) -> None:
         if self.triton_decode_plan is None:
@@ -2403,6 +2405,7 @@ class TokenPoolDecodeGraphBuffer:
                 ),
                 max_seq_len=getattr(metadata, "max_seq_len", None),
                 triton_decode_plan=getattr(metadata, "triton_decode_plan", None),
+                workspace_signature=getattr(metadata, "workspace_signature", None),
             )
         return DecodeBatchMetadata(
             req_pool_indices=metadata.req_pool_indices.clone(),
@@ -2422,6 +2425,7 @@ class TokenPoolDecodeGraphBuffer:
             ),
             max_seq_len=getattr(metadata, "max_seq_len", None),
             triton_decode_plan=getattr(metadata, "triton_decode_plan", None),
+            workspace_signature=getattr(metadata, "workspace_signature", None),
         )
 
     @classmethod
@@ -2570,14 +2574,8 @@ class TokenPoolDecodeGraphBuffer:
         return tuple(
             (
                 key,
-                id(dst_group[key]),
-                id(src_group[key]),
-                int(getattr(dst_group[key], "block_size", -1)),
-                int(getattr(src_group[key], "block_size", -1)),
-                getattr(dst_group[key], "max_seq_len", None),
-                getattr(src_group[key], "max_seq_len", None),
-                getattr(dst_group[key], "triton_decode_plan", None),
-                getattr(src_group[key], "triton_decode_plan", None),
+                TokenPoolDecodeGraphBuffer._alias_metadata_key(dst_group[key]),
+                TokenPoolDecodeGraphBuffer._alias_metadata_key(src_group[key]),
             )
             for key in dst_group
         )
@@ -2610,6 +2608,24 @@ class TokenPoolDecodeGraphBuffer:
             if set(dst_group) == set(src_group):
                 count += len(dst_group)
         return count
+
+    @staticmethod
+    def _alias_metadata_key(metadata: Any) -> tuple[Any, ...]:
+        workspace_signature = getattr(metadata, "workspace_signature", None)
+        return (
+            (
+                "workspace",
+                workspace_signature,
+            )
+            if workspace_signature is not None
+            else (
+                "object",
+                id(metadata),
+            ),
+            int(getattr(metadata, "block_size", -1)),
+            getattr(metadata, "max_seq_len", None),
+            getattr(metadata, "triton_decode_plan", None),
+        )
 
     @classmethod
     def _decode_metadata_aliases_same_workspace(
@@ -3134,7 +3150,9 @@ def _ensure_decode_metadata_workspace(
         or needs("kv_indices", kv_buffer_size, torch.int32)
     ):
         old = target
+        workspace_version = int(old.get("_workspace_version", 0) or 0) + 1
         new_workspace = {
+            "_workspace_version": workspace_version,
             "req_pool_indices": old.get("req_pool_indices")
             if old.get("req_pool_indices") is not None
             and int(old["req_pool_indices"].numel()) >= row_buffer_size
@@ -3180,6 +3198,8 @@ def _ensure_decode_metadata_workspace(
         }
         target.clear()
         target.update(new_workspace)
+    else:
+        target.setdefault("_workspace_version", 0)
     return target
 
 
@@ -3232,6 +3252,7 @@ def _ensure_paged_decode_metadata_workspace(
         or not valid_block_tables()
     ):
         old = target
+        workspace_version = int(old.get("_workspace_version", 0) or 0) + 1
 
         def reuse_1d(name: str, dtype: Any):
             tensor = old.get(name)
@@ -3259,6 +3280,7 @@ def _ensure_paged_decode_metadata_workspace(
                 device=device,
             )
         new_workspace = {
+            "_workspace_version": workspace_version,
             "req_pool_indices": reuse_1d("req_pool_indices", torch.int32),
             "seq_lens": reuse_1d("seq_lens", torch.int32),
             "logical_seq_lens": reuse_1d("logical_seq_lens", torch.int32),
@@ -3273,7 +3295,23 @@ def _ensure_paged_decode_metadata_workspace(
         }
         target.clear()
         target.update(new_workspace)
+    else:
+        target.setdefault("_workspace_version", 0)
     return target
+
+
+def _decode_metadata_workspace_signature(
+    *,
+    kind: str,
+    key: str | None,
+    workspace: dict[str, Any],
+) -> tuple[str, str, int, int]:
+    return (
+        str(kind),
+        TokenPoolDecodeMetadataWorkspace._key(key),
+        id(workspace),
+        int(workspace.get("_workspace_version", 0) or 0),
+    )
 
 
 class TokenPoolDecodeMetadataWorkspace:
@@ -3852,6 +3890,11 @@ def build_decode_metadata_from_token_slot_rows(
             kv_indices=kv_indices,
             out_cache_loc_long=out_long,
             max_seq_len=padded_max_seq_len,
+            workspace_signature=_decode_metadata_workspace_signature(
+                kind="flat",
+                key=workspace_key,
+                workspace=workspace,
+            ),
         )
 
     if total_kv:
@@ -4153,6 +4196,11 @@ def build_paged_decode_metadata_from_token_slot_rows(
             slot_mapping=out_long_result,
             out_cache_loc_long=out_long_result,
             max_seq_len=metadata_max_seq_len,
+            workspace_signature=_decode_metadata_workspace_signature(
+                kind="paged",
+                key=workspace_key,
+                workspace=metadata_workspace,
+            ),
         )
     block_tables = torch.full(
         (row_count, max_blocks),
@@ -4499,6 +4547,11 @@ class ReqToTokenTable:
                 kv_indices=kv_indices,
                 out_cache_loc_long=out_long,
                 max_seq_len=max(selected_lens),
+                workspace_signature=_decode_metadata_workspace_signature(
+                    kind="flat",
+                    key=workspace_key,
+                    workspace=workspace,
+                ),
             )
 
         if chunks:
@@ -4757,6 +4810,11 @@ class ReqToTokenTable:
                 slot_mapping=out_long,
                 out_cache_loc_long=out_long,
                 max_seq_len=max(selected_lens),
+                workspace_signature=_decode_metadata_workspace_signature(
+                    kind="paged",
+                    key=workspace_key,
+                    workspace=workspace,
+                ),
             )
 
         block_tables = torch.full(
@@ -4987,6 +5045,11 @@ class ReqToTokenTable:
                 slot_mapping=out_long,
                 out_cache_loc_long=out_long,
                 max_seq_len=max(selected_lens),
+                workspace_signature=_decode_metadata_workspace_signature(
+                    kind="paged",
+                    key=workspace_key,
+                    workspace=workspace,
+                ),
             )
 
         block_tables = torch.full(
@@ -5213,6 +5276,11 @@ class ReqToTokenTable:
                 slot_mapping=out_long,
                 out_cache_loc_long=out_long,
                 max_seq_len=max(selected_lens),
+                workspace_signature=_decode_metadata_workspace_signature(
+                    kind="paged",
+                    key=workspace_key,
+                    workspace=workspace,
+                ),
             )
 
         return PagedDecodeBatchMetadata(
