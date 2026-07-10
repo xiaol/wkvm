@@ -4411,6 +4411,61 @@ def _pop_aligned_free_slot_block(
     return None
 
 
+def _pop_cached_aligned_free_slot_block(
+    free_slots: list[int],
+    cached_blocks_by_size: dict[int, list[int]],
+    block_size: int,
+) -> tuple[int, list[int]] | None:
+    block_size = int(block_size)
+    cached_blocks = cached_blocks_by_size.get(block_size)
+    if not cached_blocks:
+        return None
+
+    while cached_blocks:
+        block = int(cached_blocks.pop(0))
+        start = block * block_size
+        slots = list(range(start, start + block_size))
+        slot_set = set(free_slots)
+        if all(slot in slot_set for slot in slots):
+            remove = set(slots)
+            free_slots[:] = [slot for slot in free_slots if slot not in remove]
+            if not cached_blocks:
+                cached_blocks_by_size.pop(block_size, None)
+            return block, slots
+    cached_blocks_by_size.pop(block_size, None)
+    return None
+
+
+def _cache_aligned_free_slot_blocks(
+    cached_blocks_by_size: dict[int, list[int]],
+    freed_slots: Iterable[int],
+    block_size: int | None,
+) -> None:
+    if block_size is None:
+        return
+    block_size = int(block_size)
+    if block_size < 1:
+        return
+    values = sorted({int(slot) for slot in freed_slots})
+    if len(values) < block_size:
+        return
+    value_set = set(values)
+    cached_blocks = cached_blocks_by_size.setdefault(block_size, [])
+    cached_block_set = set(cached_blocks)
+    for slot in values:
+        if slot % block_size:
+            continue
+        block_slots = range(slot, slot + block_size)
+        if all(candidate in value_set for candidate in block_slots):
+            block = slot // block_size
+            if block not in cached_block_set:
+                cached_blocks.append(block)
+                cached_block_set.add(block)
+    cached_blocks.sort()
+    if not cached_blocks:
+        cached_blocks_by_size.pop(block_size, None)
+
+
 class ReqToTokenTable:
     """Request-slot to token-slot table for decode metadata construction."""
 
@@ -7596,6 +7651,8 @@ class TokenSlotAllocator:
         self.dtype = dtype if dtype is not None else torch.int32
         self._next_slot = 0
         self._free_slots: list[int] = []
+        self._free_page_blocks: dict[int, list[int]] = {}
+        self._last_page_block_size: int | None = None
         self._allocated_slots: set[int] = set()
         self.high_watermark = 0
 
@@ -7634,7 +7691,14 @@ class TokenSlotAllocator:
         block_size = int(block_size)
         if block_size < 1:
             raise ValueError("block_size must be >= 1")
-        reused = _pop_aligned_free_slot_block(self._free_slots, block_size)
+        self._last_page_block_size = block_size
+        reused = _pop_cached_aligned_free_slot_block(
+            self._free_slots,
+            self._free_page_blocks,
+            block_size,
+        )
+        if reused is None:
+            reused = _pop_aligned_free_slot_block(self._free_slots, block_size)
         if reused is not None:
             block, slots = reused
             self._allocated_slots.update(slots)
@@ -7650,6 +7714,11 @@ class TokenSlotAllocator:
                 raise RuntimeError("token slot allocator page capacity exceeded")
             self._free_slots.extend(padding_slots)
             self._free_slots.sort()
+            _cache_aligned_free_slot_blocks(
+                self._free_page_blocks,
+                padding_slots,
+                self._last_page_block_size,
+            )
             start += padding
             self._next_slot = start
         if self.capacity is not None and start + block_size > self.capacity:
@@ -7671,6 +7740,11 @@ class TokenSlotAllocator:
             freed.append(slot)
         self._free_slots.extend(freed)
         self._free_slots.sort()
+        _cache_aligned_free_slot_blocks(
+            self._free_page_blocks,
+            freed,
+            self._last_page_block_size,
+        )
 
     @property
     def allocated_count(self) -> int:
@@ -7732,6 +7806,8 @@ class TokenKVPool:
                 if self._target_layers[layer_id] == layer_id:
                     self._allocate_layer_buffer(layer_id)
         self._free_slots = list(range(self.capacity))
+        self._free_page_blocks: dict[int, list[int]] = {}
+        self._last_page_block_size: int | None = None
         self._allocated_slots: set[int] = set()
         self.high_watermark = 0
 
@@ -7763,7 +7839,14 @@ class TokenKVPool:
         block_size = int(block_size)
         if block_size < 1:
             raise ValueError("block_size must be >= 1")
-        reused = _pop_aligned_free_slot_block(self._free_slots, block_size)
+        self._last_page_block_size = block_size
+        reused = _pop_cached_aligned_free_slot_block(
+            self._free_slots,
+            self._free_page_blocks,
+            block_size,
+        )
+        if reused is None:
+            reused = _pop_aligned_free_slot_block(self._free_slots, block_size)
         if reused is None:
             raise RuntimeError("token KV pool page capacity exceeded")
         start_block, slots = reused
@@ -7782,6 +7865,11 @@ class TokenKVPool:
             freed.append(slot)
         self._free_slots.extend(freed)
         self._free_slots.sort()
+        _cache_aligned_free_slot_blocks(
+            self._free_page_blocks,
+            freed,
+            self._last_page_block_size,
+        )
 
     def set_kv(self, layer_id: int, slot_ids, key_states, value_states) -> None:
         import torch
