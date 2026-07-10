@@ -5203,6 +5203,47 @@ class TokenPoolDecodeBackendState:
         block_tables = self.block_tables
         return None if block_tables is None else block_tables.tensor
 
+    def ensure_page_table_width(self, context_len: int) -> None:
+        block_tables = self.block_tables
+        if block_tables is None:
+            return
+        block_tables.ensure_context_len(context_len)
+
+    def reset_page_table_row(self, req_slot: int) -> None:
+        block_tables = self.block_tables
+        if block_tables is None:
+            return
+        block_tables.reset_row(req_slot)
+
+    def snapshot_page_table_row(self, req_slot: int) -> Any | None:
+        block_tables = self.block_tables
+        if block_tables is None:
+            return None
+        return block_tables.snapshot_row(req_slot)
+
+    def restore_page_table_row(self, req_slot: int, snapshot: Any | None) -> None:
+        block_tables = self.block_tables
+        if block_tables is None:
+            return
+        block_tables.restore_row(req_slot, snapshot)
+
+    def set_page_table_block(
+        self,
+        req_slot: int,
+        logical_block: int,
+        physical_block: int,
+    ) -> None:
+        block_tables = self.block_tables
+        if block_tables is None:
+            return
+        block_tables.set_block(req_slot, logical_block, physical_block)
+
+    def clear_page_table_block(self, req_slot: int, logical_block: int) -> None:
+        block_tables = self.block_tables
+        if block_tables is None:
+            return
+        block_tables.clear_block(req_slot, logical_block)
+
     def should_build_sliding_paged_metadata(self) -> bool:
         if _token_pool_paged_metadata_requested():
             return True

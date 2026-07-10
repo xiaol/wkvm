@@ -601,6 +601,55 @@ class TestGemmaTokenPool(unittest.TestCase):
         tables.reset_row(0)
         self.assertEqual(tables.tensor.tolist(), [[-1, -1, -1]])
 
+    def test_decode_backend_wraps_page_table_lifecycle(self) -> None:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenPoolBlockTables,
+            TokenPoolDecodeBackendState,
+        )
+
+        metadata_only = TokenPoolDecodeBackendState(
+            table=ReqToTokenTable(max_requests=1, max_context_len=4),
+            block_size=4,
+        )
+        self.assertIsNone(metadata_only.page_table_tensor)
+        self.assertIsNone(metadata_only.snapshot_page_table_row(0))
+        metadata_only.ensure_page_table_width(32)
+        metadata_only.reset_page_table_row(0)
+        metadata_only.restore_page_table_row(0, None)
+        metadata_only.set_page_table_block(0, 0, 1)
+        metadata_only.clear_page_table_block(0, 0)
+
+        block_tables = TokenPoolBlockTables(
+            max_requests=1,
+            max_context_len=4,
+            block_size=4,
+        )
+        backend = TokenPoolDecodeBackendState(
+            table=ReqToTokenTable(max_requests=1, max_context_len=4),
+            block_tables=block_tables,
+            block_size=4,
+        )
+        self.assertIs(backend.page_table_tensor, block_tables.tensor)
+        backend.set_page_table_block(0, 0, 2)
+        snapshot = backend.snapshot_page_table_row(0)
+        backend.set_page_table_block(0, 2, 7)
+        self.assertEqual(block_tables.tensor.tolist(), [[2, -1, 7]])
+        backend.restore_page_table_row(0, snapshot)
+        self.assertEqual(block_tables.tensor.tolist(), [[2, -1, -1]])
+        backend.ensure_page_table_width(17)
+        self.assertEqual(block_tables.shape, (1, 5))
+        backend.clear_page_table_block(0, 0)
+        self.assertEqual(block_tables.tensor[0, :3].tolist(), [-1, -1, -1])
+        backend.set_page_table_block(0, 1, 3)
+        backend.reset_page_table_row(0)
+        self.assertEqual(block_tables.tensor[0, :3].tolist(), [-1, -1, -1])
+
     def test_full_attention_row_manager_reuses_and_frees_slots(self) -> None:
         try:
             import torch  # noqa: F401

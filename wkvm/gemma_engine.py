@@ -1807,6 +1807,9 @@ class GemmaNativeEngine:
 
     @property
     def _token_pool_page_table_tensor(self):
+        backend = self._token_pool_decode_backend
+        if backend is not None:
+            return backend.page_table_tensor
         block_tables = self._token_pool_block_tables
         return None if block_tables is None else block_tables.tensor
 
@@ -1886,16 +1889,72 @@ class GemmaNativeEngine:
         return self._token_pool_decode_graph_signature_fallback.signatures
 
     def _token_pool_ensure_page_table_width(self, context_len: int) -> None:
+        backend = self._token_pool_decode_backend
+        if backend is not None:
+            backend.ensure_page_table_width(context_len)
+            return
         block_tables = self._token_pool_block_tables
         if block_tables is None:
             return
         block_tables.ensure_context_len(context_len)
 
     def _token_pool_reset_page_table_row(self, req_slot: int) -> None:
+        backend = self._token_pool_decode_backend
+        if backend is not None:
+            backend.reset_page_table_row(req_slot)
+            return
         block_tables = self._token_pool_block_tables
         if block_tables is None:
             return
         block_tables.reset_row(req_slot)
+
+    def _token_pool_snapshot_page_table_row(self, req_slot: int):
+        backend = self._token_pool_decode_backend
+        if backend is not None:
+            return backend.snapshot_page_table_row(req_slot)
+        block_tables = self._token_pool_block_tables
+        if block_tables is None:
+            return None
+        return block_tables.snapshot_row(req_slot)
+
+    def _token_pool_restore_page_table_row(self, req_slot: int, snapshot) -> None:
+        backend = self._token_pool_decode_backend
+        if backend is not None:
+            backend.restore_page_table_row(req_slot, snapshot)
+            return
+        block_tables = self._token_pool_block_tables
+        if block_tables is None:
+            return
+        block_tables.restore_row(req_slot, snapshot)
+
+    def _token_pool_set_page_table_block(
+        self,
+        req_slot: int,
+        logical_block: int,
+        physical_block: int,
+    ) -> None:
+        backend = self._token_pool_decode_backend
+        if backend is not None:
+            backend.set_page_table_block(req_slot, logical_block, physical_block)
+            return
+        block_tables = self._token_pool_block_tables
+        if block_tables is None:
+            return
+        block_tables.set_block(req_slot, logical_block, physical_block)
+
+    def _token_pool_clear_page_table_block(
+        self,
+        req_slot: int,
+        logical_block: int,
+    ) -> None:
+        backend = self._token_pool_decode_backend
+        if backend is not None:
+            backend.clear_page_table_block(req_slot, logical_block)
+            return
+        block_tables = self._token_pool_block_tables
+        if block_tables is None:
+            return
+        block_tables.clear_block(req_slot, logical_block)
 
     def _build_token_kv_pool(
         self,
@@ -2053,7 +2112,7 @@ class GemmaNativeEngine:
         page_owned_snapshot = set(self._token_pool_page_owned_slots.get(req.req_id, set()))
         block_table_snapshot = None
         if self._token_pool_block_tables is not None:
-            block_table_snapshot = self._token_pool_block_tables.snapshot_row(req_slot)
+            block_table_snapshot = self._token_pool_snapshot_page_table_row(req_slot)
         self._token_pool_clear_prefix(
             req.req_id,
             req_slot,
@@ -2109,7 +2168,7 @@ class GemmaNativeEngine:
                     self._token_pool_page_tables[req.req_id] = page_table_snapshot
                     self._token_pool_page_owned_slots[req.req_id] = page_owned_snapshot
                     if self._token_pool_block_tables is not None:
-                        self._token_pool_block_tables.restore_row(
+                        self._token_pool_restore_page_table_row(
                             req_slot,
                             block_table_snapshot,
                         )
@@ -2150,7 +2209,6 @@ class GemmaNativeEngine:
         owned_slots = self._token_pool_page_owned_slots.setdefault(req_id, set())
         req_slot = self._token_pool_req_slots.get(req_id)
         self._token_pool_ensure_page_table_width(start_position + n)
-        block_tables = self._token_pool_block_tables
         slots: list[int] = []
         for logical_pos in range(start_position, start_position + n):
             logical_block = logical_pos // block_size
@@ -2159,8 +2217,12 @@ class GemmaNativeEngine:
                 physical_block, block_slots = alloc_page(block_size)
                 page_table[logical_block] = int(physical_block)
                 owned_slots.update(int(slot) for slot in block_slots)
-            if block_tables is not None and req_slot is not None:
-                block_tables.set_block(req_slot, logical_block, physical_block)
+            if req_slot is not None:
+                self._token_pool_set_page_table_block(
+                    req_slot,
+                    logical_block,
+                    physical_block,
+                )
             slot = int(physical_block) * block_size + (logical_pos % block_size)
             if slot not in owned_slots:
                 raise RuntimeError("page-aligned token slot is not owned by request")
@@ -2317,7 +2379,7 @@ class GemmaNativeEngine:
                         )
                         if self._token_pool_block_tables is not None:
                             block_table_snapshot = (
-                                self._token_pool_block_tables.snapshot_row(req_slot)
+                                self._token_pool_snapshot_page_table_row(req_slot)
                             )
                     token_slot_tensor, token_slot_ids = (
                         self._token_pool_alloc_page_aligned_slots(
@@ -2648,14 +2710,12 @@ class GemmaNativeEngine:
         ]
         if not expired_logical_blocks:
             return
-        block_tables = self._token_pool_block_tables
         slots_to_free: list[int] = []
         for logical_block in sorted(expired_logical_blocks):
             physical_block = page_table.pop(logical_block, None)
             if physical_block is None:
                 continue
-            if block_tables is not None:
-                block_tables.clear_block(req_slot, logical_block)
+            self._token_pool_clear_page_table_block(req_slot, logical_block)
             start_slot = int(physical_block) * block_size
             for slot in range(start_slot, start_slot + block_size):
                 if slot in owned_slots:
@@ -2908,7 +2968,7 @@ class GemmaNativeEngine:
                     reservation.page_owned_snapshot
                 )
                 if self._token_pool_block_tables is not None:
-                    self._token_pool_block_tables.restore_row(
+                    self._token_pool_restore_page_table_row(
                         reservation.req_slot,
                         reservation.block_table_snapshot,
                     )
