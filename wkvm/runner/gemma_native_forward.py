@@ -1571,12 +1571,13 @@ def _attention_forward(
             current_value_states,
         )
     if token_pool_attention_call.decode_attention_enabled:
-        token_pool_kwargs = token_pool_attention_call.backend_decode_kwargs()
-        return _attention_forward_token_pool_gqa(
+        result = _token_pool_attention_backend().decode_call(
             attn,
             query_states,
-            **token_pool_kwargs,
+            attention_call=token_pool_attention_call,
+            timing_enabled=_native_forward_timing_enabled(),
         )
+        return result.output, result.weights
     if backend == "manual_gqa" or (
         backend == "sdpa_single_gqa"
         and query_states.shape[0] == 1

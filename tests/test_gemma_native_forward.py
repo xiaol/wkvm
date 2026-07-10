@@ -511,7 +511,7 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
         from types import SimpleNamespace
         import wkvm.runner.gemma_native_forward as native_forward
 
-        old_token_pool = native_forward._attention_forward_token_pool_gqa
+        old_backend = native_forward._TOKEN_POOL_ATTENTION_BACKEND
         events = []
         calls = {}
 
@@ -532,13 +532,16 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
                 events.append("enabled")
                 return True
 
-        def token_pool_dispatch(*args, **kwargs):
-            events.append("dispatch")
-            calls.update(kwargs)
-            return "token_pool", None
+        class Backend:
+            def decode_call(self, actual_attn, actual_query_states, **kwargs):
+                events.append("dispatch")
+                calls["attn"] = actual_attn
+                calls["query_states"] = actual_query_states
+                calls.update(kwargs["attention_call"].backend_decode_kwargs())
+                return SimpleNamespace(output="token_pool", weights=None)
 
         try:
-            native_forward._attention_forward_token_pool_gqa = token_pool_dispatch
+            native_forward._TOKEN_POOL_ATTENTION_BACKEND = Backend()
             actual = native_forward._attention_forward(
                 SimpleNamespace(num_key_value_groups=4, scaling=1.0),
                 FakeQuery(),
@@ -551,7 +554,7 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
                 current_value_states="current_value_states",
             )
         finally:
-            native_forward._attention_forward_token_pool_gqa = old_token_pool
+            native_forward._TOKEN_POOL_ATTENTION_BACKEND = old_backend
 
         self.assertEqual(actual, ("token_pool", None))
         self.assertEqual(events, ["kwargs", "enabled", "dispatch"])
