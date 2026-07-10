@@ -1538,6 +1538,45 @@ class NativeGemma4CausalLMOutput:
     shared_kv_states: dict[str, tuple[Any, Any]] | UserDict
 
 
+class NativeGemma4SharedKVState:
+    """HF-compatible shared-KV handoff for native Gemma4 attention."""
+
+    def load_shared_kv(
+        self,
+        attn: _NativeAttentionMeta,
+        shared_kv_states: dict[str, tuple[Any, Any]] | UserDict,
+        *,
+        query_device,
+        timing_enabled: bool,
+    ) -> tuple[Any, Any] | None:
+        if not attn.is_kv_shared_layer:
+            return None
+        phase_start = time.perf_counter() if timing_enabled else 0.0
+        if attn.layer_type not in shared_kv_states:
+            raise KeyError(
+                f"missing shared Gemma4 KV state for layer type {attn.layer_type!r}"
+            )
+        key_states, value_states = shared_kv_states[attn.layer_type]
+        key_states = key_states.to(query_device)
+        value_states = value_states.to(query_device)
+        if timing_enabled:
+            _record_native_timing(
+                "self_attention_shared_kv_wall_s",
+                time.perf_counter() - phase_start,
+            )
+        return key_states, value_states
+
+    def store_shared_kv(
+        self,
+        attn: _NativeAttentionMeta,
+        shared_kv_states: dict[str, tuple[Any, Any]] | UserDict,
+        key_states,
+        value_states,
+    ) -> None:
+        if attn.store_full_length_kv:
+            shared_kv_states[attn.layer_type] = key_states, value_states
+
+
 class NativeGemma4AttentionBackend:
     """Native attention dispatch wrapper for dense cache and token-pool backends."""
 
@@ -1635,6 +1674,7 @@ class NativeGemma4Attention:
         self.attention_backend = NativeGemma4AttentionBackend(
             self.native_attention_backend
         )
+        self.shared_kv_state = NativeGemma4SharedKVState()
         self.attn_meta = _NativeAttentionMeta(
             head_dim=int(hf_attn.head_dim),
             num_key_value_groups=int(hf_attn.num_key_value_groups),
@@ -1738,20 +1778,14 @@ class NativeGemma4Attention:
                 time.perf_counter() - phase_start,
             )
 
-        if attn.is_kv_shared_layer:
-            phase_start = time.perf_counter() if timing_enabled else 0.0
-            if attn.layer_type not in shared_kv_states:
-                raise KeyError(
-                    f"missing shared Gemma4 KV state for layer type {attn.layer_type!r}"
-                )
-            key_states, value_states = shared_kv_states[attn.layer_type]
-            key_states = key_states.to(query_states.device)
-            value_states = value_states.to(query_states.device)
-            if timing_enabled:
-                _record_native_timing(
-                    "self_attention_shared_kv_wall_s",
-                    time.perf_counter() - phase_start,
-                )
+        shared_kv = self.shared_kv_state.load_shared_kv(
+            attn,
+            shared_kv_states,
+            query_device=query_states.device,
+            timing_enabled=timing_enabled,
+        )
+        if shared_kv is not None:
+            key_states, value_states = shared_kv
         else:
             if key_raw is None:
                 phase_start = time.perf_counter() if timing_enabled else 0.0
@@ -1799,8 +1833,12 @@ class NativeGemma4Attention:
             wkvm_token_pool_decode=wkvm_token_pool_decode,
             timing_enabled=timing_enabled,
         )
-        if attn.store_full_length_kv:
-            shared_kv_states[attn.layer_type] = key_states, value_states
+        self.shared_kv_state.store_shared_kv(
+            attn,
+            shared_kv_states,
+            key_states,
+            value_states,
+        )
         phase_start = time.perf_counter() if timing_enabled else 0.0
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = _linear(attn_output, self.o_proj)

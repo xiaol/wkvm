@@ -125,10 +125,69 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
             native_layer.self_attn.attention_backend,
             NativeGemma4AttentionBackend,
         )
+        self.assertTrue(hasattr(native_layer.self_attn, "shared_kv_state"))
         self.assertIs(native_layer.attn_meta, native_layer.self_attn.attn_meta)
         self.assertIs(native_layer.q_proj, native_layer.self_attn.q_proj)
         self.assertIs(native_layer.o_proj, native_layer.self_attn.o_proj)
         self.assertEqual(native_layer.layer_type, native_layer.attn_meta.layer_type)
+
+    def test_attention_owns_shared_kv_state_handoff(self) -> None:
+        import torch
+        from wkvm.runner.gemma_native_forward import (
+            NativeGemma4SharedKVState,
+            _NativeAttentionMeta,
+        )
+
+        shared_kv_state = NativeGemma4SharedKVState()
+        shared_meta = _NativeAttentionMeta(
+            head_dim=4,
+            num_key_value_groups=1,
+            attention_dropout=0.0,
+            training=False,
+            scaling=1.0,
+            is_kv_shared_layer=True,
+            layer_type="sliding_attention",
+            store_full_length_kv=False,
+        )
+        key_states = torch.randn(1, 1, 3, 4)
+        value_states = torch.randn(1, 1, 3, 4)
+        shared_kv_states = UserDict(
+            {"sliding_attention": (key_states, value_states)}
+        )
+
+        loaded = shared_kv_state.load_shared_kv(
+            shared_meta,
+            shared_kv_states,
+            query_device=key_states.device,
+            timing_enabled=False,
+        )
+
+        self.assertIsNotNone(loaded)
+        self.assertIs(loaded[0], key_states)
+        self.assertIs(loaded[1], value_states)
+        with self.assertRaises(KeyError):
+            shared_kv_state.load_shared_kv(
+                shared_meta,
+                UserDict(),
+                query_device=key_states.device,
+                timing_enabled=False,
+            )
+
+        store_meta = _NativeAttentionMeta(
+            head_dim=4,
+            num_key_value_groups=1,
+            attention_dropout=0.0,
+            training=False,
+            scaling=1.0,
+            is_kv_shared_layer=False,
+            layer_type="sliding_attention",
+            store_full_length_kv=True,
+        )
+        stored = UserDict()
+        shared_kv_state.store_shared_kv(store_meta, stored, key_states, value_states)
+
+        self.assertIs(stored["sliding_attention"][0], key_states)
+        self.assertIs(stored["sliding_attention"][1], value_states)
 
     def test_prefill_layer_matches_hf_decoder_layer(self) -> None:
         import torch
