@@ -2541,7 +2541,12 @@ class GemmaNativeEngine:
             self._token_pool_sync_last_decode_batch_state()
             self.metrics.token_pool_decode_metadata_batches += 1
             self.metrics.token_pool_decode_metadata_rows += len(reqs)
-            for layer_type in self.last_token_pool_decode_covered_layer_types:
+            covered_layer_types = (
+                backend.current_covered_layer_types
+                if backend is not None
+                else frozenset()
+            )
+            for layer_type in covered_layer_types:
                 key = str(layer_type)
                 self.metrics.token_pool_decode_covered_layer_type_batches[key] = (
                     self.metrics.token_pool_decode_covered_layer_type_batches.get(
@@ -2911,12 +2916,9 @@ class GemmaNativeEngine:
         if pool is None:
             return
         backend = self._token_pool_decode_backend
-        batch_state = None if backend is None else backend.current_decode_batch_state
-        metadata_by_type = (
-            batch_state.metadata_by_layer_type
-            if batch_state is not None
-            else self.last_token_pool_decode_metadata or {}
-        )
+        if backend is None or backend.current_decode_batch_state is None:
+            return
+        metadata_by_type = backend.current_decode_batch_state.metadata_by_layer_type
         if "full_attention" not in metadata_by_type:
             return
         owner_layer_ids = self._token_pool_full_attention_owner_layer_ids()
