@@ -8,7 +8,7 @@ per-layer KV buffers, and flattened decode metadata.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import os
 import time
 from typing import Any, Iterable
@@ -1152,6 +1152,8 @@ class TokenPoolAttentionCall:
     plan: Any | None = None
     attention_kwargs: dict[str, Any] = field(default_factory=dict)
     decode_attention_enabled: bool = False
+    key_states_for_write: Any | None = None
+    value_states_for_write: Any | None = None
 
     def current_key_states(
         self,
@@ -1183,6 +1185,25 @@ class TokenPoolAttentionCall:
             bool(has_past_key_values)
             and not bool(is_kv_shared_layer)
             and not self.decode_attention_enabled
+        )
+
+    def with_current_kv(
+        self,
+        key_states: Any,
+        value_states: Any,
+        *,
+        is_kv_shared_layer: bool = False,
+    ) -> "TokenPoolAttentionCall":
+        return replace(
+            self,
+            key_states_for_write=self.current_key_states(
+                key_states,
+                is_kv_shared_layer=is_kv_shared_layer,
+            ),
+            value_states_for_write=self.current_value_states(
+                value_states,
+                is_kv_shared_layer=is_kv_shared_layer,
+            ),
         )
 
 

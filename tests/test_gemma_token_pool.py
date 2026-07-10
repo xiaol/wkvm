@@ -2825,6 +2825,16 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(call.current_value_states("value"), "value")
         self.assertIsNone(call.current_key_states("key", is_kv_shared_layer=True))
         self.assertIsNone(call.current_value_states("value", is_kv_shared_layer=True))
+        call_with_kv = call.with_current_kv("key", "value")
+        self.assertEqual(call_with_kv.key_states_for_write, "key")
+        self.assertEqual(call_with_kv.value_states_for_write, "value")
+        shared_call = call.with_current_kv(
+            "key",
+            "value",
+            is_kv_shared_layer=True,
+        )
+        self.assertIsNone(shared_call.key_states_for_write)
+        self.assertIsNone(shared_call.value_states_for_write)
         self.assertFalse(
             call.should_update_dense_cache(
                 has_past_key_values=True,

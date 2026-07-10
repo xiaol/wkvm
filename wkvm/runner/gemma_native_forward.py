@@ -1545,6 +1545,7 @@ def _attention_forward(
     token_kv_pool=None,
     layer_idx: int | None = None,
     token_pool_plan=None,
+    token_pool_attention_call=None,
     current_key_states=None,
     current_value_states=None,
 ):
@@ -1554,15 +1555,20 @@ def _attention_forward(
     backend = _normalize_attention_backend(backend)
     from wkvm.runner.gemma_token_pool import build_token_pool_attention_call
 
-    token_pool_attention_call = build_token_pool_attention_call(
-        token_pool_plan=token_pool_plan,
-        decode_metadata=decode_metadata,
-        paged_decode_metadata=paged_decode_metadata,
-        token_kv_pool=token_kv_pool,
-        layer_idx=layer_idx,
-        attention_mask_present=attention_mask is not None,
-        query_seq_len=query_states.shape[2],
-    )
+    if token_pool_attention_call is None:
+        token_pool_attention_call = build_token_pool_attention_call(
+            token_pool_plan=token_pool_plan,
+            decode_metadata=decode_metadata,
+            paged_decode_metadata=paged_decode_metadata,
+            token_kv_pool=token_kv_pool,
+            layer_idx=layer_idx,
+            attention_mask_present=attention_mask is not None,
+            query_seq_len=query_states.shape[2],
+        )
+        token_pool_attention_call = token_pool_attention_call.with_current_kv(
+            current_key_states,
+            current_value_states,
+        )
     plan_kwargs = token_pool_attention_call.attention_kwargs
     decode_metadata = plan_kwargs.get("decode_metadata")
     paged_decode_metadata = plan_kwargs.get("paged_decode_metadata")
@@ -1576,9 +1582,9 @@ def _attention_forward(
             paged_decode_metadata=paged_decode_metadata,
             token_kv_pool=token_kv_pool,
             layer_idx=int(layer_idx),
-            token_pool_plan=token_pool_plan,
-            current_key_states=current_key_states,
-            current_value_states=current_value_states,
+            token_pool_plan=token_pool_attention_call.plan,
+            current_key_states=token_pool_attention_call.key_states_for_write,
+            current_value_states=token_pool_attention_call.value_states_for_write,
         )
     if backend == "manual_gqa" or (
         backend == "sdpa_single_gqa"
@@ -2032,14 +2038,8 @@ class NativeGemma4TextDecoderLayer:
                 "self_attention_metadata_wall_s",
                 time.perf_counter() - phase_start,
             )
-        token_pool_plan = token_pool_attention_call.plan
-        token_pool_decode_attention = token_pool_attention_call.decode_attention_enabled
-
-        current_key_states = token_pool_attention_call.current_key_states(
+        token_pool_attention_call = token_pool_attention_call.with_current_kv(
             key_states,
-            is_kv_shared_layer=attn.is_kv_shared_layer,
-        )
-        current_value_states = token_pool_attention_call.current_value_states(
             value_states,
             is_kv_shared_layer=attn.is_kv_shared_layer,
         )
@@ -2068,9 +2068,7 @@ class NativeGemma4TextDecoderLayer:
             value_states,
             attention_mask,
             backend=self.native_attention_backend,
-            token_pool_plan=token_pool_plan,
-            current_key_states=current_key_states,
-            current_value_states=current_value_states,
+            token_pool_attention_call=token_pool_attention_call,
         )
         if timing_enabled:
             _record_native_timing(
