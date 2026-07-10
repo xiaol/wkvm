@@ -5251,6 +5251,31 @@ class TokenPoolDecodeBackendState:
         self._layer_plan_cache_key: tuple[Any, ...] | None = None
         self._layer_plan_cache: TokenPoolLayerPlan | None = None
 
+    def bind_storage(
+        self,
+        *,
+        allocator: Any | None = None,
+        kv_pool: Any | None = None,
+        token_pool_capacity: int | None = None,
+    ) -> None:
+        if kv_pool is not None and kv_pool is not self.kv_pool:
+            self.kv_pool = kv_pool
+            if token_pool_capacity is None:
+                token_pool_capacity = getattr(kv_pool, "capacity", None)
+            self._layer_plan_cache_key = None
+            self._layer_plan_cache = None
+        if allocator is not None and allocator is not self.allocator:
+            self.allocator = allocator
+            if self.full_attention_rows is None:
+                self.full_attention_rows = TokenPoolFullAttentionRowManager(
+                    allocator=allocator,
+                    block_size=self.block_size,
+                )
+            else:
+                self.full_attention_rows.allocator = allocator
+        if token_pool_capacity is not None:
+            self.token_pool_capacity = int(token_pool_capacity)
+
     def clear_decode_batch_state(self) -> None:
         self.current_decode_batch_state = None
 
@@ -6209,6 +6234,95 @@ class TokenPoolDecodeBackendState:
             self.table.free(req_id)
             self.request_slots.pop(req_id, None)
         return (None if req_slot is None else int(req_slot)), page_slots, token_slots
+
+    def release_prefill_sliding_storage(self, cache: Any) -> None:
+        if self.kv_pool is None or cache is None:
+            return
+        release = getattr(cache, "release_token_pool_covered_sliding_storage", None)
+        if release is None:
+            return
+        release({"sliding_attention"})
+
+    def available_prefill_tail(self, cache: Any, n: int) -> int:
+        pool = self.kv_pool
+        if pool is None:
+            return int(n)
+        if cache is None:
+            raise RuntimeError("token-pool attention requires a cache for prefill backfill")
+        layers = getattr(cache, "layers", None)
+        if layers is None:
+            raise RuntimeError("token-pool attention requires native Gemma cache layers")
+        available = int(n)
+        saw_layer = False
+        for layer_id in sorted(getattr(pool, "layer_specs", {})):
+            if pool.target_layer(layer_id) != layer_id:
+                continue
+            if layer_id >= len(layers):
+                continue
+            layer = layers[layer_id]
+            if not bool(getattr(layer, "is_sliding", False)):
+                continue
+            keys = getattr(layer, "keys", None)
+            values = getattr(layer, "values", None)
+            if keys is None or values is None:
+                raise RuntimeError(f"layer {layer_id} has no prefill KV to backfill")
+            if int(keys.shape[0]) != 1 or int(values.shape[0]) != 1:
+                raise RuntimeError("token-pool prefill backfill expects one cache row")
+            available = min(available, int(keys.shape[2]), int(values.shape[2]))
+            saw_layer = True
+        if not saw_layer:
+            raise RuntimeError("token-pool attention requires at least one sliding KV layer")
+        return max(0, int(available))
+
+    def backfill_prefill_tokens(
+        self,
+        cache: Any,
+        token_slots: Any,
+        n: int,
+        *,
+        token_slot_ids: list[int] | None = None,
+        release_covered: bool = False,
+    ) -> None:
+        pool = self.kv_pool
+        if pool is None:
+            return
+        if cache is None:
+            raise RuntimeError("token-pool attention requires a cache for prefill backfill")
+        layers = getattr(cache, "layers", None)
+        if layers is None:
+            raise RuntimeError("token-pool attention requires native Gemma cache layers")
+        for layer_id in sorted(getattr(pool, "layer_specs", {})):
+            if pool.target_layer(layer_id) != layer_id:
+                continue
+            if layer_id >= len(layers):
+                continue
+            layer = layers[layer_id]
+            if not bool(getattr(layer, "is_sliding", False)):
+                continue
+            keys = getattr(layer, "keys", None)
+            values = getattr(layer, "values", None)
+            if keys is None or values is None:
+                raise RuntimeError(f"layer {layer_id} has no prefill KV to backfill")
+            if int(keys.shape[0]) != 1 or int(values.shape[0]) != 1:
+                raise RuntimeError("token-pool prefill backfill expects one cache row")
+            tail_len = min(int(n), int(keys.shape[2]), int(values.shape[2]))
+            if tail_len != int(n):
+                raise RuntimeError(
+                    f"layer {layer_id} cache does not contain the requested prefill KV tail"
+                )
+            key_tail = keys[0, :, -tail_len:, :].permute(1, 0, 2).contiguous()
+            value_tail = values[0, :, -tail_len:, :].permute(1, 0, 2).contiguous()
+            write_slots = (
+                token_slot_ids[-tail_len:]
+                if token_slot_ids is not None
+                else token_slots[-tail_len:]
+            )
+            pool.set_kv(layer_id, write_slots, key_tail, value_tail)
+            if release_covered:
+                layer.keys = None
+                layer.values = None
+                if hasattr(layer, "_dense_storage_released"):
+                    layer._dense_storage_released = True
 
     def append_request_token_slots(self, req_id: str, slots: Iterable[int] | Any) -> None:
         req_id = str(req_id)

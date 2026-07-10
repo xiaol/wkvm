@@ -1851,6 +1851,18 @@ class GemmaNativeEngine:
             ),
         )
 
+    def _sync_token_pool_decode_backend_storage(self) -> None:
+        backend = self._token_pool_decode_backend
+        if backend is None:
+            return
+        backend.bind_storage(
+            allocator=self._token_slot_allocator,
+            kv_pool=self._token_kv_pool,
+            token_pool_capacity=(
+                None if self._token_kv_pool is None else self._token_kv_pool.capacity
+            ),
+        )
+
     def _token_pool_current_decode_batch_state(
         self,
     ) -> TokenPoolDecodeBatchState | None:
@@ -2219,6 +2231,7 @@ class GemmaNativeEngine:
         allocator = self._token_slot_allocator
         if table is None or allocator is None:
             return
+        self._sync_token_pool_decode_backend_storage()
         self._token_pool_admit_request(req)
         req_slot = self._token_pool_request_slot(req.req_id)
         current = self._token_pool_request_length(req_slot)
@@ -2380,14 +2393,21 @@ class GemmaNativeEngine:
         )
 
     def _token_pool_release_prefill_sliding_storage(self, cache) -> None:
-        if self._token_kv_pool is None or cache is None:
+        self._sync_token_pool_decode_backend_storage()
+        backend = self._token_pool_decode_backend
+        if backend is not None:
+            backend.release_prefill_sliding_storage(cache)
             return
-        release = getattr(cache, "release_token_pool_covered_sliding_storage", None)
-        if release is None:
-            return
-        release({"sliding_attention"})
+        if self._token_kv_pool is not None and cache is not None:
+            release = getattr(cache, "release_token_pool_covered_sliding_storage", None)
+            if release is not None:
+                release({"sliding_attention"})
 
     def _token_pool_available_prefill_tail(self, cache, n: int) -> int:
+        self._sync_token_pool_decode_backend_storage()
+        backend = self._token_pool_decode_backend
+        if backend is not None:
+            return backend.available_prefill_tail(cache, n)
         pool = self._token_kv_pool
         if pool is None:
             return int(n)
@@ -2427,6 +2447,18 @@ class GemmaNativeEngine:
         token_slot_ids: list[int] | None = None,
         release_covered: bool = False,
     ) -> None:
+        self._sync_token_pool_decode_backend_storage()
+        backend = self._token_pool_decode_backend
+        if backend is not None:
+            backend.backfill_prefill_tokens(
+                cache,
+                token_slots,
+                n,
+                token_slot_ids=token_slot_ids,
+                release_covered=release_covered,
+            )
+            self._record_cuda_memory_phase("token_pool_prefill_backfill")
+            return
         pool = self._token_kv_pool
         if pool is None:
             return

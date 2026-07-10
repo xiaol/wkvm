@@ -1431,6 +1431,89 @@ class TestGemmaTokenPool(unittest.TestCase):
         )
         self.assertFalse(unsupported.supports_full_attention_decode_metadata)
 
+    def test_token_pool_decode_backend_backfills_prefill_tail(self) -> None:
+        from types import SimpleNamespace
+
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenPoolDecodeBackendState,
+        )
+
+        class FakePool:
+            def __init__(self) -> None:
+                self.layer_specs = {0: object()}
+                self.writes = []
+
+            def target_layer(self, layer_id):
+                return int(layer_id)
+
+            def set_kv(self, layer_id, slots, keys, values) -> None:
+                self.writes.append(
+                    {
+                        "layer_id": int(layer_id),
+                        "slots": list(slots),
+                        "keys": keys.clone(),
+                        "values": values.clone(),
+                    }
+                )
+
+        class FakeCache:
+            def __init__(self, layer) -> None:
+                self.layers = [layer]
+                self.released = None
+
+            def release_token_pool_covered_sliding_storage(self, layer_types) -> None:
+                self.released = set(layer_types)
+
+        layer = SimpleNamespace(
+            is_sliding=True,
+            keys=torch.arange(6, dtype=torch.float32).reshape(1, 1, 3, 2),
+            values=torch.arange(6, dtype=torch.float32).reshape(1, 1, 3, 2) + 100,
+            _dense_storage_released=False,
+        )
+        cache = FakeCache(layer)
+        pool = FakePool()
+        backend = TokenPoolDecodeBackendState(
+            table=ReqToTokenTable(max_requests=1, max_context_len=8),
+            kv_pool=pool,
+        )
+
+        self.assertEqual(backend.available_prefill_tail(cache, 4), 3)
+        backend.backfill_prefill_tokens(
+            cache,
+            torch.tensor([8, 9, 10], dtype=torch.int32),
+            2,
+            token_slot_ids=[8, 9, 10],
+            release_covered=True,
+        )
+        backend.release_prefill_sliding_storage(cache)
+
+        self.assertEqual(len(pool.writes), 1)
+        write = pool.writes[0]
+        self.assertEqual(write["layer_id"], 0)
+        self.assertEqual(write["slots"], [9, 10])
+        self.assertTrue(
+            torch.equal(
+                write["keys"],
+                torch.tensor([[[2.0, 3.0]], [[4.0, 5.0]]]),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                write["values"],
+                torch.tensor([[[102.0, 103.0]], [[104.0, 105.0]]]),
+            )
+        )
+        self.assertIsNone(layer.keys)
+        self.assertIsNone(layer.values)
+        self.assertTrue(layer._dense_storage_released)
+        self.assertEqual(cache.released, {"sliding_attention"})
+
     def test_token_pool_decode_backend_commits_decode_transaction_prefix(self) -> None:
         try:
             import torch  # noqa: F401
