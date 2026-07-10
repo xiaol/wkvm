@@ -1538,6 +1538,82 @@ class NativeGemma4CausalLMOutput:
     shared_kv_states: dict[str, tuple[Any, Any]] | UserDict
 
 
+class NativeGemma4AttentionBackend:
+    """Native attention dispatch wrapper for dense cache and token-pool backends."""
+
+    def __init__(self, native_attention_backend: str) -> None:
+        self.native_attention_backend = _normalize_attention_backend(
+            native_attention_backend
+        )
+
+    def __call__(self, *args, **kwargs):
+        return self.forward(*args, **kwargs)
+
+    def forward(
+        self,
+        attn: _NativeAttentionMeta,
+        *,
+        layer_idx: int,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        past_key_values,
+        wkvm_token_pool_decode,
+        timing_enabled: bool,
+    ):
+        phase_start = time.perf_counter() if timing_enabled else 0.0
+        from wkvm.runner.gemma_token_pool import resolve_token_pool_attention_call
+
+        token_pool_attention_call = resolve_token_pool_attention_call(
+            wkvm_token_pool_decode,
+            layer_idx,
+            attn.layer_type,
+            attention_mask_present=attention_mask is not None,
+            query_seq_len=query_states.shape[2],
+        )
+        if timing_enabled:
+            _record_native_timing(
+                "self_attention_metadata_wall_s",
+                time.perf_counter() - phase_start,
+            )
+        token_pool_kv_binding = token_pool_attention_call.bind_layer_kv(
+            key_states,
+            value_states,
+            has_past_key_values=past_key_values is not None,
+            is_kv_shared_layer=attn.is_kv_shared_layer,
+        )
+        token_pool_attention_call = token_pool_kv_binding.attention_call
+        if token_pool_kv_binding.should_update_dense_cache:
+            phase_start = time.perf_counter() if timing_enabled else 0.0
+            key_states, value_states = past_key_values.update(
+                key_states,
+                value_states,
+                layer_idx,
+            )
+            if timing_enabled:
+                _record_native_timing(
+                    "self_attention_cache_update_wall_s",
+                    time.perf_counter() - phase_start,
+                )
+        phase_start = time.perf_counter() if timing_enabled else 0.0
+        attn_output, attn_weights = _attention_forward(
+            attn,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            backend=self.native_attention_backend,
+            token_pool_attention_call=token_pool_attention_call,
+        )
+        if timing_enabled:
+            _record_native_timing(
+                "self_attention_attention_wall_s",
+                time.perf_counter() - phase_start,
+            )
+        return attn_output, attn_weights, key_states, value_states
+
+
 class NativeGemma4Attention:
     """Native Gemma4 attention math and token-pool backend dispatch."""
 
@@ -1555,6 +1631,9 @@ class NativeGemma4Attention:
         self.native_attention_backend = _normalize_attention_backend(native_attention_backend)
         self.native_projection_backend = _normalize_projection_backend(
             native_projection_backend
+        )
+        self.attention_backend = NativeGemma4AttentionBackend(
+            self.native_attention_backend
         )
         self.attn_meta = _NativeAttentionMeta(
             head_dim=int(hf_attn.head_dim),
@@ -1709,58 +1788,20 @@ class NativeGemma4Attention:
                     time.perf_counter() - phase_start,
                 )
 
-        phase_start = time.perf_counter() if timing_enabled else 0.0
-        from wkvm.runner.gemma_token_pool import resolve_token_pool_attention_call
-
-        token_pool_attention_call = resolve_token_pool_attention_call(
-            wkvm_token_pool_decode,
-            self.layer_idx,
-            attn.layer_type,
-            attention_mask_present=attention_mask is not None,
-            query_seq_len=query_states.shape[2],
+        attn_output, attn_weights, key_states, value_states = self.attention_backend(
+            attn,
+            layer_idx=self.layer_idx,
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            wkvm_token_pool_decode=wkvm_token_pool_decode,
+            timing_enabled=timing_enabled,
         )
-        if timing_enabled:
-            _record_native_timing(
-                "self_attention_metadata_wall_s",
-                time.perf_counter() - phase_start,
-            )
-        token_pool_kv_binding = token_pool_attention_call.bind_layer_kv(
-            key_states,
-            value_states,
-            has_past_key_values=past_key_values is not None,
-            is_kv_shared_layer=attn.is_kv_shared_layer,
-        )
-        token_pool_attention_call = token_pool_kv_binding.attention_call
-        if token_pool_kv_binding.should_update_dense_cache:
-            phase_start = time.perf_counter() if timing_enabled else 0.0
-            key_states, value_states = past_key_values.update(
-                key_states,
-                value_states,
-                self.layer_idx,
-            )
-            if timing_enabled:
-                _record_native_timing(
-                    "self_attention_cache_update_wall_s",
-                    time.perf_counter() - phase_start,
-                )
         if attn.store_full_length_kv:
             shared_kv_states[attn.layer_type] = key_states, value_states
         phase_start = time.perf_counter() if timing_enabled else 0.0
-        attn_output, attn_weights = _attention_forward(
-            attn,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            backend=self.native_attention_backend,
-            token_pool_attention_call=token_pool_attention_call,
-        )
-        if timing_enabled:
-            _record_native_timing(
-                "self_attention_attention_wall_s",
-                time.perf_counter() - phase_start,
-            )
-            phase_start = time.perf_counter()
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = _linear(attn_output, self.o_proj)
         if timing_enabled:

@@ -112,6 +112,7 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
         from transformers.models.gemma4.modeling_gemma4 import Gemma4TextDecoderLayer
         from wkvm.runner.gemma_native_forward import (
             NativeGemma4Attention,
+            NativeGemma4AttentionBackend,
             NativeGemma4TextDecoderLayer,
         )
 
@@ -120,6 +121,10 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
         native_layer = NativeGemma4TextDecoderLayer(hf_layer)
 
         self.assertIsInstance(native_layer.self_attn, NativeGemma4Attention)
+        self.assertIsInstance(
+            native_layer.self_attn.attention_backend,
+            NativeGemma4AttentionBackend,
+        )
         self.assertIs(native_layer.attn_meta, native_layer.self_attn.attn_meta)
         self.assertIs(native_layer.q_proj, native_layer.self_attn.q_proj)
         self.assertIs(native_layer.o_proj, native_layer.self_attn.o_proj)
