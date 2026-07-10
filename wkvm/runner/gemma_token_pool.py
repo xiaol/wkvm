@@ -4881,6 +4881,7 @@ class TokenPoolDecodeBackendState:
                 block_size=block_size,
             )
         )
+        self.request_slots: dict[str, int] = {}
         self.request_page_tables: dict[str, dict[int, int]] = {}
         self.request_page_owned_slots: dict[str, set[int]] = {}
 
@@ -5145,10 +5146,15 @@ class TokenPoolDecodeBackendState:
     def stats(
         self,
         *,
-        active_request_slots: int = 0,
+        active_request_slots: int | None = None,
         attention_enabled: bool = False,
         paged_block_size: int | None = None,
     ) -> dict[str, Any]:
+        active_request_slot_count = (
+            self.active_request_slots
+            if active_request_slots is None
+            else int(active_request_slots)
+        )
         table_bytes = (
             self.table.req_to_token.numel() * self.table.req_to_token.element_size()
         )
@@ -5157,7 +5163,7 @@ class TokenPoolDecodeBackendState:
         stats = {
             "enabled": True,
             "attention_enabled": bool(attention_enabled),
-            "active_request_slots": max(0, int(active_request_slots)),
+            "active_request_slots": max(0, active_request_slot_count),
             "allocated_token_slots": int(getattr(allocator, "allocated_count", 0) or 0),
             "free_token_slots": int(getattr(allocator, "free_count", 0) or 0),
             "next_token_slot": int(getattr(allocator, "next_slot", 0) or 0),
@@ -5254,6 +5260,35 @@ class TokenPoolDecodeBackendState:
         if block_tables is None:
             return
         block_tables.clear_block(req_slot, logical_block)
+
+    @property
+    def active_request_slots(self) -> int:
+        return len(self.request_slots)
+
+    def has_request(self, req_id: str) -> bool:
+        return str(req_id) in self.request_slots
+
+    def request_slot_for(self, req_id: str) -> int:
+        return self.request_slots[str(req_id)]
+
+    def admit_request(self, req_id: str) -> int:
+        req_id = str(req_id)
+        existing = self.request_slots.get(req_id)
+        if existing is not None:
+            return int(existing)
+        req_slot = int(self.table.allocate(req_id))
+        self.request_slots[req_id] = req_slot
+        self.admit_request_page_state(req_id, req_slot)
+        return req_slot
+
+    def release_request(self, req_id: str) -> tuple[int | None, set[int]]:
+        req_id = str(req_id)
+        req_slot = self.request_slots.get(req_id)
+        page_slots = self.release_request_page_state(req_id, req_slot)
+        if req_slot is not None:
+            self.table.free(req_id)
+            self.request_slots.pop(req_id, None)
+        return (None if req_slot is None else int(req_slot)), page_slots
 
     def admit_request_page_state(self, req_id: str, req_slot: int | None = None) -> None:
         req_id = str(req_id)

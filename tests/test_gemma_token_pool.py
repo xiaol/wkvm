@@ -650,6 +650,54 @@ class TestGemmaTokenPool(unittest.TestCase):
         backend.reset_page_table_row(0)
         self.assertEqual(block_tables.tensor[0, :3].tolist(), [-1, -1, -1])
 
+    def test_decode_backend_owns_request_slot_lifecycle(self) -> None:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenPoolBlockTables,
+            TokenPoolDecodeBackendState,
+            TokenSlotAllocator,
+        )
+
+        table = ReqToTokenTable(max_requests=1, max_context_len=8)
+        block_tables = TokenPoolBlockTables(
+            max_requests=1,
+            max_context_len=8,
+            block_size=4,
+        )
+        allocator = TokenSlotAllocator(capacity=16)
+        backend = TokenPoolDecodeBackendState(
+            table=table,
+            allocator=allocator,
+            block_tables=block_tables,
+            block_size=4,
+        )
+
+        req_slot = backend.admit_request("req")
+        self.assertEqual(req_slot, 0)
+        self.assertTrue(backend.has_request("req"))
+        self.assertEqual(backend.request_slot_for("req"), req_slot)
+        self.assertEqual(backend.active_request_slots, 1)
+        self.assertEqual(backend.request_slots, {"req": 0})
+        self.assertEqual(backend.admit_request("req"), req_slot)
+
+        backend.allocate_page_aligned_slots("req", 0, 1, req_slot=req_slot)
+        self.assertEqual(allocator.allocated_count, 4)
+        released_req_slot, released_page_slots = backend.release_request("req")
+
+        self.assertEqual(released_req_slot, req_slot)
+        self.assertEqual(released_page_slots, {0, 1, 2, 3})
+        self.assertFalse(backend.has_request("req"))
+        self.assertEqual(backend.active_request_slots, 0)
+        self.assertEqual(allocator.allocated_count, 0)
+        self.assertEqual(block_tables.tensor.tolist(), [[-1, -1]])
+        with self.assertRaises(KeyError):
+            table.slot_for("req")
+
     def test_decode_backend_owns_request_page_state_rollback_and_release(self) -> None:
         try:
             import torch  # noqa: F401

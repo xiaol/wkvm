@@ -718,10 +718,13 @@ class GemmaNativeEngine:
             backend = self._token_pool_decode_backend
             row_slots = None if backend is None else backend.full_attention_transient_slots
             row_records = None if backend is None else backend.full_attention_row_records
+            request_slots = None if backend is None else backend.request_slots
             page_tables = None if backend is None else backend.request_page_tables
             page_owned_slots = (
                 None if backend is None else backend.request_page_owned_slots
             )
+            if request_slots is not None:
+                self._token_pool_req_slots = request_slots
             if page_tables is not None:
                 self._token_pool_page_tables = page_tables
             if page_owned_slots is not None:
@@ -2044,7 +2047,6 @@ class GemmaNativeEngine:
         if backend is None:
             return {"enabled": False}
         return backend.stats(
-            active_request_slots=len(self._token_pool_req_slots),
             attention_enabled=self.enable_token_pool_attention,
             paged_block_size=self.token_pool_paged_block_size,
         )
@@ -2055,13 +2057,14 @@ class GemmaNativeEngine:
             return
         if req.req_id in self._token_pool_req_slots:
             return
-        req_slot = table.allocate(req.req_id)
-        self._token_pool_req_slots[req.req_id] = req_slot
-        self._token_pool_token_slots[req.req_id] = []
         backend = self._token_pool_decode_backend
         if backend is not None:
-            backend.admit_request_page_state(req.req_id, req_slot)
+            backend.admit_request(req.req_id)
+            self._token_pool_token_slots[req.req_id] = []
         else:
+            req_slot = table.allocate(req.req_id)
+            self._token_pool_req_slots[req.req_id] = req_slot
+            self._token_pool_token_slots[req.req_id] = []
             self._token_pool_page_tables[req.req_id] = {}
             self._token_pool_page_owned_slots[req.req_id] = set()
             self._token_pool_reset_page_table_row(req_slot)
@@ -2075,7 +2078,7 @@ class GemmaNativeEngine:
         req_slot = self._token_pool_req_slots.get(req_id)
         backend = self._token_pool_decode_backend
         if backend is not None:
-            page_slots = backend.release_request_page_state(req_id, req_slot)
+            _, page_slots = backend.release_request(req_id)
         else:
             if req_slot is not None:
                 self._token_pool_reset_page_table_row(req_slot)
@@ -2086,7 +2089,7 @@ class GemmaNativeEngine:
             token_slots = [slot for slot in token_slots if slot not in page_slots]
         if token_slots:
             allocator.free_slots(token_slots)
-        if req_id in self._token_pool_req_slots:
+        if backend is None and req_id in self._token_pool_req_slots:
             table.free(req_id)
             self._token_pool_req_slots.pop(req_id, None)
 
