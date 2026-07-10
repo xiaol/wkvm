@@ -1916,15 +1916,14 @@ class NativeGemma4TextDecoderLayer:
                 "self_attention_metadata_wall_s",
                 time.perf_counter() - phase_start,
             )
-        token_pool_attention_call = token_pool_attention_call.with_current_kv(
+        token_pool_kv_binding = token_pool_attention_call.bind_layer_kv(
             key_states,
             value_states,
-            is_kv_shared_layer=attn.is_kv_shared_layer,
-        )
-        if token_pool_attention_call.should_update_dense_cache(
             has_past_key_values=past_key_values is not None,
             is_kv_shared_layer=attn.is_kv_shared_layer,
-        ):
+        )
+        token_pool_attention_call = token_pool_kv_binding.attention_call
+        if token_pool_kv_binding.should_update_dense_cache:
             phase_start = time.perf_counter() if timing_enabled else 0.0
             key_states, value_states = past_key_values.update(
                 key_states,

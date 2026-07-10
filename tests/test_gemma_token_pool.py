@@ -3409,6 +3409,15 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(call.current_value_states("value"), "value")
         self.assertIsNone(call.current_key_states("key", is_kv_shared_layer=True))
         self.assertIsNone(call.current_value_states("value", is_kv_shared_layer=True))
+        layer_kv = call.bind_layer_kv(
+            "key",
+            "value",
+            has_past_key_values=True,
+        )
+        self.assertIs(layer_kv.attention_call.plan, plan)
+        self.assertEqual(layer_kv.attention_call.key_states_for_write, "key")
+        self.assertEqual(layer_kv.attention_call.value_states_for_write, "value")
+        self.assertFalse(layer_kv.should_update_dense_cache)
         call_with_kv = call.with_current_kv("key", "value")
         self.assertEqual(call_with_kv.key_states_for_write, "key")
         self.assertEqual(call_with_kv.value_states_for_write, "value")
@@ -3432,6 +3441,15 @@ class TestGemmaTokenPool(unittest.TestCase):
         )
         self.assertIsNone(shared_call.key_states_for_write)
         self.assertIsNone(shared_call.value_states_for_write)
+        shared_layer_kv = call.bind_layer_kv(
+            "key",
+            "value",
+            has_past_key_values=True,
+            is_kv_shared_layer=True,
+        )
+        self.assertIsNone(shared_layer_kv.attention_call.key_states_for_write)
+        self.assertIsNone(shared_layer_kv.attention_call.value_states_for_write)
+        self.assertFalse(shared_layer_kv.should_update_dense_cache)
         self.assertFalse(
             call.should_update_dense_cache(
                 has_past_key_values=True,
@@ -3466,6 +3484,14 @@ class TestGemmaTokenPool(unittest.TestCase):
         )
         self.assertFalse(masked_call.decode_attention_enabled)
         self.assertIsNone(masked_call.current_key_states("key"))
+        masked_layer_kv = masked_call.bind_layer_kv(
+            "key",
+            "value",
+            has_past_key_values=True,
+        )
+        self.assertIsNone(masked_layer_kv.attention_call.key_states_for_write)
+        self.assertIsNone(masked_layer_kv.attention_call.value_states_for_write)
+        self.assertTrue(masked_layer_kv.should_update_dense_cache)
         self.assertTrue(
             masked_call.should_update_dense_cache(
                 has_past_key_values=True,

@@ -1204,6 +1204,27 @@ class TokenPoolAttentionCall:
             and not self.decode_attention_enabled
         )
 
+    def bind_layer_kv(
+        self,
+        key_states: Any,
+        value_states: Any,
+        *,
+        has_past_key_values: bool,
+        is_kv_shared_layer: bool = False,
+    ) -> "TokenPoolAttentionLayerKVBinding":
+        attention_call = self.with_current_kv(
+            key_states,
+            value_states,
+            is_kv_shared_layer=is_kv_shared_layer,
+        )
+        return TokenPoolAttentionLayerKVBinding(
+            attention_call=attention_call,
+            should_update_dense_cache=attention_call.should_update_dense_cache(
+                has_past_key_values=has_past_key_values,
+                is_kv_shared_layer=is_kv_shared_layer,
+            ),
+        )
+
     def with_current_kv(
         self,
         key_states: Any,
@@ -1249,6 +1270,12 @@ class TokenPoolAttentionCall:
 
     def current_kv_for_backend(self) -> tuple[Any | None, Any | None]:
         return self.key_states_for_write, self.value_states_for_write
+
+
+@dataclass(frozen=True)
+class TokenPoolAttentionLayerKVBinding:
+    attention_call: TokenPoolAttentionCall
+    should_update_dense_cache: bool
 
 
 def token_pool_attention_plan_kwargs(token_pool_plan: Any) -> dict[str, Any]:
