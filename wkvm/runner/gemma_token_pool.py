@@ -5131,6 +5131,73 @@ class TokenPoolDecodeBackendState:
     ) -> Any:
         return token_pool_attention_mask_for_decode(attention_mask, token_pool_decode)
 
+    def stats(
+        self,
+        *,
+        active_request_slots: int = 0,
+        attention_enabled: bool = False,
+        paged_block_size: int | None = None,
+    ) -> dict[str, Any]:
+        table_bytes = (
+            self.table.req_to_token.numel() * self.table.req_to_token.element_size()
+        )
+        allocator = self.allocator
+        kv_pool = self.kv_pool
+        stats = {
+            "enabled": True,
+            "attention_enabled": bool(attention_enabled),
+            "active_request_slots": max(0, int(active_request_slots)),
+            "allocated_token_slots": int(getattr(allocator, "allocated_count", 0) or 0),
+            "free_token_slots": int(getattr(allocator, "free_count", 0) or 0),
+            "next_token_slot": int(getattr(allocator, "next_slot", 0) or 0),
+            "token_slot_high_watermark": int(
+                getattr(allocator, "high_watermark", 0) or 0
+            ),
+            "token_slot_capacity": getattr(allocator, "capacity", None),
+            "paged_block_size": paged_block_size,
+            "page_table_metadata_max_rows": self.page_table_metadata_max_rows,
+            "max_context_len": self.table.max_context_len,
+            "metadata_bytes": int(table_bytes),
+            "kv_pool_bytes": 0 if kv_pool is None else kv_pool.state_bytes(),
+            "kv_pool_layers": 0 if kv_pool is None else len(kv_pool.layer_specs),
+        }
+        if kv_pool is not None:
+            stats.update(
+                {
+                    "kv_set_calls": int(getattr(kv_pool, "kv_set_calls", 0)),
+                    "kv_set_tokens": int(getattr(kv_pool, "kv_set_tokens", 0)),
+                    "kv_set_index_copy_calls": int(
+                        getattr(kv_pool, "kv_set_index_copy_calls", 0)
+                    ),
+                    "kv_set_slice_copy_calls": int(
+                        getattr(kv_pool, "kv_set_slice_copy_calls", 0)
+                    ),
+                    "kv_set_triton_copy_calls": int(
+                        getattr(kv_pool, "kv_set_triton_copy_calls", 0)
+                    ),
+                    "kv_set_triton_fallback_calls": int(
+                        getattr(kv_pool, "kv_set_triton_fallback_calls", 0)
+                    ),
+                    "kv_set_wall_s": float(getattr(kv_pool, "kv_set_wall_s", 0.0)),
+                    "kv_set_index_copy_wall_s": float(
+                        getattr(kv_pool, "kv_set_index_copy_wall_s", 0.0)
+                    ),
+                    "kv_set_slice_copy_wall_s": float(
+                        getattr(kv_pool, "kv_set_slice_copy_wall_s", 0.0)
+                    ),
+                    "kv_set_triton_copy_wall_s": float(
+                        getattr(kv_pool, "kv_set_triton_copy_wall_s", 0.0)
+                    ),
+                }
+            )
+        page_table = self.page_table_tensor
+        if page_table is not None:
+            stats["page_table_tensor_shape"] = tuple(int(dim) for dim in page_table.shape)
+        block_tables = self.block_tables
+        if block_tables is not None:
+            stats["block_table_bytes"] = int(block_tables.state_bytes())
+        return stats
+
     @property
     def page_table_tensor(self):
         block_tables = self.block_tables

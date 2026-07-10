@@ -1974,66 +1974,14 @@ class GemmaNativeEngine:
         return specs
 
     def _token_pool_stats(self) -> dict[str, Any]:
-        table = self._token_table
-        allocator = self._token_slot_allocator
-        if table is None or allocator is None:
+        backend = self._token_pool_decode_backend
+        if backend is None:
             return {"enabled": False}
-        table_bytes = table.req_to_token.numel() * table.req_to_token.element_size()
-        kv_pool = self._token_kv_pool
-        stats = {
-            "enabled": True,
-            "attention_enabled": self.enable_token_pool_attention,
-            "active_request_slots": len(self._token_pool_req_slots),
-            "allocated_token_slots": allocator.allocated_count,
-            "free_token_slots": allocator.free_count,
-            "next_token_slot": allocator.next_slot,
-            "token_slot_high_watermark": allocator.high_watermark,
-            "token_slot_capacity": allocator.capacity,
-            "paged_block_size": self.token_pool_paged_block_size,
-            "page_table_metadata_max_rows": self.token_pool_page_table_metadata_max_rows,
-            "max_context_len": table.max_context_len,
-            "metadata_bytes": int(table_bytes),
-            "kv_pool_bytes": 0 if kv_pool is None else kv_pool.state_bytes(),
-            "kv_pool_layers": 0 if kv_pool is None else len(kv_pool.layer_specs),
-        }
-        if kv_pool is not None:
-            stats.update(
-                {
-                    "kv_set_calls": int(getattr(kv_pool, "kv_set_calls", 0)),
-                    "kv_set_tokens": int(getattr(kv_pool, "kv_set_tokens", 0)),
-                    "kv_set_index_copy_calls": int(
-                        getattr(kv_pool, "kv_set_index_copy_calls", 0)
-                    ),
-                    "kv_set_slice_copy_calls": int(
-                        getattr(kv_pool, "kv_set_slice_copy_calls", 0)
-                    ),
-                    "kv_set_triton_copy_calls": int(
-                        getattr(kv_pool, "kv_set_triton_copy_calls", 0)
-                    ),
-                    "kv_set_triton_fallback_calls": int(
-                        getattr(kv_pool, "kv_set_triton_fallback_calls", 0)
-                    ),
-                    "kv_set_wall_s": float(getattr(kv_pool, "kv_set_wall_s", 0.0)),
-                    "kv_set_index_copy_wall_s": float(
-                        getattr(kv_pool, "kv_set_index_copy_wall_s", 0.0)
-                    ),
-                    "kv_set_slice_copy_wall_s": float(
-                        getattr(kv_pool, "kv_set_slice_copy_wall_s", 0.0)
-                    ),
-                    "kv_set_triton_copy_wall_s": float(
-                        getattr(kv_pool, "kv_set_triton_copy_wall_s", 0.0)
-                    ),
-                }
-            )
-        page_table = self._token_pool_page_table_tensor
-        if page_table is not None:
-            stats["page_table_tensor_shape"] = tuple(
-                int(dim) for dim in page_table.shape
-            )
-        block_tables = self._token_pool_block_tables
-        if block_tables is not None:
-            stats["block_table_bytes"] = int(block_tables.state_bytes())
-        return stats
+        return backend.stats(
+            active_request_slots=len(self._token_pool_req_slots),
+            attention_enabled=self.enable_token_pool_attention,
+            paged_block_size=self.token_pool_paged_block_size,
+        )
 
     def _token_pool_admit_request(self, req: Request) -> None:
         table = self._token_table

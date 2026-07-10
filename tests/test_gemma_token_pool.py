@@ -825,6 +825,29 @@ class TestGemmaTokenPool(unittest.TestCase):
         backend.clear_full_attention_rows("transient")
         self.assertEqual(transient_slots, {})
         self.assertEqual(allocator.allocated_count, 0)
+        self.assertEqual(
+            backend.stats(
+                active_request_slots=1,
+                attention_enabled=True,
+                paged_block_size=4,
+            ),
+            {
+                "enabled": True,
+                "attention_enabled": True,
+                "active_request_slots": 1,
+                "allocated_token_slots": 0,
+                "free_token_slots": 8,
+                "next_token_slot": 8,
+                "token_slot_high_watermark": 8,
+                "token_slot_capacity": 24,
+                "paged_block_size": 4,
+                "page_table_metadata_max_rows": 2,
+                "max_context_len": 8,
+                "metadata_bytes": 96,
+                "kv_pool_bytes": 0,
+                "kv_pool_layers": 0,
+            },
+        )
 
     def test_token_pool_decode_backend_builds_sliding_metadata_from_block_tables(self) -> None:
         try:
