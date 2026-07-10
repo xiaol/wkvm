@@ -4103,6 +4103,7 @@ class TestGemmaTokenPool(unittest.TestCase):
             TokenPoolAttentionPlan,
             TokenPoolDecodeContext,
             build_decode_metadata_from_token_slot_rows,
+            resolve_token_pool_attention_call,
             resolve_token_pool_attention_plan,
         )
 
@@ -4156,6 +4157,29 @@ class TestGemmaTokenPool(unittest.TestCase):
                 "token_kv_pool": pool,
                 "layer_idx": 7,
             },
+        )
+        attention_call = context.attention_call_for_layer(
+            7,
+            "full_attention",
+            query_seq_len=1,
+        )
+        self.assertTrue(attention_call.decode_attention_enabled)
+        self.assertEqual(attention_call.backend_decode_kwargs()["layer_idx"], 7)
+        self.assertIs(
+            attention_call.backend_decode_kwargs()["decode_metadata"],
+            metadata,
+        )
+        resolved_call = resolve_token_pool_attention_call(
+            context,
+            7,
+            "full_attention",
+            query_seq_len=1,
+        )
+        self.assertTrue(resolved_call.decode_attention_enabled)
+        self.assertEqual(resolved_call.backend_decode_kwargs()["layer_idx"], 7)
+        self.assertIs(
+            resolved_call.backend_decode_kwargs()["decode_metadata"],
+            metadata,
         )
 
         key_states = object()

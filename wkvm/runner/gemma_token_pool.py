@@ -1622,6 +1622,20 @@ def resolve_token_pool_attention_call(
 ) -> TokenPoolAttentionCall:
     if token_pool_decode is None or layer_idx is None or layer_type is None:
         return TokenPoolAttentionCall()
+    attention_call_for_layer = getattr(
+        token_pool_decode,
+        "attention_call_for_layer",
+        None,
+    )
+    if attention_call_for_layer is not None:
+        call = attention_call_for_layer(
+            layer_idx,
+            layer_type,
+            attention_mask_present=attention_mask_present,
+            query_seq_len=query_seq_len,
+        )
+        if call is not None:
+            return call
     plan = resolve_token_pool_attention_plan(
         token_pool_decode,
         layer_idx,
@@ -1759,6 +1773,23 @@ class TokenPoolDecodeContext:
             layer_idx=layer_idx,
             attention_mask_present=attention_mask_present,
             query_seq_len=query_seq_len,
+        )
+
+    def attention_call_for_layer(
+        self,
+        layer_idx: int | None,
+        layer_type: str | None,
+        *,
+        attention_mask_present: bool = False,
+        query_seq_len: int | None = None,
+    ) -> TokenPoolAttentionCall:
+        return build_token_pool_attention_call(
+            token_pool_plan=self.attention_plan_for_layer(
+                layer_idx,
+                layer_type,
+                attention_mask_present=attention_mask_present,
+                query_seq_len=query_seq_len,
+            )
         )
 
     def attention_binding_for_layer(
