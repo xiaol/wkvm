@@ -1494,22 +1494,25 @@ def _attention_forward_token_pool_gqa(
 ):
     timing_enabled = _native_forward_timing_enabled()
     dispatch_plan = _token_pool_triton_dispatch_plan()
-    from wkvm.runner.gemma_token_pool import build_token_pool_attention_dispatch_context
+    from wkvm.runner.gemma_token_pool import build_token_pool_attention_call
 
-    dispatch_context = build_token_pool_attention_dispatch_context(
+    attention_call = build_token_pool_attention_call(
         token_pool_plan=token_pool_plan,
         decode_metadata=decode_metadata,
         paged_decode_metadata=paged_decode_metadata,
         token_kv_pool=token_kv_pool,
         layer_idx=layer_idx,
+        attention_mask_present=False,
+        query_seq_len=query_states.shape[2],
+    ).with_current_kv(
+        current_key_states,
+        current_value_states,
     )
-    result = _token_pool_attention_backend().decode(
+    result = _token_pool_attention_backend().decode_call(
         attn,
         query_states,
-        dispatch_context=dispatch_context,
+        attention_call=attention_call,
         dispatch_plan=dispatch_plan,
-        current_key_states=current_key_states,
-        current_value_states=current_value_states,
         timing_enabled=timing_enabled,
     )
     return result.output, result.weights

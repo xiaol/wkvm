@@ -3438,6 +3438,136 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(triton_attempt_timings, [])
         self.assertEqual(attention_timings, [("reference", 2, 1.0)])
 
+    def test_attention_backend_decode_call_builds_dispatch_context(self) -> None:
+        from types import SimpleNamespace
+        from wkvm.runner.gemma_token_pool import build_token_pool_attention_call
+        from wkvm.runner.gemma_token_pool_attention import (
+            TokenPoolAttentionBackend,
+            TokenPoolAttentionBackendHooks,
+            TokenPoolTritonAttentionBackendHooks,
+        )
+
+        stats = {
+            "calls": 0,
+            "env_enabled_calls": 0,
+            "env_disabled_calls": 0,
+            "effective_enabled_calls": 0,
+            "effective_disabled_calls": 0,
+            "auto_enabled_calls": 0,
+            "paged_enabled_calls": 0,
+            "split_enabled_calls": 0,
+            "paged_split_enabled_calls": 0,
+        }
+        events = []
+
+        class QueryStates:
+            is_cuda = False
+            shape = (1, 4, 1, 8)
+
+        class DispatchContext:
+            def store_current_kv(self, key_states, value_states):
+                events.append(("store", key_states, value_states))
+                return ("slot",)
+
+            def reference_decode_inputs(self):
+                events.append(("reference_inputs",))
+                return "context_metadata", "context_pool", 9
+
+        class Plan:
+            def attention_kwargs(self):
+                return {
+                    "decode_metadata": "stale_metadata",
+                    "paged_decode_metadata": None,
+                    "token_kv_pool": "stale_pool",
+                    "layer_idx": 3,
+                }
+
+            def decode_attention_enabled(self):
+                return True
+
+            def attention_dispatch_context(self, **kwargs):
+                events.append(("context", kwargs))
+                return DispatchContext()
+
+        def reference_decode(actual_attn, actual_query_states, **kwargs):
+            events.append(("reference_decode", actual_attn, actual_query_states, kwargs))
+            return "output", None
+
+        attention_call = build_token_pool_attention_call(
+            token_pool_plan=Plan(),
+        ).with_current_kv("key", "value")
+        backend = TokenPoolAttentionBackend(
+            stats=stats,
+            disabled_shapes=set(),
+            hooks=TokenPoolAttentionBackendHooks(
+                triton=TokenPoolTritonAttentionBackendHooks(
+                    decode_fn=lambda: None,
+                    split_decode_fn=lambda: None,
+                    paged_decode_fn=lambda: None,
+                    paged_split_decode_fn=lambda: None,
+                    block_groups=lambda groups, dtype: groups,
+                    record_fallback=lambda reason: events.append(("fallback", reason)),
+                    is_recoverable_runtime_error=lambda exc: True,
+                ),
+                reference_decode=reference_decode,
+                slot_count=len,
+                record_kv_write_timing=lambda **kwargs: None,
+                record_triton_attempt_timing=lambda elapsed: None,
+                record_attention_timing=lambda kind, rows, elapsed: None,
+                now=lambda: 0.0,
+            ),
+        )
+
+        query_states = QueryStates()
+        attn = object()
+        result = backend.decode_call(
+            attn,
+            query_states,
+            attention_call=attention_call,
+            dispatch_plan=SimpleNamespace(
+                env_enabled=False,
+                env_forced_off=False,
+                env_disabled=False,
+                effective_enabled=True,
+                auto_default_enabled=True,
+                paged_enabled=False,
+                split_enabled=False,
+                paged_split_enabled=False,
+            ),
+            timing_enabled=False,
+        )
+
+        self.assertEqual(result.output, "output")
+        self.assertEqual(
+            events,
+            [
+                (
+                    "context",
+                    {
+                        "decode_metadata": "stale_metadata",
+                        "paged_decode_metadata": None,
+                        "token_kv_pool": "stale_pool",
+                        "layer_idx": 3,
+                    },
+                ),
+                ("store", "key", "value"),
+                ("reference_inputs",),
+                (
+                    "reference_decode",
+                    attn,
+                    query_states,
+                    {
+                        "decode_metadata": "context_metadata",
+                        "token_kv_pool": "context_pool",
+                        "layer_idx": 9,
+                    },
+                ),
+            ],
+        )
+        self.assertEqual(stats["calls"], 1)
+        self.assertEqual(stats["auto_enabled_calls"], 1)
+        self.assertEqual(stats["effective_enabled_calls"], 1)
+
     def test_decode_backend_owns_attention_workspace(self) -> None:
         try:
             import torch

@@ -265,6 +265,37 @@ class TokenPoolAttentionBackend:
             kind="reference",
         )
 
+    def decode_call(
+        self,
+        attn: Any,
+        query_states: Any,
+        *,
+        attention_call: Any,
+        dispatch_plan: Any,
+        timing_enabled: bool = False,
+    ) -> TokenPoolAttentionDecodeResult:
+        from wkvm.runner.gemma_token_pool import (
+            build_token_pool_attention_dispatch_context,
+        )
+
+        call_kwargs = attention_call.backend_decode_kwargs()
+        dispatch_context = build_token_pool_attention_dispatch_context(
+            token_pool_plan=call_kwargs.get("token_pool_plan"),
+            decode_metadata=call_kwargs.get("decode_metadata"),
+            paged_decode_metadata=call_kwargs.get("paged_decode_metadata"),
+            token_kv_pool=call_kwargs.get("token_kv_pool"),
+            layer_idx=call_kwargs.get("layer_idx"),
+        )
+        return self.decode(
+            attn,
+            query_states,
+            dispatch_context=dispatch_context,
+            dispatch_plan=dispatch_plan,
+            current_key_states=call_kwargs.get("current_key_states"),
+            current_value_states=call_kwargs.get("current_value_states"),
+            timing_enabled=timing_enabled,
+        )
+
     def _record_dispatch_plan_call(self, dispatch_plan: Any) -> None:
         self._stats["calls"] += 1
         if dispatch_plan.env_enabled:
