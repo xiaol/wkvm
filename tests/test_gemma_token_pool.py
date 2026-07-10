@@ -1508,6 +1508,65 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(backend.request_token_slots["req"], prefill_ids)
         self.assertEqual(allocator.allocated_count, 2)
 
+    def test_token_pool_decode_backend_prepares_decode_batch_state(self) -> None:
+        from types import SimpleNamespace
+
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenPoolDecodeBackendState,
+            TokenPoolDecodeReservation,
+        )
+
+        table = ReqToTokenTable(max_requests=1, max_context_len=8)
+        req_slot = table.allocate("req")
+        table.append_slots(req_slot, [1, 2, 3])
+        pool = SimpleNamespace(
+            layer_specs={0: object()},
+            capacity=8,
+            device="cpu",
+        )
+        backend = TokenPoolDecodeBackendState(
+            table=table,
+            kv_pool=pool,
+            token_pool_capacity=8,
+        )
+        reservation = TokenPoolDecodeReservation(
+            req_id="req",
+            req_slot=req_slot,
+            token_slot=3,
+            token_slot_tensor=torch.tensor([3], dtype=torch.int32),
+            previous_length=2,
+        )
+
+        prepared = backend.prepare_decode_batch_state(
+            [reservation],
+            sliding_window=2,
+            layer_type_by_layer_id={0: "sliding_attention"},
+        )
+        context = prepared.build_context(
+            kv_pool=pool,
+            attention_workspace=backend.attention_workspace,
+        )
+
+        self.assertIs(backend.current_decode_batch_state, prepared.state)
+        self.assertEqual(
+            prepared.covered_layer_types,
+            frozenset({"sliding_attention"}),
+        )
+        self.assertIsNotNone(context)
+        assert context is not None
+        metadata = context.metadata_for_layer(0, "sliding_attention")
+        self.assertIsNotNone(metadata)
+        self.assertEqual(metadata.seq_lens.tolist(), [2])
+        self.assertEqual(metadata.logical_seq_lens.tolist(), [3])
+        self.assertEqual(metadata.kv_indices.tolist(), [2, 3])
+        self.assertEqual(metadata.out_cache_loc.tolist(), [3])
+
     def test_token_pool_decode_backend_discards_decode_transaction(self) -> None:
         try:
             import torch  # noqa: F401

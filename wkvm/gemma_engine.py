@@ -2541,39 +2541,11 @@ class GemmaNativeEngine:
                         self._token_pool_token_slots[req.req_id].append(token_slot)
                     req_slots.append(req_slot)
                     out_cache_loc.append(token_slot)
-            if self._token_kv_pool is None:
-                if backend is None:
-                    raise RuntimeError("token-pool decode backend is not initialized")
-                metadata_by_type = backend.build_decode_metadata_by_layer_type(
-                    req_slots=req_slots,
-                    out_cache_loc=out_cache_loc,
-                    sliding_window=self.config.sliding_window,
-                )
-                backend.set_decode_batch_state(
-                    metadata_by_layer_type=metadata_by_type,
-                    covered_layer_types=frozenset(),
-                )
-            else:
-                if backend is None:
-                    raise RuntimeError("token-pool decode backend is not initialized")
-                logical_lens = [
-                    int(reservation.previous_length) + 1
-                    for reservation in reservations
-                ]
-                sliding_metadata, sliding_paged_metadata = (
-                    backend.build_sliding_decode_metadata(
-                        req_slots=req_slots,
-                        logical_seq_lens=logical_lens,
-                        out_cache_loc=out_cache_loc,
-                        sliding_window=self.config.sliding_window,
-                        page_tables=backend.page_tables_for_requests(
-                            reservation.req_id for reservation in reservations
-                        ),
-                        kv_indices_padding_steps=(
-                            sliding_attention_kv_indices_padding_steps
-                        ),
-                    )
-                )
+            if backend is None:
+                raise RuntimeError("token-pool decode backend is not initialized")
+            full_metadata = None
+            full_paged_metadata = None
+            if self._token_kv_pool is not None:
                 (
                     full_metadata,
                     full_paged_metadata,
@@ -2587,32 +2559,22 @@ class GemmaNativeEngine:
                         persistent_full_attention_rows
                     ),
                 )
-                metadata_by_type = {
-                    "sliding_attention": sliding_metadata,
-                }
-                paged_metadata_by_type = None
-                if sliding_paged_metadata is not None:
-                    paged_metadata_by_type = {
-                        "sliding_attention": sliding_paged_metadata,
-                    }
-                if full_metadata is not None:
-                    metadata_by_type["full_attention"] = full_metadata
-                if full_paged_metadata is not None:
-                    if paged_metadata_by_type is None:
-                        paged_metadata_by_type = {}
-                    paged_metadata_by_type["full_attention"] = full_paged_metadata
-                backend.set_decode_batch_state_by_layer_type(
-                    metadata_by_layer_type=metadata_by_type,
-                    paged_metadata_by_layer_type=paged_metadata_by_type,
-                    layer_type_by_layer_id=self._token_pool_layer_type_by_layer_id(),
-                )
+            prepared_batch = backend.prepare_decode_batch_state(
+                reservations,
+                sliding_window=self.config.sliding_window,
+                layer_type_by_layer_id=(
+                    {}
+                    if self._token_kv_pool is None
+                    else self._token_pool_layer_type_by_layer_id()
+                ),
+                full_attention_metadata=full_metadata,
+                full_attention_paged_metadata=full_paged_metadata,
+                sliding_attention_kv_indices_padding_steps=(
+                    sliding_attention_kv_indices_padding_steps
+                ),
+            )
             self.metrics.token_pool_decode_metadata_batches += 1
             self.metrics.token_pool_decode_metadata_rows += len(reqs)
-            prepared_batch = (
-                backend.prepared_decode_batch(reservations)
-                if backend is not None
-                else None
-            )
             covered_layer_types = (
                 prepared_batch.covered_layer_types
                 if prepared_batch is not None

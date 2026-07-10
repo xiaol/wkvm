@@ -5906,6 +5906,78 @@ class TokenPoolDecodeBackendState:
             self.discard_decode_batch(reservations)
             raise
 
+    def prepare_decode_batch_state(
+        self,
+        reservations: Iterable[Any],
+        *,
+        sliding_window: int,
+        layer_type_by_layer_id: dict[int, str] | None = None,
+        full_attention_metadata: DecodeBatchMetadata | None = None,
+        full_attention_paged_metadata: PagedDecodeBatchMetadata | None = None,
+        sliding_attention_kv_indices_padding_steps: int = 0,
+    ) -> TokenPoolPreparedDecodeBatch:
+        reservation_tuple = self._decode_batch_reservations(reservations)
+        if not reservation_tuple:
+            self.clear_decode_batch_state()
+            return self.prepared_decode_batch(())
+
+        req_slots = [
+            int(getattr(reservation, "req_slot"))
+            for reservation in reservation_tuple
+        ]
+        out_cache_loc = [
+            int(getattr(reservation, "token_slot"))
+            for reservation in reservation_tuple
+        ]
+        if self.kv_pool is None:
+            metadata_by_type = self.build_decode_metadata_by_layer_type(
+                req_slots=req_slots,
+                out_cache_loc=out_cache_loc,
+                sliding_window=sliding_window,
+            )
+            state = self.set_decode_batch_state(
+                metadata_by_layer_type=metadata_by_type,
+                covered_layer_types=frozenset(),
+            )
+            return TokenPoolPreparedDecodeBatch(
+                reservations=reservation_tuple,
+                state=state,
+            )
+
+        logical_lens = [
+            int(getattr(reservation, "previous_length")) + 1
+            for reservation in reservation_tuple
+        ]
+        sliding_metadata, sliding_paged_metadata = self.build_sliding_decode_metadata(
+            req_slots=req_slots,
+            logical_seq_lens=logical_lens,
+            out_cache_loc=out_cache_loc,
+            sliding_window=sliding_window,
+            page_tables=self.page_tables_for_requests(
+                getattr(reservation, "req_id") for reservation in reservation_tuple
+            ),
+            kv_indices_padding_steps=sliding_attention_kv_indices_padding_steps,
+        )
+        metadata_by_type = {"sliding_attention": sliding_metadata}
+        paged_metadata_by_type = None
+        if sliding_paged_metadata is not None:
+            paged_metadata_by_type = {"sliding_attention": sliding_paged_metadata}
+        if full_attention_metadata is not None:
+            metadata_by_type["full_attention"] = full_attention_metadata
+        if full_attention_paged_metadata is not None:
+            if paged_metadata_by_type is None:
+                paged_metadata_by_type = {}
+            paged_metadata_by_type["full_attention"] = full_attention_paged_metadata
+        state = self.set_decode_batch_state_by_layer_type(
+            metadata_by_layer_type=metadata_by_type,
+            paged_metadata_by_layer_type=paged_metadata_by_type,
+            layer_type_by_layer_id=layer_type_by_layer_id or {},
+        )
+        return TokenPoolPreparedDecodeBatch(
+            reservations=reservation_tuple,
+            state=state,
+        )
+
     def append_table_slots(
         self,
         req_id_or_slot: str | int,
