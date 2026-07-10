@@ -35,6 +35,7 @@ from wkvm.runner.gemma_token_pool import (
     TokenKVPool,
     TokenPoolBlockTables,
     TokenPoolDecodeBackendState,
+    TokenPoolDecodeBatchState,
     TokenPoolDecodeContext,
     TokenPoolDecodeGraphSignatureUpdate,
     TokenPoolDecodeGraphSignatureTracker,
@@ -678,15 +679,6 @@ class GemmaNativeEngine:
         self._token_pool_decode_backend: TokenPoolDecodeBackendState | None = None
         self._token_pool_full_attention_slots: dict[str, list[int]] = {}
         self._token_pool_full_attention_rows: dict[str, TokenPoolFullAttentionRow] = {}
-        self.last_token_pool_decode_metadata: dict[str, DecodeBatchMetadata] | None = None
-        self.last_token_pool_decode_metadata_by_layer_id: dict[int, DecodeBatchMetadata] | None = None
-        self.last_token_pool_paged_decode_metadata: (
-            dict[str, PagedDecodeBatchMetadata] | None
-        ) = None
-        self.last_token_pool_paged_decode_metadata_by_layer_id: (
-            dict[int, PagedDecodeBatchMetadata] | None
-        ) = None
-        self.last_token_pool_decode_covered_layer_types: frozenset[str] = frozenset()
         if self.enable_token_pool_metadata:
             model_cfg = getattr(self.runner.model, "config", getattr(model, "config", None))
             initial_context_len = token_pool_max_context_len
@@ -1857,23 +1849,54 @@ class GemmaNativeEngine:
             ),
         )
 
-    def _token_pool_sync_last_decode_batch_state(self) -> None:
+    def _token_pool_current_decode_batch_state(
+        self,
+    ) -> TokenPoolDecodeBatchState | None:
         backend = self._token_pool_decode_backend
-        state = None if backend is None else backend.current_decode_batch_state
+        return None if backend is None else backend.current_decode_batch_state
+
+    @property
+    def last_token_pool_decode_metadata(
+        self,
+    ) -> dict[str, DecodeBatchMetadata] | None:
+        state = self._token_pool_current_decode_batch_state()
         if state is None:
-            self.last_token_pool_decode_metadata = None
-            self.last_token_pool_decode_metadata_by_layer_id = None
-            self.last_token_pool_paged_decode_metadata = None
-            self.last_token_pool_paged_decode_metadata_by_layer_id = None
-            self.last_token_pool_decode_covered_layer_types = frozenset()
-            return
-        self.last_token_pool_decode_metadata = state.metadata_by_layer_type
-        self.last_token_pool_decode_metadata_by_layer_id = state.metadata_by_layer_id
-        self.last_token_pool_paged_decode_metadata = state.paged_metadata_by_layer_type
-        self.last_token_pool_paged_decode_metadata_by_layer_id = (
-            state.paged_metadata_by_layer_id
-        )
-        self.last_token_pool_decode_covered_layer_types = state.covered_layer_types
+            return None
+        return state.metadata_by_layer_type
+
+    @property
+    def last_token_pool_decode_metadata_by_layer_id(
+        self,
+    ) -> dict[int, DecodeBatchMetadata] | None:
+        state = self._token_pool_current_decode_batch_state()
+        if state is None:
+            return None
+        return state.metadata_by_layer_id
+
+    @property
+    def last_token_pool_paged_decode_metadata(
+        self,
+    ) -> dict[str, PagedDecodeBatchMetadata] | None:
+        state = self._token_pool_current_decode_batch_state()
+        if state is None:
+            return None
+        return state.paged_metadata_by_layer_type
+
+    @property
+    def last_token_pool_paged_decode_metadata_by_layer_id(
+        self,
+    ) -> dict[int, PagedDecodeBatchMetadata] | None:
+        state = self._token_pool_current_decode_batch_state()
+        if state is None:
+            return None
+        return state.paged_metadata_by_layer_id
+
+    @property
+    def last_token_pool_decode_covered_layer_types(self) -> frozenset[str]:
+        backend = self._token_pool_decode_backend
+        if backend is None:
+            return frozenset()
+        return backend.current_covered_layer_types
 
     def _token_pool_clear_graph_decode_signatures(self) -> None:
         backend = self._token_pool_decode_backend
@@ -2387,7 +2410,6 @@ class GemmaNativeEngine:
         backend = self._token_pool_decode_backend
         if backend is not None:
             backend.clear_decode_batch_state()
-        self._token_pool_sync_last_decode_batch_state()
         if table is None or allocator is None:
             return []
         reservations: list[_TokenPoolDecodeReservation] = []
@@ -2538,7 +2560,6 @@ class GemmaNativeEngine:
                     paged_metadata_by_layer_id=paged_metadata_by_layer_id,
                     covered_layer_types=frozenset(covered_layer_types),
                 )
-            self._token_pool_sync_last_decode_batch_state()
             self.metrics.token_pool_decode_metadata_batches += 1
             self.metrics.token_pool_decode_metadata_rows += len(reqs)
             covered_layer_types = (
@@ -2569,7 +2590,6 @@ class GemmaNativeEngine:
             self._token_pool_discard_decode_reservations(reservations)
             if backend is not None:
                 backend.clear_decode_batch_state()
-            self._token_pool_sync_last_decode_batch_state()
             raise
 
     def _token_pool_decode_context(
