@@ -149,6 +149,49 @@ class TestGemmaSchedulerAssumptions(unittest.TestCase):
             [{"B": None, "problems": ["no_successful_rows_to_check"]}],
         )
 
+    def test_native_bench_applies_token_pool_triton_env_flags(self) -> None:
+        from experiments.native_gemma_bench import (
+            TOKEN_POOL_TRITON_BENCH_ENV_NAMES,
+            apply_token_pool_triton_bench_env,
+        )
+
+        old_env = {
+            name: os.environ.get(name)
+            for name in TOKEN_POOL_TRITON_BENCH_ENV_NAMES
+        }
+        try:
+            for name in TOKEN_POOL_TRITON_BENCH_ENV_NAMES:
+                os.environ.pop(name, None)
+            args = SimpleNamespace(
+                enable_token_pool_triton=True,
+                enable_token_pool_paged_triton=True,
+                enable_token_pool_paged_split_triton=False,
+                token_pool_triton_strict=True,
+                token_pool_sliding_paged_metadata_only=True,
+            )
+
+            report = apply_token_pool_triton_bench_env(args)
+
+            self.assertEqual(report["WKVM_ENABLE_TOKEN_POOL_TRITON"], "1")
+            self.assertEqual(report["WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON"], "1")
+            self.assertIsNone(report["WKVM_ENABLE_TOKEN_POOL_PAGED_SPLIT_TRITON"])
+            self.assertEqual(report["WKVM_TOKEN_POOL_TRITON_STRICT"], "1")
+            self.assertEqual(
+                report["WKVM_TOKEN_POOL_SLIDING_PAGED_METADATA_ONLY"],
+                "1",
+            )
+        finally:
+            for name, value in old_env.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+            from wkvm.runner.gemma_token_pool_attention import (
+                reset_token_pool_triton_dispatch_plan_cache,
+            )
+
+            reset_token_pool_triton_dispatch_plan_cache()
+
     def test_native_bench_engine_honors_prefill_chunk_cap(self) -> None:
         from experiments.native_gemma_bench import make_engine
         from wkvm.models.gemma import gemma4_e4b_routed_span_config

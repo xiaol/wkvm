@@ -176,6 +176,50 @@ def env_flag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+TOKEN_POOL_TRITON_BENCH_ENV_NAMES = (
+    "WKVM_ENABLE_TOKEN_POOL_TRITON",
+    "WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON",
+    "WKVM_ENABLE_TOKEN_POOL_PAGED_SPLIT_TRITON",
+    "WKVM_TOKEN_POOL_TRITON_STRICT",
+    "WKVM_TOKEN_POOL_SLIDING_PAGED_METADATA_ONLY",
+)
+
+
+def apply_token_pool_triton_bench_env(args) -> dict[str, str | None]:
+    flag_to_env = (
+        ("enable_token_pool_triton", "WKVM_ENABLE_TOKEN_POOL_TRITON"),
+        ("enable_token_pool_paged_triton", "WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON"),
+        (
+            "enable_token_pool_paged_split_triton",
+            "WKVM_ENABLE_TOKEN_POOL_PAGED_SPLIT_TRITON",
+        ),
+        ("token_pool_triton_strict", "WKVM_TOKEN_POOL_TRITON_STRICT"),
+        (
+            "token_pool_sliding_paged_metadata_only",
+            "WKVM_TOKEN_POOL_SLIDING_PAGED_METADATA_ONLY",
+        ),
+    )
+    for attr, env_name in flag_to_env:
+        if bool(getattr(args, attr, False)):
+            os.environ[env_name] = "1"
+    try:
+        from wkvm.runner.gemma_token_pool_attention import (
+            reset_token_pool_triton_dispatch_plan_cache,
+        )
+
+        reset_token_pool_triton_dispatch_plan_cache()
+    except Exception:
+        pass
+    return token_pool_triton_bench_env_report()
+
+
+def token_pool_triton_bench_env_report() -> dict[str, str | None]:
+    return {
+        name: os.environ.get(name)
+        for name in TOKEN_POOL_TRITON_BENCH_ENV_NAMES
+    }
+
+
 def token_pool_triton_stats_snapshot() -> dict[str, Any]:
     try:
         from wkvm.runner.gemma_native_forward import token_pool_triton_stats
@@ -708,6 +752,7 @@ def run(args) -> dict[str, Any]:
     import torch
     from transformers import AutoTokenizer
 
+    token_pool_triton_env = apply_token_pool_triton_bench_env(args)
     path = resolve_model_path(args.model_path)
     tok = AutoTokenizer.from_pretrained(path)
     if args.native_gemma_checkpoint_loader:
@@ -807,6 +852,7 @@ def run(args) -> dict[str, Any]:
             args.native_gemma_release_hf_decoder_layers
         ),
         "token_pool_attention_enabled": args.enable_token_pool_attention,
+        "token_pool_triton_env": token_pool_triton_env,
         "cuda_phase_metrics_enabled": args.cuda_phase_metrics,
         "git_commit": git_commit(),
         "launch_command": shlex.join([sys.executable, *sys.argv]),
@@ -848,6 +894,16 @@ def run(args) -> dict[str, Any]:
             "token_pool_max_context_len": args.token_pool_max_context_len,
             "token_pool_capacity": args.token_pool_capacity,
             "token_pool_paged_block_size": args.token_pool_paged_block_size,
+            "enable_token_pool_triton": args.enable_token_pool_triton,
+            "enable_token_pool_paged_triton": args.enable_token_pool_paged_triton,
+            "enable_token_pool_paged_split_triton": (
+                args.enable_token_pool_paged_split_triton
+            ),
+            "token_pool_triton_strict": args.token_pool_triton_strict,
+            "token_pool_sliding_paged_metadata_only": (
+                args.token_pool_sliding_paged_metadata_only
+            ),
+            "token_pool_triton_env": token_pool_triton_env,
             "slots": args.slots,
             "token_budget": args.token_budget,
         },
@@ -996,6 +1052,37 @@ def main() -> None:
         "--token-pool-paged-block-size",
         type=int,
         default=None,
+    )
+    ap.add_argument(
+        "--enable-token-pool-triton",
+        action="store_true",
+        help="Set WKVM_ENABLE_TOKEN_POOL_TRITON=1 for this benchmark process.",
+    )
+    ap.add_argument(
+        "--enable-token-pool-paged-triton",
+        action="store_true",
+        help="Set WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON=1 for this benchmark process.",
+    )
+    ap.add_argument(
+        "--enable-token-pool-paged-split-triton",
+        action="store_true",
+        help=(
+            "Set WKVM_ENABLE_TOKEN_POOL_PAGED_SPLIT_TRITON=1 for this "
+            "benchmark process."
+        ),
+    )
+    ap.add_argument(
+        "--token-pool-triton-strict",
+        action="store_true",
+        help="Set WKVM_TOKEN_POOL_TRITON_STRICT=1 and raise instead of fallback.",
+    )
+    ap.add_argument(
+        "--token-pool-sliding-paged-metadata-only",
+        action="store_true",
+        help=(
+            "Set WKVM_TOKEN_POOL_SLIDING_PAGED_METADATA_ONLY=1 to skip dense "
+            "sliding kv_indices metadata. Use with paged Triton enabled."
+        ),
     )
     ap.add_argument(
         "--decode-batch-planner",
