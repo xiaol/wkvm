@@ -2101,18 +2101,82 @@ class GemmaNativeEngine:
         table = self._token_table
         if table is None:
             return
-        if req.req_id in self._token_pool_req_slots:
-            return
         backend = self._token_pool_decode_backend
         if backend is not None:
+            if backend.has_request(req.req_id):
+                return
             backend.admit_request(req.req_id)
-        else:
-            req_slot = table.allocate(req.req_id)
-            self._token_pool_req_slots[req.req_id] = req_slot
-            self._token_pool_token_slots[req.req_id] = []
-            self._token_pool_page_tables[req.req_id] = {}
-            self._token_pool_page_owned_slots[req.req_id] = set()
-            self._token_pool_reset_page_table_row(req_slot)
+            return
+        if req.req_id in self._token_pool_req_slots:
+            return
+        req_slot = table.allocate(req.req_id)
+        self._token_pool_req_slots[req.req_id] = req_slot
+        self._token_pool_token_slots[req.req_id] = []
+        self._token_pool_page_tables[req.req_id] = {}
+        self._token_pool_page_owned_slots[req.req_id] = set()
+        self._token_pool_reset_page_table_row(req_slot)
+
+    def _token_pool_request_slot(self, req_id: str) -> int:
+        backend = self._token_pool_decode_backend
+        if backend is not None:
+            return backend.request_slot_for(req_id)
+        return self._token_pool_req_slots[req_id]
+
+    def _token_pool_request_length(self, req_id_or_slot: str | int) -> int:
+        backend = self._token_pool_decode_backend
+        if backend is not None:
+            return backend.request_length(req_id_or_slot)
+        table = self._token_table
+        if table is None:
+            raise RuntimeError("token-pool table is not initialized")
+        return table.length(req_id_or_slot)
+
+    def _token_pool_ensure_context_len(self, context_len: int) -> None:
+        backend = self._token_pool_decode_backend
+        if backend is not None:
+            backend.ensure_context_len(context_len)
+            return
+        table = self._token_table
+        if table is not None:
+            table.ensure_context_len(context_len)
+        self._token_pool_ensure_page_table_width(context_len)
+
+    def _token_pool_append_table_slots(self, req_id_or_slot: str | int, slots) -> None:
+        backend = self._token_pool_decode_backend
+        if backend is not None:
+            backend.append_table_slots(req_id_or_slot, slots)
+            return
+        table = self._token_table
+        if table is None:
+            raise RuntimeError("token-pool table is not initialized")
+        table.append_slots(req_id_or_slot, slots)
+
+    def _token_pool_truncate_table_row(
+        self,
+        req_id_or_slot: str | int,
+        length: int,
+    ) -> None:
+        backend = self._token_pool_decode_backend
+        if backend is not None:
+            backend.truncate_table_row(req_id_or_slot, length)
+            return
+        table = self._token_table
+        if table is None:
+            return
+        table.truncate(req_id_or_slot, length)
+
+    def _token_pool_clear_table_before(
+        self,
+        req_id_or_slot: str | int,
+        length: int,
+    ) -> list[int]:
+        backend = self._token_pool_decode_backend
+        if backend is not None:
+            return backend.clear_table_before(req_id_or_slot, length)
+        table = self._token_table
+        if table is None:
+            return []
+        return table.clear_before(req_id_or_slot, length)
 
     def _token_pool_release_request(self, req_id: str) -> None:
         table = self._token_table
@@ -2151,16 +2215,15 @@ class GemmaNativeEngine:
         if table is None or allocator is None:
             return
         self._token_pool_admit_request(req)
-        req_slot = self._token_pool_req_slots[req.req_id]
-        current = table.length(req_slot)
+        req_slot = self._token_pool_request_slot(req.req_id)
+        current = self._token_pool_request_length(req_slot)
         if current != req.num_computed_tokens:
             raise RuntimeError(
                 f"{req.req_id}: token table length {current} does not match "
                 f"computed tokens {req.num_computed_tokens}"
             )
         new_length = current + n
-        table.ensure_context_len(new_length)
-        self._token_pool_ensure_page_table_width(new_length)
+        self._token_pool_ensure_context_len(new_length)
         sliding_window = self._token_pool_attention_window()
         keep_start = 0 if sliding_window is None else max(new_length - sliding_window, 0)
         keep_new_start = current if sliding_window is None else max(current, keep_start)
@@ -2216,7 +2279,7 @@ class GemmaNativeEngine:
             if append_values:
                 import torch
 
-                table.append_slots(req_slot, torch.cat(append_values))
+                self._token_pool_append_table_slots(req_slot, torch.cat(append_values))
         except Exception:
             if token_slots is not None:
                 if self._token_kv_pool is None:
@@ -2255,7 +2318,11 @@ class GemmaNativeEngine:
                 req_id,
                 start_position,
                 n,
-                req_slot=self._token_pool_req_slots.get(req_id),
+                req_slot=(
+                    backend.request_slot_for(req_id)
+                    if backend.has_request(req_id)
+                    else None
+                ),
             )
         allocator = self._token_slot_allocator
         if allocator is None:
@@ -2418,15 +2485,14 @@ class GemmaNativeEngine:
         try:
             for req in reqs:
                 self._token_pool_admit_request(req)
-                req_slot = self._token_pool_req_slots[req.req_id]
-                previous_length = table.length(req_slot)
+                req_slot = self._token_pool_request_slot(req.req_id)
+                previous_length = self._token_pool_request_length(req_slot)
                 if previous_length != req.num_computed_tokens:
                     raise RuntimeError(
                         f"{req.req_id}: token table length {previous_length} "
                         f"does not match computed tokens {req.num_computed_tokens}"
                     )
-                table.ensure_context_len(previous_length + 1)
-                self._token_pool_ensure_page_table_width(previous_length + 1)
+                self._token_pool_ensure_context_len(previous_length + 1)
                 page_state_snapshot = None
                 if self._token_kv_pool is not None:
                     if (
@@ -2461,7 +2527,7 @@ class GemmaNativeEngine:
                     page_state_snapshot=page_state_snapshot,
                 )
                 reservations.append(reservation)
-                table.append_slots(req_slot, token_slot_tensor)
+                self._token_pool_append_table_slots(req_slot, token_slot_tensor)
                 if self._token_kv_pool is None:
                     backend = self._token_pool_decode_backend
                     if backend is not None:
@@ -2726,7 +2792,7 @@ class GemmaNativeEngine:
         allocator = self._token_slot_allocator
         if table is None or allocator is None:
             return
-        dropped = table.clear_before(req_slot, int(length))
+        dropped = self._token_pool_clear_table_before(req_slot, int(length))
         if dropped:
             self._token_pool_invalidate_full_attention_rows_containing(dropped)
             backend = self._token_pool_decode_backend
@@ -3013,7 +3079,10 @@ class GemmaNativeEngine:
         )
         for reservation in reversed(reservations):
             if reservation.req_id in self._token_pool_req_slots:
-                table.truncate(reservation.req_slot, reservation.previous_length)
+                self._token_pool_truncate_table_row(
+                    reservation.req_slot,
+                    reservation.previous_length,
+                )
             backend = self._token_pool_decode_backend
             if backend is not None:
                 backend.remove_request_token_slot(

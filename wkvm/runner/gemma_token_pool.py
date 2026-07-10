@@ -5394,6 +5394,26 @@ class TokenPoolDecodeBackendState:
     def request_slot_for(self, req_id: str) -> int:
         return self.request_slots[str(req_id)]
 
+    def request_length(self, req_id_or_slot: str | int) -> int:
+        return self.table.length(req_id_or_slot)
+
+    def ensure_context_len(self, context_len: int) -> None:
+        self.table.ensure_context_len(context_len)
+        self.ensure_page_table_width(context_len)
+
+    def append_table_slots(
+        self,
+        req_id_or_slot: str | int,
+        token_slots: Iterable[int] | Any,
+    ) -> tuple[int, int]:
+        return self.table.append_slots(req_id_or_slot, token_slots)
+
+    def truncate_table_row(self, req_id_or_slot: str | int, length: int) -> None:
+        self.table.truncate(req_id_or_slot, length)
+
+    def clear_table_before(self, req_id_or_slot: str | int, length: int) -> list[int]:
+        return self.table.clear_before(req_id_or_slot, length)
+
     def admit_request(self, req_id: str) -> int:
         req_id = str(req_id)
         existing = self.request_slots.get(req_id)

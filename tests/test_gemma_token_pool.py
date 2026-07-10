@@ -685,6 +685,14 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(backend.request_slots, {"req": 0})
         self.assertEqual(backend.request_token_slots, {"req": []})
         self.assertEqual(backend.admit_request("req"), req_slot)
+        backend.ensure_context_len(9)
+        self.assertGreaterEqual(table.max_context_len, 9)
+        self.assertGreaterEqual(block_tables.shape[1], 3)
+        backend.append_table_slots(req_slot, [9, 10, 11])
+        self.assertEqual(backend.request_length(req_slot), 3)
+        self.assertEqual(backend.clear_table_before(req_slot, 2), [9, 10])
+        backend.truncate_table_row(req_slot, 1)
+        self.assertEqual(backend.request_length("req"), 1)
 
         _, normal_token_slots = allocator.alloc_slots_with_ids(2)
         backend.append_request_token_slots("req", normal_token_slots)
@@ -700,7 +708,7 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertFalse(backend.has_request("req"))
         self.assertEqual(backend.active_request_slots, 0)
         self.assertEqual(allocator.allocated_count, 0)
-        self.assertEqual(block_tables.tensor.tolist(), [[-1, -1]])
+        self.assertEqual(block_tables.tensor[0].tolist(), [-1] * block_tables.shape[1])
         with self.assertRaises(KeyError):
             table.slot_for("req")
 
