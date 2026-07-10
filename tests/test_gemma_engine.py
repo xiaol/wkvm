@@ -77,6 +77,57 @@ class TestGemmaEngineMetrics(unittest.TestCase):
 
 
 class TestGemmaSchedulerAssumptions(unittest.TestCase):
+    def native_bench_payload_args(self, **overrides):
+        values = {
+            "ctx": 512,
+            "prompt_lengths": "uniform",
+            "out": 8,
+            "mem_cap_gib": 19.0,
+            "headroom_gib": 1.0,
+            "device": "cuda",
+            "attn": "sdpa",
+            "require_native_no_hf": True,
+            "native_gemma_checkpoint_loader": True,
+            "native_gemma_attention_backend": "sdpa_single_gqa",
+            "native_gemma_projection_backend": "separate",
+            "native_gemma_weight_backend": "hf_live",
+            "native_gemma_release_hf_decoder_layers": False,
+            "enable_token_pool_attention": True,
+            "cuda_phase_metrics": False,
+            "concurrency": [2],
+            "sink": 16,
+            "window": 1024,
+            "m_slots": 64,
+            "route_chunk": 512,
+            "chunk": 2048,
+            "decode_microbatch_rows": 16,
+            "decode_microbatch_bytes": None,
+            "decode_batch_planner": "scheduler",
+            "decode_workspace_bytes": None,
+            "decode_workspace_width_bucket": 16,
+            "disable_persistent_exact_decode": False,
+            "disable_persistent_padded_decode": False,
+            "persistent_padded_decode_steps": 8,
+            "persistent_padded_full_attention_rows": None,
+            "persistent_padded_sliding_metadata_padding": False,
+            "persistent_padded_decode_cuda_graph": True,
+            "persistent_padded_decode_graph_warmup_iters": 1,
+            "use_native_gemma_forward": True,
+            "enable_token_pool_metadata": None,
+            "token_pool_max_context_len": 1024,
+            "token_pool_capacity": 4096,
+            "token_pool_paged_block_size": None,
+            "enable_token_pool_triton": True,
+            "enable_token_pool_paged_triton": True,
+            "enable_token_pool_paged_split_triton": True,
+            "token_pool_triton_strict": True,
+            "token_pool_sliding_paged_metadata_only": True,
+            "slots": None,
+            "token_budget": None,
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
     def test_native_bench_hf_boundary_summary_uses_row_evidence(self) -> None:
         from experiments.native_gemma_bench import hf_boundary_summary
 
@@ -148,6 +199,43 @@ class TestGemmaSchedulerAssumptions(unittest.TestCase):
             empty["violations"],
             [{"B": None, "problems": ["no_successful_rows_to_check"]}],
         )
+
+    def test_native_bench_payload_records_setup_failure_without_rows(self) -> None:
+        from experiments.native_gemma_bench import build_benchmark_payload
+
+        args = self.native_bench_payload_args()
+        fatal_error = {
+            "type": "RuntimeError",
+            "message": "CUDA out of memory",
+            "phase": "model_load",
+        }
+
+        payload = build_benchmark_payload(
+            args,
+            path="/models/gemma",
+            rows=[],
+            usable_gib=None,
+            token_pool_triton_env={"WKVM_ENABLE_TOKEN_POOL_TRITON": "1"},
+            fatal_error=fatal_error,
+        )
+
+        self.assertEqual(payload["fatal_error"], fatal_error)
+        self.assertEqual(payload["rows"], [])
+        self.assertEqual(payload["summary"]["bmax_green"], 0)
+        self.assertEqual(payload["torch_usable_gib"], None)
+        self.assertFalse(payload["uses_hf_transformer_forward"])
+        self.assertFalse(payload["uses_hf_model_construction"])
+        self.assertTrue(payload["native_gemma_checkpoint_loader"])
+        self.assertEqual(payload["hf_boundary"]["evidence_rows"], 0)
+        self.assertEqual(
+            payload["model_forward_backend"],
+            "wkvm_native_gemma_forward_bridge",
+        )
+        self.assertEqual(
+            payload["native_no_hf_requirement"]["violations"],
+            [{"B": None, "problems": ["no_successful_rows_to_check"]}],
+        )
+        self.assertFalse(payload["native_no_hf_requirement"]["passed"])
 
     def test_native_bench_applies_token_pool_triton_env_flags(self) -> None:
         from experiments.native_gemma_bench import (

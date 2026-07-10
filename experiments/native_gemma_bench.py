@@ -316,6 +316,139 @@ def git_commit() -> str | None:
         return None
 
 
+def benchmark_fatal_error(exc: BaseException, *, phase: str) -> dict[str, Any]:
+    return {
+        "type": type(exc).__name__,
+        "message": str(exc).splitlines()[0],
+        "phase": phase,
+    }
+
+
+def build_benchmark_payload(
+    args,
+    *,
+    path: str,
+    rows: list[dict[str, Any]],
+    usable_gib: float | None,
+    token_pool_triton_env: dict[str, str | None],
+    fatal_error: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    hf_boundary = hf_boundary_summary(rows, args)
+    native_no_hf_requirement = native_no_hf_requirement_report(
+        rows,
+        required=args.require_native_no_hf,
+    )
+    payload: dict[str, Any] = {
+        "schema": "wkvm.native_gemma_bench.v1",
+        "engine": "wkvm-native",
+        "context_tokens_per_session": args.ctx,
+        "prompt_lengths_mode": args.prompt_lengths,
+        "decode_tokens_per_session": args.out,
+        "mem_cap_gib": args.mem_cap_gib,
+        "headroom_gib": args.headroom_gib,
+        "torch_usable_gib": round_or_none(usable_gib),
+        "model_path": path,
+        "dtype": "bfloat16",
+        "device": args.device,
+        "attn": args.attn,
+        "model_forward_backend": hf_boundary["model_forward_backend"],
+        "uses_hf_transformer_forward": hf_boundary[
+            "uses_hf_transformer_forward"
+        ],
+        "uses_hf_model_construction": hf_boundary["uses_hf_model_construction"],
+        "native_gemma_checkpoint_loader": hf_boundary[
+            "native_gemma_checkpoint_loader"
+        ],
+        "hf_boundary": hf_boundary,
+        "native_no_hf_requirement": native_no_hf_requirement,
+        "native_gemma_attention_backend": args.native_gemma_attention_backend,
+        "native_gemma_projection_backend": args.native_gemma_projection_backend,
+        "native_gemma_weight_backend": args.native_gemma_weight_backend,
+        "native_gemma_release_hf_decoder_layers": (
+            args.native_gemma_release_hf_decoder_layers
+        ),
+        "token_pool_attention_enabled": args.enable_token_pool_attention,
+        "token_pool_triton_env": token_pool_triton_env,
+        "cuda_phase_metrics_enabled": args.cuda_phase_metrics,
+        "git_commit": git_commit(),
+        "launch_command": shlex.join([sys.executable, *sys.argv]),
+        "concurrency": args.concurrency,
+        "config": {
+            "sink": args.sink,
+            "window": args.window,
+            "m_slots": args.m_slots,
+            "route_chunk": args.route_chunk,
+            "chunk": args.chunk,
+            "decode_microbatch_rows": args.decode_microbatch_rows,
+            "decode_microbatch_bytes": args.decode_microbatch_bytes,
+            "decode_batch_planner": args.decode_batch_planner,
+            "decode_workspace_bytes": args.decode_workspace_bytes,
+            "decode_workspace_width_bucket": args.decode_workspace_width_bucket,
+            "persistent_exact_decode": not args.disable_persistent_exact_decode,
+            "persistent_padded_decode": not args.disable_persistent_padded_decode,
+            "persistent_padded_decode_steps": args.persistent_padded_decode_steps,
+            "persistent_padded_full_attention_rows": (
+                args.persistent_padded_full_attention_rows
+            ),
+            "persistent_padded_sliding_metadata_padding": (
+                args.persistent_padded_sliding_metadata_padding
+            ),
+            "persistent_padded_decode_cuda_graph": args.persistent_padded_decode_cuda_graph,
+            "persistent_padded_decode_graph_warmup_iters": (
+                args.persistent_padded_decode_graph_warmup_iters
+            ),
+            "cuda_phase_metrics": args.cuda_phase_metrics,
+            "use_native_gemma_forward": args.use_native_gemma_forward,
+            "native_gemma_attention_backend": args.native_gemma_attention_backend,
+            "native_gemma_projection_backend": args.native_gemma_projection_backend,
+            "native_gemma_weight_backend": args.native_gemma_weight_backend,
+            "native_gemma_release_hf_decoder_layers": (
+                args.native_gemma_release_hf_decoder_layers
+            ),
+            "enable_token_pool_metadata": args.enable_token_pool_metadata,
+            "enable_token_pool_attention": args.enable_token_pool_attention,
+            "token_pool_max_context_len": args.token_pool_max_context_len,
+            "token_pool_capacity": args.token_pool_capacity,
+            "token_pool_paged_block_size": args.token_pool_paged_block_size,
+            "enable_token_pool_triton": args.enable_token_pool_triton,
+            "enable_token_pool_paged_triton": args.enable_token_pool_paged_triton,
+            "enable_token_pool_paged_split_triton": (
+                args.enable_token_pool_paged_split_triton
+            ),
+            "token_pool_triton_strict": args.token_pool_triton_strict,
+            "token_pool_sliding_paged_metadata_only": (
+                args.token_pool_sliding_paged_metadata_only
+            ),
+            "token_pool_triton_env": token_pool_triton_env,
+            "slots": args.slots,
+            "token_budget": args.token_budget,
+        },
+        "summary": {
+            "bmax_green": max((r.get("B", 0) for r in rows if r.get("green")), default=0),
+            "max_success_B": max(
+                (r.get("B", 0) for r in rows if r.get("success_count") == r.get("B")),
+                default=0,
+            ),
+            "best_green_agg_decode_tok_s": max(
+                (r.get("agg_decode_tok_s") or 0.0 for r in rows if r.get("green")),
+                default=0.0,
+            ),
+        },
+        "rows": rows,
+    }
+    if fatal_error is not None:
+        payload["fatal_error"] = fatal_error
+    return payload
+
+
+def emit_benchmark_payload(args, payload: dict[str, Any]) -> None:
+    if args.json:
+        atomic_write_json(Path(args.json), payload)
+        print(f"WROTE {args.json}")
+    else:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+
+
 def build_native_config(model, args):
     return gemma4_e4b_routed_span_config(
         num_hidden_layers=model.config.num_hidden_layers,
@@ -754,41 +887,35 @@ def run(args) -> dict[str, Any]:
 
     token_pool_triton_env = apply_token_pool_triton_bench_env(args)
     path = resolve_model_path(args.model_path)
-    tok = AutoTokenizer.from_pretrained(path)
-    if args.native_gemma_checkpoint_loader:
-        args.use_native_gemma_forward = True
-        if args.native_gemma_weight_backend != "hf_live":
-            raise ValueError(
-                "--native-gemma-checkpoint-loader owns checkpoint tensors directly "
-                "and requires --native-gemma-weight-backend hf_live"
-            )
-        if args.native_gemma_release_hf_decoder_layers:
-            raise ValueError(
-                "--native-gemma-checkpoint-loader does not construct HF decoder "
-                "layers, so --native-gemma-release-hf-decoder-layers is invalid"
-            )
-    release_per_row = bool(args.native_gemma_release_hf_decoder_layers)
-
-    model = None
-    cfg = None
-    if not release_per_row:
-        model = load_model(
-            path,
-            args.device,
-            args.attn,
-            native_checkpoint_loader=args.native_gemma_checkpoint_loader,
-            native_gemma_attention_backend=args.native_gemma_attention_backend,
-            native_gemma_projection_backend=args.native_gemma_projection_backend,
-        )
-        cfg = build_native_config(model, args)
-    usable_gib = torch_usable_gib(args.mem_cap_gib)
-
     rows = []
-    for B in args.concurrency:
-        row_model = model
-        row_cfg = cfg
-        if release_per_row:
-            row_model = load_model(
+    usable_gib: float | None = None
+    setup_phase = "setup"
+    try:
+        setup_phase = "torch_memory_probe"
+        usable_gib = torch_usable_gib(args.mem_cap_gib)
+        setup_phase = "tokenizer_load"
+        tok = AutoTokenizer.from_pretrained(path)
+        setup_phase = "native_checkpoint_argument_validation"
+        if args.native_gemma_checkpoint_loader:
+            args.use_native_gemma_forward = True
+            if args.native_gemma_weight_backend != "hf_live":
+                raise ValueError(
+                    "--native-gemma-checkpoint-loader owns checkpoint tensors "
+                    "directly and requires --native-gemma-weight-backend hf_live"
+                )
+            if args.native_gemma_release_hf_decoder_layers:
+                raise ValueError(
+                    "--native-gemma-checkpoint-loader does not construct HF "
+                    "decoder layers, so "
+                    "--native-gemma-release-hf-decoder-layers is invalid"
+                )
+        release_per_row = bool(args.native_gemma_release_hf_decoder_layers)
+
+        model = None
+        cfg = None
+        if not release_per_row:
+            setup_phase = "model_load"
+            model = load_model(
                 path,
                 args.device,
                 args.attn,
@@ -796,137 +923,70 @@ def run(args) -> dict[str, Any]:
                 native_gemma_attention_backend=args.native_gemma_attention_backend,
                 native_gemma_projection_backend=args.native_gemma_projection_backend,
             )
-            row_cfg = build_native_config(row_model, args)
-        try:
-            row = run_row(row_model, tok, row_cfg, B, args, usable_gib)
-        finally:
-            if release_per_row:
-                del row_model
-                del row_cfg
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-        rows.append(row)
-        print(
-            f"[wkvm-native ctx={args.ctx} out={args.out} B={B}] "
-            f"success={row['success_count']}/{B} "
-            f"p50={row['p50_latency_s']}s p95={row['p95_latency_s']}s "
-            f"agg={row['agg_decode_tok_s']}tok/s "
-            f"reserved={row['peak_reserved_gib']}GiB green={row['green']}"
-        )
-        if row.get("error") and args.stop_on_failure:
-            break
+            setup_phase = "native_config_build"
+            cfg = build_native_config(model, args)
 
-    hf_boundary = hf_boundary_summary(rows, args)
-    native_no_hf_requirement = native_no_hf_requirement_report(
-        rows,
-        required=args.require_native_no_hf,
+        for B in args.concurrency:
+            setup_phase = f"benchmark_row_B{B}"
+            row_model = model
+            row_cfg = cfg
+            if release_per_row:
+                setup_phase = f"model_load_B{B}"
+                row_model = load_model(
+                    path,
+                    args.device,
+                    args.attn,
+                    native_checkpoint_loader=args.native_gemma_checkpoint_loader,
+                    native_gemma_attention_backend=args.native_gemma_attention_backend,
+                    native_gemma_projection_backend=args.native_gemma_projection_backend,
+                )
+                setup_phase = f"native_config_build_B{B}"
+                row_cfg = build_native_config(row_model, args)
+            try:
+                setup_phase = f"run_row_B{B}"
+                row = run_row(row_model, tok, row_cfg, B, args, usable_gib)
+            finally:
+                if release_per_row:
+                    del row_model
+                    del row_cfg
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+            rows.append(row)
+            print(
+                f"[wkvm-native ctx={args.ctx} out={args.out} B={B}] "
+                f"success={row['success_count']}/{B} "
+                f"p50={row['p50_latency_s']}s p95={row['p95_latency_s']}s "
+                f"agg={row['agg_decode_tok_s']}tok/s "
+                f"reserved={row['peak_reserved_gib']}GiB green={row['green']}"
+            )
+            if row.get("error") and args.stop_on_failure:
+                break
+    except Exception as exc:
+        payload = build_benchmark_payload(
+            args,
+            path=path,
+            rows=rows,
+            usable_gib=usable_gib,
+            token_pool_triton_env=token_pool_triton_env,
+            fatal_error=benchmark_fatal_error(exc, phase=setup_phase),
+        )
+        emit_benchmark_payload(args, payload)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        raise
+
+    payload = build_benchmark_payload(
+        args,
+        path=path,
+        rows=rows,
+        usable_gib=usable_gib,
+        token_pool_triton_env=token_pool_triton_env,
     )
-    payload: dict[str, Any] = {
-        "schema": "wkvm.native_gemma_bench.v1",
-        "engine": "wkvm-native",
-        "context_tokens_per_session": args.ctx,
-        "prompt_lengths_mode": args.prompt_lengths,
-        "decode_tokens_per_session": args.out,
-        "mem_cap_gib": args.mem_cap_gib,
-        "headroom_gib": args.headroom_gib,
-        "torch_usable_gib": round_or_none(usable_gib),
-        "model_path": path,
-        "dtype": "bfloat16",
-        "device": args.device,
-        "attn": args.attn,
-        "model_forward_backend": hf_boundary["model_forward_backend"],
-        "uses_hf_transformer_forward": hf_boundary[
-            "uses_hf_transformer_forward"
-        ],
-        "uses_hf_model_construction": hf_boundary["uses_hf_model_construction"],
-        "native_gemma_checkpoint_loader": hf_boundary[
-            "native_gemma_checkpoint_loader"
-        ],
-        "hf_boundary": hf_boundary,
-        "native_no_hf_requirement": native_no_hf_requirement,
-        "native_gemma_attention_backend": args.native_gemma_attention_backend,
-        "native_gemma_projection_backend": args.native_gemma_projection_backend,
-        "native_gemma_weight_backend": args.native_gemma_weight_backend,
-        "native_gemma_release_hf_decoder_layers": (
-            args.native_gemma_release_hf_decoder_layers
-        ),
-        "token_pool_attention_enabled": args.enable_token_pool_attention,
-        "token_pool_triton_env": token_pool_triton_env,
-        "cuda_phase_metrics_enabled": args.cuda_phase_metrics,
-        "git_commit": git_commit(),
-        "launch_command": shlex.join([sys.executable, *sys.argv]),
-        "concurrency": args.concurrency,
-        "config": {
-            "sink": args.sink,
-            "window": args.window,
-            "m_slots": args.m_slots,
-            "route_chunk": args.route_chunk,
-            "chunk": args.chunk,
-            "decode_microbatch_rows": args.decode_microbatch_rows,
-            "decode_microbatch_bytes": args.decode_microbatch_bytes,
-            "decode_batch_planner": args.decode_batch_planner,
-            "decode_workspace_bytes": args.decode_workspace_bytes,
-            "decode_workspace_width_bucket": args.decode_workspace_width_bucket,
-            "persistent_exact_decode": not args.disable_persistent_exact_decode,
-            "persistent_padded_decode": not args.disable_persistent_padded_decode,
-                "persistent_padded_decode_steps": args.persistent_padded_decode_steps,
-                "persistent_padded_full_attention_rows": (
-                    args.persistent_padded_full_attention_rows
-                ),
-            "persistent_padded_sliding_metadata_padding": (
-                args.persistent_padded_sliding_metadata_padding
-            ),
-            "persistent_padded_decode_cuda_graph": args.persistent_padded_decode_cuda_graph,
-            "persistent_padded_decode_graph_warmup_iters": (
-                args.persistent_padded_decode_graph_warmup_iters
-            ),
-            "cuda_phase_metrics": args.cuda_phase_metrics,
-            "use_native_gemma_forward": args.use_native_gemma_forward,
-            "native_gemma_attention_backend": args.native_gemma_attention_backend,
-            "native_gemma_projection_backend": args.native_gemma_projection_backend,
-            "native_gemma_weight_backend": args.native_gemma_weight_backend,
-            "native_gemma_release_hf_decoder_layers": (
-                args.native_gemma_release_hf_decoder_layers
-            ),
-            "enable_token_pool_metadata": args.enable_token_pool_metadata,
-            "enable_token_pool_attention": args.enable_token_pool_attention,
-            "token_pool_max_context_len": args.token_pool_max_context_len,
-            "token_pool_capacity": args.token_pool_capacity,
-            "token_pool_paged_block_size": args.token_pool_paged_block_size,
-            "enable_token_pool_triton": args.enable_token_pool_triton,
-            "enable_token_pool_paged_triton": args.enable_token_pool_paged_triton,
-            "enable_token_pool_paged_split_triton": (
-                args.enable_token_pool_paged_split_triton
-            ),
-            "token_pool_triton_strict": args.token_pool_triton_strict,
-            "token_pool_sliding_paged_metadata_only": (
-                args.token_pool_sliding_paged_metadata_only
-            ),
-            "token_pool_triton_env": token_pool_triton_env,
-            "slots": args.slots,
-            "token_budget": args.token_budget,
-        },
-        "summary": {
-            "bmax_green": max((r["B"] for r in rows if r["green"]), default=0),
-            "max_success_B": max(
-                (r["B"] for r in rows if r["success_count"] == r["B"]),
-                default=0,
-            ),
-            "best_green_agg_decode_tok_s": max(
-                (r["agg_decode_tok_s"] or 0.0 for r in rows if r["green"]),
-                default=0.0,
-            ),
-        },
-        "rows": rows,
-    }
-    if args.json:
-        atomic_write_json(Path(args.json), payload)
-        print(f"WROTE {args.json}")
-    else:
-        print(json.dumps(payload, indent=2, sort_keys=True))
+    emit_benchmark_payload(args, payload)
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    native_no_hf_requirement = payload["native_no_hf_requirement"]
     if args.require_native_no_hf and not native_no_hf_requirement["passed"]:
         raise RuntimeError(
             "native no-HF requirement failed: "
