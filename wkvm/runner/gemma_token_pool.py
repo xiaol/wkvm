@@ -6312,6 +6312,7 @@ class TokenPoolDecodeBackendState:
                     "kv_indptr",
                     "kv_indices",
                     "block_tables",
+                    "request_block_tables",
                     "block_table_lens",
                     "selected_start_positions",
                     "slot_mapping",

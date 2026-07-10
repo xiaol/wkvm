@@ -6490,6 +6490,7 @@ class TestGemmaTokenPool(unittest.TestCase):
     def test_graph_decode_context_graphable_requires_cuda_metadata(self) -> None:
         from wkvm.runner.gemma_token_pool import (
             DecodeBatchMetadata,
+            PagedDecodeBatchMetadata,
             TokenPoolDecodeBackendState,
             TokenPoolDecodeContext,
         )
@@ -6505,7 +6506,12 @@ class TestGemmaTokenPool(unittest.TestCase):
             def numel(self) -> int:
                 return 1
 
-        def context(*, is_cuda: bool, kv_pool=object()) -> TokenPoolDecodeContext:
+        def context(
+            *,
+            is_cuda: bool,
+            kv_pool=object(),
+            request_block_tables_cuda: bool | None = None,
+        ) -> TokenPoolDecodeContext:
             tensor = FakeTensor(is_cuda=is_cuda)
             metadata = DecodeBatchMetadata(
                 req_pool_indices=tensor,
@@ -6515,10 +6521,32 @@ class TestGemmaTokenPool(unittest.TestCase):
                 kv_indptr=tensor,
                 kv_indices=tensor,
             )
+            paged_metadata = None
+            if request_block_tables_cuda is not None:
+                paged_metadata = PagedDecodeBatchMetadata(
+                    req_pool_indices=tensor,
+                    seq_lens=tensor,
+                    logical_seq_lens=tensor,
+                    out_cache_loc=tensor,
+                    block_tables=tensor,
+                    block_table_lens=tensor,
+                    selected_start_positions=tensor,
+                    block_size=1,
+                    slot_mapping=tensor,
+                    out_cache_loc_long=tensor,
+                    request_block_tables=FakeTensor(
+                        is_cuda=request_block_tables_cuda
+                    ),
+                )
             return TokenPoolDecodeContext(
                 metadata_by_layer_type={"sliding_attention": metadata},
                 kv_pool=kv_pool,
                 metadata_by_layer_id={0: metadata},
+                paged_metadata_by_layer_type=(
+                    None
+                    if paged_metadata is None
+                    else {"sliding_attention": paged_metadata}
+                ),
                 covered_layer_types=frozenset({"sliding_attention"}),
             )
 
@@ -6533,6 +6561,16 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertFalse(
             TokenPoolDecodeBackendState.graph_decode_context_is_graphable(
                 context(is_cuda=False),
+            )
+        )
+        self.assertFalse(
+            TokenPoolDecodeBackendState.graph_decode_context_is_graphable(
+                context(is_cuda=True, request_block_tables_cuda=False),
+            )
+        )
+        self.assertTrue(
+            TokenPoolDecodeBackendState.graph_decode_context_is_graphable(
+                context(is_cuda=True, request_block_tables_cuda=True),
             )
         )
         self.assertTrue(
