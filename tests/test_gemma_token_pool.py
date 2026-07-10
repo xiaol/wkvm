@@ -764,6 +764,68 @@ class TestGemmaTokenPool(unittest.TestCase):
         allocator.free_slots(reservation_slot_ids)
         self.assertEqual(allocator.allocated_count, 0)
 
+    def test_token_pool_decode_backend_wraps_full_attention_row_lifecycle(self) -> None:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenPoolDecodeBackendState,
+            TokenPoolFullAttentionRow,
+            TokenSlotAllocator,
+        )
+
+        metadata_only = TokenPoolDecodeBackendState(
+            table=ReqToTokenTable(max_requests=1, max_context_len=4),
+        )
+        self.assertFalse(metadata_only.has_full_attention_rows())
+        self.assertIsNone(metadata_only.full_attention_transient_slots)
+        self.assertIsNone(metadata_only.full_attention_row_records)
+        self.assertEqual(metadata_only.invalidate_full_attention_rows(["missing"]), 0)
+
+        allocator = TokenSlotAllocator(capacity=24)
+        backend = TokenPoolDecodeBackendState(
+            table=ReqToTokenTable(max_requests=2, max_context_len=8),
+            allocator=allocator,
+            block_size=4,
+        )
+        self.assertTrue(backend.has_full_attention_rows())
+        transient_slots = backend.full_attention_transient_slots
+        row_records = backend.full_attention_row_records
+        self.assertIsNotNone(transient_slots)
+        self.assertIsNotNone(row_records)
+
+        page_tensor, page_slots, page_owned_slots = (
+            backend.allocate_page_aligned_full_attention_row_slots(0, 5)
+        )
+        self.assertEqual(page_tensor.tolist(), list(range(8)))
+        self.assertEqual(page_slots, list(range(8)))
+        self.assertEqual(page_owned_slots, list(range(8)))
+        allocator.free_slots(page_owned_slots)
+
+        row_tensor, row_owned_slots = allocator.alloc_slots_with_ids(3)
+        transient_tensor, transient_owned_slots = allocator.alloc_slots_with_ids(2)
+        self.assertEqual(row_tensor.tolist(), row_owned_slots)
+        self.assertEqual(transient_tensor.tolist(), transient_owned_slots)
+        row_records["persist"] = TokenPoolFullAttentionRow(
+            row_slots=row_owned_slots[:2],
+            owned_slots=row_owned_slots,
+        )
+        transient_slots["transient"] = transient_owned_slots
+        self.assertEqual(allocator.allocated_count, 5)
+
+        self.assertEqual(
+            backend.invalidate_full_attention_rows_containing([row_owned_slots[1]]),
+            1,
+        )
+        self.assertEqual(row_records, {})
+        self.assertEqual(allocator.allocated_count, 2)
+        backend.clear_full_attention_rows("transient")
+        self.assertEqual(transient_slots, {})
+        self.assertEqual(allocator.allocated_count, 0)
+
     def test_token_pool_decode_backend_builds_sliding_metadata_from_block_tables(self) -> None:
         try:
             import torch  # noqa: F401

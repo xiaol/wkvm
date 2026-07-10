@@ -716,14 +716,13 @@ class GemmaNativeEngine:
             else:
                 self._token_slot_allocator = TokenSlotAllocator(capacity=token_pool_capacity)
             self._token_pool_decode_backend = self._new_token_pool_decode_backend()
-            row_manager = (
-                None
-                if self._token_pool_decode_backend is None
-                else self._token_pool_decode_backend.full_attention_rows
-            )
-            if row_manager is not None:
-                self._token_pool_full_attention_slots = row_manager.transient_slots
-                self._token_pool_full_attention_rows = row_manager.rows
+            backend = self._token_pool_decode_backend
+            row_slots = None if backend is None else backend.full_attention_transient_slots
+            row_records = None if backend is None else backend.full_attention_row_records
+            if row_slots is not None:
+                self._token_pool_full_attention_slots = row_slots
+            if row_records is not None:
+                self._token_pool_full_attention_rows = row_records
         self._record_cuda_memory_phase("engine_init")
 
     def add_request(self, request: Request, *, break_mask: list[bool] | None = None) -> None:
@@ -2226,10 +2225,9 @@ class GemmaNativeEngine:
         min_slots: int,
     ):
         backend = self._token_pool_decode_backend
-        row_manager = None if backend is None else backend.full_attention_rows
-        if row_manager is None:
+        if backend is None:
             raise RuntimeError("token-pool full-attention row manager is not initialized")
-        return row_manager.allocate_page_aligned_row_slots(
+        return backend.allocate_page_aligned_full_attention_row_slots(
             start_position,
             min_slots,
         )
@@ -2775,7 +2773,7 @@ class GemmaNativeEngine:
         backend = self._token_pool_decode_backend
         if pool is None or backend is None:
             return None, None
-        if backend.full_attention_rows is None:
+        if not backend.has_full_attention_rows():
             return None, None
         owner_layer_ids = self._token_pool_full_attention_owner_layer_ids()
         if not owner_layer_ids:
@@ -2907,26 +2905,23 @@ class GemmaNativeEngine:
 
     def _token_pool_clear_full_attention_rows(self, req_ids) -> None:
         backend = self._token_pool_decode_backend
-        row_manager = None if backend is None else backend.full_attention_rows
-        if row_manager is None:
+        if backend is None:
             return
-        row_manager.clear(req_ids)
+        backend.clear_full_attention_rows(req_ids)
 
     def _token_pool_invalidate_full_attention_rows(self, req_ids) -> None:
         backend = self._token_pool_decode_backend
-        row_manager = None if backend is None else backend.full_attention_rows
-        if row_manager is None:
+        if backend is None:
             return
-        invalidated = row_manager.invalidate(req_ids)
+        invalidated = backend.invalidate_full_attention_rows(req_ids)
         if invalidated:
             self.metrics.token_pool_full_attention_row_invalidations += invalidated
 
     def _token_pool_invalidate_full_attention_rows_containing(self, slots) -> None:
         backend = self._token_pool_decode_backend
-        row_manager = None if backend is None else backend.full_attention_rows
-        if row_manager is None:
+        if backend is None:
             return
-        invalidated = row_manager.invalidate_containing(slots)
+        invalidated = backend.invalidate_full_attention_rows_containing(slots)
         if invalidated:
             self.metrics.token_pool_full_attention_row_invalidations += invalidated
 

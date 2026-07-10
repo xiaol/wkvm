@@ -4874,6 +4874,50 @@ class TokenPoolDecodeBackendState:
         )
 
     @property
+    def full_attention_transient_slots(self) -> dict[str, list[int]] | None:
+        if self.full_attention_rows is None:
+            return None
+        return self.full_attention_rows.transient_slots
+
+    @property
+    def full_attention_row_records(
+        self,
+    ) -> dict[str, TokenPoolFullAttentionRow] | None:
+        if self.full_attention_rows is None:
+            return None
+        return self.full_attention_rows.rows
+
+    def has_full_attention_rows(self) -> bool:
+        return self.full_attention_rows is not None
+
+    def allocate_page_aligned_full_attention_row_slots(
+        self,
+        start_position: int,
+        min_slots: int,
+    ) -> tuple[Any, list[int], list[int]]:
+        if self.full_attention_rows is None:
+            raise RuntimeError("token-pool full-attention row manager is not initialized")
+        return self.full_attention_rows.allocate_page_aligned_row_slots(
+            start_position,
+            min_slots,
+        )
+
+    def clear_full_attention_rows(self, req_ids: str | Iterable[Any]) -> None:
+        if self.full_attention_rows is None:
+            return
+        self.full_attention_rows.clear(req_ids)
+
+    def invalidate_full_attention_rows(self, req_ids: str | Iterable[Any]) -> int:
+        if self.full_attention_rows is None:
+            return 0
+        return self.full_attention_rows.invalidate(req_ids)
+
+    def invalidate_full_attention_rows_containing(self, slots: Iterable[int] | Any) -> int:
+        if self.full_attention_rows is None:
+            return 0
+        return self.full_attention_rows.invalidate_containing(slots)
+
+    @property
     def graph_decode_signatures(self) -> dict[tuple[str, ...], dict[str, Any]]:
         return self.graph_signature_tracker.signatures
 
