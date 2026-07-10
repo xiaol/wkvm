@@ -646,8 +646,12 @@ class _CheckpointGemma4Attention:
         self.training = False
         self.is_causal = getattr(config, "use_bidirectional_attention", None) != "all"
 
+        self.kv_shared_layer_index = _gemma4_kv_shared_layer_index(
+            config,
+            layer_idx,
+        )
         first_kv_shared_layer_idx = config.num_hidden_layers - getattr(config, "num_kv_shared_layers", 0)
-        self.is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx >= 0
+        self.is_kv_shared_layer = self.kv_shared_layer_index is not None
         prev_layers = config.layer_types[:first_kv_shared_layer_idx]
         self.store_full_length_kv = (
             not self.is_kv_shared_layer
@@ -1508,6 +1512,21 @@ def _attention_forward(
     return attn_output.transpose(1, 2).contiguous(), attn_weights
 
 
+def _gemma4_kv_shared_layer_index(config: Any, layer_idx: int) -> int | None:
+    num_kv_shared_layers = int(getattr(config, "num_kv_shared_layers", 0) or 0)
+    if num_kv_shared_layers <= 0:
+        return None
+    first_kv_shared_layer_idx = int(config.num_hidden_layers) - num_kv_shared_layers
+    if first_kv_shared_layer_idx < 0 or layer_idx < first_kv_shared_layer_idx:
+        return None
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types is None:
+        return None
+    prev_layers = layer_types[:first_kv_shared_layer_idx]
+    current_layer_type = layer_types[layer_idx]
+    return len(prev_layers) - 1 - prev_layers[::-1].index(current_layer_type)
+
+
 @dataclass
 class NativeGemma4PrefixOutput:
     hidden_states: Any
@@ -1527,6 +1546,7 @@ class _NativeAttentionMeta:
     scaling: float
     is_kv_shared_layer: bool
     layer_type: str | None
+    kv_shared_layer_index: int | None
     store_full_length_kv: bool
 
 
@@ -1675,6 +1695,16 @@ class NativeGemma4Attention:
             self.native_attention_backend
         )
         self.shared_kv_state = NativeGemma4SharedKVState()
+        kv_shared_layer_index = getattr(hf_attn, "kv_shared_layer_index", None)
+        if kv_shared_layer_index is None and bool(
+            getattr(hf_attn, "is_kv_shared_layer", False)
+        ):
+            config = getattr(hf_attn, "config", None)
+            if config is not None:
+                kv_shared_layer_index = _gemma4_kv_shared_layer_index(
+                    config,
+                    self.layer_idx,
+                )
         self.attn_meta = _NativeAttentionMeta(
             head_dim=int(hf_attn.head_dim),
             num_key_value_groups=int(hf_attn.num_key_value_groups),
@@ -1683,6 +1713,9 @@ class NativeGemma4Attention:
             scaling=float(hf_attn.scaling),
             is_kv_shared_layer=bool(getattr(hf_attn, "is_kv_shared_layer", False)),
             layer_type=getattr(hf_attn, "layer_type", None),
+            kv_shared_layer_index=(
+                None if kv_shared_layer_index is None else int(kv_shared_layer_index)
+            ),
             store_full_length_kv=bool(
                 getattr(hf_attn, "store_full_length_kv", False)
             ),

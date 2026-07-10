@@ -130,6 +130,43 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
         self.assertIs(native_layer.q_proj, native_layer.self_attn.q_proj)
         self.assertIs(native_layer.o_proj, native_layer.self_attn.o_proj)
         self.assertEqual(native_layer.layer_type, native_layer.attn_meta.layer_type)
+        self.assertIsNone(native_layer.attn_meta.kv_shared_layer_index)
+
+    def test_shared_kv_source_layer_index_is_model_side_metadata(self) -> None:
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4TextDecoderLayer
+        from wkvm.runner.gemma_native_forward import (
+            NativeGemma4TextDecoderLayer,
+            _CheckpointGemma4Attention,
+        )
+
+        cfg = _tiny_shared_config()
+        source_layer = NativeGemma4TextDecoderLayer(
+            Gemma4TextDecoderLayer(cfg, layer_idx=0).eval()
+        )
+        shared_sliding_hf = Gemma4TextDecoderLayer(cfg, layer_idx=2).eval()
+        shared_sliding = NativeGemma4TextDecoderLayer(shared_sliding_hf)
+        shared_full_hf = Gemma4TextDecoderLayer(cfg, layer_idx=3).eval()
+        shared_full = NativeGemma4TextDecoderLayer(shared_full_hf)
+
+        self.assertFalse(source_layer.attn_meta.is_kv_shared_layer)
+        self.assertTrue(source_layer.attn_meta.store_full_length_kv)
+        self.assertIsNone(source_layer.attn_meta.kv_shared_layer_index)
+
+        self.assertTrue(shared_sliding.attn_meta.is_kv_shared_layer)
+        self.assertFalse(shared_sliding.attn_meta.store_full_length_kv)
+        self.assertEqual(shared_sliding.attn_meta.kv_shared_layer_index, 0)
+
+        self.assertTrue(shared_full.attn_meta.is_kv_shared_layer)
+        self.assertEqual(shared_full.attn_meta.kv_shared_layer_index, 1)
+
+        checkpoint_attn = _CheckpointGemma4Attention(
+            cfg,
+            3,
+            shared_full_hf.state_dict(),
+            "self_attn",
+        )
+        self.assertTrue(checkpoint_attn.is_kv_shared_layer)
+        self.assertEqual(checkpoint_attn.kv_shared_layer_index, 1)
 
     def test_attention_owns_shared_kv_state_handoff(self) -> None:
         import torch
@@ -147,6 +184,7 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
             scaling=1.0,
             is_kv_shared_layer=True,
             layer_type="sliding_attention",
+            kv_shared_layer_index=0,
             store_full_length_kv=False,
         )
         key_states = torch.randn(1, 1, 3, 4)
@@ -181,6 +219,7 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
             scaling=1.0,
             is_kv_shared_layer=False,
             layer_type="sliding_attention",
+            kv_shared_layer_index=None,
             store_full_length_kv=True,
         )
         stored = UserDict()

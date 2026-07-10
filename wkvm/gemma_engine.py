@@ -2065,9 +2065,12 @@ class GemmaNativeEngine:
             layer_idx = int(layer.layer_idx)
             share_target = None
             if bool(getattr(attn, "is_kv_shared_layer", False)):
-                share_target = owner_by_type.get(layer_type)
+                share_target = getattr(attn, "kv_shared_layer_index", None)
+                if share_target is None:
+                    share_target = owner_by_type.get(layer_type)
                 if share_target is None:
                     continue
+                share_target = int(share_target)
             specs.append(
                 TokenKVLayerSpec(
                     layer_id=layer_idx,

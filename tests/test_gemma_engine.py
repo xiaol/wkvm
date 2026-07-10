@@ -1817,24 +1817,28 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
                     SimpleNamespace(
                         layer_type="sliding_attention",
                         is_kv_shared_layer=False,
+                        kv_shared_layer_index=None,
                         num_key_value_groups=2,
                         head_dim=4,
                     ),
                     SimpleNamespace(
                         layer_type="full_attention",
                         is_kv_shared_layer=False,
+                        kv_shared_layer_index=None,
                         num_key_value_groups=1,
                         head_dim=8,
                     ),
                     SimpleNamespace(
                         layer_type="sliding_attention",
                         is_kv_shared_layer=True,
+                        kv_shared_layer_index=0,
                         num_key_value_groups=2,
                         head_dim=4,
                     ),
                     SimpleNamespace(
                         layer_type="full_attention",
                         is_kv_shared_layer=True,
+                        kv_shared_layer_index=1,
                         num_key_value_groups=1,
                         head_dim=8,
                     ),
@@ -1877,6 +1881,8 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         self.assertEqual(pool.target_layer(1), 1)
         self.assertEqual(pool.target_layer(2), 0)
         self.assertEqual(pool.target_layer(3), 1)
+        self.assertEqual(specs[2].kv_share_target_layer, 0)
+        self.assertEqual(specs[3].kv_share_target_layer, 1)
         self.assertEqual(specs[0].num_kv_heads, 2)
         self.assertEqual(specs[1].num_kv_heads, 4)
         self.assertEqual(specs[1].head_dim, 8)
