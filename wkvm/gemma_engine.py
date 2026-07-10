@@ -41,6 +41,7 @@ from wkvm.runner.gemma_token_pool import (
     TokenPoolDecodeGraphSignatureUpdate,
     TokenPoolDecodeGraphSignatureTracker,
     TokenPoolFullAttentionRow,
+    TokenPoolPreparedDecodeBatch,
     TokenSlotAllocator,
 )
 
@@ -1006,8 +1007,8 @@ class GemmaNativeEngine:
                 if persistent is not None:
                     return persistent
         if batched:
-            reservations = self._token_pool_prepare_decode_batch(reqs)
-            token_pool_decode = self._token_pool_decode_context(reservations)
+            prepared_decode = self._token_pool_prepare_decode_model_batch(reqs)
+            token_pool_decode = self._token_pool_decode_context(prepared_decode)
             try:
                 logits = self.runner.decode_batch(
                     [self._caches[req.req_id] for req in reqs],
@@ -1015,7 +1016,7 @@ class GemmaNativeEngine:
                     position_ids=[req.num_computed_tokens for req in reqs],
                     token_pool_decode=token_pool_decode,
                 )
-                self._token_pool_commit_decode_reservations(reservations)
+                self._token_pool_commit_decode_reservations(prepared_decode)
                 self.metrics.decode_model_calls += 1
                 self.metrics.batched_decode_model_calls += 1
                 info = getattr(self.runner, "last_decode_batch_info", {})
@@ -1037,17 +1038,17 @@ class GemmaNativeEngine:
                         sampled[req.req_id] = [token_ids[row]]
                 return sampled
             except DistinctCacheBatchError as exc:
-                self._token_pool_discard_decode_reservations(reservations)
+                self._token_pool_discard_decode_reservations(prepared_decode)
                 self._record_decode_batch_fallback(exc)
             except Exception:
-                self._token_pool_discard_decode_reservations(reservations)
+                self._token_pool_discard_decode_reservations(prepared_decode)
                 raise
 
         for req in reqs:
             cache = self._caches[req.req_id]
             last_token = self._feed_tokens(req, 1)[0]
-            reservations = self._token_pool_prepare_decode_batch([req])
-            token_pool_decode = self._token_pool_decode_context(reservations)
+            prepared_decode = self._token_pool_prepare_decode_model_batch([req])
+            token_pool_decode = self._token_pool_decode_context(prepared_decode)
             try:
                 logits = self.runner.decode_step(
                     cache,
@@ -1055,9 +1056,9 @@ class GemmaNativeEngine:
                     position_ids=[req.num_computed_tokens],
                     token_pool_decode=token_pool_decode,
                 )
-                self._token_pool_commit_decode_reservations(reservations)
+                self._token_pool_commit_decode_reservations(prepared_decode)
             except Exception:
-                self._token_pool_discard_decode_reservations(reservations)
+                self._token_pool_discard_decode_reservations(prepared_decode)
                 raise
             self.metrics.decode_model_calls += 1
             self.metrics.fallback_decode_model_calls += 1
@@ -1096,8 +1097,8 @@ class GemmaNativeEngine:
         last_tokens = [self._feed_tokens(req, 1)[0] for req in reqs]
         position_ids = [req.num_computed_tokens for req in reqs]
         merged_cache = self._persistent_exact_decode_groups.get(key)
-        reservations = self._token_pool_prepare_decode_batch(reqs)
-        token_pool_decode = self._token_pool_decode_context(reservations)
+        prepared_decode = self._token_pool_prepare_decode_model_batch(reqs)
+        token_pool_decode = self._token_pool_decode_context(prepared_decode)
         started_new = merged_cache is None
         try:
             if started_new:
@@ -1118,13 +1119,13 @@ class GemmaNativeEngine:
                     token_pool_decode=token_pool_decode,
                 )
                 self.metrics.persistent_exact_decode_reuses += 1
-            self._token_pool_commit_decode_reservations(reservations)
+            self._token_pool_commit_decode_reservations(prepared_decode)
         except DistinctCacheBatchError as exc:
-            self._token_pool_discard_decode_reservations(reservations)
+            self._token_pool_discard_decode_reservations(prepared_decode)
             self._record_decode_batch_fallback(exc)
             return None
         except Exception:
-            self._token_pool_discard_decode_reservations(reservations)
+            self._token_pool_discard_decode_reservations(prepared_decode)
             raise
 
         self.metrics.decode_model_calls += 1
@@ -1171,7 +1172,7 @@ class GemmaNativeEngine:
         last_tokens = [self._feed_tokens(req, 1)[0] for req in reqs]
         position_ids = [req.num_computed_tokens for req in reqs]
         merged_cache = self._persistent_padded_decode_groups.get(key)
-        reservations: list[_TokenPoolDecodeReservation] = []
+        prepared_decode: Any = ()
         started_new = merged_cache is None
         post_step_remaining_capacity: int | None = None
         token_pool_decode: TokenPoolDecodeContext | None = None
@@ -1180,7 +1181,7 @@ class GemmaNativeEngine:
                 reserve_steps = self._persistent_padded_reserve_steps(reqs)
                 if reserve_steps < 1:
                     return None
-                reservations = self._token_pool_prepare_decode_batch(
+                prepared_decode = self._token_pool_prepare_decode_model_batch(
                     reqs,
                     full_attention_kv_indices_padding_steps=max(
                         0,
@@ -1196,7 +1197,7 @@ class GemmaNativeEngine:
                         self.persistent_padded_full_attention_rows
                     ),
                 )
-                token_pool_decode = self._token_pool_decode_context(reservations)
+                token_pool_decode = self._token_pool_decode_context(prepared_decode)
                 logits, merged_cache = begin(
                     [self._caches[req.req_id] for req in reqs],
                     last_tokens,
@@ -1225,7 +1226,7 @@ class GemmaNativeEngine:
                 if remaining_capacity < 1:
                     self._flush_padded_decode_group(key)
                     return self._try_execute_persistent_padded_decode_batch(reqs)
-                reservations = self._token_pool_prepare_decode_batch(
+                prepared_decode = self._token_pool_prepare_decode_model_batch(
                     reqs,
                     full_attention_kv_indices_padding_steps=max(
                         0,
@@ -1241,7 +1242,7 @@ class GemmaNativeEngine:
                         self.persistent_padded_full_attention_rows
                     ),
                 )
-                token_pool_decode = self._token_pool_decode_context(reservations)
+                token_pool_decode = self._token_pool_decode_context(prepared_decode)
                 logits = reuse(
                     merged_cache,
                     last_tokens,
@@ -1256,7 +1257,7 @@ class GemmaNativeEngine:
                         started_new=False,
                     )
                 post_step_remaining_capacity = int(remaining_capacity) - 1
-            self._token_pool_commit_decode_reservations(reservations)
+            self._token_pool_commit_decode_reservations(prepared_decode)
         except DistinctCacheBatchError as exc:
             if (
                 self.record_token_pool_decode_graph_signatures
@@ -1268,13 +1269,13 @@ class GemmaNativeEngine:
                     token_pool_decode,
                     started_new=started_new,
                 )
-            self._token_pool_discard_decode_reservations(reservations)
+            self._token_pool_discard_decode_reservations(prepared_decode)
             self._record_decode_batch_fallback(exc)
             if key in self._persistent_padded_decode_groups:
                 self._flush_padded_decode_group(key)
             return None
         except Exception:
-            self._token_pool_discard_decode_reservations(reservations)
+            self._token_pool_discard_decode_reservations(prepared_decode)
             raise
 
         self.metrics.decode_model_calls += 1
@@ -2540,9 +2541,34 @@ class GemmaNativeEngine:
         )
         return list(prepared_batch.reservations)
 
+    def _token_pool_prepare_decode_model_batch(
+        self,
+        reqs: list[Request],
+        *,
+        full_attention_kv_indices_padding_steps: int = 0,
+        sliding_attention_kv_indices_padding_steps: int = 0,
+        persistent_full_attention_rows: bool = False,
+    ) -> TokenPoolPreparedDecodeBatch | list[_TokenPoolDecodeReservation]:
+        batch_or_reservations = self._token_pool_prepare_decode_batch(
+            reqs,
+            full_attention_kv_indices_padding_steps=(
+                full_attention_kv_indices_padding_steps
+            ),
+            sliding_attention_kv_indices_padding_steps=(
+                sliding_attention_kv_indices_padding_steps
+            ),
+            persistent_full_attention_rows=persistent_full_attention_rows,
+        )
+        if isinstance(batch_or_reservations, TokenPoolPreparedDecodeBatch):
+            return batch_or_reservations
+        backend = self._token_pool_decode_backend
+        if backend is None:
+            return batch_or_reservations
+        return backend.prepared_decode_batch(batch_or_reservations)
+
     def _token_pool_decode_context(
         self,
-        reservations: list[_TokenPoolDecodeReservation],
+        reservations: Any,
     ) -> TokenPoolDecodeContext | None:
         if not reservations or self._token_kv_pool is None:
             return None
@@ -2642,7 +2668,7 @@ class GemmaNativeEngine:
 
     def _token_pool_commit_decode_reservations(
         self,
-        reservations: list[_TokenPoolDecodeReservation],
+        reservations: Any,
     ) -> None:
         allocator = self._token_slot_allocator
         if allocator is None or not reservations:
@@ -2664,6 +2690,7 @@ class GemmaNativeEngine:
                 allocator.high_watermark,
             )
             return
+        reservations = list(reservations)
         try:
             self._token_pool_commit_decode_to_full_attention_caches(reservations)
         finally:
@@ -2925,7 +2952,7 @@ class GemmaNativeEngine:
 
     def _token_pool_discard_decode_reservations(
         self,
-        reservations: list[_TokenPoolDecodeReservation],
+        reservations: Any,
     ) -> None:
         table = self._token_table
         allocator = self._token_slot_allocator
@@ -2935,6 +2962,7 @@ class GemmaNativeEngine:
         if backend is not None:
             backend.discard_decode_batch(reservations)
             return
+        reservations = list(reservations)
         self._token_pool_clear_full_attention_rows(
             [reservation.req_id for reservation in reservations]
         )

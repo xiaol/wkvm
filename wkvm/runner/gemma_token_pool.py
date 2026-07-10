@@ -1864,6 +1864,15 @@ class TokenPoolPreparedDecodeBatch:
     def __post_init__(self) -> None:
         object.__setattr__(self, "reservations", tuple(self.reservations))
 
+    def __iter__(self):
+        return iter(self.reservations)
+
+    def __len__(self) -> int:
+        return len(self.reservations)
+
+    def __getitem__(self, index: Any) -> Any:
+        return self.reservations[index]
+
     @property
     def covered_layer_types(self) -> frozenset[str]:
         if self.state is None:
