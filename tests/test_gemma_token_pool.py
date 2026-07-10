@@ -4152,6 +4152,90 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(stats["auto_enabled_calls"], 1)
         self.assertEqual(stats["effective_enabled_calls"], 1)
 
+    def test_attention_backend_try_decode_call_skips_disabled_call(self) -> None:
+        from wkvm.runner.gemma_token_pool import build_token_pool_attention_call
+        from wkvm.runner.gemma_token_pool_attention import (
+            TokenPoolAttentionBackend,
+            TokenPoolAttentionBackendHooks,
+            TokenPoolTritonAttentionBackendHooks,
+        )
+
+        stats = {
+            "calls": 0,
+            "env_enabled_calls": 0,
+            "env_disabled_calls": 0,
+            "effective_enabled_calls": 0,
+            "effective_disabled_calls": 0,
+            "auto_enabled_calls": 0,
+            "paged_enabled_calls": 0,
+            "split_enabled_calls": 0,
+            "paged_split_enabled_calls": 0,
+        }
+        events = []
+
+        class Plan:
+            def attention_kwargs(self):
+                events.append("kwargs")
+                return {
+                    "decode_metadata": "metadata",
+                    "paged_decode_metadata": None,
+                    "token_kv_pool": "pool",
+                    "layer_idx": 3,
+                }
+
+            def decode_attention_enabled(self):
+                events.append("enabled")
+                return False
+
+            def attention_dispatch_context(self, **kwargs):
+                events.append(("context", kwargs))
+                raise AssertionError("disabled calls should not build context")
+
+        backend = TokenPoolAttentionBackend(
+            stats=stats,
+            disabled_shapes=set(),
+            hooks=TokenPoolAttentionBackendHooks(
+                triton=TokenPoolTritonAttentionBackendHooks(
+                    decode_fn=lambda: None,
+                    split_decode_fn=lambda: None,
+                    paged_decode_fn=lambda: None,
+                    paged_split_decode_fn=lambda: None,
+                    block_groups=lambda groups, dtype: groups,
+                    record_fallback=lambda reason: events.append(("fallback", reason)),
+                    is_recoverable_runtime_error=lambda exc: True,
+                ),
+                reference_decode=lambda *args, **kwargs: (
+                    events.append(("reference", args, kwargs))
+                    or ("output", None)
+                ),
+                slot_count=len,
+                record_kv_write_timing=lambda **kwargs: events.append(
+                    ("kv_timing", kwargs)
+                ),
+                record_triton_attempt_timing=lambda elapsed: events.append(
+                    ("triton_timing", elapsed)
+                ),
+                record_attention_timing=lambda kind, rows, elapsed: events.append(
+                    ("attention_timing", kind, rows, elapsed)
+                ),
+                now=lambda: 0.0,
+            ),
+        )
+        attention_call = build_token_pool_attention_call(token_pool_plan=Plan())
+        events.clear()
+
+        result = backend.try_decode_call(
+            object(),
+            object(),
+            attention_call=attention_call,
+            timing_enabled=True,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(events, [])
+        self.assertEqual(stats["calls"], 0)
+        self.assertEqual(stats["effective_enabled_calls"], 0)
+
     def test_attention_backend_factory_owns_default_triton_state(self) -> None:
         from types import SimpleNamespace
         from wkvm.runner.gemma_token_pool_attention import (

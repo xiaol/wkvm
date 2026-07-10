@@ -443,6 +443,25 @@ class TokenPoolAttentionBackend:
             timing_enabled=timing_enabled,
         )
 
+    def try_decode_call(
+        self,
+        attn: Any,
+        query_states: Any,
+        *,
+        attention_call: Any,
+        dispatch_plan: Any | None = None,
+        timing_enabled: bool = False,
+    ) -> TokenPoolAttentionDecodeResult | None:
+        if not bool(attention_call.decode_attention_enabled):
+            return None
+        return self.decode_call(
+            attn,
+            query_states,
+            attention_call=attention_call,
+            dispatch_plan=dispatch_plan,
+            timing_enabled=timing_enabled,
+        )
+
     def _record_dispatch_plan_call(self, dispatch_plan: Any) -> None:
         self._stats["calls"] += 1
         if dispatch_plan.env_enabled:

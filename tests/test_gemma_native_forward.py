@@ -467,6 +467,7 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
 
     def test_attention_forward_respects_disabled_token_pool_plan(self) -> None:
         import torch
+        import wkvm.runner.gemma_native_forward as native_forward
         from transformers.models.gemma4.modeling_gemma4 import Gemma4TextDecoderLayer
         from wkvm.runner.gemma_native_forward import (
             NativeGemma4TextDecoderLayer,
@@ -520,25 +521,43 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
         query = torch.randn(1, cfg.num_attention_heads, 1, cfg.head_dim)
         dense_keys = torch.randn(1, cfg.num_key_value_heads, 2, cfg.head_dim)
         dense_values = torch.randn(1, cfg.num_key_value_heads, 2, cfg.head_dim)
+        old_backend = native_forward._TOKEN_POOL_ATTENTION_BACKEND
+        backend_seen_enabled = []
 
-        with torch.inference_mode():
-            expected, expected_weights = _attention_forward_manual_gqa(
-                native_layer.attn_meta,
-                query,
-                dense_keys,
-                dense_values,
-                None,
-            )
-            actual, actual_weights = _attention_forward(
-                native_layer.attn_meta,
-                query,
-                dense_keys,
-                dense_values,
-                None,
-                backend="manual_gqa",
-                token_pool_plan=plan,
-            )
+        class Backend:
+            def try_decode_call(self, actual_attn, actual_query_states, **kwargs):
+                del actual_attn, actual_query_states
+                backend_seen_enabled.append(
+                    kwargs["attention_call"].decode_attention_enabled
+                )
+                return None
 
+            def decode_call(self, *args, **kwargs):
+                raise AssertionError("native forward should call try_decode_call")
+
+        try:
+            native_forward._TOKEN_POOL_ATTENTION_BACKEND = Backend()
+            with torch.inference_mode():
+                expected, expected_weights = _attention_forward_manual_gqa(
+                    native_layer.attn_meta,
+                    query,
+                    dense_keys,
+                    dense_values,
+                    None,
+                )
+                actual, actual_weights = _attention_forward(
+                    native_layer.attn_meta,
+                    query,
+                    dense_keys,
+                    dense_values,
+                    None,
+                    backend="manual_gqa",
+                    token_pool_plan=plan,
+                )
+        finally:
+            native_forward._TOKEN_POOL_ATTENTION_BACKEND = old_backend
+
+        self.assertEqual(backend_seen_enabled, [False])
         self.assertIsNotNone(actual_weights)
         self.assertLess((expected - actual).abs().max().item(), 1e-6)
         self.assertLess((expected_weights - actual_weights).abs().max().item(), 1e-6)
@@ -569,12 +588,15 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
                 return True
 
         class Backend:
-            def decode_call(self, actual_attn, actual_query_states, **kwargs):
+            def try_decode_call(self, actual_attn, actual_query_states, **kwargs):
                 events.append("dispatch")
                 calls["attn"] = actual_attn
                 calls["query_states"] = actual_query_states
                 calls.update(kwargs["attention_call"].backend_decode_kwargs())
                 return SimpleNamespace(output="token_pool", weights=None)
+
+            def decode_call(self, *args, **kwargs):
+                raise AssertionError("native forward should call try_decode_call")
 
         try:
             native_forward._TOKEN_POOL_ATTENTION_BACKEND = Backend()
