@@ -983,6 +983,179 @@ def _token_pool_paged_gqa_decode_grouped_split_stage1_kernel(
 
 
 @triton.jit
+def _token_pool_paged_request_table_gqa_decode_grouped_split_stage1_kernel(
+    query,
+    keys,
+    values,
+    req_pool_indices,
+    request_block_tables,
+    block_table_lens,
+    selected_start_positions,
+    seq_lens,
+    partial_m,
+    partial_l,
+    partial_acc,
+    q_stride_b: tl.constexpr,
+    q_stride_h: tl.constexpr,
+    q_stride_t: tl.constexpr,
+    q_stride_d: tl.constexpr,
+    k_stride_t: tl.constexpr,
+    k_stride_h: tl.constexpr,
+    k_stride_d: tl.constexpr,
+    v_stride_t: tl.constexpr,
+    v_stride_h: tl.constexpr,
+    v_stride_d: tl.constexpr,
+    rbt_stride_r: tl.constexpr,
+    rbt_stride_m: tl.constexpr,
+    pm_stride_b: tl.constexpr,
+    pm_stride_h: tl.constexpr,
+    pm_stride_s: tl.constexpr,
+    pm_stride_g: tl.constexpr,
+    pl_stride_b: tl.constexpr,
+    pl_stride_h: tl.constexpr,
+    pl_stride_s: tl.constexpr,
+    pl_stride_g: tl.constexpr,
+    pa_stride_b: tl.constexpr,
+    pa_stride_h: tl.constexpr,
+    pa_stride_s: tl.constexpr,
+    pa_stride_g: tl.constexpr,
+    pa_stride_d: tl.constexpr,
+    scaling: tl.constexpr,
+    groups: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_d: tl.constexpr,
+    block_n: tl.constexpr,
+    block_g: tl.constexpr,
+    page_size: tl.constexpr,
+    split_size: tl.constexpr,
+    input_precision: tl.constexpr,
+    native_dot: tl.constexpr,
+):
+    row = tl.program_id(0)
+    kv_head = tl.program_id(1)
+    split_id = tl.program_id(2)
+    group_offsets = tl.arange(0, block_g)
+    d_offsets = tl.arange(0, block_d)
+    n_offsets = tl.arange(0, block_n)
+    valid_g = group_offsets < groups
+    q_heads = kv_head * groups + group_offsets
+
+    q = tl.load(
+        query
+        + row * q_stride_b
+        + q_heads[:, None] * q_stride_h
+        + d_offsets[None, :] * q_stride_d,
+        mask=valid_g[:, None] & (d_offsets[None, :] < head_dim),
+        other=0.0,
+    )
+    if not native_dot:
+        q = q.to(tl.float32)
+
+    req_slot = tl.load(req_pool_indices + row)
+    seq_len = tl.load(seq_lens + row)
+    selected_start = tl.load(selected_start_positions + row)
+    selected_start_block = selected_start // page_size
+    block_table_len = tl.load(block_table_lens + row)
+    split_start = split_id * split_size
+    split_end = tl.minimum(seq_len, split_start + split_size)
+    split_len = tl.maximum(split_end - split_start, 0)
+
+    m_i = tl.full((block_g,), -float("inf"), tl.float32)
+    l_i = tl.zeros((block_g,), tl.float32)
+    acc = tl.zeros((block_g, block_d), tl.float32)
+
+    offset = 0
+    while offset < split_len:
+        row_offsets = split_start + offset + n_offsets
+        valid_n = offset + n_offsets < split_len
+        logical_pos = selected_start + row_offsets
+        logical_block = logical_pos // page_size
+        block_table_offsets = logical_block - selected_start_block
+        valid_block = (block_table_offsets >= 0) & (block_table_offsets < block_table_len)
+        physical_blocks = tl.load(
+            request_block_tables
+            + req_slot * rbt_stride_r
+            + logical_block * rbt_stride_m,
+            mask=valid_n & valid_block,
+            other=0,
+        )
+        token_ids = physical_blocks * page_size + (logical_pos % page_size)
+
+        k = tl.load(
+            keys
+            + token_ids[:, None] * k_stride_t
+            + kv_head * k_stride_h
+            + d_offsets[None, :] * k_stride_d,
+            mask=valid_n[:, None] & valid_block[:, None] & (d_offsets[None, :] < head_dim),
+            other=0.0,
+        )
+        if not native_dot:
+            k = k.to(tl.float32)
+        scores = tl.dot(k, tl.trans(q), input_precision=input_precision).to(tl.float32) * scaling
+        scores = tl.where(
+            valid_n[:, None] & valid_block[:, None] & valid_g[None, :],
+            scores,
+            -float("inf"),
+        )
+
+        block_m = tl.max(scores, axis=0)
+        m_new = tl.maximum(m_i, block_m)
+        p = tl.exp(scores - m_new[None, :])
+        alpha = tl.exp(m_i - m_new)
+
+        v = tl.load(
+            values
+            + token_ids[:, None] * v_stride_t
+            + kv_head * v_stride_h
+            + d_offsets[None, :] * v_stride_d,
+            mask=valid_n[:, None] & valid_block[:, None] & (d_offsets[None, :] < head_dim),
+            other=0.0,
+        )
+        if not native_dot:
+            v = v.to(tl.float32)
+            p_v = p
+        else:
+            p_v = p.to(v.dtype)
+        acc = acc * alpha[:, None] + tl.dot(
+            tl.trans(p_v),
+            v,
+            input_precision=input_precision,
+        ).to(tl.float32)
+        l_i = l_i * alpha + tl.sum(p, axis=0)
+        m_i = m_new
+        offset += block_n
+
+    tl.store(
+        partial_m
+        + row * pm_stride_b
+        + kv_head * pm_stride_h
+        + split_id * pm_stride_s
+        + group_offsets * pm_stride_g,
+        m_i,
+        mask=valid_g,
+    )
+    tl.store(
+        partial_l
+        + row * pl_stride_b
+        + kv_head * pl_stride_h
+        + split_id * pl_stride_s
+        + group_offsets * pl_stride_g,
+        l_i,
+        mask=valid_g,
+    )
+    tl.store(
+        partial_acc
+        + row * pa_stride_b
+        + kv_head * pa_stride_h
+        + split_id * pa_stride_s
+        + group_offsets[:, None] * pa_stride_g
+        + d_offsets[None, :] * pa_stride_d,
+        acc,
+        mask=valid_g[:, None] & (d_offsets[None, :] < head_dim),
+    )
+
+
+@triton.jit
 def _dense_padded_gqa_decode_grouped_kernel(
     query,
     keys,
@@ -2106,6 +2279,285 @@ def token_pool_paged_gqa_decode_split_kv(
         value_buffer.stride(2),
         block_tables.stride(0),
         block_tables.stride(1),
+        partial_m.stride(0),
+        partial_m.stride(1),
+        partial_m.stride(2),
+        partial_m.stride(3),
+        partial_l.stride(0),
+        partial_l.stride(1),
+        partial_l.stride(2),
+        partial_l.stride(3),
+        partial_acc.stride(0),
+        partial_acc.stride(1),
+        partial_acc.stride(2),
+        partial_acc.stride(3),
+        partial_acc.stride(4),
+        float(scaling),
+        groups,
+        head_dim,
+        bd,
+        bn,
+        bg,
+        page_size,
+        split,
+        precision,
+        native_dot,
+        num_warps=num_warps,
+    )
+    _token_pool_gqa_decode_grouped_split_stage2_kernel[(batch, kv_heads)](
+        partial_m,
+        partial_l,
+        partial_acc,
+        output,
+        seq_lens_for_kernel,
+        partial_m.stride(0),
+        partial_m.stride(1),
+        partial_m.stride(2),
+        partial_m.stride(3),
+        partial_l.stride(0),
+        partial_l.stride(1),
+        partial_l.stride(2),
+        partial_l.stride(3),
+        partial_acc.stride(0),
+        partial_acc.stride(1),
+        partial_acc.stride(2),
+        partial_acc.stride(3),
+        partial_acc.stride(4),
+        output.stride(0),
+        output.stride(2),
+        output.stride(3),
+        groups,
+        head_dim,
+        bd,
+        bg,
+        max_splits,
+        split,
+        True,
+        num_warps=num_warps,
+    )
+    return output
+
+
+def token_pool_paged_request_table_gqa_decode_split_kv(
+    query_states,
+    key_buffer,
+    value_buffer,
+    req_pool_indices,
+    request_block_tables,
+    block_table_lens,
+    selected_start_positions,
+    seq_lens,
+    *,
+    block_size: int,
+    num_key_value_groups: int,
+    scaling: float,
+    max_seq_len: int | None = None,
+    split_size: int | None = None,
+    min_splits: int | None = None,
+    block_n: int | None = None,
+    input_precision: str | None = None,
+    dot_dtype: str | None = None,
+    workspace=None,
+    output=None,
+):
+    """Split-KV paged GQA attention over a persistent request block table."""
+
+    import torch
+
+    if query_states.ndim != 4 or int(query_states.shape[2]) != 1:
+        raise ValueError(
+            "token-pool request-table paged split-KV Triton attention "
+            "requires [B, Hq, 1, D] queries"
+        )
+    if not query_states.is_cuda:
+        raise RuntimeError(
+            "token-pool request-table paged split-KV Triton attention "
+            "requires CUDA tensors"
+        )
+    if key_buffer.device != query_states.device or value_buffer.device != query_states.device:
+        raise ValueError("token-pool K/V buffers must be on the query device")
+    for name, tensor in (
+        ("req_pool_indices", req_pool_indices),
+        ("request_block_tables", request_block_tables),
+        ("block_table_lens", block_table_lens),
+        ("selected_start_positions", selected_start_positions),
+        ("seq_lens", seq_lens),
+    ):
+        if tensor.device != query_states.device:
+            raise ValueError(
+                f"token-pool request-table paged split metadata tensor {name} "
+                "must be on the query device"
+            )
+
+    batch = int(query_states.shape[0])
+    query_heads = int(query_states.shape[1])
+    head_dim = int(query_states.shape[3])
+    groups = int(num_key_value_groups)
+    page_size = int(block_size)
+    if page_size < 1:
+        raise ValueError("token-pool paged block_size must be >= 1")
+    if groups < 1 or query_heads % groups:
+        raise ValueError("invalid grouped-query head layout")
+    kv_heads = int(key_buffer.shape[1])
+    if kv_heads * groups != query_heads:
+        raise ValueError("token-pool K/V head count does not match query heads")
+    if int(key_buffer.shape[2]) != head_dim or int(value_buffer.shape[2]) != head_dim:
+        raise ValueError("token-pool K/V head_dim does not match query head_dim")
+    if request_block_tables.ndim != 2:
+        raise ValueError("request_block_tables must have shape [max_requests, max_pages]")
+    for name, tensor in (
+        ("req_pool_indices", req_pool_indices),
+        ("block_table_lens", block_table_lens),
+        ("selected_start_positions", selected_start_positions),
+        ("seq_lens", seq_lens),
+    ):
+        if tensor.reshape(-1).numel() != batch:
+            raise ValueError(f"{name} length must match query batch")
+
+    req_pool_indices = req_pool_indices.reshape(-1)
+    block_table_lens = block_table_lens.reshape(-1)
+    selected_start_positions = selected_start_positions.reshape(-1)
+    seq_lens_for_kernel = seq_lens.reshape(-1)
+    if not req_pool_indices.is_contiguous():
+        req_pool_indices = req_pool_indices.contiguous()
+    if not block_table_lens.is_contiguous():
+        block_table_lens = block_table_lens.contiguous()
+    if not selected_start_positions.is_contiguous():
+        selected_start_positions = selected_start_positions.contiguous()
+    if not seq_lens_for_kernel.is_contiguous():
+        seq_lens_for_kernel = seq_lens_for_kernel.contiguous()
+    if not request_block_tables.is_contiguous():
+        request_block_tables = request_block_tables.contiguous()
+
+    output_shape = (batch, 1, query_heads, head_dim)
+    if output is None:
+        output = torch.empty(
+            output_shape,
+            dtype=query_states.dtype,
+            device=query_states.device,
+        )
+    elif tuple(output.shape) != output_shape:
+        raise ValueError(
+            "token-pool request-table paged split-KV output buffer has the wrong shape"
+        )
+    elif output.dtype != query_states.dtype or output.device != query_states.device:
+        raise ValueError(
+            "token-pool request-table paged split-KV output buffer must match "
+            "query dtype/device"
+        )
+
+    if max_seq_len is None:
+        max_seq_len = int(seq_lens_for_kernel.max().item())
+    else:
+        max_seq_len = int(max_seq_len)
+    if max_seq_len < 1:
+        raise ValueError(
+            "token-pool request-table paged split rows must contain at least one KV token"
+        )
+    split = _resolve_split_size(split_size)
+    required_splits = _resolve_split_min_splits(min_splits)
+    max_splits = (max_seq_len + split - 1) // split
+    if max_splits < required_splits:
+        return token_pool_paged_request_table_gqa_decode(
+            query_states,
+            key_buffer,
+            value_buffer,
+            req_pool_indices,
+            request_block_tables,
+            block_table_lens,
+            selected_start_positions,
+            seq_lens_for_kernel,
+            block_size=page_size,
+            num_key_value_groups=groups,
+            scaling=scaling,
+            block_n=block_n,
+            input_precision=input_precision,
+            dot_dtype=dot_dtype,
+            output=output,
+        )
+
+    native_dot = _resolve_native_dot(query_states.dtype, dot_dtype)
+    bd = _block_d(head_dim)
+    bg = _block_g(groups, native_dot)
+    bn = _resolve_block_n(
+        head_dim,
+        block_n,
+        env_names=(
+            "WKVM_TOKEN_POOL_PAGED_TRITON_BLOCK_N",
+            "WKVM_TOKEN_POOL_TRITON_BLOCK_N",
+        ),
+    )
+    precision = _resolve_input_precision(query_states.dtype, input_precision)
+    stats_shape = (batch, kv_heads, max_splits, bg)
+    acc_shape = (batch, kv_heads, max_splits, bg, head_dim)
+    if workspace is None:
+        partial_m = torch.empty(stats_shape, dtype=torch.float32, device=query_states.device)
+        partial_l = torch.empty(stats_shape, dtype=torch.float32, device=query_states.device)
+        partial_acc = torch.empty(acc_shape, dtype=torch.float32, device=query_states.device)
+    else:
+        if len(workspace) != 3:
+            raise ValueError(
+                "token-pool request-table paged split-KV workspace must be a 3-tuple"
+            )
+        partial_m, partial_l, partial_acc = workspace
+        if tuple(partial_m.shape) != stats_shape or tuple(partial_l.shape) != stats_shape:
+            raise ValueError(
+                "token-pool request-table paged split-KV stats workspace has the wrong shape"
+            )
+        if tuple(partial_acc.shape) != acc_shape:
+            raise ValueError(
+                "token-pool request-table paged split-KV accumulator workspace has the wrong shape"
+            )
+        if (
+            partial_m.dtype != torch.float32
+            or partial_l.dtype != torch.float32
+            or partial_acc.dtype != torch.float32
+        ):
+            raise ValueError(
+                "token-pool request-table paged split-KV workspace must use float32 tensors"
+            )
+        if (
+            partial_m.device != query_states.device
+            or partial_l.device != query_states.device
+            or partial_acc.device != query_states.device
+        ):
+            raise ValueError(
+                "token-pool request-table paged split-KV workspace must be on the query device"
+            )
+
+    num_warps = _resolve_num_warps(
+        bd,
+        env_names=(
+            "WKVM_TOKEN_POOL_PAGED_TRITON_NUM_WARPS",
+            "WKVM_TOKEN_POOL_TRITON_NUM_WARPS",
+        ),
+    )
+    _token_pool_paged_request_table_gqa_decode_grouped_split_stage1_kernel[
+        (batch, kv_heads, max_splits)
+    ](
+        query_states,
+        key_buffer,
+        value_buffer,
+        req_pool_indices,
+        request_block_tables,
+        block_table_lens,
+        selected_start_positions,
+        seq_lens_for_kernel,
+        partial_m,
+        partial_l,
+        partial_acc,
+        query_states.stride(0),
+        query_states.stride(1),
+        query_states.stride(2),
+        query_states.stride(3),
+        key_buffer.stride(0),
+        key_buffer.stride(1),
+        key_buffer.stride(2),
+        value_buffer.stride(0),
+        value_buffer.stride(1),
+        value_buffer.stride(2),
+        request_block_tables.stride(0),
+        request_block_tables.stride(1),
         partial_m.stride(0),
         partial_m.stride(1),
         partial_m.stride(2),

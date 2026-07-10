@@ -2116,16 +2116,6 @@ def _token_pool_sliding_paged_metadata_only_requested() -> bool:
     )
 
 
-def _token_pool_paged_split_requested() -> bool:
-    return any(
-        _env_flag(name)
-        for name in (
-            "WKVM_ENABLE_TOKEN_POOL_PAGED_SPLIT_TRITON",
-            "WKVM_TOKEN_POOL_TRITON_PAGED_SPLIT_KV",
-        )
-    )
-
-
 def _token_pool_timing_enabled() -> bool:
     return _env_flag("WKVM_TOKEN_POOL_TIMING") or _env_flag("WKVM_NATIVE_FORWARD_TIMING")
 
@@ -7142,9 +7132,7 @@ class TokenPoolDecodeBackendState:
         )
         if paged_only:
             should_build_paged = True
-        compact_paged_block_tables = not (
-            paged_only and not _token_pool_paged_split_requested()
-        )
+        compact_paged_block_tables = not paged_only
 
         paged_metadata = None
         if should_build_paged:

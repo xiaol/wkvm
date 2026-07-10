@@ -3722,6 +3722,7 @@ class TestGemmaTokenPool(unittest.TestCase):
         from wkvm.runner.gemma_token_pool_triton import (
             token_pool_paged_gqa_decode,
             token_pool_paged_gqa_decode_split_kv,
+            token_pool_paged_request_table_gqa_decode_split_kv,
         )
 
         torch.manual_seed(913)
@@ -3794,9 +3795,39 @@ class TestGemmaTokenPool(unittest.TestCase):
             block_n=16,
             workspace=workspace,
         )
+        req_pool_indices = torch.tensor([1, 3], dtype=torch.int32, device=device)
+        request_block_tables = torch.full((4, 3), -1, dtype=torch.int32, device=device)
+        request_block_tables[1, 0] = 0
+        request_block_tables[1, 1] = 2
+        request_block_tables[3, 1] = 1
+        request_block_tables[3, 2] = 2
+        request_workspace = (
+            torch.full((batch, kv_heads, 3, groups), float("nan"), device=device),
+            torch.full((batch, kv_heads, 3, groups), float("nan"), device=device),
+            torch.full((batch, kv_heads, 3, groups, head_dim), float("nan"), device=device),
+        )
+        request_table_actual = token_pool_paged_request_table_gqa_decode_split_kv(
+            query,
+            keys,
+            values,
+            req_pool_indices,
+            request_block_tables,
+            block_table_lens,
+            selected_start_positions,
+            seq_lens,
+            block_size=block_size,
+            num_key_value_groups=groups,
+            scaling=scaling,
+            max_seq_len=8,
+            split_size=3,
+            min_splits=2,
+            block_n=16,
+            workspace=request_workspace,
+        )
         torch.cuda.synchronize()
 
         self.assertLess((expected - actual).abs().max().item(), 1e-5)
+        self.assertLess((actual - request_table_actual).abs().max().item(), 1e-5)
 
     def test_token_pool_decode_context_prefers_layer_id_metadata(self) -> None:
         from types import SimpleNamespace
@@ -5212,11 +5243,14 @@ class TestGemmaTokenPool(unittest.TestCase):
             dtype = "fake_dtype"
             device = "cuda:0"
 
+        class KeyBuffer:
+            shape = (4096, 2, 16)
+
         class DispatchContext:
             has_flat_metadata = False
 
             def kv_buffers_for_attention(self):
-                return "key_buffer", "value_buffer"
+                return KeyBuffer(), "value_buffer"
 
             def attention_output_buffer(self, **kwargs):
                 events.append(("output_buffer", kwargs))
@@ -5284,8 +5318,146 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(stats["paged_request_table_successes"], 1)
         decode_event = events[-1]
         self.assertEqual(decode_event[0], "request_table_decode")
-        self.assertEqual(decode_event[1][3:8], ("reqs", "request_tables", "block_lens", "starts", "seq_lens"))
+        self.assertEqual(
+            decode_event[1][3:8],
+            ("reqs", "request_tables", "block_lens", "starts", "seq_lens"),
+        )
         self.assertEqual(decode_event[2]["block_size"], 16)
+
+    def test_triton_backend_dispatches_request_table_paged_split_decode(self) -> None:
+        from types import SimpleNamespace
+        from wkvm.runner.gemma_token_pool_attention import (
+            TokenPoolTritonAttentionBackend,
+            TokenPoolTritonAttentionBackendHooks,
+        )
+
+        stats = {
+            "attempts": 0,
+            "successes": 0,
+            "disabled_shape_skips": 0,
+            "import_error_fallbacks": 0,
+            "runtime_errors": 0,
+            "recoverable_runtime_fallbacks": 0,
+            "nonrecoverable_runtime_errors": 0,
+            "paged_attempts": 0,
+            "paged_successes": 0,
+            "paged_request_table_attempts": 0,
+            "paged_request_table_successes": 0,
+            "paged_request_table_split_attempts": 0,
+            "paged_request_table_split_successes": 0,
+            "paged_split_attempts": 0,
+            "paged_split_successes": 0,
+            "paged_split_skips_by_min_splits": 0,
+            "split_attempts": 0,
+            "split_successes": 0,
+            "split_skips_by_min_splits": 0,
+        }
+        events = []
+
+        class QueryStates:
+            is_cuda = True
+            shape = (2, 8, 1, 16)
+            dtype = "fake_dtype"
+            device = "cuda:0"
+
+        class KeyBuffer:
+            shape = (4096, 2, 16)
+
+        class DispatchContext:
+            has_flat_metadata = False
+
+            def kv_buffers_for_attention(self):
+                return KeyBuffer(), "value_buffer"
+
+            def attention_output_buffer(self, **kwargs):
+                events.append(("output_buffer", kwargs))
+                return "output_buffer"
+
+            def attention_split_workspace(self, **kwargs):
+                events.append(("split_workspace", kwargs))
+                return "split_workspace"
+
+            def select_triton_dispatch(self, **kwargs):
+                events.append(("select", kwargs))
+                return SimpleNamespace(
+                    is_paged=True,
+                    is_split=True,
+                    max_seq_len=1024,
+                    split_size=256,
+                    min_splits=2,
+                    max_splits=4,
+                    metadata=SimpleNamespace(
+                        req_pool_indices="reqs",
+                        request_block_tables="request_tables",
+                        block_tables="compact_tables",
+                        block_table_lens="block_lens",
+                        selected_start_positions="starts",
+                        seq_lens="seq_lens",
+                        block_size=16,
+                        block_tables_materialized=False,
+                    ),
+                )
+
+        def compact_split_decode(*args, **kwargs):
+            raise AssertionError("compact paged split decode should not run")
+
+        def request_table_split_decode(*args, **kwargs):
+            events.append(("request_table_split_decode", args, kwargs))
+            return "direct_split_output"
+
+        backend = TokenPoolTritonAttentionBackend(
+            stats=stats,
+            disabled_shapes=set(),
+            hooks=TokenPoolTritonAttentionBackendHooks(
+                decode_fn=lambda: None,
+                split_decode_fn=lambda: None,
+                paged_decode_fn=lambda: None,
+                paged_split_decode_fn=lambda: compact_split_decode,
+                block_groups=lambda groups, dtype: groups,
+                record_fallback=lambda reason: events.append(("fallback", reason)),
+                is_recoverable_runtime_error=lambda exc: True,
+                paged_request_table_split_decode_fn=lambda: request_table_split_decode,
+            ),
+        )
+        result = backend.decode(
+            SimpleNamespace(num_key_value_groups=4, scaling=0.5),
+            QueryStates(),
+            dispatch_context=DispatchContext(),
+            dispatch_plan=SimpleNamespace(
+                effective_enabled=True,
+                paged_enabled=True,
+                split_enabled=False,
+                paged_split_enabled=True,
+                input_precision_policy="ieee",
+                dot_dtype_policy="native",
+                strict=True,
+            ),
+        )
+
+        self.assertTrue(result.succeeded)
+        self.assertEqual(result.output, "direct_split_output")
+        self.assertEqual(stats["paged_attempts"], 1)
+        self.assertEqual(stats["paged_successes"], 1)
+        self.assertEqual(stats["paged_split_attempts"], 1)
+        self.assertEqual(stats["paged_split_successes"], 1)
+        self.assertEqual(stats["split_attempts"], 1)
+        self.assertEqual(stats["split_successes"], 1)
+        self.assertEqual(stats["paged_request_table_attempts"], 1)
+        self.assertEqual(stats["paged_request_table_successes"], 1)
+        self.assertEqual(stats["paged_request_table_split_attempts"], 1)
+        self.assertEqual(stats["paged_request_table_split_successes"], 1)
+        decode_event = events[-1]
+        self.assertEqual(decode_event[0], "request_table_split_decode")
+        self.assertEqual(
+            decode_event[1][3:8],
+            ("reqs", "request_tables", "block_lens", "starts", "seq_lens"),
+        )
+        self.assertEqual(decode_event[2]["block_size"], 16)
+        self.assertEqual(decode_event[2]["max_seq_len"], 1024)
+        self.assertEqual(decode_event[2]["split_size"], 256)
+        self.assertEqual(decode_event[2]["min_splits"], 2)
+        self.assertEqual(decode_event[2]["workspace"], "split_workspace")
+        self.assertEqual(decode_event[2]["output"], "output_buffer")
 
     def test_attention_backend_factory_owns_default_triton_state(self) -> None:
         from types import SimpleNamespace
