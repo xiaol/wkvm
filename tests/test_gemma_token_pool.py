@@ -683,14 +683,20 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(backend.request_slot_for("req"), req_slot)
         self.assertEqual(backend.active_request_slots, 1)
         self.assertEqual(backend.request_slots, {"req": 0})
+        self.assertEqual(backend.request_token_slots, {"req": []})
         self.assertEqual(backend.admit_request("req"), req_slot)
 
+        _, normal_token_slots = allocator.alloc_slots_with_ids(2)
+        backend.append_request_token_slots("req", normal_token_slots)
         backend.allocate_page_aligned_slots("req", 0, 1, req_slot=req_slot)
-        self.assertEqual(allocator.allocated_count, 4)
-        released_req_slot, released_page_slots = backend.release_request("req")
+        self.assertEqual(allocator.allocated_count, 6)
+        released_req_slot, released_page_slots, released_token_slots = (
+            backend.release_request("req")
+        )
 
         self.assertEqual(released_req_slot, req_slot)
-        self.assertEqual(released_page_slots, {0, 1, 2, 3})
+        self.assertEqual(released_page_slots, {4, 5, 6, 7})
+        self.assertEqual(released_token_slots, [0, 1])
         self.assertFalse(backend.has_request("req"))
         self.assertEqual(backend.active_request_slots, 0)
         self.assertEqual(allocator.allocated_count, 0)

@@ -719,12 +719,17 @@ class GemmaNativeEngine:
             row_slots = None if backend is None else backend.full_attention_transient_slots
             row_records = None if backend is None else backend.full_attention_row_records
             request_slots = None if backend is None else backend.request_slots
+            request_token_slots = (
+                None if backend is None else backend.request_token_slots
+            )
             page_tables = None if backend is None else backend.request_page_tables
             page_owned_slots = (
                 None if backend is None else backend.request_page_owned_slots
             )
             if request_slots is not None:
                 self._token_pool_req_slots = request_slots
+            if request_token_slots is not None:
+                self._token_pool_token_slots = request_token_slots
             if page_tables is not None:
                 self._token_pool_page_tables = page_tables
             if page_owned_slots is not None:
@@ -2060,7 +2065,6 @@ class GemmaNativeEngine:
         backend = self._token_pool_decode_backend
         if backend is not None:
             backend.admit_request(req.req_id)
-            self._token_pool_token_slots[req.req_id] = []
         else:
             req_slot = table.allocate(req.req_id)
             self._token_pool_req_slots[req.req_id] = req_slot
@@ -2078,20 +2082,20 @@ class GemmaNativeEngine:
         req_slot = self._token_pool_req_slots.get(req_id)
         backend = self._token_pool_decode_backend
         if backend is not None:
-            _, page_slots = backend.release_request(req_id)
+            backend.release_request(req_id)
         else:
             if req_slot is not None:
                 self._token_pool_reset_page_table_row(req_slot)
             page_slots = self._token_pool_page_owned_slots.pop(req_id, set())
             self._token_pool_page_tables.pop(req_id, None)
-        token_slots = self._token_pool_token_slots.pop(req_id, [])
-        if page_slots:
-            token_slots = [slot for slot in token_slots if slot not in page_slots]
-        if token_slots:
-            allocator.free_slots(token_slots)
-        if backend is None and req_id in self._token_pool_req_slots:
-            table.free(req_id)
-            self._token_pool_req_slots.pop(req_id, None)
+            token_slots = self._token_pool_token_slots.pop(req_id, [])
+            if page_slots:
+                token_slots = [slot for slot in token_slots if slot not in page_slots]
+            if token_slots:
+                allocator.free_slots(token_slots)
+            if req_id in self._token_pool_req_slots:
+                table.free(req_id)
+                self._token_pool_req_slots.pop(req_id, None)
 
     def _token_pool_commit_prefill_tokens(
         self,
@@ -2183,7 +2187,11 @@ class GemmaNativeEngine:
             raise
         if token_slots is not None:
             if self._token_kv_pool is None:
-                self._token_pool_token_slots[req.req_id].extend(token_slot_ids)
+                backend = self._token_pool_decode_backend
+                if backend is not None:
+                    backend.append_request_token_slots(req.req_id, token_slot_ids)
+                else:
+                    self._token_pool_token_slots[req.req_id].extend(token_slot_ids)
         self.metrics.token_pool_slot_high_watermark = max(
             self.metrics.token_pool_slot_high_watermark,
             allocator.high_watermark,
@@ -2415,7 +2423,11 @@ class GemmaNativeEngine:
                 reservations.append(reservation)
                 table.append_slots(req_slot, token_slot_tensor)
                 if self._token_kv_pool is None:
-                    self._token_pool_token_slots[req.req_id].append(token_slot)
+                    backend = self._token_pool_decode_backend
+                    if backend is not None:
+                        backend.append_request_token_slot(req.req_id, token_slot)
+                    else:
+                        self._token_pool_token_slots[req.req_id].append(token_slot)
                 req_slots.append(req_slot)
                 out_cache_loc.append(token_slot)
             if self._token_kv_pool is None:
@@ -2688,12 +2700,15 @@ class GemmaNativeEngine:
             releasable = [slot for slot in dropped if slot not in page_owned]
             if releasable:
                 allocator.free_slots(releasable)
-            active = self._token_pool_token_slots.get(req_id)
-            if active is not None:
-                dropped_set = set(dropped)
-                self._token_pool_token_slots[req_id] = [
-                    slot for slot in active if slot not in dropped_set
-                ]
+            if backend is not None:
+                backend.prune_request_token_slots(req_id, dropped)
+            else:
+                active = self._token_pool_token_slots.get(req_id)
+                if active is not None:
+                    dropped_set = set(dropped)
+                    self._token_pool_token_slots[req_id] = [
+                        slot for slot in active if slot not in dropped_set
+                    ]
         self._token_pool_release_expired_page_blocks(req_id, req_slot, length)
 
     def _token_pool_release_expired_page_blocks(
@@ -2959,15 +2974,25 @@ class GemmaNativeEngine:
         for reservation in reversed(reservations):
             if reservation.req_id in self._token_pool_req_slots:
                 table.truncate(reservation.req_slot, reservation.previous_length)
-            token_slots = self._token_pool_token_slots.get(reservation.req_id)
-            if token_slots is not None and reservation.token_slot in token_slots:
-                token_slots.remove(reservation.token_slot)
+            backend = self._token_pool_decode_backend
+            if backend is not None:
+                backend.remove_request_token_slot(
+                    reservation.req_id,
+                    reservation.token_slot,
+                )
+            else:
+                token_slots = self._token_pool_token_slots.get(reservation.req_id)
+                if token_slots is not None and reservation.token_slot in token_slots:
+                    token_slots.remove(reservation.token_slot)
             if reservation.page_state_snapshot is not None:
-                backend = self._token_pool_decode_backend
                 if backend is not None:
                     backend.restore_request_page_state(reservation.page_state_snapshot)
                 continue
-            page_owned = self._token_pool_page_owned_slots.get(reservation.req_id, set())
+            page_owned = (
+                backend.page_owned_slots_for_request(reservation.req_id)
+                if backend is not None
+                else self._token_pool_page_owned_slots.get(reservation.req_id, set())
+            )
             if reservation.token_slot not in page_owned:
                 allocator.free_slots([reservation.token_slot])
 

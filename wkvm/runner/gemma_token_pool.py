@@ -4882,6 +4882,7 @@ class TokenPoolDecodeBackendState:
             )
         )
         self.request_slots: dict[str, int] = {}
+        self.request_token_slots: dict[str, list[int]] = {}
         self.request_page_tables: dict[str, dict[int, int]] = {}
         self.request_page_owned_slots: dict[str, set[int]] = {}
 
@@ -5278,17 +5279,58 @@ class TokenPoolDecodeBackendState:
             return int(existing)
         req_slot = int(self.table.allocate(req_id))
         self.request_slots[req_id] = req_slot
+        self.request_token_slots[req_id] = []
         self.admit_request_page_state(req_id, req_slot)
         return req_slot
 
-    def release_request(self, req_id: str) -> tuple[int | None, set[int]]:
+    def release_request(self, req_id: str) -> tuple[int | None, set[int], list[int]]:
         req_id = str(req_id)
         req_slot = self.request_slots.get(req_id)
         page_slots = self.release_request_page_state(req_id, req_slot)
+        token_slots = self.request_token_slots.pop(req_id, [])
+        if page_slots:
+            token_slots = [slot for slot in token_slots if slot not in page_slots]
+        if token_slots:
+            allocator = self.allocator
+            if allocator is None:
+                raise RuntimeError("token-pool allocator is not initialized")
+            allocator.free_slots(token_slots)
         if req_slot is not None:
             self.table.free(req_id)
             self.request_slots.pop(req_id, None)
-        return (None if req_slot is None else int(req_slot)), page_slots
+        return (None if req_slot is None else int(req_slot)), page_slots, token_slots
+
+    def append_request_token_slots(self, req_id: str, slots: Iterable[int] | Any) -> None:
+        req_id = str(req_id)
+        self.request_token_slots.setdefault(req_id, []).extend(
+            int(slot) for slot in _slot_values_to_list(slots)
+        )
+
+    def append_request_token_slot(self, req_id: str, slot: int) -> None:
+        self.request_token_slots.setdefault(str(req_id), []).append(int(slot))
+
+    def remove_request_token_slot(self, req_id: str, slot: int) -> bool:
+        token_slots = self.request_token_slots.get(str(req_id))
+        if token_slots is None:
+            return False
+        slot = int(slot)
+        if slot not in token_slots:
+            return False
+        token_slots.remove(slot)
+        return True
+
+    def prune_request_token_slots(
+        self,
+        req_id: str,
+        dropped_slots: Iterable[int] | Any,
+    ) -> None:
+        token_slots = self.request_token_slots.get(str(req_id))
+        if token_slots is None:
+            return
+        dropped = {int(slot) for slot in _slot_values_to_list(dropped_slots)}
+        self.request_token_slots[str(req_id)] = [
+            slot for slot in token_slots if slot not in dropped
+        ]
 
     def admit_request_page_state(self, req_id: str, req_slot: int | None = None) -> None:
         req_id = str(req_id)
