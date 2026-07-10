@@ -220,8 +220,20 @@ python experiments/native_gemma_bench.py \
   --ctx 13824 \
   --out 128 \
   --concurrency 1,8,16,32 \
+  --prompt-lengths staggered \
+  --synthetic-prompts \
   --mem-cap-gib 19 \
   --headroom-gib 1 \
+  --decode-microbatch-rows 16 \
+  --route-chunk 512 \
+  --persistent-padded-decode-steps 8 \
+  --persistent-padded-decode-cuda-graph \
+  --persistent-padded-decode-graph-warmup-iters 1 \
+  --use-native-gemma-forward \
+  --native-gemma-checkpoint-loader \
+  --native-gemma-attention-backend sdpa_single_gqa \
+  --native-gemma-projection-backend separate \
+  --require-native-no-hf \
   --json experiments/results/native_gemma_routed_span_concurrency.json &&
 python - <<'PY'
 import json
@@ -229,8 +241,20 @@ from pathlib import Path
 d=json.loads(Path('experiments/results/native_gemma_routed_span_concurrency.json').read_text())
 assert d['engine'] == 'wkvm-native'
 assert d['context_tokens_per_session'] == 13824
+assert d['prompt_token_source'] == 'synthetic'
+assert d['uses_hf_tokenizer'] is False
+assert d['uses_hf_config'] is False
+assert d['native_gemma_config_loader'] is True
+assert d['native_gemma_checkpoint_loader'] is True
+assert d['native_no_hf_requirement']['passed'] is True
 assert any(r['success_count'] == r['B'] for r in d['rows'])
-assert all(k in d['rows'][0] for k in ['p50_latency_s','p95_latency_s','agg_decode_tok_s','peak_reserved_gib'])
+assert all(k in d['rows'][0] for k in [
+    'p50_latency_s',
+    'p95_latency_s',
+    'agg_decode_tok_s',
+    'peak_reserved_gib',
+    'prompt_token_ids_sha256',
+])
 print('NATIVE_BENCH_OK')
 PY
 ```
@@ -239,13 +263,17 @@ Benchmark report must include:
 
 - Exact launch command and git commit.
 - Model path and dtype.
-- Prompt length, output length, concurrency.
+- Prompt length, output length, concurrency, prompt-token source, and exact prompt-token fingerprint.
 - p50/p95 latency.
+- Queue time, first-token latency, prefill time, decode time, finish reason, and errors when available.
 - Success/error counts.
 - Aggregate decode tok/s and end-to-end output tok/s.
 - GPU peak allocated/reserved/device-used memory.
+- Native setup provenance: `uses_hf_tokenizer`, `uses_hf_config`, `native_gemma_config_loader`, `uses_hf_model_construction`, `uses_hf_transformer_forward`, `native_gemma_checkpoint_loader`, and `native_no_hf_requirement`.
+- Scheduler/engine evidence: max waiting/running/runnable rows, resident state slots, backpressure/retraction counts, graph capture/replay/skip counts, graph-shape reuse/mismatch counts.
 - Whether each row is under the 19 GiB cap with 1 GiB headroom.
 - Comparison rows for vLLM and SGLang must state when they are nearest existing full-KV runs rather than identical semantics.
+- Strict same-workload reports should be rendered with `experiments/gemma_bench_report.py --require-same-shape --require-same-prompt-fingerprint --require-native-no-hf`.
 
 ### N8. README and Demo Update
 
