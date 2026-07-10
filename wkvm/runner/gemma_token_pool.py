@@ -129,6 +129,21 @@ class TokenPoolRequestPrefixClearResult:
     invalidated_full_attention_rows: int = 0
 
 
+@dataclass(frozen=True)
+class TokenPoolPrefillCommitResult:
+    req_id: str
+    req_slot: int
+    previous_length: int
+    new_length: int
+    kept_tokens: int
+    padded_tokens: int
+    allocated_token_slots: tuple[int, ...] = ()
+    backfilled: bool = False
+    prefix_clear_result: TokenPoolRequestPrefixClearResult = field(
+        default_factory=TokenPoolRequestPrefixClearResult
+    )
+
+
 class TokenPoolAttentionWorkspace:
     """Backend-owned reusable scratch buffers for token-pool attention."""
 
@@ -6234,6 +6249,114 @@ class TokenPoolDecodeBackendState:
             self.table.free(req_id)
             self.request_slots.pop(req_id, None)
         return (None if req_slot is None else int(req_slot)), page_slots, token_slots
+
+    def commit_prefill_tokens(
+        self,
+        request: Any,
+        n: int,
+        *,
+        expected_length: int,
+        cache: Any = None,
+        sliding_window: int | None = None,
+        final_prefill: bool = False,
+    ) -> TokenPoolPrefillCommitResult:
+        req_id = str(getattr(request, "req_id", request))
+        allocator = self.allocator
+        if allocator is None:
+            raise RuntimeError("token-pool allocator is not initialized")
+
+        req_slot = self.admit_request(req_id)
+        current = self.request_length(req_slot)
+        if current != int(expected_length):
+            raise RuntimeError(
+                f"{req_id}: token table length {current} does not match "
+                f"computed tokens {int(expected_length)}"
+            )
+
+        n = int(n)
+        new_length = current + n
+        self.ensure_context_len(new_length)
+        window = None if sliding_window is None else max(1, int(sliding_window))
+        keep_start = 0 if window is None else max(new_length - window, 0)
+        keep_new_start = current if window is None else max(current, keep_start)
+        keep_new = n - (keep_new_start - current)
+        if self.kv_pool is not None:
+            keep_new = min(keep_new, self.available_prefill_tail(cache, n))
+        keep_new = max(0, int(keep_new))
+        pad_new = n - keep_new
+
+        token_slots = None
+        token_slot_ids: list[int] = []
+        page_state_snapshot = None
+        if self.kv_pool is not None:
+            page_state_snapshot = self.snapshot_request_page_state(req_id, req_slot)
+        prefix_clear_result = self.clear_request_prefix(
+            req_id,
+            req_slot,
+            min(current, keep_start),
+        )
+
+        try:
+            if keep_new:
+                if self.kv_pool is not None:
+                    token_slots, token_slot_ids = self.allocate_page_aligned_slots(
+                        req_id,
+                        current + pad_new,
+                        keep_new,
+                        req_slot=req_slot,
+                    )
+                else:
+                    token_slots, token_slot_ids = allocator.alloc_slots_with_ids(
+                        keep_new
+                    )
+                self.backfill_prefill_tokens(
+                    cache,
+                    token_slots,
+                    keep_new,
+                    token_slot_ids=token_slot_ids,
+                    release_covered=final_prefill,
+                )
+
+            append_values = []
+            if pad_new:
+                import torch
+
+                append_values.append(
+                    torch.full(
+                        (pad_new,),
+                        self.table.padding_token,
+                        dtype=self.table.dtype,
+                        device=self.table.req_to_token.device,
+                    )
+                )
+            if token_slots is not None:
+                append_values.append(token_slots)
+            if append_values:
+                import torch
+
+                self.append_table_slots(req_slot, torch.cat(append_values))
+        except Exception:
+            if token_slots is not None:
+                if self.kv_pool is None:
+                    allocator.free_slots(token_slot_ids)
+                else:
+                    self.restore_request_page_state(page_state_snapshot)
+            raise
+
+        if token_slots is not None and self.kv_pool is None:
+            self.append_request_token_slots(req_id, token_slot_ids)
+
+        return TokenPoolPrefillCommitResult(
+            req_id=req_id,
+            req_slot=int(req_slot),
+            previous_length=int(current),
+            new_length=int(new_length),
+            kept_tokens=int(keep_new),
+            padded_tokens=int(pad_new),
+            allocated_token_slots=tuple(int(slot) for slot in token_slot_ids),
+            backfilled=bool(self.kv_pool is not None and keep_new),
+            prefix_clear_result=prefix_clear_result,
+        )
 
     def release_prefill_sliding_storage(self, cache: Any) -> None:
         if self.kv_pool is None or cache is None:

@@ -2232,6 +2232,28 @@ class GemmaNativeEngine:
         if table is None or allocator is None:
             return
         self._sync_token_pool_decode_backend_storage()
+        backend = self._token_pool_decode_backend
+        if backend is not None:
+            result = backend.commit_prefill_tokens(
+                req,
+                n,
+                expected_length=req.num_computed_tokens,
+                cache=cache,
+                sliding_window=self._token_pool_attention_window(),
+                final_prefill=final_prefill,
+            )
+            if result.backfilled:
+                self._record_cuda_memory_phase("token_pool_prefill_backfill")
+            if result.prefix_clear_result.invalidated_full_attention_rows:
+                self.metrics.token_pool_full_attention_row_invalidations += (
+                    result.prefix_clear_result.invalidated_full_attention_rows
+                )
+            self.metrics.token_pool_slot_high_watermark = max(
+                self.metrics.token_pool_slot_high_watermark,
+                allocator.high_watermark,
+            )
+            return
+
         self._token_pool_admit_request(req)
         req_slot = self._token_pool_request_slot(req.req_id)
         current = self._token_pool_request_length(req_slot)
@@ -2252,7 +2274,6 @@ class GemmaNativeEngine:
         pad_new = n - keep_new
         token_slots = None
         page_state_snapshot = None
-        backend = self._token_pool_decode_backend
         if self._token_kv_pool is not None and backend is not None:
             page_state_snapshot = backend.snapshot_request_page_state(
                 req.req_id,
