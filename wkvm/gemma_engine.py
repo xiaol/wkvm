@@ -2477,133 +2477,68 @@ class GemmaNativeEngine:
         table = self._token_table
         allocator = self._token_slot_allocator
         backend = self._token_pool_decode_backend
-        if backend is not None:
-            backend.clear_decode_batch_state()
         if table is None or allocator is None:
             return []
-        reservations: list[_TokenPoolDecodeReservation] = []
-        req_slots: list[int] = []
-        out_cache_loc: list[int] = []
-        try:
-            if backend is not None:
-                reservations = list(
-                    backend.prepare_decode_reservations(
-                        reqs,
-                        expected_lengths=(
-                            req.num_computed_tokens for req in reqs
-                        ),
-                        persistent_full_attention_rows=(
-                            persistent_full_attention_rows
-                        ),
-                    )
-                )
-                req_slots = [reservation.req_slot for reservation in reservations]
-                out_cache_loc = [
-                    reservation.token_slot for reservation in reservations
-                ]
-            else:
-                for req in reqs:
-                    self._token_pool_admit_request(req)
-                    req_slot = self._token_pool_request_slot(req.req_id)
-                    previous_length = self._token_pool_request_length(req_slot)
-                    if previous_length != req.num_computed_tokens:
-                        raise RuntimeError(
-                            f"{req.req_id}: token table length {previous_length} "
-                            f"does not match computed tokens {req.num_computed_tokens}"
-                        )
-                    self._token_pool_ensure_context_len(previous_length + 1)
-                    if self._token_kv_pool is not None:
-                        token_slot_tensor, token_slot_ids = (
-                            self._token_pool_alloc_page_aligned_slots(
-                                req.req_id,
-                                previous_length,
-                                1,
-                            )
-                        )
-                    else:
-                        token_slot_tensor, token_slot_ids = (
-                            allocator.alloc_slots_with_ids(1)
-                        )
-                    token_slot = token_slot_ids[0]
-                    reservation = _TokenPoolDecodeReservation(
-                        req_id=req.req_id,
-                        req_slot=req_slot,
-                        token_slot=token_slot,
-                        token_slot_tensor=token_slot_tensor[:1],
-                        previous_length=previous_length,
-                        persistent_full_attention_row=bool(
-                            persistent_full_attention_rows
-                        ),
-                    )
-                    reservations.append(reservation)
-                    self._token_pool_append_table_slots(req_slot, token_slot_tensor)
-                    if self._token_kv_pool is None:
-                        self._token_pool_token_slots[req.req_id].append(token_slot)
-                    req_slots.append(req_slot)
-                    out_cache_loc.append(token_slot)
-            if backend is None:
-                raise RuntimeError("token-pool decode backend is not initialized")
-            full_metadata = None
-            full_paged_metadata = None
-            if self._token_kv_pool is not None:
-                (
-                    full_metadata,
-                    full_paged_metadata,
-                ) = self._token_pool_prepare_layer_decode_metadata(
-                    reqs,
-                    reservations,
-                    full_attention_kv_indices_padding_steps=(
-                        full_attention_kv_indices_padding_steps
-                    ),
-                    persistent_full_attention_rows=(
-                        persistent_full_attention_rows
-                    ),
-                )
-            prepared_batch = backend.prepare_decode_batch_state(
-                reservations,
-                sliding_window=self.config.sliding_window,
-                layer_type_by_layer_id=(
-                    {}
-                    if self._token_kv_pool is None
-                    else self._token_pool_layer_type_by_layer_id()
+        if backend is None:
+            raise RuntimeError("token-pool decode backend is not initialized")
+
+        def prepare_full_attention_metadata(
+            reservations: tuple[_TokenPoolDecodeReservation, ...],
+        ) -> tuple[DecodeBatchMetadata | None, PagedDecodeBatchMetadata | None]:
+            if self._token_kv_pool is None:
+                return None, None
+            return self._token_pool_prepare_layer_decode_metadata(
+                reqs,
+                list(reservations),
+                full_attention_kv_indices_padding_steps=(
+                    full_attention_kv_indices_padding_steps
                 ),
-                full_attention_metadata=full_metadata,
-                full_attention_paged_metadata=full_paged_metadata,
-                sliding_attention_kv_indices_padding_steps=(
-                    sliding_attention_kv_indices_padding_steps
+                persistent_full_attention_rows=(
+                    persistent_full_attention_rows
                 ),
             )
-            self.metrics.token_pool_decode_metadata_batches += 1
-            self.metrics.token_pool_decode_metadata_rows += len(reqs)
-            covered_layer_types = (
-                prepared_batch.covered_layer_types
-                if prepared_batch is not None
-                else frozenset()
-            )
-            for layer_type in covered_layer_types:
-                key = str(layer_type)
-                self.metrics.token_pool_decode_covered_layer_type_batches[key] = (
-                    self.metrics.token_pool_decode_covered_layer_type_batches.get(
-                        key, 0
-                    )
-                    + 1
+
+        prepared_batch = backend.prepare_decode_batch(
+            reqs,
+            expected_lengths=[req.num_computed_tokens for req in reqs],
+            sliding_window=self.config.sliding_window,
+            layer_type_by_layer_id=(
+                {}
+                if self._token_kv_pool is None
+                else self._token_pool_layer_type_by_layer_id()
+            ),
+            full_attention_metadata_provider=(
+                prepare_full_attention_metadata
+                if self._token_kv_pool is not None
+                else None
+            ),
+            persistent_full_attention_rows=persistent_full_attention_rows,
+            sliding_attention_kv_indices_padding_steps=(
+                sliding_attention_kv_indices_padding_steps
+            ),
+        )
+        self.metrics.token_pool_decode_metadata_batches += 1
+        self.metrics.token_pool_decode_metadata_rows += len(reqs)
+        covered_layer_types = prepared_batch.covered_layer_types
+        for layer_type in covered_layer_types:
+            key = str(layer_type)
+            self.metrics.token_pool_decode_covered_layer_type_batches[key] = (
+                self.metrics.token_pool_decode_covered_layer_type_batches.get(
+                    key, 0
                 )
-                self.metrics.token_pool_decode_covered_layer_type_rows[key] = (
-                    self.metrics.token_pool_decode_covered_layer_type_rows.get(
-                        key, 0
-                    )
-                    + len(reqs)
-                )
-            self.metrics.token_pool_slot_high_watermark = max(
-                self.metrics.token_pool_slot_high_watermark,
-                allocator.high_watermark,
+                + 1
             )
-            return reservations
-        except Exception:
-            self._token_pool_discard_decode_reservations(reservations)
-            if backend is not None:
-                backend.clear_decode_batch_state()
-            raise
+            self.metrics.token_pool_decode_covered_layer_type_rows[key] = (
+                self.metrics.token_pool_decode_covered_layer_type_rows.get(
+                    key, 0
+                )
+                + len(reqs)
+            )
+        self.metrics.token_pool_slot_high_watermark = max(
+            self.metrics.token_pool_slot_high_watermark,
+            allocator.high_watermark,
+        )
+        return list(prepared_batch.reservations)
 
     def _token_pool_decode_context(
         self,

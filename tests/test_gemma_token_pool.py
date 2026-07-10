@@ -1508,6 +1508,89 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(backend.request_token_slots["req"], prefill_ids)
         self.assertEqual(allocator.allocated_count, 2)
 
+    def test_token_pool_decode_backend_prepares_decode_batch(self) -> None:
+        from types import SimpleNamespace
+
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenPoolDecodeBackendState,
+            TokenSlotAllocator,
+        )
+
+        table = ReqToTokenTable(max_requests=1, max_context_len=8)
+        allocator = TokenSlotAllocator(capacity=8)
+        backend = TokenPoolDecodeBackendState(table=table, allocator=allocator)
+        req_slot = backend.admit_request("req")
+        prefill_tensor, prefill_ids = allocator.alloc_slots_with_ids(2)
+        backend.append_table_slots(req_slot, prefill_tensor)
+        backend.append_request_token_slots("req", prefill_ids)
+
+        prepared = backend.prepare_decode_batch(
+            [SimpleNamespace(req_id="req")],
+            expected_lengths=[2],
+            sliding_window=2,
+        )
+
+        self.assertIs(backend.current_decode_batch_state, prepared.state)
+        self.assertEqual(len(prepared.reservations), 1)
+        reservation = prepared.reservations[0]
+        self.assertEqual(reservation.req_id, "req")
+        self.assertEqual(table.length(req_slot), 3)
+        self.assertEqual(
+            backend.request_token_slots["req"],
+            prefill_ids + [reservation.token_slot],
+        )
+        assert prepared.state is not None
+        metadata = prepared.state.metadata_by_layer_type["full_attention"]
+        self.assertEqual(metadata.logical_seq_lens.tolist(), [3])
+        self.assertEqual(metadata.out_cache_loc.tolist(), [reservation.token_slot])
+
+    def test_token_pool_decode_backend_prepare_batch_rolls_back_on_metadata_failure(
+        self,
+    ) -> None:
+        from types import SimpleNamespace
+
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenPoolDecodeBackendState,
+            TokenSlotAllocator,
+        )
+
+        table = ReqToTokenTable(max_requests=1, max_context_len=8)
+        allocator = TokenSlotAllocator(capacity=8)
+        backend = TokenPoolDecodeBackendState(table=table, allocator=allocator)
+        req_slot = backend.admit_request("req")
+        prefill_tensor, prefill_ids = allocator.alloc_slots_with_ids(2)
+        backend.append_table_slots(req_slot, prefill_tensor)
+        backend.append_request_token_slots("req", prefill_ids)
+
+        def raise_metadata_failure(_reservations):
+            raise RuntimeError("forced metadata failure")
+
+        with self.assertRaisesRegex(RuntimeError, "forced metadata failure"):
+            backend.prepare_decode_batch(
+                [SimpleNamespace(req_id="req")],
+                expected_lengths=[2],
+                sliding_window=2,
+                full_attention_metadata_provider=raise_metadata_failure,
+            )
+
+        self.assertIsNone(backend.current_decode_batch_state)
+        self.assertEqual(table.length(req_slot), 2)
+        self.assertEqual(table.slots_for("req").tolist(), prefill_ids)
+        self.assertEqual(backend.request_token_slots["req"], prefill_ids)
+        self.assertEqual(allocator.allocated_count, 2)
+
     def test_token_pool_decode_backend_prepares_decode_batch_state(self) -> None:
         from types import SimpleNamespace
 

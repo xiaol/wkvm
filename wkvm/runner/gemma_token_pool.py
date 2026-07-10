@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 import os
 import time
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 
 @dataclass(frozen=True)
@@ -5904,6 +5904,52 @@ class TokenPoolDecodeBackendState:
             return tuple(reservations)
         except Exception:
             self.discard_decode_batch(reservations)
+            raise
+
+    def prepare_decode_batch(
+        self,
+        requests: Iterable[Any],
+        *,
+        expected_lengths: Iterable[int],
+        sliding_window: int,
+        layer_type_by_layer_id: dict[int, str] | None = None,
+        full_attention_metadata_provider: Callable[
+            [tuple[TokenPoolDecodeReservation, ...]],
+            tuple[DecodeBatchMetadata | None, PagedDecodeBatchMetadata | None],
+        ]
+        | None = None,
+        persistent_full_attention_rows: bool = False,
+        sliding_attention_kv_indices_padding_steps: int = 0,
+    ) -> TokenPoolPreparedDecodeBatch:
+        """Prepare a backend-owned decode transaction and current metadata state."""
+
+        self.clear_decode_batch_state()
+        reservations: tuple[TokenPoolDecodeReservation, ...] = ()
+        try:
+            reservations = self.prepare_decode_reservations(
+                requests,
+                expected_lengths=expected_lengths,
+                persistent_full_attention_rows=persistent_full_attention_rows,
+            )
+            full_metadata = None
+            full_paged_metadata = None
+            if full_attention_metadata_provider is not None and reservations:
+                full_metadata, full_paged_metadata = (
+                    full_attention_metadata_provider(reservations)
+                )
+            return self.prepare_decode_batch_state(
+                reservations,
+                sliding_window=sliding_window,
+                layer_type_by_layer_id=layer_type_by_layer_id,
+                full_attention_metadata=full_metadata,
+                full_attention_paged_metadata=full_paged_metadata,
+                sliding_attention_kv_indices_padding_steps=(
+                    sliding_attention_kv_indices_padding_steps
+                ),
+            )
+        except Exception:
+            self.discard_decode_batch(reservations)
+            self.clear_decode_batch_state()
             raise
 
     def prepare_decode_batch_state(
