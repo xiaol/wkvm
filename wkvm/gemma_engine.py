@@ -2819,44 +2819,40 @@ class GemmaNativeEngine:
         backend = self._token_pool_decode_backend
         if pool is None or backend is None:
             return None, None
-        if not backend.has_full_attention_rows():
-            return None, None
         layer_plan = self._token_pool_layer_plan()
-        if not layer_plan.supports_full_attention_decode_metadata:
-            return None, None
-        owner_layer_ids = list(layer_plan.full_attention_owner_layer_ids)
-        req_ids = [req.req_id for req in reqs]
-        if not persistent_rows:
-            self._token_pool_clear_full_attention_rows(req_ids)
         build_paged_rows = bool(
             persistent_rows and _token_pool_full_attention_paged_metadata_requested()
         )
-        try:
-            prepared_batch = backend.prepare_full_attention_decode_batch(
-                requests=reqs,
-                reservations=reservations,
-                caches_by_req_id=self._caches,
-                owner_layer_ids=owner_layer_ids,
-                kv_indices_padding_steps=kv_indices_padding_steps,
-                persistent_rows=persistent_rows,
-                build_paged_rows=build_paged_rows,
-            )
-            self.metrics.token_pool_full_attention_row_invalidations += (
-                prepared_batch.invalidated_existing_rows
-            )
-            self.metrics.token_pool_full_attention_row_reuses += (
-                prepared_batch.reused_existing_rows
-            )
-            self.metrics.token_pool_full_attention_row_appends += (
-                prepared_batch.appended_existing_rows
-            )
-            self.metrics.token_pool_full_attention_row_rebuilds += (
-                prepared_batch.rebuilt_persistent_rows
-            )
-            return prepared_batch.metadata, prepared_batch.paged_metadata
-        except (DistinctCacheBatchError, RuntimeError, ValueError, KeyError):
-            self._token_pool_clear_full_attention_rows(req_ids)
+        prepared_batch = backend.prepare_full_attention_decode_metadata(
+            requests=reqs,
+            reservations=reservations,
+            caches_by_req_id=self._caches,
+            layer_plan=layer_plan,
+            kv_indices_padding_steps=kv_indices_padding_steps,
+            persistent_rows=persistent_rows,
+            build_paged_rows=build_paged_rows,
+            recoverable_errors=(
+                DistinctCacheBatchError,
+                RuntimeError,
+                ValueError,
+                KeyError,
+            ),
+        )
+        if prepared_batch is None:
             return None, None
+        self.metrics.token_pool_full_attention_row_invalidations += (
+            prepared_batch.invalidated_existing_rows
+        )
+        self.metrics.token_pool_full_attention_row_reuses += (
+            prepared_batch.reused_existing_rows
+        )
+        self.metrics.token_pool_full_attention_row_appends += (
+            prepared_batch.appended_existing_rows
+        )
+        self.metrics.token_pool_full_attention_row_rebuilds += (
+            prepared_batch.rebuilt_persistent_rows
+        )
+        return prepared_batch.metadata, prepared_batch.paged_metadata
 
     def _token_pool_effective_layer_types(self) -> tuple[Any, ...]:
         runner_model = getattr(self.runner, "model", None)

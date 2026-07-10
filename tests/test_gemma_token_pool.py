@@ -2104,6 +2104,29 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(second.rebuilt_persistent_rows, 0)
         self.assertEqual(second.metadata.kv_indices.tolist(), [0, 1, 2, 3, 4])
 
+        layer_plan = backend.build_layer_plan(
+            layer_types=("sliding_attention", "full_attention"),
+            model_layer_ids=[1],
+            expected_full_attention_owner_layer_ids=[1],
+        )
+        failed = backend.prepare_full_attention_decode_metadata(
+            requests=[request],
+            reservations=[
+                SimpleNamespace(
+                    req_slot=0,
+                    token_slot=10,
+                    token_slot_tensor=torch.tensor([10], dtype=torch.int32),
+                    full_attention_token_slot=None,
+                )
+            ],
+            caches_by_req_id={"req": SimpleNamespace(layers=[None, object()])},
+            layer_plan=layer_plan,
+            persistent_rows=True,
+        )
+
+        self.assertIsNone(failed)
+        self.assertEqual(backend.full_attention_row_records, {})
+
     def test_req_to_token_table_reuses_decode_metadata_workspace_by_key(self) -> None:
         try:
             import torch

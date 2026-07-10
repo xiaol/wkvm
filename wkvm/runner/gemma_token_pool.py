@@ -6839,6 +6839,45 @@ class TokenPoolDecodeBackendState:
             logical_seq_lens=tuple(logical_lens),
         )
 
+    def prepare_full_attention_decode_metadata(
+        self,
+        *,
+        requests: Iterable[Any],
+        reservations: Iterable[Any],
+        caches_by_req_id: Any,
+        layer_plan: TokenPoolLayerPlan,
+        kv_indices_padding_steps: int = 0,
+        persistent_rows: bool = False,
+        build_paged_rows: bool = False,
+        recoverable_errors: tuple[type[BaseException], ...] = (
+            RuntimeError,
+            ValueError,
+            KeyError,
+        ),
+    ) -> TokenPoolFullAttentionPreparedBatch | None:
+        if self.kv_pool is None or not self.has_full_attention_rows():
+            return None
+        if not layer_plan.supports_full_attention_decode_metadata:
+            return None
+        request_list = list(requests)
+        reservation_list = list(reservations)
+        req_ids = [str(getattr(request, "req_id", request)) for request in request_list]
+        if not persistent_rows:
+            self.clear_full_attention_rows(req_ids)
+        try:
+            return self.prepare_full_attention_decode_batch(
+                requests=request_list,
+                reservations=reservation_list,
+                caches_by_req_id=caches_by_req_id,
+                owner_layer_ids=layer_plan.full_attention_owner_layer_ids,
+                kv_indices_padding_steps=kv_indices_padding_steps,
+                persistent_rows=persistent_rows,
+                build_paged_rows=build_paged_rows,
+            )
+        except recoverable_errors:
+            self.clear_full_attention_rows(req_ids)
+            return None
+
     def commit_full_attention_decode_to_caches(
         self,
         *,
