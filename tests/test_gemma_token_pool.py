@@ -660,6 +660,7 @@ class TestGemmaTokenPool(unittest.TestCase):
             ReqToTokenTable,
             TokenPoolBlockTables,
             TokenPoolDecodeBackendState,
+            TokenPoolFullAttentionRow,
             TokenSlotAllocator,
         )
 
@@ -697,7 +698,14 @@ class TestGemmaTokenPool(unittest.TestCase):
         _, normal_token_slots = allocator.alloc_slots_with_ids(2)
         backend.append_request_token_slots("req", normal_token_slots)
         backend.allocate_page_aligned_slots("req", 0, 1, req_slot=req_slot)
-        self.assertEqual(allocator.allocated_count, 6)
+        _, full_row_slots = allocator.alloc_slots_with_ids(2)
+        full_attention_rows = backend.full_attention_row_records
+        self.assertIsNotNone(full_attention_rows)
+        full_attention_rows["req"] = TokenPoolFullAttentionRow(
+            row_slots=full_row_slots,
+            owned_slots=full_row_slots,
+        )
+        self.assertEqual(allocator.allocated_count, 8)
         released_req_slot, released_page_slots, released_token_slots = (
             backend.release_request("req")
         )

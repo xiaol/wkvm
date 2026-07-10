@@ -5481,6 +5481,7 @@ class TokenPoolDecodeBackendState:
     def release_request(self, req_id: str) -> tuple[int | None, set[int], list[int]]:
         req_id = str(req_id)
         req_slot = self.request_slots.get(req_id)
+        self.clear_full_attention_rows([req_id])
         page_slots = self.release_request_page_state(req_id, req_slot)
         token_slots = self.request_token_slots.pop(req_id, [])
         if page_slots:

@@ -2183,12 +2183,12 @@ class GemmaNativeEngine:
         allocator = self._token_slot_allocator
         if table is None or allocator is None:
             return
-        self._token_pool_clear_full_attention_rows([req_id])
-        req_slot = self._token_pool_req_slots.get(req_id)
         backend = self._token_pool_decode_backend
         if backend is not None:
             backend.release_request(req_id)
         else:
+            self._token_pool_clear_full_attention_rows([req_id])
+            req_slot = self._token_pool_req_slots.get(req_id)
             if req_slot is not None:
                 self._token_pool_reset_page_table_row(req_slot)
             page_slots = self._token_pool_page_owned_slots.pop(req_id, set())
