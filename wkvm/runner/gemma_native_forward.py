@@ -1561,7 +1561,7 @@ class NativeGemma4CausalLMOutput:
 
 
 class NativeGemma4SharedKVState:
-    """HF-compatible shared-KV handoff for native Gemma4 attention."""
+    """Shared-KV handoff for native Gemma4 attention."""
 
     def load_shared_kv(
         self,
@@ -1569,16 +1569,26 @@ class NativeGemma4SharedKVState:
         shared_kv_states: dict[str, tuple[Any, Any]] | UserDict,
         *,
         query_device,
+        past_key_values=None,
         timing_enabled: bool,
     ) -> tuple[Any, Any] | None:
         if not attn.is_kv_shared_layer:
             return None
         phase_start = time.perf_counter() if timing_enabled else 0.0
-        if attn.layer_type not in shared_kv_states:
-            raise KeyError(
-                f"missing shared Gemma4 KV state for layer type {attn.layer_type!r}"
+        shared_kv = None
+        get_shared_kv = getattr(past_key_values, "get_shared_kv", None)
+        if callable(get_shared_kv) and attn.kv_shared_layer_index is not None:
+            shared_kv = get_shared_kv(
+                layer_idx=int(attn.kv_shared_layer_index),
+                layer_type=attn.layer_type,
             )
-        key_states, value_states = shared_kv_states[attn.layer_type]
+        if shared_kv is None:
+            if attn.layer_type not in shared_kv_states:
+                raise KeyError(
+                    f"missing shared Gemma4 KV state for layer type {attn.layer_type!r}"
+                )
+            shared_kv = shared_kv_states[attn.layer_type]
+        key_states, value_states = shared_kv
         key_states = key_states.to(query_device)
         value_states = value_states.to(query_device)
         if timing_enabled:
@@ -1594,9 +1604,21 @@ class NativeGemma4SharedKVState:
         shared_kv_states: dict[str, tuple[Any, Any]] | UserDict,
         key_states,
         value_states,
+        *,
+        layer_idx: int | None = None,
+        past_key_values=None,
     ) -> None:
-        if attn.store_full_length_kv:
-            shared_kv_states[attn.layer_type] = key_states, value_states
+        if not attn.store_full_length_kv:
+            return
+        shared_kv_states[attn.layer_type] = key_states, value_states
+        store_shared_kv = getattr(past_key_values, "store_shared_kv", None)
+        if callable(store_shared_kv) and layer_idx is not None:
+            store_shared_kv(
+                layer_idx=int(layer_idx),
+                layer_type=attn.layer_type,
+                key_states=key_states,
+                value_states=value_states,
+            )
 
 
 class NativeGemma4AttentionBackend:
@@ -1863,6 +1885,7 @@ class NativeGemma4Attention:
                 attn,
                 shared_kv_states,
                 query_device=query_states.device,
+                past_key_values=past_key_values,
                 timing_enabled=timing_enabled,
             )
 
@@ -1921,6 +1944,8 @@ class NativeGemma4Attention:
             shared_kv_states,
             key_states,
             value_states,
+            layer_idx=self.layer_idx,
+            past_key_values=past_key_values,
         )
         phase_start = time.perf_counter() if timing_enabled else 0.0
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()

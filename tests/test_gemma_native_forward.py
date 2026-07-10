@@ -203,6 +203,31 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
         self.assertIsNotNone(loaded)
         self.assertIs(loaded[0], key_states)
         self.assertIs(loaded[1], value_states)
+
+        class SharedKVCache:
+            def __init__(self) -> None:
+                self.requests = []
+                self.stored = None
+
+            def get_shared_kv(self, *, layer_idx, layer_type):
+                self.requests.append((layer_idx, layer_type))
+                return key_states, value_states
+
+            def store_shared_kv(self, **kwargs):
+                self.stored = kwargs
+
+        cache = SharedKVCache()
+        loaded_from_cache = shared_kv_state.load_shared_kv(
+            shared_meta,
+            UserDict(),
+            query_device=key_states.device,
+            past_key_values=cache,
+            timing_enabled=False,
+        )
+        self.assertEqual(cache.requests, [(0, "sliding_attention")])
+        self.assertIs(loaded_from_cache[0], key_states)
+        self.assertIs(loaded_from_cache[1], value_states)
+
         with self.assertRaises(KeyError):
             shared_kv_state.load_shared_kv(
                 shared_meta,
@@ -223,10 +248,21 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
             store_full_length_kv=True,
         )
         stored = UserDict()
-        shared_kv_state.store_shared_kv(store_meta, stored, key_states, value_states)
+        shared_kv_state.store_shared_kv(
+            store_meta,
+            stored,
+            key_states,
+            value_states,
+            layer_idx=0,
+            past_key_values=cache,
+        )
 
         self.assertIs(stored["sliding_attention"][0], key_states)
         self.assertIs(stored["sliding_attention"][1], value_states)
+        self.assertEqual(cache.stored["layer_idx"], 0)
+        self.assertEqual(cache.stored["layer_type"], "sliding_attention")
+        self.assertIs(cache.stored["key_states"], key_states)
+        self.assertIs(cache.stored["value_states"], value_states)
 
     def test_attention_backend_resolves_shared_kv_source_layer(self) -> None:
         from types import SimpleNamespace
@@ -2089,6 +2125,83 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
         self.assertEqual(pool.target_layer(2), 0)
         self.assertEqual(context.last_request, (0, "sliding_attention", False))
         self.assertEqual(binding.store_calls, 0)
+        self.assertLess((expected - actual).abs().max().item(), 1e-6)
+
+    def test_dense_shared_kv_decode_uses_source_layer_cache_alias(self) -> None:
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import (
+            Gemma4TextDecoderLayer,
+            Gemma4TextRotaryEmbedding,
+        )
+        from wkvm.models.gemma import GemmaRoutedSpanConfig
+        from wkvm.runner.gemma_native_forward import NativeGemma4TextDecoderLayer
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+
+        torch.manual_seed(26)
+        cfg = _tiny_shared_config()
+        source_layer = NativeGemma4TextDecoderLayer(
+            Gemma4TextDecoderLayer(cfg, layer_idx=0).eval(),
+            native_attention_backend="manual_gqa",
+        )
+        shared_layer = NativeGemma4TextDecoderLayer(
+            Gemma4TextDecoderLayer(cfg, layer_idx=2).eval(),
+            native_attention_backend="manual_gqa",
+        )
+        rotary = Gemma4TextRotaryEmbedding(cfg)
+        native_cfg = GemmaRoutedSpanConfig(
+            num_hidden_layers=cfg.num_hidden_layers,
+            num_kv_shared_layers=cfg.num_kv_shared_layers,
+            layer_types=tuple(cfg.layer_types),
+            num_kv_heads=cfg.num_key_value_heads,
+            head_dim=cfg.head_dim,
+            sliding_window=cfg.sliding_window,
+        )
+        cache = NativeGemmaRoutedCache(cfg, native_cfg)
+
+        hidden = torch.randn(1, 3, cfg.hidden_size)
+        per_layer_input = torch.randn(1, 3, cfg.hidden_size_per_layer_input)
+        position_ids = torch.arange(3).unsqueeze(0)
+        position_embeddings = rotary(hidden, position_ids, "sliding_attention")
+        mask = _causal_mask(1, 3, dtype=hidden.dtype, device=hidden.device)
+        shared_kv_states = UserDict()
+
+        with torch.inference_mode():
+            source_layer(
+                hidden,
+                per_layer_input,
+                shared_kv_states=shared_kv_states,
+                position_embeddings=position_embeddings,
+                attention_mask=mask,
+                position_ids=position_ids,
+                past_key_values=cache,
+            )
+            source_shared_kv = cache.get_shared_kv(
+                layer_idx=0,
+                layer_type="sliding_attention",
+            )
+            expected = shared_layer(
+                hidden,
+                per_layer_input,
+                shared_kv_states=UserDict(
+                    {"sliding_attention": source_shared_kv}
+                ),
+                position_embeddings=position_embeddings,
+                attention_mask=mask,
+                position_ids=position_ids,
+                past_key_values=None,
+            )
+            actual = shared_layer(
+                hidden,
+                per_layer_input,
+                shared_kv_states=UserDict(),
+                position_embeddings=position_embeddings,
+                attention_mask=mask,
+                position_ids=position_ids,
+                past_key_values=cache,
+            )
+
+        self.assertIn("sliding_attention", shared_kv_states)
+        self.assertIsNotNone(source_shared_kv)
         self.assertLess((expected - actual).abs().max().item(), 1e-6)
 
     def test_full_attention_token_pool_context_matches_routed_dense_cache(self) -> None:

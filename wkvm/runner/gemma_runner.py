@@ -741,6 +741,8 @@ class NativeGemmaRoutedCache:
         self.slot_state = slot_state
         self.static_padded_decode = False
         self._static_padded_decode_layers = None
+        self._shared_kv_by_layer: dict[int, tuple[Any, Any]] = {}
+        self._shared_kv_by_type: dict[str, tuple[Any, Any]] = {}
         n_owned = decoder.num_hidden_layers - getattr(decoder, "num_kv_shared_layers", 0)
         layer_types = list(decoder.layer_types[:n_owned])
         coord: list | None = []
@@ -774,6 +776,33 @@ class NativeGemmaRoutedCache:
     def update(self, key_states, value_states, layer_idx: int, *args, **kwargs):
         return self.layers[layer_idx].update(key_states, value_states, *args, **kwargs)
 
+    def store_shared_kv(
+        self,
+        *,
+        layer_idx: int,
+        layer_type: str | None,
+        key_states,
+        value_states,
+    ) -> None:
+        shared_kv = (key_states, value_states)
+        self._shared_kv_by_layer[int(layer_idx)] = shared_kv
+        if layer_type is not None:
+            self._shared_kv_by_type[str(layer_type)] = shared_kv
+
+    def get_shared_kv(
+        self,
+        *,
+        layer_idx: int | None = None,
+        layer_type: str | None = None,
+    ):
+        if layer_idx is not None:
+            shared_kv = self._shared_kv_by_layer.get(int(layer_idx))
+            if shared_kv is not None:
+                return shared_kv
+        if layer_type is not None:
+            return self._shared_kv_by_type.get(str(layer_type))
+        return None
+
     def get_seq_length(self, layer_idx: int = 0) -> int:
         if not self.layers:
             return 0
@@ -794,16 +823,52 @@ class NativeGemmaRoutedCache:
     def batch_repeat_interleave(self, repeats: int) -> None:
         for layer in self.layers:
             layer.batch_repeat_interleave(repeats)
+        repeated: dict[int, tuple[Any, Any]] = {}
+
+        def repeat_shared(kv: tuple[Any, Any]) -> tuple[Any, Any]:
+            key = id(kv)
+            if key not in repeated:
+                repeated[key] = (
+                    kv[0].repeat_interleave(repeats, dim=0).contiguous(),
+                    kv[1].repeat_interleave(repeats, dim=0).contiguous(),
+                )
+            return repeated[key]
+
+        self._shared_kv_by_layer = {
+            layer_idx: repeat_shared(kv)
+            for layer_idx, kv in self._shared_kv_by_layer.items()
+        }
+        self._shared_kv_by_type = {
+            layer_type: repeat_shared(kv)
+            for layer_type, kv in self._shared_kv_by_type.items()
+        }
 
     def state_bytes(self) -> int:
         total = 0
+        seen: set[int] = set()
+
+        def add_tensor(tensor) -> None:
+            nonlocal total
+            if tensor is None:
+                return
+            ptr = int(tensor.data_ptr())
+            if ptr in seen:
+                return
+            seen.add(ptr)
+            total += tensor.numel() * tensor.element_size()
+
         for layer in self.layers:
             for tensor in (getattr(layer, "keys", None), getattr(layer, "values", None)):
-                if tensor is not None:
-                    total += tensor.numel() * tensor.element_size()
+                add_tensor(tensor)
+        for store in (self._shared_kv_by_layer, self._shared_kv_by_type):
+            for key_states, value_states in store.values():
+                add_tensor(key_states)
+                add_tensor(value_states)
         return total
 
     def release_tensor_storage(self) -> None:
+        self._shared_kv_by_layer.clear()
+        self._shared_kv_by_type.clear()
         for layer in self.layers:
             layer.keys = None
             layer.values = None
