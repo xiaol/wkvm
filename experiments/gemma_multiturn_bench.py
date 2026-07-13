@@ -93,7 +93,13 @@ def git_commit() -> str | None:
 
 def git_tree_state() -> dict[str, Any]:
     try:
-        status = subprocess.check_output(
+        tracked_status = subprocess.check_output(
+            ["git", "status", "--porcelain=v1", "--untracked-files=no"],
+            cwd=ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        full_status = subprocess.check_output(
             ["git", "status", "--porcelain=v1", "--untracked-files=all"],
             cwd=ROOT,
             text=True,
@@ -102,14 +108,26 @@ def git_tree_state() -> dict[str, Any]:
     except Exception:
         return {
             "clean": None,
+            "tracked_clean": None,
             "status_sha256": None,
+            "tracked_status_sha256": None,
             "changed_path_count": None,
+            "tracked_changed_path_count": None,
+            "untracked_path_count": None,
         }
-    lines = [line for line in status.splitlines() if line]
+    tracked_lines = [line for line in tracked_status.splitlines() if line]
+    full_lines = [line for line in full_status.splitlines() if line]
+    untracked_lines = [line for line in full_lines if line.startswith("?? ")]
     return {
-        "clean": not lines,
-        "status_sha256": hashlib.sha256(status.encode("utf-8")).hexdigest(),
-        "changed_path_count": len(lines),
+        "clean": not full_lines,
+        "tracked_clean": not tracked_lines,
+        "status_sha256": hashlib.sha256(full_status.encode("utf-8")).hexdigest(),
+        "tracked_status_sha256": hashlib.sha256(
+            tracked_status.encode("utf-8")
+        ).hexdigest(),
+        "changed_path_count": len(full_lines),
+        "tracked_changed_path_count": len(tracked_lines),
+        "untracked_path_count": len(untracked_lines),
     }
 
 
