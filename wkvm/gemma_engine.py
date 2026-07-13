@@ -217,6 +217,7 @@ class GemmaEngineMetrics:
     token_pool_full_attention_row_reuses: int = 0
     token_pool_full_attention_row_appends: int = 0
     token_pool_full_attention_row_invalidations: int = 0
+    token_pool_full_attention_coverage_splits: int = 0
     token_pool_slot_high_watermark: int = 0
     max_waiting: int = 0
     max_running: int = 0
@@ -379,6 +380,9 @@ class GemmaEngineMetrics:
             ),
             "token_pool_full_attention_row_invalidations": (
                 self.token_pool_full_attention_row_invalidations
+            ),
+            "token_pool_full_attention_coverage_splits": (
+                self.token_pool_full_attention_coverage_splits
             ),
             "token_pool_slot_high_watermark": self.token_pool_slot_high_watermark,
             "max_waiting": self.max_waiting,
@@ -1451,6 +1455,13 @@ class GemmaNativeEngine:
         if batched:
             prepared_decode = self._token_pool_prepare_decode_model_batch(reqs)
             token_pool_decode = self._token_pool_decode_context(prepared_decode)
+            coverage_split = self._split_missing_full_attention_coverage(
+                reqs,
+                prepared_decode,
+                token_pool_decode,
+            )
+            if coverage_split is not None:
+                return coverage_split
             try:
                 logits = self.runner.decode_batch(
                     [self._caches[req.req_id] for req in reqs],
@@ -1522,6 +1533,37 @@ class GemmaNativeEngine:
             return bool(can_graph())
         except Exception:
             return False
+
+    def _split_missing_full_attention_coverage(
+        self,
+        reqs: list[Request],
+        prepared_decode: Any,
+        token_pool_decode: TokenPoolDecodeContext | None,
+        *,
+        padded_group_key: tuple[str, ...] | None = None,
+    ) -> dict[str, list[int]] | None:
+        if (
+            len(reqs) < 2
+            or self._token_kv_pool is None
+            or not self._token_pool_full_attention_owner_layer_ids()
+        ):
+            return None
+        covered_layer_types = (
+            frozenset()
+            if token_pool_decode is None
+            else token_pool_decode.covered_decode_layer_types()
+        )
+        if "full_attention" in covered_layer_types:
+            return None
+        self._token_pool_discard_decode_reservations(prepared_decode)
+        if padded_group_key is not None:
+            self._flush_padded_decode_group(padded_group_key)
+        self.metrics.decode_microbatch_splits += 1
+        self.metrics.token_pool_full_attention_coverage_splits += 1
+        sampled: dict[str, list[int]] = {}
+        for req in reqs:
+            sampled.update(self._execute_decode_model_batch([req]))
+        return sampled
 
     def _try_execute_persistent_exact_decode_batch(
         self,
@@ -1640,6 +1682,14 @@ class GemmaNativeEngine:
                     ),
                 )
                 token_pool_decode = self._token_pool_decode_context(prepared_decode)
+                coverage_split = self._split_missing_full_attention_coverage(
+                    reqs,
+                    prepared_decode,
+                    token_pool_decode,
+                    padded_group_key=key,
+                )
+                if coverage_split is not None:
+                    return coverage_split
                 logits, merged_cache = begin(
                     [self._caches[req.req_id] for req in reqs],
                     last_tokens,
@@ -1685,6 +1735,14 @@ class GemmaNativeEngine:
                     ),
                 )
                 token_pool_decode = self._token_pool_decode_context(prepared_decode)
+                coverage_split = self._split_missing_full_attention_coverage(
+                    reqs,
+                    prepared_decode,
+                    token_pool_decode,
+                    padded_group_key=key,
+                )
+                if coverage_split is not None:
+                    return coverage_split
                 logits = reuse(
                     merged_cache,
                     last_tokens,

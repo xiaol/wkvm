@@ -27,6 +27,7 @@ class TestGemmaEngineMetrics(unittest.TestCase):
         metrics.token_pool_full_attention_row_reuses = 5
         metrics.token_pool_full_attention_row_appends = 6
         metrics.token_pool_full_attention_row_invalidations = 7
+        metrics.token_pool_full_attention_coverage_splits = 8
         metrics.persistent_padded_decode_cuda_graph_skips = 1
         metrics.persistent_padded_decode_cuda_graph_skip_reasons[
             "capture_failed:RuntimeError"
@@ -59,6 +60,7 @@ class TestGemmaEngineMetrics(unittest.TestCase):
         self.assertEqual(data["token_pool_full_attention_row_reuses"], 5)
         self.assertEqual(data["token_pool_full_attention_row_appends"], 6)
         self.assertEqual(data["token_pool_full_attention_row_invalidations"], 7)
+        self.assertEqual(data["token_pool_full_attention_coverage_splits"], 8)
         self.assertEqual(data["persistent_padded_decode_cuda_graph_skips"], 1)
         self.assertEqual(
             data["persistent_padded_decode_cuda_graph_skip_reasons"],
@@ -3322,6 +3324,73 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         engine._token_pool_discard_decode_reservations(reservations)
         engine._token_pool_release_request(req.req_id)
         self.assertEqual(engine.stats()["token_pool"]["allocated_token_slots"], 0)
+
+    def test_decode_batch_splits_when_full_attention_pool_coverage_is_missing(self) -> None:
+        from wkvm.gemma_engine import GemmaNativeEngine
+        from wkvm.models.gemma import gemma4_e4b_routed_span_config
+
+        cfg = gemma4_e4b_routed_span_config(
+            num_hidden_layers=2,
+            num_kv_shared_layers=0,
+            layer_types=("sliding_attention", "full_attention"),
+        )
+        engine = GemmaNativeEngine(
+            model=FakeModel(),
+            config=cfg,
+            num_slots=2,
+            scheduler_config=SchedulerConfig(
+                max_tokens_per_step=16,
+                max_running_requests=2,
+                max_tokens_per_request_per_step=8,
+            ),
+        )
+        runner = FakePersistentPaddedBatchRunner()
+        engine.runner = runner  # type: ignore[assignment]
+        engine._token_kv_pool = object()  # type: ignore[assignment]
+        reqs = [
+            Request(prompt_token_ids=[1, 2, 3], max_new_tokens=3, req_id="a"),
+            Request(prompt_token_ids=[4, 5, 6], max_new_tokens=3, req_id="b"),
+        ]
+        for req in reqs:
+            req.output_token_ids.append(9)
+            req.num_computed_tokens = req.num_tokens - 1
+            engine._caches[req.req_id] = FakeCache()
+
+        discarded = []
+
+        def prepare(rows, **kwargs):
+            return tuple(req.req_id for req in rows)
+
+        def context(prepared):
+            if len(prepared) == 1:
+                return None
+            return SimpleNamespace(
+                covered_decode_layer_types=lambda: frozenset(
+                    {"sliding_attention"}
+                )
+            )
+
+        engine._token_pool_prepare_decode_model_batch = prepare  # type: ignore[method-assign]
+        engine._token_pool_decode_context = context  # type: ignore[method-assign]
+        engine._token_pool_discard_decode_reservations = (  # type: ignore[method-assign]
+            lambda prepared: discarded.append(prepared)
+        )
+        engine._token_pool_commit_decode_reservations = (  # type: ignore[method-assign]
+            lambda prepared: None
+        )
+        engine._token_pool_full_attention_owner_layer_ids = (  # type: ignore[method-assign]
+            lambda: (1,)
+        )
+
+        sampled = engine._execute_decode_model_batch(reqs)
+
+        self.assertEqual(discarded, [("a", "b")])
+        self.assertEqual(runner.persistent_padded_starts, [])
+        self.assertEqual(runner.decode_batch_calls, [])
+        self.assertEqual(runner.decode_step_calls, 2)
+        self.assertEqual(set(sampled), {"a", "b"})
+        self.assertEqual(engine.metrics.decode_microbatch_splits, 1)
+        self.assertEqual(engine.metrics.token_pool_full_attention_coverage_splits, 1)
 
     def test_token_kv_layer_specs_include_full_and_shared_aliases(self) -> None:
         import torch
