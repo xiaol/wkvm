@@ -17,10 +17,12 @@ class RequestStatus(enum.Enum):
     WAITING = enum.auto()
     RUNNING = enum.auto()
     PREEMPTED = enum.auto()  # slot released; state swapped out or recomputable
+    PARKED = enum.auto()  # turn complete; state slot retained for continuation
     FINISHED_STOPPED = enum.auto()  # stop token / stop condition
     FINISHED_LENGTH = enum.auto()  # max_new_tokens reached
     FINISHED_ABORTED = enum.auto()
     FINISHED_ERROR = enum.auto()
+    FINISHED_CLOSED = enum.auto()  # explicitly closed retained session
 
     @property
     def is_finished(self) -> bool:
@@ -29,6 +31,7 @@ class RequestStatus(enum.Enum):
             RequestStatus.FINISHED_LENGTH,
             RequestStatus.FINISHED_ABORTED,
             RequestStatus.FINISHED_ERROR,
+            RequestStatus.FINISHED_CLOSED,
         )
 
 
@@ -49,6 +52,7 @@ class Request:
     output_token_ids: list[int] = field(default_factory=list)
     # Family name -> slot id, while RUNNING. Owned by the scheduler/arena.
     slots: dict[str, int] = field(default_factory=dict)
+    parked_finish_status: RequestStatus | None = None
 
     def __post_init__(self) -> None:
         if not self.prompt_token_ids:

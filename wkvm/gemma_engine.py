@@ -12,12 +12,13 @@ from __future__ import annotations
 import os
 import time
 from collections import OrderedDict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from wkvm.core.arena import StateArena
 from wkvm.core.config import SchedulerConfig
-from wkvm.core.request import Request
+from wkvm.core.request import Request, RequestStatus
 from wkvm.core.scheduler import Scheduler, SchedulerOutput
 from wkvm.models.gemma import GemmaRoutedSpanConfig
 from wkvm.runner.gemma_runner import (
@@ -134,6 +135,7 @@ class GemmaEngineMetrics:
     error_count: int = 0
     prefill_calls: int = 0
     prefill_model_calls: int = 0
+    cache_builds: int = 0
     batched_prefill_model_calls: int = 0
     batched_prefill_rows: int = 0
     max_prefill_batch_rows: int = 0
@@ -221,6 +223,17 @@ class GemmaEngineMetrics:
     max_runnable_rows: int = 0
     max_resident_state_slots: int = 0
     max_active_cache_bytes: int = 0
+    sessions_opened: int = 0
+    session_turns_completed: int = 0
+    sessions_closed: int = 0
+    session_reuse_hits: int = 0
+    session_reuse_misses: int = 0
+    continuation_input_tokens_computed: int = 0
+    prefix_tokens_reused: int = 0
+    full_reprefill_turns: int = 0
+    session_sliding_tail_restores: int = 0
+    session_sliding_tail_tokens_restored: int = 0
+    max_resident_sessions: int = 0
     backpressure_events: int = 0
     retraction_events: int = 0
     max_cuda_allocated_bytes: int = 0
@@ -251,6 +264,7 @@ class GemmaEngineMetrics:
             "error_count": self.error_count,
             "prefill_calls": self.prefill_calls,
             "prefill_model_calls": self.prefill_model_calls,
+            "cache_builds": self.cache_builds,
             "batched_prefill_model_calls": self.batched_prefill_model_calls,
             "batched_prefill_rows": self.batched_prefill_rows,
             "max_prefill_batch_rows": self.max_prefill_batch_rows,
@@ -372,6 +386,21 @@ class GemmaEngineMetrics:
             "max_runnable_rows": self.max_runnable_rows,
             "max_resident_state_slots": self.max_resident_state_slots,
             "max_active_cache_bytes": self.max_active_cache_bytes,
+            "sessions_opened": self.sessions_opened,
+            "session_turns_completed": self.session_turns_completed,
+            "sessions_closed": self.sessions_closed,
+            "session_reuse_hits": self.session_reuse_hits,
+            "session_reuse_misses": self.session_reuse_misses,
+            "continuation_input_tokens_computed": (
+                self.continuation_input_tokens_computed
+            ),
+            "prefix_tokens_reused": self.prefix_tokens_reused,
+            "full_reprefill_turns": self.full_reprefill_turns,
+            "session_sliding_tail_restores": self.session_sliding_tail_restores,
+            "session_sliding_tail_tokens_restored": (
+                self.session_sliding_tail_tokens_restored
+            ),
+            "max_resident_sessions": self.max_resident_sessions,
             "max_cuda_allocated_bytes": self.max_cuda_allocated_bytes,
             "max_cuda_reserved_bytes": self.max_cuda_reserved_bytes,
             "max_cuda_allocated_phase": self.max_cuda_allocated_phase,
@@ -413,6 +442,10 @@ class GemmaRequestTrace:
     enqueue_time: float
     prompt_tokens: int
     target_output_tokens: int
+    session_id: str | None = None
+    turn_index: int | None = None
+    reused_prefix_tokens: int = 0
+    computed_input_tokens: int | None = None
     prefill_start: float | None = None
     prefill_end: float | None = None
     first_token_time: float | None = None
@@ -431,8 +464,12 @@ class GemmaRequestTrace:
             first_token_latency = self.first_token_time - self.enqueue_time
         return {
             "req_id": self.req_id,
+            "session_id": self.session_id,
+            "turn_index": self.turn_index,
             "prompt_tokens": self.prompt_tokens,
             "target_output_tokens": self.target_output_tokens,
+            "reused_prefix_tokens": self.reused_prefix_tokens,
+            "computed_input_tokens": self.computed_input_tokens,
             "output_tokens": self.output_tokens,
             "finish_reason": self.finish_reason,
             "error": self.error,
@@ -696,6 +733,9 @@ class GemmaNativeEngine:
         )
         self._traces: dict[str, GemmaRequestTrace] = {}
         self.finished_traces: OrderedDict[str, GemmaRequestTrace] = OrderedDict()
+        self._session_req_ids: set[str] = set()
+        self._session_turn_indices: dict[str, int] = {}
+        self._pending_session_reuse: dict[str, int] = {}
         self.enable_token_pool_metadata = bool(enable_token_pool_metadata)
         self.enable_token_pool_attention = bool(enable_token_pool_attention)
         self.token_pool_capacity = token_pool_capacity
@@ -779,6 +819,161 @@ class GemmaNativeEngine:
         )
         self._record_queue_state()
 
+    def add_session_request(
+        self,
+        request: Request,
+        *,
+        break_mask: list[bool] | None = None,
+    ) -> None:
+        if request.req_id in self._session_req_ids:
+            raise ValueError(f"duplicate session request {request.req_id}")
+        self.scheduler.add_request(request, park_on_finish=True)
+        self._session_req_ids.add(request.req_id)
+        self._session_turn_indices[request.req_id] = 0
+        self._break_masks[request.req_id] = break_mask
+        self._traces[request.req_id] = GemmaRequestTrace(
+            req_id=request.req_id,
+            session_id=request.req_id,
+            turn_index=0,
+            enqueue_time=time.perf_counter(),
+            prompt_tokens=request.num_prompt_tokens,
+            target_output_tokens=request.max_new_tokens,
+            computed_input_tokens=request.num_prompt_tokens,
+        )
+        self.metrics.sessions_opened += 1
+        self._record_queue_state()
+
+    def continue_session_requests(
+        self,
+        continuations: dict[str, list[int]],
+        *,
+        max_new_tokens: int,
+        break_masks: dict[str, list[bool] | None] | None = None,
+    ) -> None:
+        if not continuations:
+            raise ValueError("continuations must not be empty")
+        max_new_tokens = int(max_new_tokens)
+        if max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be >= 1")
+        if (
+            len(self.scheduler.running) + len(continuations)
+            > self.scheduler.config.max_running_requests
+        ):
+            raise RuntimeError("no running capacity for session continuations")
+
+        prepared: list[
+            tuple[Request, list[int], list[int], list[bool] | None]
+        ] = []
+        for req_id, raw_tokens in continuations.items():
+            req = self.scheduler.parked.get(req_id)
+            if req is None or req.status is not RequestStatus.PARKED:
+                self.metrics.session_reuse_misses += 1
+                raise ValueError(f"{req_id}: session is not parked")
+            if req_id not in self._session_req_ids or req_id not in self._caches:
+                self.metrics.session_reuse_misses += 1
+                raise ValueError(f"{req_id}: session state is unavailable")
+            if not req.output_token_ids:
+                raise ValueError(f"{req_id}: parked session has no completed output")
+            if req.num_scheduled_gap != 1:
+                raise ValueError(
+                    f"{req_id}: parked session must retain one pending sampled token"
+                )
+            tokens = [int(token_id) for token_id in raw_tokens]
+            if not tokens:
+                raise ValueError(f"{req_id}: continuation input must not be empty")
+            committed_output = list(req.output_token_ids)
+            new_prompt_length = (
+                len(req.prompt_token_ids) + len(committed_output) + len(tokens)
+            )
+            current_break_mask = self._break_masks.get(req_id)
+            next_break_mask = None
+            if break_masks is not None:
+                if req_id not in break_masks:
+                    raise ValueError(f"{req_id}: continuation break mask is missing")
+                supplied_break_mask = break_masks[req_id]
+                if current_break_mask is not None and supplied_break_mask is None:
+                    raise ValueError(
+                        f"{req_id}: continuation cannot discard an active break mask"
+                    )
+                if supplied_break_mask is not None:
+                    next_break_mask = [bool(value) for value in supplied_break_mask]
+                    if len(next_break_mask) != new_prompt_length:
+                        raise ValueError(
+                            f"{req_id}: continuation break mask length "
+                            f"{len(next_break_mask)} != prompt length {new_prompt_length}"
+                        )
+                    if (
+                        current_break_mask is not None
+                        and next_break_mask[: len(current_break_mask)]
+                        != current_break_mask
+                    ):
+                        raise ValueError(
+                            f"{req_id}: continuation break mask changed retained history"
+                        )
+            elif current_break_mask is not None:
+                raise ValueError(
+                    f"{req_id}: continuation requires an updated break mask"
+                )
+            prepared.append((req, committed_output, tokens, next_break_mask))
+
+        touched = set(continuations)
+        self._flush_exact_decode_groups_touching(touched)
+        self._flush_padded_decode_groups_touching(touched)
+        now = time.perf_counter()
+        for req, committed_output, tokens, next_break_mask in prepared:
+            reused_prefix_tokens = req.num_computed_tokens
+            req.prompt_token_ids.extend(committed_output)
+            req.prompt_token_ids.extend(tokens)
+            req.output_token_ids.clear()
+            req.max_new_tokens = max_new_tokens
+            self._break_masks[req.req_id] = next_break_mask
+            if req.num_scheduled_gap != len(tokens) + 1:
+                raise AssertionError(
+                    f"{req.req_id}: continuation gap did not match pending token plus input"
+                )
+            turn_index = self._session_turn_indices[req.req_id] + 1
+            self._session_turn_indices[req.req_id] = turn_index
+            self._traces[req.req_id] = GemmaRequestTrace(
+                req_id=req.req_id,
+                session_id=req.req_id,
+                turn_index=turn_index,
+                enqueue_time=now,
+                prompt_tokens=req.num_prompt_tokens,
+                target_output_tokens=max_new_tokens,
+                reused_prefix_tokens=reused_prefix_tokens,
+                computed_input_tokens=len(tokens) + 1,
+            )
+            self._pending_session_reuse[req.req_id] = reused_prefix_tokens
+            self.scheduler.resume_parked_request(req.req_id)
+        self._record_cache_bytes()
+        self._record_queue_state()
+
+    def close_sessions(self, req_ids: Iterable[str]) -> list[Request]:
+        req_ids = list(req_ids)
+        for req_id in req_ids:
+            if req_id not in self._session_req_ids:
+                raise KeyError(f"unknown session {req_id}")
+            req = self.scheduler.parked.get(req_id)
+            if req is None or req.status is not RequestStatus.PARKED:
+                raise ValueError(f"{req_id}: session must be parked before close")
+        touched = set(req_ids)
+        self._flush_exact_decode_groups_touching(touched)
+        self._flush_padded_decode_groups_touching(touched)
+        closed: list[Request] = []
+        for req_id in req_ids:
+            req = self.scheduler.close_parked_request(req_id)
+            self._break_masks.pop(req_id, None)
+            self._caches.pop(req_id, None)
+            self._token_pool_release_request(req_id)
+            self._session_req_ids.discard(req_id)
+            self._session_turn_indices.pop(req_id, None)
+            self._pending_session_reuse.pop(req_id, None)
+            closed.append(req)
+        self.metrics.sessions_closed += len(closed)
+        self._record_cache_bytes()
+        self._record_queue_state()
+        return closed
+
     def abort_request(self, req_id: str) -> None:
         self._flush_exact_decode_groups_touching({req_id})
         self._flush_padded_decode_groups_touching({req_id})
@@ -793,6 +988,9 @@ class GemmaNativeEngine:
         self._break_masks.pop(req_id, None)
         self._caches.pop(req_id, None)
         self._token_pool_release_request(req_id)
+        self._session_req_ids.discard(req_id)
+        self._session_turn_indices.pop(req_id, None)
+        self._pending_session_reuse.pop(req_id, None)
         self._record_queue_state()
 
     def fail_unfinished(self, error: str) -> list[Request]:
@@ -812,6 +1010,9 @@ class GemmaNativeEngine:
             self._break_masks.pop(req_id, None)
             self._caches.pop(req_id, None)
             self._token_pool_release_request(req_id)
+            self._session_req_ids.discard(req_id)
+            self._session_turn_indices.pop(req_id, None)
+            self._pending_session_reuse.pop(req_id, None)
             failed.append(failed_req)
         self.metrics.error_count += len(failed)
         self._record_cache_bytes()
@@ -835,25 +1036,32 @@ class GemmaNativeEngine:
         self.metrics.scheduled_tokens += out.total_tokens
         try:
             sampled = self._execute(out)
-            finished = self.scheduler.update_from_output(
+            completed = self.scheduler.update_from_output(
                 out, sampled, stop_token_ids=self.stop_token_ids
             )
         except Exception as exc:
             self.metrics.error_count += 1
             self._fail_scheduled(out, str(exc).splitlines()[0])
             raise
-        for req in finished:
+        finished_count = 0
+        for req in completed:
             self._flush_exact_decode_groups_touching({req.req_id})
             self._flush_padded_decode_groups_touching({req.req_id})
             self._finish_trace(req)
+            if req.status is RequestStatus.PARKED:
+                self.metrics.session_turns_completed += 1
+                continue
             self._break_masks.pop(req.req_id, None)
             self._caches.pop(req.req_id, None)
             self._token_pool_release_request(req.req_id)
-        self.metrics.finished_requests += len(finished)
+            self._session_req_ids.discard(req.req_id)
+            self._session_turn_indices.pop(req.req_id, None)
+            finished_count += 1
+        self.metrics.finished_requests += finished_count
         self._record_cache_bytes()
         self._record_queue_state()
         self._record_cuda_memory_phase("step_end")
-        return finished
+        return completed
 
     def stats(self) -> dict[str, Any]:
         gpu_memory = self._gpu_memory_stats()
@@ -861,6 +1069,12 @@ class GemmaNativeEngine:
             **self.metrics.as_dict(),
             "queue_depth": len(self.scheduler.waiting),
             "runnable_rows": len(self.scheduler.running),
+            "parked_sessions": len(self.scheduler.parked),
+            "resident_sessions": sum(
+                1
+                for req_id in self._session_req_ids
+                if self.scheduler.requests[req_id].slots
+            ),
             "resident_state_slots": self.arena.num_slots - self.arena.num_free_slots(),
             "free_state_slots": self.arena.num_free_slots(),
             "active_cache_bytes": self._active_cache_bytes(),
@@ -1015,8 +1229,10 @@ class GemmaNativeEngine:
                         )
                     cache = self.runner.build_cache(req.slots)
                     self._caches[req.req_id] = cache
+                    self.metrics.cache_builds += 1
                 else:
                     cache = self._caches[req.req_id]
+                    self._restore_session_sliding_tail_for_prefill(req, cache)
                 trace = self._traces.get(req.req_id)
                 if trace is not None and trace.prefill_start is None:
                     trace.prefill_start = time.perf_counter()
@@ -1058,7 +1274,8 @@ class GemmaNativeEngine:
 
         self._record_cuda_memory_phase("prefill_token_pool_commit")
         now = time.perf_counter()
-        for req, _n, cache, final_prefill, _authoritative_prefill in prepared:
+        for req, n, cache, final_prefill, _authoritative_prefill in prepared:
+            self._record_session_prefill(req, n)
             if final_prefill:
                 self._token_pool_release_prefill_sliding_storage(cache)
                 trace = self._traces.get(req.req_id)
@@ -1107,9 +1324,11 @@ class GemmaNativeEngine:
                 raise AssertionError(f"{req.req_id}: initial prefill from nonzero offset")
             cache = self.runner.build_cache(req.slots)
             self._caches[req.req_id] = cache
+            self.metrics.cache_builds += 1
             self._record_cuda_memory_phase("prefill_cache_build")
         else:
             cache = self._caches[req.req_id]
+            self._restore_session_sliding_tail_for_prefill(req, cache)
         if trace is not None and trace.prefill_start is None:
             trace.prefill_start = time.perf_counter()
         final_prefill = req.num_computed_tokens + n >= req.num_prompt_tokens
@@ -1143,6 +1362,7 @@ class GemmaNativeEngine:
             )
             raise
         self._record_cuda_memory_phase("prefill_token_pool_commit")
+        self._record_session_prefill(req, n)
         if final_prefill:
             self._token_pool_release_prefill_sliding_storage(cache)
             self._record_cuda_memory_phase("prefill_final_release")
@@ -1161,6 +1381,18 @@ class GemmaNativeEngine:
         if self._closes_gap(req, n):
             return {req.req_id: _sample_argmax_token_ids(logits, rows=1)}
         return {}
+
+    def _record_session_prefill(self, req: Request, token_count: int) -> None:
+        if req.req_id not in self._session_req_ids:
+            return
+        turn_index = self._session_turn_indices.get(req.req_id, 0)
+        if turn_index <= 0:
+            return
+        self.metrics.continuation_input_tokens_computed += int(token_count)
+        reused_tokens = self._pending_session_reuse.pop(req.req_id, None)
+        if reused_tokens is not None:
+            self.metrics.session_reuse_hits += 1
+            self.metrics.prefix_tokens_reused += reused_tokens
 
     def _execute_decode_batch(self, reqs: list[Request]) -> dict[str, list[int]]:
         self.metrics.decode_batches += 1
@@ -1847,6 +2079,9 @@ class GemmaNativeEngine:
             self._break_masks.pop(req_id, None)
             self._caches.pop(req_id, None)
             self._token_pool_release_request(req_id)
+            self._session_req_ids.discard(req_id)
+            self._session_turn_indices.pop(req_id, None)
+            self._pending_session_reuse.pop(req_id, None)
             self.metrics.finished_requests += 1
         self._record_cache_bytes()
         self._record_queue_state()
@@ -1949,8 +2184,11 @@ class GemmaNativeEngine:
             return
         trace.finish_time = time.perf_counter()
         trace.output_tokens = len(req.output_token_ids)
+        terminal_status = req.parked_finish_status or req.status
         trace.finish_reason = (
-            "error" if error is not None else req.status.name.removeprefix("FINISHED_").lower()
+            "error"
+            if error is not None
+            else terminal_status.name.removeprefix("FINISHED_").lower()
         )
         trace.error = error
         self._store_finished_trace(req.req_id, trace)
@@ -1969,6 +2207,15 @@ class GemmaNativeEngine:
         self.metrics.max_runnable_rows = max(self.metrics.max_runnable_rows, len(self.scheduler.running))
         resident = self.arena.num_slots - self.arena.num_free_slots()
         self.metrics.max_resident_state_slots = max(self.metrics.max_resident_state_slots, resident)
+        resident_sessions = sum(
+            1
+            for req_id in self._session_req_ids
+            if self.scheduler.requests[req_id].slots
+        )
+        self.metrics.max_resident_sessions = max(
+            self.metrics.max_resident_sessions,
+            resident_sessions,
+        )
 
     def _record_cache_bytes(self) -> None:
         active = self._active_cache_bytes()
@@ -2734,6 +2981,90 @@ class GemmaNativeEngine:
             if release is not None:
                 release({"sliding_attention"})
 
+    def _restore_session_sliding_tail_for_prefill(self, req: Request, cache) -> int:
+        if req.req_id not in self._pending_session_reuse:
+            return 0
+        table = self._token_table
+        pool = self._token_kv_pool
+        if table is None or pool is None or cache is None:
+            return 0
+        current_length = self._token_pool_request_length(req.req_id)
+        if current_length != req.num_computed_tokens:
+            raise RuntimeError(
+                f"{req.req_id}: token table length {current_length} does not match "
+                f"computed tokens {req.num_computed_tokens} before continuation"
+            )
+        tail_length = min(
+            int(current_length),
+            max(0, int(self.config.sliding_window) - 1),
+        )
+        if tail_length < 1:
+            return 0
+        token_slots = table.slots_for(req.req_id)[-tail_length:]
+        if bool(token_slots.eq(int(table.padding_token)).any().item()):
+            raise RuntimeError(
+                f"{req.req_id}: continuation sliding tail contains released token slots"
+            )
+
+        layers = getattr(cache, "layers", None)
+        if layers is None:
+            raise RuntimeError(
+                f"{req.req_id}: continuation requires native Gemma cache layers"
+            )
+        restored: list[tuple[Any, Any, Any]] = []
+        layer_specs = getattr(pool, "layer_specs", {})
+        for layer_id, layer in enumerate(layers):
+            if not bool(getattr(layer, "is_sliding", False)):
+                continue
+            if layer_id not in layer_specs:
+                raise RuntimeError(
+                    f"{req.req_id}: sliding layer {layer_id} is absent from token KV pool"
+                )
+            key_rows, value_rows = pool.gather_kv(layer_id, token_slots)
+            if (
+                key_rows.ndim != 3
+                or value_rows.ndim != 3
+                or key_rows.shape != value_rows.shape
+                or int(key_rows.shape[0]) != tail_length
+            ):
+                raise RuntimeError(
+                    f"{req.req_id}: invalid pooled KV tail for sliding layer {layer_id}"
+                )
+            restored.append(
+                (
+                    layer,
+                    key_rows.permute(1, 0, 2).unsqueeze(0).contiguous(),
+                    value_rows.permute(1, 0, 2).unsqueeze(0).contiguous(),
+                )
+            )
+        if not restored:
+            raise RuntimeError(
+                f"{req.req_id}: continuation cache has no sliding layers to restore"
+            )
+
+        shared_by_type = getattr(cache, "_shared_kv_by_type", None)
+        if isinstance(shared_by_type, dict):
+            shared_by_type.pop("sliding_attention", None)
+        shared_by_layer = getattr(cache, "_shared_kv_by_layer", None)
+        if isinstance(shared_by_layer, dict):
+            for layer_id, layer in enumerate(layers):
+                if bool(getattr(layer, "is_sliding", False)):
+                    shared_by_layer.pop(layer_id, None)
+        for layer, keys, values in restored:
+            layer.keys = keys
+            layer.values = values
+            layer.dtype = keys.dtype
+            layer.device = keys.device
+            layer.is_initialized = True
+            layer.cumulative_length = int(current_length)
+            layer._dense_storage_released = False
+            if hasattr(layer, "_token_pool_authoritative_prefill"):
+                layer._token_pool_authoritative_prefill = None
+        self.metrics.session_sliding_tail_restores += 1
+        self.metrics.session_sliding_tail_tokens_restored += tail_length
+        self._record_cuda_memory_phase("session_sliding_tail_restore")
+        return tail_length
+
     def _token_pool_available_prefill_tail(self, cache, n: int) -> int:
         self._sync_token_pool_decode_backend_storage()
         backend = self._token_pool_decode_backend
@@ -3345,9 +3676,13 @@ class GemmaNativeEngine:
 
     def _state_stats(self) -> dict[str, int]:
         resident = self.arena.num_slots - self.arena.num_free_slots()
+        resident_requests = [
+            *self.scheduler.running,
+            *self.scheduler.parked.values(),
+        ]
         active_slot_ids = {
             slots["gemma_routed_span"]
-            for req in self.scheduler.running
+            for req in resident_requests
             for slots in (req.slots,)
             if "gemma_routed_span" in slots
         }

@@ -49,7 +49,9 @@ class Scheduler:
         self.arena = arena
         self.waiting: deque[Request] = deque()
         self.running: list[Request] = []
+        self.parked: dict[str, Request] = {}
         self.requests: dict[str, Request] = {}
+        self._park_on_finish: set[str] = set()
         # Called with each finishing request BEFORE its slots are released —
         # the one moment end-of-life state is still addressable (the engine
         # uses it for snapshot-on-finish; see wkvm/store.py).
@@ -57,10 +59,12 @@ class Scheduler:
 
     # -- intake ------------------------------------------------------------
 
-    def add_request(self, request: Request) -> None:
+    def add_request(self, request: Request, *, park_on_finish: bool = False) -> None:
         if request.req_id in self.requests:
             raise ValueError(f"duplicate req_id {request.req_id}")
         self.requests[request.req_id] = request
+        if park_on_finish:
+            self._park_on_finish.add(request.req_id)
         self.waiting.append(request)
 
     def abort_request(self, req_id: str) -> None:
@@ -69,12 +73,16 @@ class Scheduler:
             return  # abort is idempotent
         if req.status is RequestStatus.RUNNING:
             self._release(req)
+        elif req.status is RequestStatus.PARKED:
+            self._release_parked(req)
         else:
             try:
                 self.waiting.remove(req)
             except ValueError:
                 pass
         req.status = RequestStatus.FINISHED_ABORTED
+        req.parked_finish_status = None
+        self._park_on_finish.discard(req_id)
 
     def fail_request(self, req_id: str) -> Request | None:
         """Finish a request as errored and release any owned state slot.
@@ -88,12 +96,16 @@ class Scheduler:
             return None
         if req.status is RequestStatus.RUNNING:
             self._release(req)
+        elif req.status is RequestStatus.PARKED:
+            self._release_parked(req)
         else:
             try:
                 self.waiting.remove(req)
             except ValueError:
                 pass
         req.status = RequestStatus.FINISHED_ERROR
+        req.parked_finish_status = None
+        self._park_on_finish.discard(req_id)
         return req
 
     # -- the loop ----------------------------------------------------------
@@ -176,9 +188,36 @@ class Scheduler:
             if req.status.is_finished:
                 if self.on_finish is not None:
                     self.on_finish(req)
-                self._release(req)
+                if req.req_id in self._park_on_finish:
+                    self._park(req)
+                else:
+                    self._release(req)
                 finished.append(req)
         return finished
+
+    def resume_parked_request(self, req_id: str) -> Request:
+        req = self.parked.get(req_id)
+        if req is None or req.status is not RequestStatus.PARKED:
+            raise ValueError(f"{req_id}: request is not parked")
+        if len(self.running) >= self.config.max_running_requests:
+            raise RuntimeError("no running capacity for parked request")
+        if req.num_scheduled_gap < 1:
+            raise ValueError("parked request has no schedulable gap")
+        self.parked.pop(req_id)
+        req.status = RequestStatus.RUNNING
+        req.parked_finish_status = None
+        self.running.append(req)
+        return req
+
+    def close_parked_request(self, req_id: str) -> Request:
+        req = self.parked.get(req_id)
+        if req is None or req.status is not RequestStatus.PARKED:
+            raise ValueError(f"{req_id}: request is not parked")
+        self._release_parked(req)
+        req.status = RequestStatus.FINISHED_CLOSED
+        req.parked_finish_status = None
+        self._park_on_finish.discard(req_id)
+        return req
 
     def add_resumed_request(self, request: Request, slots: dict[str, int]) -> None:
         """Admit a request whose state already occupies arena slots (loaded
@@ -200,6 +239,18 @@ class Scheduler:
 
     def _release(self, req: Request) -> None:
         self.running.remove(req)
+        if req.slots:
+            self.arena.free(req.slots)
+            req.slots = {}
+
+    def _park(self, req: Request) -> None:
+        self.running.remove(req)
+        req.parked_finish_status = req.status
+        req.status = RequestStatus.PARKED
+        self.parked[req.req_id] = req
+
+    def _release_parked(self, req: Request) -> None:
+        self.parked.pop(req.req_id, None)
         if req.slots:
             self.arena.free(req.slots)
             req.slots = {}

@@ -108,6 +108,55 @@ class TestExactAdmission(unittest.TestCase):
         self.assertEqual(finished, [b])
         self.assertEqual(sched.arena.num_free_slots(), 1)
 
+    def test_parked_finish_retains_and_reuses_same_slot(self) -> None:
+        sched = make_scheduler(num_slots=1, max_tokens_per_step=1024)
+        session = Request(prompt_token_ids=[1, 2], max_new_tokens=1, req_id="session")
+        waiting = Request(prompt_token_ids=[3, 4], max_new_tokens=1, req_id="waiting")
+        sched.add_request(session, park_on_finish=True)
+        sched.add_request(waiting)
+
+        completed = sched.update_from_output(
+            sched.schedule(),
+            {session.req_id: [9]},
+        )
+        retained_slots = dict(session.slots)
+        self.assertEqual(completed, [session])
+        self.assertIs(session.status, RequestStatus.PARKED)
+        self.assertIs(
+            session.parked_finish_status,
+            RequestStatus.FINISHED_LENGTH,
+        )
+        self.assertEqual(sched.parked, {session.req_id: session})
+        self.assertEqual(sched.arena.num_free_slots(), 0)
+
+        session.prompt_token_ids.extend(session.output_token_ids)
+        session.prompt_token_ids.append(8)
+        session.output_token_ids.clear()
+        session.max_new_tokens = 1
+        resumed = sched.resume_parked_request(session.req_id)
+        self.assertIs(resumed, session)
+        self.assertEqual(session.slots, retained_slots)
+        self.assertIs(session.status, RequestStatus.RUNNING)
+        self.assertEqual(sched.schedule().num_scheduled_tokens, {session.req_id: 2})
+
+    def test_close_or_abort_parked_request_releases_slot(self) -> None:
+        for close in (True, False):
+            with self.subTest(close=close):
+                sched = make_scheduler(num_slots=1, max_tokens_per_step=1024)
+                req = Request(prompt_token_ids=[1, 2], max_new_tokens=1, req_id="session")
+                sched.add_request(req, park_on_finish=True)
+                sched.update_from_output(sched.schedule(), {req.req_id: [9]})
+                self.assertEqual(sched.arena.num_free_slots(), 0)
+
+                if close:
+                    sched.close_parked_request(req.req_id)
+                    self.assertIs(req.status, RequestStatus.FINISHED_CLOSED)
+                else:
+                    sched.abort_request(req.req_id)
+                    self.assertIs(req.status, RequestStatus.FINISHED_ABORTED)
+                self.assertEqual(sched.arena.num_free_slots(), 1)
+                self.assertFalse(sched.parked)
+
     def test_abort_is_idempotent_and_frees(self) -> None:
         sched = make_scheduler(num_slots=1)
         a = Request(prompt_token_ids=[1, 2, 3], max_new_tokens=8)

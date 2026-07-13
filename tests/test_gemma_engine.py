@@ -1066,6 +1066,98 @@ class FakeAuthoritativePrefillRunner(FakeBatchRunner):
         return FakeLogits([100 + len(self.prefill_chunk_calls)])
 
 
+class FakeSessionTokenPoolRunner(FakeAuthoritativePrefillRunner):
+    def __init__(self, model, hf_config, native_config) -> None:
+        super().__init__(model, hf_config, native_config)
+        self.prefill_entry_tails = []
+
+    def _prefill_cache(self, cache, token_ids, start_pos):
+        import torch
+
+        if int(start_pos) > 0:
+            layer = cache.layers[0]
+            self.prefill_entry_tails.append(
+                (
+                    id(cache),
+                    int(layer.cumulative_length),
+                    layer.keys.clone(),
+                    layer.values.clone(),
+                )
+            )
+        width = len(token_ids)
+        start = int(start_pos) * 4
+        keys = torch.arange(
+            start,
+            start + width * 4,
+            dtype=torch.float32,
+        ).reshape(1, 1, width, 4)
+        values = keys + 1000
+        returned_k, returned_v = cache.layers[0].update(keys, values)
+        cache.store_shared_kv(
+            layer_idx=0,
+            layer_type="sliding_attention",
+            key_states=returned_k,
+            value_states=returned_v,
+        )
+        self.last_keys = keys
+        self.last_values = values
+
+    def prefill_chunk_step(self, cache, token_ids, slots, *, start_pos, break_mask=None):
+        self.prefill_chunk_calls.append((list(token_ids), int(start_pos)))
+        self.prefill_chunk_cache_ids.append(id(cache))
+        self._prefill_cache(cache, token_ids, start_pos)
+        return FakeLogits([100 + len(self.prefill_chunk_calls)])
+
+    def prefill_batch_step(
+        self,
+        caches,
+        token_rows,
+        slots,
+        *,
+        start_positions,
+        break_masks=None,
+    ):
+        logits = []
+        for cache, token_ids, start_pos in zip(caches, token_rows, start_positions):
+            self.prefill_chunk_calls.append((list(token_ids), int(start_pos)))
+            self.prefill_chunk_cache_ids.append(id(cache))
+            self._prefill_cache(cache, token_ids, start_pos)
+            logits.append(100 + len(self.prefill_chunk_calls))
+        return FakeLogits(logits)
+
+    def _write_decode_rows(self, token_pool_decode, position_ids):
+        import torch
+
+        metadata = token_pool_decode.metadata_for_layer(0, "sliding_attention")
+        if metadata is None:
+            metadata = token_pool_decode.paged_metadata_for_layer(
+                0,
+                "sliding_attention",
+            )
+        if metadata is None:
+            raise AssertionError("missing sliding token-pool metadata")
+        key_rows = torch.as_tensor(position_ids, dtype=torch.float32).reshape(-1, 1, 1)
+        key_rows = key_rows * 4 + torch.arange(4, dtype=torch.float32).reshape(1, 1, 4)
+        token_pool_decode.kv_pool.set_kv(
+            0,
+            metadata.out_cache_loc,
+            key_rows,
+            key_rows + 1000,
+        )
+
+    def decode_step(self, cache, last_tokens, *, position_ids=None, token_pool_decode=None):
+        self.decode_step_calls += 1
+        self.decode_step_token_pool_contexts.append(token_pool_decode)
+        self._write_decode_rows(token_pool_decode, position_ids)
+        return FakeLogits([200 + self.decode_step_calls])
+
+    def decode_batch(self, caches, last_tokens, *, position_ids=None, token_pool_decode=None):
+        self.decode_batch_calls.append((list(last_tokens), list(position_ids or [])))
+        self.decode_batch_token_pool_contexts.append(token_pool_decode)
+        self._write_decode_rows(token_pool_decode, position_ids)
+        return FakeLogits([300 + row for row in range(len(last_tokens))])
+
+
 class FakeModel:
     device = "cpu"
 
@@ -1912,6 +2004,70 @@ class FakeSizedCache:
 
 
 class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
+    def _make_sliding_session_token_pool_engine(
+        self,
+        *,
+        num_slots: int,
+        prefill_microbatch_rows: int,
+    ):
+        import torch
+        from wkvm.gemma_engine import GemmaNativeEngine
+        from wkvm.models.gemma import gemma4_e4b_routed_span_config
+
+        class FakeNativeTokenPoolModel:
+            wkvm_no_hf_transformer_forward = True
+
+            def __init__(self) -> None:
+                self._param = torch.empty((), dtype=torch.float32)
+                self.config = SimpleNamespace(num_attention_heads=2)
+                attn = SimpleNamespace(
+                    layer_type="sliding_attention",
+                    is_kv_shared_layer=False,
+                    num_key_value_groups=2,
+                    head_dim=4,
+                )
+                self.text_prefix = SimpleNamespace(
+                    layers=[SimpleNamespace(layer_idx=0, attn_meta=attn)]
+                )
+
+            def parameters(self):
+                return iter([self._param])
+
+        cfg = gemma4_e4b_routed_span_config(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("sliding_attention",),
+            num_kv_heads=1,
+            head_dim=4,
+            sliding_window=4,
+        )
+        model = FakeNativeTokenPoolModel()
+        engine = GemmaNativeEngine(
+            model=model,
+            config=cfg,
+            num_slots=num_slots,
+            scheduler_config=SchedulerConfig(
+                max_tokens_per_step=64,
+                max_running_requests=num_slots,
+                max_tokens_per_request_per_step=64,
+            ),
+            prefill_microbatch_rows=prefill_microbatch_rows,
+            persistent_exact_decode=False,
+            persistent_padded_decode=False,
+            enable_token_pool_attention=True,
+            token_pool_max_context_len=32,
+            token_pool_capacity=128,
+        )
+        hf_config = SimpleNamespace(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("sliding_attention",),
+            sliding_window=4,
+        )
+        runner = FakeSessionTokenPoolRunner(model, hf_config, cfg)
+        engine.runner = runner
+        return engine, runner
+
     def _make_full_attention_token_pool_fixture(
         self,
         *,
@@ -2271,6 +2427,237 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         self.assertEqual(token_pool["active_request_slots"], 0)
         self.assertEqual(token_pool["allocated_token_slots"], 0)
         self.assertEqual(token_pool["token_slot_high_watermark"], 11)
+
+    def test_session_turn_parks_and_reuses_cache_for_delta_prefill(self) -> None:
+        from wkvm.gemma_engine import GemmaNativeEngine
+        from wkvm.models.gemma import gemma4_e4b_routed_span_config
+
+        cfg = gemma4_e4b_routed_span_config(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("sliding_attention",),
+        )
+        engine = GemmaNativeEngine(
+            model=FakeModel(),
+            config=cfg,
+            num_slots=1,
+            enable_token_pool_metadata=True,
+            scheduler_config=SchedulerConfig(
+                max_tokens_per_step=8,
+                max_running_requests=1,
+                max_tokens_per_request_per_step=8,
+            ),
+        )
+        runner = FakeBatchRunner()
+        engine.runner = runner  # type: ignore[assignment]
+        req = Request(
+            prompt_token_ids=[1, 2, 3],
+            max_new_tokens=2,
+            req_id="session",
+        )
+        engine.add_session_request(req, break_mask=[False, False, False])
+
+        engine.step()
+        retained_slots = dict(req.slots)
+        retained_cache = engine._caches[req.req_id]
+        completed = engine.step()
+        self.assertEqual(completed, [req])
+        self.assertIs(req.status, RequestStatus.PARKED)
+        self.assertEqual(req.output_token_ids, [101, 999])
+        self.assertEqual(engine.stats()["resident_sessions"], 1)
+        self.assertEqual(engine.stats()["parked_sessions"], 1)
+        self.assertEqual(engine.stats()["token_pool"]["active_request_slots"], 1)
+        first_trace = engine.finished_traces[req.req_id].as_dict()
+        self.assertEqual(first_trace["turn_index"], 0)
+        self.assertEqual(first_trace["finish_reason"], "length")
+
+        with self.assertRaisesRegex(ValueError, "changed retained history"):
+            engine.continue_session_requests(
+                {req.req_id: [7, 8]},
+                max_new_tokens=2,
+                break_masks={req.req_id: [True, *([False] * 6)]},
+            )
+        engine.continue_session_requests(
+            {req.req_id: [7, 8]},
+            max_new_tokens=2,
+            break_masks={req.req_id: [False] * 7},
+        )
+        self.assertIs(req.status, RequestStatus.RUNNING)
+        self.assertEqual(req.prompt_token_ids, [1, 2, 3, 101, 999, 7, 8])
+        self.assertEqual(req.output_token_ids, [])
+        self.assertEqual(req.slots, retained_slots)
+        self.assertIs(engine._caches[req.req_id], retained_cache)
+        self.assertEqual(engine.metrics.session_reuse_hits, 0)
+        self.assertEqual(engine.metrics.prefix_tokens_reused, 0)
+        self.assertEqual(engine.metrics.continuation_input_tokens_computed, 0)
+
+        engine.step()
+        self.assertEqual(runner.prefill_chunk_calls[-1], ([999, 7, 8], 4))
+        self.assertEqual(runner.caches_built, 1)
+        self.assertEqual(engine.metrics.cache_builds, 1)
+        self.assertEqual(engine.metrics.session_reuse_hits, 1)
+        self.assertEqual(engine.metrics.prefix_tokens_reused, 4)
+        self.assertEqual(engine.metrics.continuation_input_tokens_computed, 3)
+        engine.step()
+        self.assertIs(req.status, RequestStatus.PARKED)
+        second_trace = engine.finished_traces[req.req_id].as_dict()
+        self.assertEqual(second_trace["turn_index"], 1)
+        self.assertEqual(second_trace["reused_prefix_tokens"], 4)
+        self.assertEqual(second_trace["computed_input_tokens"], 3)
+        self.assertEqual(engine.metrics.session_turns_completed, 2)
+
+        closed = engine.close_sessions([req.req_id])
+        self.assertEqual(closed, [req])
+        self.assertIs(req.status, RequestStatus.FINISHED_CLOSED)
+        self.assertEqual(engine.stats()["resident_sessions"], 0)
+        self.assertEqual(engine.stats()["resident_state_slots"], 0)
+        self.assertEqual(engine.stats()["token_pool"]["active_request_slots"], 0)
+
+    def test_session_continuation_failure_releases_all_retained_state(self) -> None:
+        from wkvm.gemma_engine import GemmaNativeEngine
+        from wkvm.models.gemma import gemma4_e4b_routed_span_config
+
+        cfg = gemma4_e4b_routed_span_config(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("sliding_attention",),
+        )
+        engine = GemmaNativeEngine(
+            model=FakeModel(),
+            config=cfg,
+            num_slots=1,
+            enable_token_pool_metadata=True,
+            scheduler_config=SchedulerConfig(
+                max_tokens_per_step=8,
+                max_running_requests=1,
+                max_tokens_per_request_per_step=8,
+            ),
+        )
+        engine.runner = FakeFailingContinuationPrefillRunner()  # type: ignore[assignment]
+        req = Request(
+            prompt_token_ids=[1, 2, 3],
+            max_new_tokens=2,
+            req_id="session-error",
+        )
+        engine.add_session_request(req)
+        engine.step()
+        engine.step()
+        self.assertIs(req.status, RequestStatus.PARKED)
+
+        engine.continue_session_requests(
+            {req.req_id: [7, 8]},
+            max_new_tokens=2,
+        )
+        with self.assertRaisesRegex(RuntimeError, "synthetic continuation prefill failure"):
+            engine.step()
+
+        self.assertIs(req.status, RequestStatus.FINISHED_ERROR)
+        self.assertNotIn(req.req_id, engine._session_req_ids)
+        self.assertNotIn(req.req_id, engine._session_turn_indices)
+        self.assertNotIn(req.req_id, engine._pending_session_reuse)
+        self.assertNotIn(req.req_id, engine._caches)
+        self.assertEqual(engine.stats()["resident_state_slots"], 0)
+        self.assertEqual(engine.stats()["token_pool"]["active_request_slots"], 0)
+
+    def test_token_pool_session_restores_exact_sliding_tail_for_continuation(self) -> None:
+        import torch
+
+        engine, runner = self._make_sliding_session_token_pool_engine(
+            num_slots=1,
+            prefill_microbatch_rows=1,
+        )
+        req = Request(
+            prompt_token_ids=[1, 2, 3, 4, 5],
+            max_new_tokens=3,
+            req_id="session-tail",
+        )
+        engine.add_session_request(req)
+        for _ in range(3):
+            engine.step()
+        self.assertIs(req.status, RequestStatus.PARKED)
+        cache = engine._caches[req.req_id]
+        self.assertIsNone(cache.layers[0].keys)
+        tail_slots = engine._token_table.slots_for(req.req_id)[-3:]
+        pooled_keys, pooled_values = engine._token_kv_pool.gather_kv(0, tail_slots)
+        expected_keys = pooled_keys.permute(1, 0, 2).unsqueeze(0).contiguous()
+        expected_values = pooled_values.permute(1, 0, 2).unsqueeze(0).contiguous()
+
+        engine.continue_session_requests(
+            {req.req_id: [7, 8]},
+            max_new_tokens=2,
+        )
+        engine.step()
+
+        self.assertEqual(len(runner.prefill_entry_tails), 1)
+        cache_id, cumulative_length, restored_keys, restored_values = (
+            runner.prefill_entry_tails[0]
+        )
+        self.assertEqual(cache_id, id(cache))
+        self.assertEqual(cumulative_length, 7)
+        self.assertTrue(torch.equal(restored_keys, expected_keys))
+        self.assertTrue(torch.equal(restored_values, expected_values))
+        self.assertEqual(engine.metrics.session_sliding_tail_restores, 1)
+        self.assertEqual(engine.metrics.session_sliding_tail_tokens_restored, 3)
+        self.assertIsNone(cache.layers[0].keys)
+        self.assertTrue(cache.layers[0]._dense_storage_released)
+
+        engine.step()
+        self.assertIs(req.status, RequestStatus.PARKED)
+        engine.close_sessions([req.req_id])
+        self.assertEqual(engine.stats()["token_pool"]["active_request_slots"], 0)
+
+    def test_batched_token_pool_sessions_restore_each_continuation_tail(self) -> None:
+        import torch
+
+        engine, runner = self._make_sliding_session_token_pool_engine(
+            num_slots=2,
+            prefill_microbatch_rows=2,
+        )
+        reqs = [
+            Request(
+                prompt_token_ids=[1, 2, 3, 4, 5],
+                max_new_tokens=3,
+                req_id=f"session-tail-{row}",
+            )
+            for row in range(2)
+        ]
+        for req in reqs:
+            engine.add_session_request(req)
+        for _ in range(3):
+            engine.step()
+        self.assertTrue(all(req.status is RequestStatus.PARKED for req in reqs))
+
+        expected_by_cache = {}
+        for req in reqs:
+            cache = engine._caches[req.req_id]
+            tail_slots = engine._token_table.slots_for(req.req_id)[-3:]
+            pooled_keys, pooled_values = engine._token_kv_pool.gather_kv(0, tail_slots)
+            expected_by_cache[id(cache)] = (
+                pooled_keys.permute(1, 0, 2).unsqueeze(0).contiguous(),
+                pooled_values.permute(1, 0, 2).unsqueeze(0).contiguous(),
+            )
+
+        engine.continue_session_requests(
+            {req.req_id: [7, 8] for req in reqs},
+            max_new_tokens=2,
+        )
+        engine.step()
+
+        self.assertEqual(len(runner.prefill_entry_tails), 2)
+        for cache_id, cumulative_length, restored_keys, restored_values in (
+            runner.prefill_entry_tails
+        ):
+            expected_keys, expected_values = expected_by_cache[cache_id]
+            self.assertEqual(cumulative_length, 7)
+            self.assertTrue(torch.equal(restored_keys, expected_keys))
+            self.assertTrue(torch.equal(restored_values, expected_values))
+        self.assertEqual(engine.metrics.session_sliding_tail_restores, 2)
+        self.assertEqual(engine.metrics.session_sliding_tail_tokens_restored, 6)
+
+        engine.step()
+        self.assertTrue(all(req.status is RequestStatus.PARKED for req in reqs))
+        engine.close_sessions([req.req_id for req in reqs])
+        self.assertEqual(engine.stats()["token_pool"]["active_request_slots"], 0)
 
     def test_decode_batch_uses_one_runner_call_for_compatible_rows(self) -> None:
         from wkvm.gemma_engine import GemmaNativeEngine
