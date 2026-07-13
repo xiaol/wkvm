@@ -1,0 +1,4575 @@
+{
+  "break_mask_fingerprint": {
+    "break_masks_sha256": "4b62bcc0f76b435b09093d0d7e5187b0a4a9de0436dc95c2f980cfc93810a8ba",
+    "mask_value_count": 573440,
+    "request_count": 35,
+    "schema": "wkvm.quality_break_masks.sha256.v1",
+    "true_value_count": 33129
+  },
+  "config": {
+    "chunk": 2048,
+    "decode_microbatch_rows": 16,
+    "enable_token_pool_attention": true,
+    "m_slots": 64,
+    "native_gemma_attention_backend": "sdpa_single_gqa",
+    "native_gemma_checkpoint_loader": true,
+    "native_gemma_projection_backend": "separate",
+    "persistent_padded_decode_cuda_graph": true,
+    "persistent_padded_decode_graph_warmup_iters": 0,
+    "persistent_padded_decode_steps": 128,
+    "persistent_padded_sliding_metadata_padding": true,
+    "prefill_microbatch_rows": 2,
+    "route_chunk": 512,
+    "runtime_environment": {
+      "WKVM_ENABLE_TOKEN_POOL_PAGED_SPLIT_TRITON": "1",
+      "WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON": "1",
+      "WKVM_ENABLE_TOKEN_POOL_TRITON": "1",
+      "WKVM_TOKEN_POOL_SLIDING_PAGED_METADATA_ONLY": "1",
+      "WKVM_TOKEN_POOL_TRITON_STRICT": "1"
+    },
+    "sink": 16,
+    "slots": 16,
+    "token_pool_capacity": 36864,
+    "token_pool_max_context_len": 33024,
+    "token_pool_paged_block_size": 16,
+    "use_native_gemma_forward": true,
+    "window": 1024
+  },
+  "device": "cuda",
+  "dtype": "bfloat16",
+  "engine": "wkvm-native",
+  "engine_stats": {
+    "active_cache_bytes": 0,
+    "admitted_requests": 35,
+    "backpressure_events": 78,
+    "backpressure_reasons": {
+      "max_running_requests": 78,
+      "no_free_slots": 78
+    },
+    "batched_decode_model_calls": 117,
+    "batched_prefill_model_calls": 136,
+    "batched_prefill_rows": 272,
+    "cuda_current_allocated_by_phase": {},
+    "cuda_current_reserved_by_phase": {},
+    "cuda_peak_allocated_advances_by_phase": {},
+    "cuda_peak_reserved_advances_by_phase": {},
+    "cuda_phase_metrics_enabled": false,
+    "decode_batch_fallback_reasons": {},
+    "decode_batch_planner": "scheduler",
+    "decode_batches": 117,
+    "decode_cuda_current_allocated_by_phase": {},
+    "decode_cuda_current_reserved_by_phase": {},
+    "decode_cuda_peak_allocated_advances_by_phase": {},
+    "decode_cuda_peak_reserved_advances_by_phase": {},
+    "decode_length_bucketed_batches": 0,
+    "decode_microbatch_byte_splits": 0,
+    "decode_microbatch_bytes": null,
+    "decode_microbatch_rows": 16,
+    "decode_microbatch_splits": 0,
+    "decode_model_calls": 117,
+    "decode_rows": 1165,
+    "decode_timing_commit_s": 0.006120503001511679,
+    "decode_timing_graph_input_copy_s": 0.0008865400068316376,
+    "decode_timing_graph_metadata_copy_s": 0.004309464999096235,
+    "decode_timing_graph_replay_s": 0.001077961002010852,
+    "decode_timing_mask_s": 0.006310427008429542,
+    "decode_timing_merge_s": 0.09063410599992494,
+    "decode_timing_model_forward_s": 1.626518107002994,
+    "decode_timing_split_s": 0.0,
+    "decode_timing_total_s": 1.8932683630082465,
+    "decode_workspace_bytes": null,
+    "decode_workspace_width_bucket": 16,
+    "distinct_history_decode_batches": 8,
+    "error_count": 0,
+    "exact_decode_batch_rows": 0,
+    "fallback_decode_model_calls": 0,
+    "finished_requests": 35,
+    "free_state_slots": 16,
+    "gpu_memory": {
+      "allocated_bytes": 15898453504,
+      "max_allocated_bytes": 22024212992,
+      "max_reserved_bytes": 22921871360,
+      "reserved_bytes": 16846422016
+    },
+    "max_active_cache_bytes": 2969071616,
+    "max_cuda_allocated_bytes": 0,
+    "max_cuda_allocated_phase": "",
+    "max_cuda_reserved_bytes": 0,
+    "max_cuda_reserved_phase": "",
+    "max_decode_batch_rows": 16,
+    "max_decode_cuda_allocated_bytes": 0,
+    "max_decode_cuda_allocated_phase": "",
+    "max_decode_cuda_reserved_bytes": 0,
+    "max_decode_cuda_reserved_phase": "",
+    "max_decode_model_batch_bytes": 2043674624,
+    "max_decode_model_batch_rows": 16,
+    "max_padded_decode_pad_slots": 20772,
+    "max_padded_decode_temp_bytes": 2052039808,
+    "max_padded_decode_workspace_extra_pad_slots": 1984,
+    "max_prefill_batch_rows": 2,
+    "max_resident_state_slots": 16,
+    "max_runnable_rows": 16,
+    "max_running": 16,
+    "max_waiting": 35,
+    "model_forward_backend": "wkvm_native_gemma_forward_bridge",
+    "native_config": {
+      "pending_tokens": 512,
+      "ring_tokens": 1024,
+      "routed_slots": 64,
+      "sink_tokens": 16,
+      "sliding_window": 512
+    },
+    "native_gemma_attention_backend": "sdpa_single_gqa",
+    "native_gemma_checkpoint_loader": true,
+    "native_gemma_projection_backend": "separate",
+    "native_gemma_release_hf_decoder_layers": false,
+    "native_gemma_released_hf_decoder_layers": 0,
+    "native_gemma_weight_backend": "hf_live",
+    "padded_decode_batch_rows": 1165,
+    "padded_decode_copied_kv_bytes": 4509106176,
+    "padded_decode_pad_kv_bytes": 175767552,
+    "padded_decode_reserved_kv_bytes": 0,
+    "padded_decode_source_pad_kv_bytes": 158859264,
+    "padded_decode_temp_bytes": 4686017496,
+    "padded_decode_temp_mask_bytes": 1143768,
+    "padded_decode_workspace_allocations": 0,
+    "padded_decode_workspace_bypasses": 0,
+    "padded_decode_workspace_extra_pad_kv_bytes": 16908288,
+    "padded_decode_workspace_reuses": 0,
+    "persistent_exact_decode": true,
+    "persistent_exact_decode_reuses": 0,
+    "persistent_exact_decode_rows": 0,
+    "persistent_exact_decode_splits": 0,
+    "persistent_exact_decode_starts": 0,
+    "persistent_padded_decode": true,
+    "persistent_padded_decode_cuda_graph": true,
+    "persistent_padded_decode_cuda_graph_cache_hits": 0,
+    "persistent_padded_decode_cuda_graph_captures": 2,
+    "persistent_padded_decode_cuda_graph_replays": 47,
+    "persistent_padded_decode_cuda_graph_skip_reasons": {
+      "partial_token_pool_coverage": 3
+    },
+    "persistent_padded_decode_cuda_graph_skips": 3,
+    "persistent_padded_decode_graph_warmup_iters": 0,
+    "persistent_padded_decode_reuses": 112,
+    "persistent_padded_decode_rows": 1165,
+    "persistent_padded_decode_splits": 5,
+    "persistent_padded_decode_starts": 5,
+    "persistent_padded_decode_steps": 128,
+    "persistent_padded_full_attention_rows": true,
+    "persistent_padded_sliding_metadata_padding": true,
+    "prefill_calls": 280,
+    "prefill_microbatch_rows": 2,
+    "prefill_model_calls": 144,
+    "queue_depth": 0,
+    "requests": {
+      "quality-c16384-t1-needle-d0.100000-s0": {
+        "decode_time_s": 7.393939,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 31.136578,
+        "output_tokens": 32,
+        "prefill_time_s": 31.135313,
+        "prompt_tokens": 16384,
+        "queue_time_s": 0.001265,
+        "req_id": "quality-c16384-t1-needle-d0.100000-s0",
+        "target_output_tokens": 32,
+        "total_latency_s": 38.530517
+      },
+      "quality-c16384-t1-needle-d0.100000-s1": {
+        "decode_time_s": 7.397162,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 31.13653,
+        "output_tokens": 32,
+        "prefill_time_s": 31.135298,
+        "prompt_tokens": 16384,
+        "queue_time_s": 0.001232,
+        "req_id": "quality-c16384-t1-needle-d0.100000-s1",
+        "target_output_tokens": 32,
+        "total_latency_s": 38.533692
+      },
+      "quality-c16384-t1-needle-d0.100000-s2": {
+        "decode_time_s": 6.798253,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 31.73844,
+        "output_tokens": 32,
+        "prefill_time_s": 31.007783,
+        "prompt_tokens": 16384,
+        "queue_time_s": 0.730656,
+        "req_id": "quality-c16384-t1-needle-d0.100000-s2",
+        "target_output_tokens": 32,
+        "total_latency_s": 38.536693
+      },
+      "quality-c16384-t1-needle-d0.300000-s0": {
+        "decode_time_s": 6.801429,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 31.738407,
+        "output_tokens": 32,
+        "prefill_time_s": 31.007773,
+        "prompt_tokens": 16384,
+        "queue_time_s": 0.730634,
+        "req_id": "quality-c16384-t1-needle-d0.300000-s0",
+        "target_output_tokens": 32,
+        "total_latency_s": 38.539836
+      },
+      "quality-c16384-t1-needle-d0.300000-s1": {
+        "decode_time_s": 6.199065,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 32.343697,
+        "output_tokens": 32,
+        "prefill_time_s": 31.255142,
+        "prompt_tokens": 16384,
+        "queue_time_s": 1.088555,
+        "req_id": "quality-c16384-t1-needle-d0.300000-s1",
+        "target_output_tokens": 32,
+        "total_latency_s": 38.542761
+      },
+      "quality-c16384-t1-needle-d0.300000-s2": {
+        "decode_time_s": 6.202229,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 32.343627,
+        "output_tokens": 32,
+        "prefill_time_s": 31.25513,
+        "prompt_tokens": 16384,
+        "queue_time_s": 1.088497,
+        "req_id": "quality-c16384-t1-needle-d0.300000-s2",
+        "target_output_tokens": 32,
+        "total_latency_s": 38.545856
+      },
+      "quality-c16384-t1-needle-d0.500000-s0": {
+        "decode_time_s": 5.598403,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 32.95038,
+        "output_tokens": 32,
+        "prefill_time_s": 31.502829,
+        "prompt_tokens": 16384,
+        "queue_time_s": 1.44755,
+        "req_id": "quality-c16384-t1-needle-d0.500000-s0",
+        "target_output_tokens": 32,
+        "total_latency_s": 38.548783
+      },
+      "quality-c16384-t1-needle-d0.500000-s1": {
+        "decode_time_s": 5.60149,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 32.950345,
+        "output_tokens": 32,
+        "prefill_time_s": 31.502818,
+        "prompt_tokens": 16384,
+        "queue_time_s": 1.447527,
+        "req_id": "quality-c16384-t1-needle-d0.500000-s1",
+        "target_output_tokens": 32,
+        "total_latency_s": 38.551835
+      },
+      "quality-c16384-t1-needle-d0.500000-s2": {
+        "decode_time_s": 4.996001,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 33.558733,
+        "output_tokens": 32,
+        "prefill_time_s": 31.750626,
+        "prompt_tokens": 16384,
+        "queue_time_s": 1.808107,
+        "req_id": "quality-c16384-t1-needle-d0.500000-s2",
+        "target_output_tokens": 32,
+        "total_latency_s": 38.554734
+      },
+      "quality-c16384-t1-needle-d0.700000-s0": {
+        "decode_time_s": 4.999156,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 33.558702,
+        "output_tokens": 32,
+        "prefill_time_s": 31.750615,
+        "prompt_tokens": 16384,
+        "queue_time_s": 1.808087,
+        "req_id": "quality-c16384-t1-needle-d0.700000-s0",
+        "target_output_tokens": 32,
+        "total_latency_s": 38.557857
+      },
+      "quality-c16384-t1-needle-d0.700000-s1": {
+        "decode_time_s": 4.40059,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 34.160383,
+        "output_tokens": 32,
+        "prefill_time_s": 31.986564,
+        "prompt_tokens": 16384,
+        "queue_time_s": 2.17382,
+        "req_id": "quality-c16384-t1-needle-d0.700000-s1",
+        "target_output_tokens": 32,
+        "total_latency_s": 38.560973
+      },
+      "quality-c16384-t1-needle-d0.700000-s2": {
+        "decode_time_s": 4.403694,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 34.160353,
+        "output_tokens": 32,
+        "prefill_time_s": 31.986553,
+        "prompt_tokens": 16384,
+        "queue_time_s": 2.1738,
+        "req_id": "quality-c16384-t1-needle-d0.700000-s2",
+        "target_output_tokens": 32,
+        "total_latency_s": 38.564046
+      },
+      "quality-c16384-t1-needle-d0.900000-s0": {
+        "decode_time_s": 3.794138,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 34.773347,
+        "output_tokens": 32,
+        "prefill_time_s": 32.237885,
+        "prompt_tokens": 16384,
+        "queue_time_s": 2.535462,
+        "req_id": "quality-c16384-t1-needle-d0.900000-s0",
+        "target_output_tokens": 32,
+        "total_latency_s": 38.567485
+      },
+      "quality-c16384-t1-needle-d0.900000-s1": {
+        "decode_time_s": 3.797206,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 34.773317,
+        "output_tokens": 32,
+        "prefill_time_s": 32.237871,
+        "prompt_tokens": 16384,
+        "queue_time_s": 2.535446,
+        "req_id": "quality-c16384-t1-needle-d0.900000-s1",
+        "target_output_tokens": 32,
+        "total_latency_s": 38.570523
+      },
+      "quality-c16384-t1-needle-d0.900000-s2": {
+        "decode_time_s": 3.201988,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 35.371556,
+        "output_tokens": 32,
+        "prefill_time_s": 32.473408,
+        "prompt_tokens": 16384,
+        "queue_time_s": 2.898148,
+        "req_id": "quality-c16384-t1-needle-d0.900000-s2",
+        "target_output_tokens": 32,
+        "total_latency_s": 38.573544
+      },
+      "quality-c16384-t2-multikey-d0.100000-s0": {
+        "decode_time_s": 3.205071,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 35.371526,
+        "output_tokens": 32,
+        "prefill_time_s": 32.473396,
+        "prompt_tokens": 16384,
+        "queue_time_s": 2.89813,
+        "req_id": "quality-c16384-t2-multikey-d0.100000-s0",
+        "target_output_tokens": 32,
+        "total_latency_s": 38.576596
+      },
+      "quality-c16384-t2-multikey-d0.100000-s1": {
+        "decode_time_s": 7.498922,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 69.873762,
+        "output_tokens": 32,
+        "prefill_time_s": 31.287895,
+        "prompt_tokens": 16384,
+        "queue_time_s": 38.585867,
+        "req_id": "quality-c16384-t2-multikey-d0.100000-s1",
+        "target_output_tokens": 32,
+        "total_latency_s": 77.372684
+      },
+      "quality-c16384-t2-multikey-d0.100000-s2": {
+        "decode_time_s": 7.502737,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 69.873731,
+        "output_tokens": 32,
+        "prefill_time_s": 31.287884,
+        "prompt_tokens": 16384,
+        "queue_time_s": 38.585847,
+        "req_id": "quality-c16384-t2-multikey-d0.100000-s2",
+        "target_output_tokens": 32,
+        "total_latency_s": 77.376468
+      },
+      "quality-c16384-t2-multikey-d0.300000-s0": {
+        "decode_time_s": 6.901159,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 70.478623,
+        "output_tokens": 32,
+        "prefill_time_s": 31.477782,
+        "prompt_tokens": 16384,
+        "queue_time_s": 39.000841,
+        "req_id": "quality-c16384-t2-multikey-d0.300000-s0",
+        "target_output_tokens": 32,
+        "total_latency_s": 77.379782
+      },
+      "quality-c16384-t2-multikey-d0.300000-s1": {
+        "decode_time_s": 6.904494,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 70.47859,
+        "output_tokens": 32,
+        "prefill_time_s": 31.477771,
+        "prompt_tokens": 16384,
+        "queue_time_s": 39.00082,
+        "req_id": "quality-c16384-t2-multikey-d0.300000-s1",
+        "target_output_tokens": 32,
+        "total_latency_s": 77.383084
+      },
+      "quality-c16384-t2-multikey-d0.300000-s2": {
+        "decode_time_s": 6.295195,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 71.091074,
+        "output_tokens": 32,
+        "prefill_time_s": 31.678951,
+        "prompt_tokens": 16384,
+        "queue_time_s": 39.412124,
+        "req_id": "quality-c16384-t2-multikey-d0.300000-s2",
+        "target_output_tokens": 32,
+        "total_latency_s": 77.386269
+      },
+      "quality-c16384-t2-multikey-d0.500000-s0": {
+        "decode_time_s": 6.298581,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 71.091041,
+        "output_tokens": 32,
+        "prefill_time_s": 31.678934,
+        "prompt_tokens": 16384,
+        "queue_time_s": 39.412107,
+        "req_id": "quality-c16384-t2-multikey-d0.500000-s0",
+        "target_output_tokens": 32,
+        "total_latency_s": 77.389622
+      },
+      "quality-c16384-t2-multikey-d0.500000-s1": {
+        "decode_time_s": 5.693443,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 71.699354,
+        "output_tokens": 32,
+        "prefill_time_s": 31.876808,
+        "prompt_tokens": 16384,
+        "queue_time_s": 39.822546,
+        "req_id": "quality-c16384-t2-multikey-d0.500000-s1",
+        "target_output_tokens": 32,
+        "total_latency_s": 77.392798
+      },
+      "quality-c16384-t2-multikey-d0.500000-s2": {
+        "decode_time_s": 5.696681,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 71.699325,
+        "output_tokens": 32,
+        "prefill_time_s": 31.876795,
+        "prompt_tokens": 16384,
+        "queue_time_s": 39.82253,
+        "req_id": "quality-c16384-t2-multikey-d0.500000-s2",
+        "target_output_tokens": 32,
+        "total_latency_s": 77.396006
+      },
+      "quality-c16384-t2-multikey-d0.700000-s0": {
+        "decode_time_s": 5.094467,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 72.304744,
+        "output_tokens": 32,
+        "prefill_time_s": 32.073227,
+        "prompt_tokens": 16384,
+        "queue_time_s": 40.231517,
+        "req_id": "quality-c16384-t2-multikey-d0.700000-s0",
+        "target_output_tokens": 32,
+        "total_latency_s": 77.399211
+      },
+      "quality-c16384-t2-multikey-d0.700000-s1": {
+        "decode_time_s": 5.097735,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 72.304712,
+        "output_tokens": 32,
+        "prefill_time_s": 32.073214,
+        "prompt_tokens": 16384,
+        "queue_time_s": 40.231498,
+        "req_id": "quality-c16384-t2-multikey-d0.700000-s1",
+        "target_output_tokens": 32,
+        "total_latency_s": 77.402447
+      },
+      "quality-c16384-t2-multikey-d0.700000-s2": {
+        "decode_time_s": 4.492264,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 72.913333,
+        "output_tokens": 32,
+        "prefill_time_s": 32.275543,
+        "prompt_tokens": 16384,
+        "queue_time_s": 40.63779,
+        "req_id": "quality-c16384-t2-multikey-d0.700000-s2",
+        "target_output_tokens": 32,
+        "total_latency_s": 77.405597
+      },
+      "quality-c16384-t2-multikey-d0.900000-s0": {
+        "decode_time_s": 4.495563,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 72.913302,
+        "output_tokens": 32,
+        "prefill_time_s": 32.275531,
+        "prompt_tokens": 16384,
+        "queue_time_s": 40.637771,
+        "req_id": "quality-c16384-t2-multikey-d0.900000-s0",
+        "target_output_tokens": 32,
+        "total_latency_s": 77.408865
+      },
+      "quality-c16384-t2-multikey-d0.900000-s1": {
+        "decode_time_s": 3.882158,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 73.529936,
+        "output_tokens": 32,
+        "prefill_time_s": 32.486426,
+        "prompt_tokens": 16384,
+        "queue_time_s": 41.04351,
+        "req_id": "quality-c16384-t2-multikey-d0.900000-s1",
+        "target_output_tokens": 32,
+        "total_latency_s": 77.412095
+      },
+      "quality-c16384-t2-multikey-d0.900000-s2": {
+        "decode_time_s": 3.885346,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 73.529907,
+        "output_tokens": 32,
+        "prefill_time_s": 32.486415,
+        "prompt_tokens": 16384,
+        "queue_time_s": 41.043492,
+        "req_id": "quality-c16384-t2-multikey-d0.900000-s2",
+        "target_output_tokens": 32,
+        "total_latency_s": 77.415252
+      },
+      "quality-c16384-t3-aggregate-d0.100000-s0": {
+        "decode_time_s": 10.956439,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 74.142535,
+        "output_tokens": 48,
+        "prefill_time_s": 32.695504,
+        "prompt_tokens": 16384,
+        "queue_time_s": 41.447031,
+        "req_id": "quality-c16384-t3-aggregate-d0.100000-s0",
+        "target_output_tokens": 48,
+        "total_latency_s": 85.098974
+      },
+      "quality-c16384-t3-aggregate-d0.300000-s0": {
+        "decode_time_s": 10.95998,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 74.142505,
+        "output_tokens": 48,
+        "prefill_time_s": 32.695492,
+        "prompt_tokens": 16384,
+        "queue_time_s": 41.447013,
+        "req_id": "quality-c16384-t3-aggregate-d0.300000-s0",
+        "target_output_tokens": 48,
+        "total_latency_s": 85.102484
+      },
+      "quality-c16384-t3-aggregate-d0.500000-s0": {
+        "decode_time_s": 2.146505,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 84.099085,
+        "output_tokens": 48,
+        "prefill_time_s": 6.677129,
+        "prompt_tokens": 16384,
+        "queue_time_s": 77.421956,
+        "req_id": "quality-c16384-t3-aggregate-d0.500000-s0",
+        "target_output_tokens": 48,
+        "total_latency_s": 86.24559
+      },
+      "quality-c16384-t3-aggregate-d0.700000-s0": {
+        "decode_time_s": 2.150035,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 84.099054,
+        "output_tokens": 48,
+        "prefill_time_s": 6.677117,
+        "prompt_tokens": 16384,
+        "queue_time_s": 77.421938,
+        "req_id": "quality-c16384-t3-aggregate-d0.700000-s0",
+        "target_output_tokens": 48,
+        "total_latency_s": 86.24909
+      },
+      "quality-c16384-t3-aggregate-d0.900000-s0": {
+        "decode_time_s": 1.862525,
+        "error": null,
+        "finish_reason": "length",
+        "first_token_latency_s": 84.390006,
+        "output_tokens": 48,
+        "prefill_time_s": 6.55871,
+        "prompt_tokens": 16384,
+        "queue_time_s": 77.831296,
+        "req_id": "quality-c16384-t3-aggregate-d0.900000-s0",
+        "target_output_tokens": 48,
+        "total_latency_s": 86.252531
+      }
+    },
+    "resident_state_slots": 0,
+    "retraction_events": 0,
+    "runnable_rows": 0,
+    "scheduled_tokens": 574605,
+    "state": {
+      "pending_span_tokens": 0,
+      "resident_slots": 0,
+      "ring_tokens": 0,
+      "span_bank_tokens": 0
+    },
+    "state_bytes_per_request": 219455804,
+    "steps": 133,
+    "token_pool": {
+      "active_request_slots": 0,
+      "allocated_token_slots": 0,
+      "attention_enabled": true,
+      "block_table_bytes": 132096,
+      "enabled": true,
+      "free_token_slots": 36864,
+      "kv_pool_buffer_generation": 24,
+      "kv_pool_bytes": 950009856,
+      "kv_pool_layer_capacities": {
+        "0": 8448,
+        "1": 8448,
+        "2": 8448,
+        "3": 8448,
+        "4": 8448,
+        "5": 36864,
+        "6": 8448,
+        "7": 8448,
+        "8": 8448,
+        "9": 8448,
+        "10": 8448,
+        "11": 36864,
+        "12": 8448,
+        "13": 8448,
+        "14": 8448,
+        "15": 8448,
+        "16": 8448,
+        "17": 36864,
+        "18": 8448,
+        "19": 8448,
+        "20": 8448,
+        "21": 8448,
+        "22": 8448,
+        "23": 36864
+      },
+      "kv_pool_layers": 42,
+      "kv_set_calls": 8236,
+      "kv_set_index_copy_calls": 0,
+      "kv_set_index_copy_wall_s": 0.0,
+      "kv_set_slice_copy_calls": 5600,
+      "kv_set_slice_copy_wall_s": 0.0,
+      "kv_set_tokens": 11333520,
+      "kv_set_triton_copy_calls": 2636,
+      "kv_set_triton_copy_wall_s": 0.0,
+      "kv_set_triton_fallback_calls": 0,
+      "kv_set_wall_s": 0.0,
+      "max_context_len": 33024,
+      "metadata_bytes": 2245632,
+      "next_token_slot": 0,
+      "page_table_metadata_max_rows": 2,
+      "page_table_tensor_shape": [
+        16,
+        2064
+      ],
+      "paged_block_size": 16,
+      "token_slot_capacity": 36864,
+      "token_slot_high_watermark": 36718
+    },
+    "token_pool_attention_enabled": true,
+    "token_pool_authoritative_prefill_layer_writes": 0,
+    "token_pool_authoritative_prefill_requests": 0,
+    "token_pool_authoritative_prefill_tokens": 0,
+    "token_pool_decode_covered_layer_type_batches": {
+      "full_attention": 47,
+      "sliding_attention": 117
+    },
+    "token_pool_decode_covered_layer_type_rows": {
+      "full_attention": 133,
+      "sliding_attention": 1165
+    },
+    "token_pool_decode_graph_candidate_batches": 117,
+    "token_pool_decode_graph_metadata_alias_fastpath_metadata_skips": 2064,
+    "token_pool_decode_graph_metadata_tensor_copies": 0,
+    "token_pool_decode_graph_metadata_tensor_copy_skips": 34,
+    "token_pool_decode_graph_prefill_cache_clears": 0,
+    "token_pool_decode_graph_prefill_cache_evictions": 0,
+    "token_pool_decode_graph_shape_mismatch_reasons": {},
+    "token_pool_decode_graph_shape_mismatches": 0,
+    "token_pool_decode_graph_signature_recording": true,
+    "token_pool_decode_graph_static_shape_reuses": 112,
+    "token_pool_decode_graph_static_shape_starts": 5,
+    "token_pool_decode_metadata_batches": 117,
+    "token_pool_decode_metadata_rows": 1165,
+    "token_pool_full_attention_row_appends": 128,
+    "token_pool_full_attention_row_invalidations": 0,
+    "token_pool_full_attention_row_rebuilds": 5,
+    "token_pool_full_attention_row_reuses": 128,
+    "token_pool_metadata_enabled": true,
+    "token_pool_slot_high_watermark": 36718,
+    "use_native_gemma_forward": true,
+    "uses_hf_model_construction": false,
+    "uses_hf_transformer_forward": false
+  },
+  "generated_output_fingerprint": {
+    "output_token_count": 1200,
+    "output_token_counts": [
+      32,
+      32,
+      32,
+      32,
+      32,
+      32,
+      32,
+      32,
+      32,
+      32,
+      32,
+      32,
+      32,
+      32,
+      32,
+      32,
+      32,
+      32,
+      32,
+      32,
+      32,
+      32,
+      32,
+      32,
+      32,
+      32,
+      32,
+      32,
+      32,
+      32,
+      48,
+      48,
+      48,
+      48,
+      48
+    ],
+    "request_count": 35,
+    "request_ids": [
+      "quality-c16384-t1-needle-d0.100000-s0",
+      "quality-c16384-t1-needle-d0.100000-s1",
+      "quality-c16384-t1-needle-d0.100000-s2",
+      "quality-c16384-t1-needle-d0.300000-s0",
+      "quality-c16384-t1-needle-d0.300000-s1",
+      "quality-c16384-t1-needle-d0.300000-s2",
+      "quality-c16384-t1-needle-d0.500000-s0",
+      "quality-c16384-t1-needle-d0.500000-s1",
+      "quality-c16384-t1-needle-d0.500000-s2",
+      "quality-c16384-t1-needle-d0.700000-s0",
+      "quality-c16384-t1-needle-d0.700000-s1",
+      "quality-c16384-t1-needle-d0.700000-s2",
+      "quality-c16384-t1-needle-d0.900000-s0",
+      "quality-c16384-t1-needle-d0.900000-s1",
+      "quality-c16384-t1-needle-d0.900000-s2",
+      "quality-c16384-t2-multikey-d0.100000-s0",
+      "quality-c16384-t2-multikey-d0.100000-s1",
+      "quality-c16384-t2-multikey-d0.100000-s2",
+      "quality-c16384-t2-multikey-d0.300000-s0",
+      "quality-c16384-t2-multikey-d0.300000-s1",
+      "quality-c16384-t2-multikey-d0.300000-s2",
+      "quality-c16384-t2-multikey-d0.500000-s0",
+      "quality-c16384-t2-multikey-d0.500000-s1",
+      "quality-c16384-t2-multikey-d0.500000-s2",
+      "quality-c16384-t2-multikey-d0.700000-s0",
+      "quality-c16384-t2-multikey-d0.700000-s1",
+      "quality-c16384-t2-multikey-d0.700000-s2",
+      "quality-c16384-t2-multikey-d0.900000-s0",
+      "quality-c16384-t2-multikey-d0.900000-s1",
+      "quality-c16384-t2-multikey-d0.900000-s2",
+      "quality-c16384-t3-aggregate-d0.100000-s0",
+      "quality-c16384-t3-aggregate-d0.300000-s0",
+      "quality-c16384-t3-aggregate-d0.500000-s0",
+      "quality-c16384-t3-aggregate-d0.700000-s0",
+      "quality-c16384-t3-aggregate-d0.900000-s0"
+    ],
+    "request_output_token_ids_sha256": "ea1e676d7066b9d442bbb7bfe78ad780f5c3739e1f336a82950a82b4a5760651",
+    "schema": "wkvm.generated_output_token_ids.sha256.v1"
+  },
+  "model_path": "/run/media/xiaol/B214449214445C0B/models/gemma/gemma-4-E4B-it",
+  "prompt_fingerprint": {
+    "prompt_count": 35,
+    "prompt_lengths": [
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384,
+      16384
+    ],
+    "prompt_token_ids_sha256": "d0395f7a3b9ef0d7074cb07e121aa85747f7451c5f53067c8208d9a968e74f26",
+    "prompt_token_source": "hf_tokenizer",
+    "prompt_total_tokens": 573440,
+    "schema": "wkvm.prompt_token_ids.sha256.v1"
+  },
+  "prompt_token_ids_sha256": "d0395f7a3b9ef0d7074cb07e121aa85747f7451c5f53067c8208d9a968e74f26",
+  "provenance": {
+    "cwd": "/home/xiaol/X/wkvm",
+    "git_commit": "59f736b9b80a2c54c397a481775cb008dc2ce2ef",
+    "git_identity_unchanged_during_run": true,
+    "git_status_sha256": "8c2ac473ef0e415b0d6dcce18bf5ad71b3de0f243efd5272304d2c872ae6e50a",
+    "git_tracked_diff_sha256": "76f647f1ec22902a201b61d9b58d34665c582c9ef5a77637ab8a6da362fe45e1",
+    "git_worktree_clean": false,
+    "harness_source_sha256": "aeefe7dd4780b1c1f4478f8186349e905f04892d20be04ba7984773b1f32e95a",
+    "launch_command": "/home/xiaol/X/HRM-Text/.venv/bin/python experiments/native_gemma_quality.py --model-path /run/media/xiaol/B214449214445C0B/models/gemma/gemma-4-E4B-it --ctxs 16384 --depths 0.1,0.3,0.5,0.7,0.9 --t12-seeds 3 --t3-seeds 1 --slots 16 --graph-warmup-iters 0 --token-pool-max-context-len 33024 --no-require-benchmark-shape --json /tmp/wkvm-native-quality-16k-b16-partial-coverage-eager.json",
+    "pre_run_git_commit": "59f736b9b80a2c54c397a481775cb008dc2ce2ef",
+    "pre_run_git_status_sha256": "8c2ac473ef0e415b0d6dcce18bf5ad71b3de0f243efd5272304d2c872ae6e50a",
+    "pre_run_git_tracked_diff_sha256": "76f647f1ec22902a201b61d9b58d34665c582c9ef5a77637ab8a6da362fe45e1",
+    "pre_run_timestamp_utc": "2026-07-13T06:08:33.275567+00:00",
+    "runtime_source_identity_after": {
+      "combined_sha256": "0701cd18b31f38ec9e53be1be2d9d29883383a5b2c1a5e5b3c956c0f8ef292de",
+      "file_count": 17,
+      "files": {
+        "experiments/bench_prompt_utils.py": "b35907d613acf155de7d4abd9552bfe70cfc81a523af1a092358c05793998bcc",
+        "experiments/native_gemma_engine_smoke.py": "70da76819a0531be6fb67e899347fe3162300626e34abe8618e551d3dfd13a8d",
+        "experiments/native_gemma_quality.py": "aeefe7dd4780b1c1f4478f8186349e905f04892d20be04ba7984773b1f32e95a",
+        "experiments/native_gemma_smoke.py": "cccebe94e0ef90b41538c5144cfcb349c2ffd58129c238796e1381318dcda972",
+        "experiments/quality_eval.py": "4998e273eccac00a4e7545961390385e51b29deafacc3c97e96f5709592d2f7d",
+        "wkvm/core/arena.py": "06fc88bcb0166bd2b24554616be8c0f48ca9d8b6180d83a4a5751eb7654f056c",
+        "wkvm/core/request.py": "8ec601e6492178170ff360ff16408a7a837c5d01e643673d4d8221e59267a115",
+        "wkvm/core/scheduler.py": "8c579a26710d920a98c877de17c5d1f88e0354997e10606ad11a86cea2412cbb",
+        "wkvm/gemma_engine.py": "8270b958a1b0d1990d1fde7ff9910c2ea8f393494206a539067778bb939f3028",
+        "wkvm/models/gemma.py": "041e9f6ef0feb2a59faf87729d841d1a170dc61386a248c587727c9f3785246a",
+        "wkvm/runner/gemma_fused_ops.py": "fa31fcaf8cfd78c906f6917db91b4c2968de5707fc96d14c685cedbdb0354d99",
+        "wkvm/runner/gemma_native_forward.py": "8d05336254abb64c11e3093a5ae7b26c96a82ec869c2c1533b51f3f00eaf1dca",
+        "wkvm/runner/gemma_runner.py": "8e3e181b446c56741ba6adcda85fba12474c6c28ca47b7b23e64c0a9602d0673",
+        "wkvm/runner/gemma_state.py": "c64296c8443e6edaf16877aa4b7183c5636b6d9309c9c1688f4b22c62ea105f9",
+        "wkvm/runner/gemma_token_pool.py": "94f97ebee0cbb0367d2bdb88f4b106e5ccceadf0302d3db306c8028aac7e84ae",
+        "wkvm/runner/gemma_token_pool_attention.py": "4a46f0b7db607cb4a5ff53b1c9572988b62d1e06f4dc06c01fdda56871596ed3",
+        "wkvm/runner/gemma_token_pool_triton.py": "4490bd9b47495b4c53641ec8460e8dcc786220320968c9337957bb3d5935e187"
+      },
+      "schema": "wkvm.runtime_source_identity.sha256.v1"
+    },
+    "runtime_source_identity_before": {
+      "combined_sha256": "0701cd18b31f38ec9e53be1be2d9d29883383a5b2c1a5e5b3c956c0f8ef292de",
+      "file_count": 17,
+      "files": {
+        "experiments/bench_prompt_utils.py": "b35907d613acf155de7d4abd9552bfe70cfc81a523af1a092358c05793998bcc",
+        "experiments/native_gemma_engine_smoke.py": "70da76819a0531be6fb67e899347fe3162300626e34abe8618e551d3dfd13a8d",
+        "experiments/native_gemma_quality.py": "aeefe7dd4780b1c1f4478f8186349e905f04892d20be04ba7984773b1f32e95a",
+        "experiments/native_gemma_smoke.py": "cccebe94e0ef90b41538c5144cfcb349c2ffd58129c238796e1381318dcda972",
+        "experiments/quality_eval.py": "4998e273eccac00a4e7545961390385e51b29deafacc3c97e96f5709592d2f7d",
+        "wkvm/core/arena.py": "06fc88bcb0166bd2b24554616be8c0f48ca9d8b6180d83a4a5751eb7654f056c",
+        "wkvm/core/request.py": "8ec601e6492178170ff360ff16408a7a837c5d01e643673d4d8221e59267a115",
+        "wkvm/core/scheduler.py": "8c579a26710d920a98c877de17c5d1f88e0354997e10606ad11a86cea2412cbb",
+        "wkvm/gemma_engine.py": "8270b958a1b0d1990d1fde7ff9910c2ea8f393494206a539067778bb939f3028",
+        "wkvm/models/gemma.py": "041e9f6ef0feb2a59faf87729d841d1a170dc61386a248c587727c9f3785246a",
+        "wkvm/runner/gemma_fused_ops.py": "fa31fcaf8cfd78c906f6917db91b4c2968de5707fc96d14c685cedbdb0354d99",
+        "wkvm/runner/gemma_native_forward.py": "8d05336254abb64c11e3093a5ae7b26c96a82ec869c2c1533b51f3f00eaf1dca",
+        "wkvm/runner/gemma_runner.py": "8e3e181b446c56741ba6adcda85fba12474c6c28ca47b7b23e64c0a9602d0673",
+        "wkvm/runner/gemma_state.py": "c64296c8443e6edaf16877aa4b7183c5636b6d9309c9c1688f4b22c62ea105f9",
+        "wkvm/runner/gemma_token_pool.py": "94f97ebee0cbb0367d2bdb88f4b106e5ccceadf0302d3db306c8028aac7e84ae",
+        "wkvm/runner/gemma_token_pool_attention.py": "4a46f0b7db607cb4a5ff53b1c9572988b62d1e06f4dc06c01fdda56871596ed3",
+        "wkvm/runner/gemma_token_pool_triton.py": "4490bd9b47495b4c53641ec8460e8dcc786220320968c9337957bb3d5935e187"
+      },
+      "schema": "wkvm.runtime_source_identity.sha256.v1"
+    },
+    "runtime_source_unchanged_during_run": true,
+    "timestamp_utc": "2026-07-13T06:10:02.668417+00:00"
+  },
+  "quality_validation": {
+    "full_grid_observed": false,
+    "full_grid_required": false,
+    "gate": {
+      "overall_cell_mean_score": 0.9,
+      "task_mean_scores": {
+        "t1-needle": 1.0,
+        "t2-multikey": 0.8888888888888888,
+        "t3-aggregate": 0.8
+      },
+      "task_minimum_cell_scores": {
+        "t1-needle": 1.0,
+        "t2-multikey": 0.6666666666666666,
+        "t3-aggregate": 0.6666666666666666
+      }
+    },
+    "passed": false,
+    "violations": [
+      "overall_cell_mean_below_gate",
+      "t2-multikey_mean_below_gate",
+      "t3-aggregate_mean_below_gate"
+    ]
+  },
+  "request_output_token_ids_sha256": "ea1e676d7066b9d442bbb7bfe78ad780f5c3739e1f336a82950a82b4a5760651",
+  "routed_cache_observations": {
+    "cache_samples": 2820,
+    "dense_storage_release_observed": true,
+    "max_active_route_slots": 64,
+    "max_cumulative_tokens": 16430,
+    "max_evicted_tokens": 15344,
+    "max_materialized_tokens": 7795,
+    "max_pending_tokens": 62,
+    "minimum_materialized_fraction": 0.4356689453125,
+    "routed_layer_samples": 11280
+  },
+  "rows": [
+    {
+      "context_tokens": 16384,
+      "depth": 0.1,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t1-needle-d0.100000-s0"
+        ],
+        "request_output_token_ids_sha256": "57036be78b24b399787220181045c3d037252795ca4ecfb2f5270eca19d6ae68",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "IVORY-700",
+      "output_text_sha256": "526f11867a8e0f9d075713183c4e25cf0dd06a844424418e33dbc8fb99a55463",
+      "output_token_ids": [
+        3767,
+        15681,
+        236772,
+        236832,
+        236771,
+        236771,
+        106,
+        106,
+        106,
+        106,
+        1,
+        1,
+        1,
+        1,
+        106,
+        100,
+        45518,
+        107,
+        120474,
+        12364,
+        236787,
+        108,
+        236770,
+        236761,
+        138,
+        1018,
+        115863,
+        506,
+        16499,
+        53121,
+        669,
+        2430
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "2724e80a8e78b6ecc09e90ae9190130b8022e4a82e3133fa29430684ac288604",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "2724e80a8e78b6ecc09e90ae9190130b8022e4a82e3133fa29430684ac288604",
+      "req_id": "quality-c16384-t1-needle-d0.100000-s0",
+      "request_output_token_ids_sha256": "57036be78b24b399787220181045c3d037252795ca4ecfb2f5270eca19d6ae68",
+      "score": 1.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 6,
+      "scorer_metadata": {
+        "source": "scorer.closure",
+        "value": {
+          "code": "IVORY-700"
+        }
+      },
+      "seed": 0,
+      "seed_key": "16384/t1-needle/0.1/0",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t1-needle"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.1,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t1-needle-d0.100000-s1"
+        ],
+        "request_output_token_ids_sha256": "620a4420893dfe00bfc8cf9e94412bef14054e6f46d0bad178ef72f4b1d91b68",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "COBALT-806",
+      "output_text_sha256": "512f65e84236258a28c3473de8b2e8ad6c91df439c92237dc32edfb445e72561",
+      "output_token_ids": [
+        2457,
+        36269,
+        236774,
+        236772,
+        236828,
+        236771,
+        236825,
+        106,
+        106,
+        106,
+        106,
+        1,
+        1,
+        1,
+        1,
+        106,
+        100,
+        45518,
+        107,
+        8291,
+        236789,
+        236751,
+        496,
+        6972,
+        1657,
+        531,
+        15074,
+        657,
+        506,
+        3890,
+        236787,
+        108
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "967a12ba024e7f4c032dd29813e13f277920fbb172bdaaa8ffc68f05fcff1d74",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "967a12ba024e7f4c032dd29813e13f277920fbb172bdaaa8ffc68f05fcff1d74",
+      "req_id": "quality-c16384-t1-needle-d0.100000-s1",
+      "request_output_token_ids_sha256": "620a4420893dfe00bfc8cf9e94412bef14054e6f46d0bad178ef72f4b1d91b68",
+      "score": 1.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 7,
+      "scorer_metadata": {
+        "source": "scorer.closure",
+        "value": {
+          "code": "COBALT-806"
+        }
+      },
+      "seed": 1,
+      "seed_key": "16384/t1-needle/0.1/1",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t1-needle"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.1,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t1-needle-d0.100000-s2"
+        ],
+        "request_output_token_ids_sha256": "674533d2c795fbffce0c90d50b87645d9cbd0aad29dec50a8a2e13958352c755",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "CRIMSON-820",
+      "output_text_sha256": "2d6a16019156b251ef066a9679449ec91a8a83e21a0a63fd90058e6aed735b6e",
+      "output_token_ids": [
+        6459,
+        2783,
+        5430,
+        236772,
+        236828,
+        236778,
+        236771,
+        106,
+        106,
+        106,
+        106,
+        1,
+        1,
+        1,
+        1,
+        106,
+        100,
+        45518,
+        107,
+        8291,
+        236789,
+        236751,
+        496,
+        6972,
+        1657,
+        531,
+        15074,
+        657,
+        506,
+        3890,
+        236787,
+        108
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "21acace0f651f5b78348fc236621ecdda65f2f7cdf2080e12e5a47c6012fee05",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "21acace0f651f5b78348fc236621ecdda65f2f7cdf2080e12e5a47c6012fee05",
+      "req_id": "quality-c16384-t1-needle-d0.100000-s2",
+      "request_output_token_ids_sha256": "674533d2c795fbffce0c90d50b87645d9cbd0aad29dec50a8a2e13958352c755",
+      "score": 1.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 7,
+      "scorer_metadata": {
+        "source": "scorer.closure",
+        "value": {
+          "code": "CRIMSON-820"
+        }
+      },
+      "seed": 2,
+      "seed_key": "16384/t1-needle/0.1/2",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t1-needle"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.3,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t1-needle-d0.300000-s0"
+        ],
+        "request_output_token_ids_sha256": "3a87eeca43850f909c617b5f7e24e2b52079127c3e5c7d83afd4407b44426688",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "COBALT-243",
+      "output_text_sha256": "77e4a44811b6aca7373a53ee15a32f700ee5aefd442e6be70663517b47c78e54",
+      "output_token_ids": [
+        2457,
+        36269,
+        236774,
+        236772,
+        236778,
+        236812,
+        236800,
+        106,
+        106,
+        106,
+        106,
+        1,
+        1,
+        1,
+        1,
+        106,
+        106,
+        1,
+        1,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "e946a7fbcd1e2b3298575fda0218f03dc846047e91e57dbfc41ca1eef9cf4322",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "e946a7fbcd1e2b3298575fda0218f03dc846047e91e57dbfc41ca1eef9cf4322",
+      "req_id": "quality-c16384-t1-needle-d0.300000-s0",
+      "request_output_token_ids_sha256": "3a87eeca43850f909c617b5f7e24e2b52079127c3e5c7d83afd4407b44426688",
+      "score": 1.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 7,
+      "scorer_metadata": {
+        "source": "scorer.closure",
+        "value": {
+          "code": "COBALT-243"
+        }
+      },
+      "seed": 0,
+      "seed_key": "16384/t1-needle/0.3/0",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t1-needle"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.3,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t1-needle-d0.300000-s1"
+        ],
+        "request_output_token_ids_sha256": "eb375f33e0dc8183e1b00f3ae4122035e8a37fc1fd0c61fce83dee6487646a16",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "SIENNA-161",
+      "output_text_sha256": "d2fc089751842c0787ddb8190f4e4a800541b1a1bd8815543df6732369b3f422",
+      "output_token_ids": [
+        5491,
+        1439,
+        4383,
+        236772,
+        236770,
+        236825,
+        236770,
+        106,
+        106,
+        106,
+        106,
+        1,
+        1,
+        1,
+        1,
+        106,
+        100,
+        45518,
+        107,
+        120474,
+        12364,
+        236787,
+        108,
+        236770,
+        236761,
+        138,
+        1018,
+        115863,
+        506,
+        16499,
+        53121,
+        669
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "4a48267e8ac3eece5a5ee9874b0c993923ff41e532b4572ef9280da2094cfd1a",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "4a48267e8ac3eece5a5ee9874b0c993923ff41e532b4572ef9280da2094cfd1a",
+      "req_id": "quality-c16384-t1-needle-d0.300000-s1",
+      "request_output_token_ids_sha256": "eb375f33e0dc8183e1b00f3ae4122035e8a37fc1fd0c61fce83dee6487646a16",
+      "score": 1.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 7,
+      "scorer_metadata": {
+        "source": "scorer.closure",
+        "value": {
+          "code": "SIENNA-161"
+        }
+      },
+      "seed": 1,
+      "seed_key": "16384/t1-needle/0.3/1",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t1-needle"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.3,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t1-needle-d0.300000-s2"
+        ],
+        "request_output_token_ids_sha256": "be09c26e2d3ccdb368a3dad3281c2ed18dd04fadda37670731a1c5f03d687b4c",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "COBALT-371",
+      "output_text_sha256": "d59cb5c45b5ede7a25b9a2a9e27237c82d67f95996704f20835ed49ca12e98a5",
+      "output_token_ids": [
+        2457,
+        36269,
+        236774,
+        236772,
+        236800,
+        236832,
+        236770,
+        106,
+        106,
+        106,
+        106,
+        1,
+        1,
+        1,
+        106,
+        236813,
+        106,
+        818,
+        6789,
+        3393,
+        563,
+        2671,
+        36269,
+        236774,
+        236772,
+        236800,
+        236832,
+        236770,
+        236761,
+        106,
+        106,
+        106
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "9a5cd0aeece307900f77b0ed19dc84fafeca3728c612d2b8984f2d02b08b466a",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "9a5cd0aeece307900f77b0ed19dc84fafeca3728c612d2b8984f2d02b08b466a",
+      "req_id": "quality-c16384-t1-needle-d0.300000-s2",
+      "request_output_token_ids_sha256": "be09c26e2d3ccdb368a3dad3281c2ed18dd04fadda37670731a1c5f03d687b4c",
+      "score": 1.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 7,
+      "scorer_metadata": {
+        "source": "scorer.closure",
+        "value": {
+          "code": "COBALT-371"
+        }
+      },
+      "seed": 2,
+      "seed_key": "16384/t1-needle/0.3/2",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t1-needle"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.5,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t1-needle-d0.500000-s0"
+        ],
+        "request_output_token_ids_sha256": "4e518e7554b7c07cd9aec255331578f4381036bf8162ff182cc5687351c1e78c",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "IVORY-917",
+      "output_text_sha256": "62b29568b3676d4842784e30d1cbe66f9e1378589bef231def7336ef70978212",
+      "output_token_ids": [
+        3767,
+        15681,
+        236772,
+        236819,
+        236770,
+        236832,
+        106,
+        106,
+        106,
+        106,
+        1,
+        1,
+        1,
+        1,
+        106,
+        100,
+        45518,
+        107,
+        120474,
+        12364,
+        236787,
+        108,
+        236770,
+        236761,
+        138,
+        1018,
+        115863,
+        506,
+        16499,
+        53121,
+        669,
+        2430
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "e2fc864e4b3b3a4577ca3c1e3b2a79270b36e70d3735e2588494c84a2d7a990f",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "e2fc864e4b3b3a4577ca3c1e3b2a79270b36e70d3735e2588494c84a2d7a990f",
+      "req_id": "quality-c16384-t1-needle-d0.500000-s0",
+      "request_output_token_ids_sha256": "4e518e7554b7c07cd9aec255331578f4381036bf8162ff182cc5687351c1e78c",
+      "score": 1.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 6,
+      "scorer_metadata": {
+        "source": "scorer.closure",
+        "value": {
+          "code": "IVORY-917"
+        }
+      },
+      "seed": 0,
+      "seed_key": "16384/t1-needle/0.5/0",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t1-needle"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.5,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t1-needle-d0.500000-s1"
+        ],
+        "request_output_token_ids_sha256": "5cc80fdf929b922fbe165972dcf3d6a1f9dc249e184d54b4e1f00ff618fd11c8",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "CRIMSON-636",
+      "output_text_sha256": "dd123f8c0d70e91ae8d81f2ab14d08cde522c4356f8b99606881543a81348f72",
+      "output_token_ids": [
+        6459,
+        2783,
+        5430,
+        236772,
+        236825,
+        236800,
+        236825,
+        106,
+        106,
+        106,
+        106,
+        1,
+        1,
+        1,
+        1,
+        106,
+        100,
+        45518,
+        107,
+        120474,
+        12364,
+        236787,
+        108,
+        236770,
+        236761,
+        138,
+        1018,
+        115863,
+        506,
+        16499,
+        53121,
+        669
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "37a6e627926fd4047e1d9371e98e60bb9abeffa146665d0f203f9728caaa25ae",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "37a6e627926fd4047e1d9371e98e60bb9abeffa146665d0f203f9728caaa25ae",
+      "req_id": "quality-c16384-t1-needle-d0.500000-s1",
+      "request_output_token_ids_sha256": "5cc80fdf929b922fbe165972dcf3d6a1f9dc249e184d54b4e1f00ff618fd11c8",
+      "score": 1.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 7,
+      "scorer_metadata": {
+        "source": "scorer.closure",
+        "value": {
+          "code": "CRIMSON-636"
+        }
+      },
+      "seed": 1,
+      "seed_key": "16384/t1-needle/0.5/1",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t1-needle"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.5,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t1-needle-d0.500000-s2"
+        ],
+        "request_output_token_ids_sha256": "48e02b021de93a33597cb0c59459a65a940f17a888d667782c59ecd4d2cc5527",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "COBALT-320",
+      "output_text_sha256": "6d8f4c72051af57e7010fdcdeaca30b1565665a720a828ee66b967da38fc7f28",
+      "output_token_ids": [
+        2457,
+        36269,
+        236774,
+        236772,
+        236800,
+        236778,
+        236771,
+        106,
+        106,
+        106,
+        106,
+        1,
+        1,
+        1,
+        1,
+        106,
+        106,
+        1,
+        1,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "aad50bcc7e01d4874acf28c8aa8db074ca13fe2d65bbd996e2138b61912c342a",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "aad50bcc7e01d4874acf28c8aa8db074ca13fe2d65bbd996e2138b61912c342a",
+      "req_id": "quality-c16384-t1-needle-d0.500000-s2",
+      "request_output_token_ids_sha256": "48e02b021de93a33597cb0c59459a65a940f17a888d667782c59ecd4d2cc5527",
+      "score": 1.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 7,
+      "scorer_metadata": {
+        "source": "scorer.closure",
+        "value": {
+          "code": "COBALT-320"
+        }
+      },
+      "seed": 2,
+      "seed_key": "16384/t1-needle/0.5/2",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t1-needle"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.7,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t1-needle-d0.700000-s0"
+        ],
+        "request_output_token_ids_sha256": "7440fef4095626556a0f7ae40895684f10c8455e7d5e98a0f7d4b4227eeb3a9e",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "CRIMSON-190",
+      "output_text_sha256": "312a762d48bc40a693762004a4fa8fc98be0a7680b6e861fac9be35e78211924",
+      "output_token_ids": [
+        6459,
+        2783,
+        5430,
+        236772,
+        236770,
+        236819,
+        236771,
+        106,
+        106,
+        106,
+        106,
+        1,
+        1,
+        1,
+        106,
+        236813,
+        106,
+        818,
+        6789,
+        3393,
+        563,
+        104506,
+        5430,
+        236772,
+        236770,
+        236819,
+        236771,
+        236761,
+        106,
+        106,
+        106,
+        1
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "f0fbb7637e9f5bc23fa757b43649b793f85b74def7d45cbd33c3540bfebf761a",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "f0fbb7637e9f5bc23fa757b43649b793f85b74def7d45cbd33c3540bfebf761a",
+      "req_id": "quality-c16384-t1-needle-d0.700000-s0",
+      "request_output_token_ids_sha256": "7440fef4095626556a0f7ae40895684f10c8455e7d5e98a0f7d4b4227eeb3a9e",
+      "score": 1.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 7,
+      "scorer_metadata": {
+        "source": "scorer.closure",
+        "value": {
+          "code": "CRIMSON-190"
+        }
+      },
+      "seed": 0,
+      "seed_key": "16384/t1-needle/0.7/0",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t1-needle"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.7,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t1-needle-d0.700000-s1"
+        ],
+        "request_output_token_ids_sha256": "a0de7d758a86baa935f7afb363f1c3c276c1eaddcebe2105f1c01a0e2192d6e8",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "COBALT-639",
+      "output_text_sha256": "1cd537ea100b8e859f1b34df8a3402be3c1b3975090cd264687603f08527a6ab",
+      "output_token_ids": [
+        2457,
+        36269,
+        236774,
+        236772,
+        236825,
+        236800,
+        236819,
+        106,
+        106,
+        106,
+        106,
+        1,
+        1,
+        1,
+        1,
+        106,
+        100,
+        45518,
+        107,
+        120474,
+        12364,
+        236787,
+        108,
+        236770,
+        236761,
+        138,
+        1018,
+        115863,
+        506,
+        16499,
+        53121,
+        669
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "5a53821c85868d78e6998bec167e3c6cd40cf1b43d0f0c9727787dab9e5efddc",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "5a53821c85868d78e6998bec167e3c6cd40cf1b43d0f0c9727787dab9e5efddc",
+      "req_id": "quality-c16384-t1-needle-d0.700000-s1",
+      "request_output_token_ids_sha256": "a0de7d758a86baa935f7afb363f1c3c276c1eaddcebe2105f1c01a0e2192d6e8",
+      "score": 1.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 7,
+      "scorer_metadata": {
+        "source": "scorer.closure",
+        "value": {
+          "code": "COBALT-639"
+        }
+      },
+      "seed": 1,
+      "seed_key": "16384/t1-needle/0.7/1",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t1-needle"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.7,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t1-needle-d0.700000-s2"
+        ],
+        "request_output_token_ids_sha256": "f629192133903682cbc4038806ead3e6448d60b4d131eeb2de2d5825f907aef9",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "SIENNA-910",
+      "output_text_sha256": "3b8e17adde19990b6f85e2e5524fcd863ffeae1af5863610ba5c131d867bf827",
+      "output_token_ids": [
+        5491,
+        1439,
+        4383,
+        236772,
+        236819,
+        236770,
+        236771,
+        106,
+        106,
+        106,
+        106,
+        1,
+        1,
+        1,
+        1,
+        106,
+        100,
+        45518,
+        107,
+        120474,
+        12364,
+        236787,
+        108,
+        236770,
+        236761,
+        138,
+        1018,
+        115863,
+        506,
+        16499,
+        53121,
+        669
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "3805a4a47a20deca81725998707b64ca2da947ada56a3f5908a7c7e7f93b63e6",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "3805a4a47a20deca81725998707b64ca2da947ada56a3f5908a7c7e7f93b63e6",
+      "req_id": "quality-c16384-t1-needle-d0.700000-s2",
+      "request_output_token_ids_sha256": "f629192133903682cbc4038806ead3e6448d60b4d131eeb2de2d5825f907aef9",
+      "score": 1.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 7,
+      "scorer_metadata": {
+        "source": "scorer.closure",
+        "value": {
+          "code": "SIENNA-910"
+        }
+      },
+      "seed": 2,
+      "seed_key": "16384/t1-needle/0.7/2",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t1-needle"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.9,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t1-needle-d0.900000-s0"
+        ],
+        "request_output_token_ids_sha256": "d782bfcd07ff4aaf6566d54a0a30557afa78a5157d22b65f2a117e7a27ac5b53",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "SIENNA-980",
+      "output_text_sha256": "75c29ef6bc46c53305fd7729ed5382c9ea0e9e331e34c87169ca3c14498c35b9",
+      "output_token_ids": [
+        5491,
+        1439,
+        4383,
+        236772,
+        236819,
+        236828,
+        236771,
+        106,
+        106,
+        106,
+        106,
+        1,
+        1,
+        1,
+        1,
+        106,
+        100,
+        45518,
+        107,
+        120474,
+        12364,
+        236787,
+        108,
+        236770,
+        236761,
+        138,
+        1018,
+        115863,
+        506,
+        16499,
+        53121,
+        669
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "60389140704c7587783f6bcf59cb9e8221447fa22d1014b13cd130f2fb48c9c8",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "60389140704c7587783f6bcf59cb9e8221447fa22d1014b13cd130f2fb48c9c8",
+      "req_id": "quality-c16384-t1-needle-d0.900000-s0",
+      "request_output_token_ids_sha256": "d782bfcd07ff4aaf6566d54a0a30557afa78a5157d22b65f2a117e7a27ac5b53",
+      "score": 1.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 7,
+      "scorer_metadata": {
+        "source": "scorer.closure",
+        "value": {
+          "code": "SIENNA-980"
+        }
+      },
+      "seed": 0,
+      "seed_key": "16384/t1-needle/0.9/0",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t1-needle"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.9,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t1-needle-d0.900000-s1"
+        ],
+        "request_output_token_ids_sha256": "94d47f421c22f2d2fa82f264054ecc06017a9ff07dee151e60e8dcb14d5b0c51",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "COBALT-956",
+      "output_text_sha256": "2498deb99264d227ff348c20e659f3c0c0eabba386a8c56f8625f1f25d4fb212",
+      "output_token_ids": [
+        2457,
+        36269,
+        236774,
+        236772,
+        236819,
+        236810,
+        236825,
+        106,
+        106,
+        106,
+        106,
+        1,
+        1,
+        1,
+        1,
+        106,
+        100,
+        45518,
+        107,
+        120474,
+        12364,
+        236787,
+        108,
+        236770,
+        236761,
+        138,
+        1018,
+        115863,
+        506,
+        16499,
+        53121,
+        669
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "8294d350788bfa4b194a54ce57cb83fef64a1e2798c6f8c92df374ab13e19f0d",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "8294d350788bfa4b194a54ce57cb83fef64a1e2798c6f8c92df374ab13e19f0d",
+      "req_id": "quality-c16384-t1-needle-d0.900000-s1",
+      "request_output_token_ids_sha256": "94d47f421c22f2d2fa82f264054ecc06017a9ff07dee151e60e8dcb14d5b0c51",
+      "score": 1.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 7,
+      "scorer_metadata": {
+        "source": "scorer.closure",
+        "value": {
+          "code": "COBALT-956"
+        }
+      },
+      "seed": 1,
+      "seed_key": "16384/t1-needle/0.9/1",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t1-needle"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.9,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t1-needle-d0.900000-s2"
+        ],
+        "request_output_token_ids_sha256": "a24c7fb7a4042e47c82e68bf87621b4df587d0192701fa0372839bdba7ac975b",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "AMBER-804",
+      "output_text_sha256": "0ffa1913259b8f76692932f77e2cd8085d190a18c4a6438f93fdb5bb61226b4b",
+      "output_token_ids": [
+        1936,
+        11471,
+        236772,
+        236828,
+        236771,
+        236812,
+        106,
+        106,
+        106,
+        1,
+        1,
+        1,
+        1,
+        106,
+        100,
+        45518,
+        107,
+        8291,
+        236789,
+        236751,
+        496,
+        6972,
+        1657,
+        531,
+        15074,
+        657,
+        506,
+        3890,
+        236787,
+        108,
+        236770,
+        236761
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "b3b8fab4741521daabe4535bc3b0103539229dbc598e873d3c125e04fe1c913c",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "b3b8fab4741521daabe4535bc3b0103539229dbc598e873d3c125e04fe1c913c",
+      "req_id": "quality-c16384-t1-needle-d0.900000-s2",
+      "request_output_token_ids_sha256": "a24c7fb7a4042e47c82e68bf87621b4df587d0192701fa0372839bdba7ac975b",
+      "score": 1.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 6,
+      "scorer_metadata": {
+        "source": "scorer.closure",
+        "value": {
+          "code": "AMBER-804"
+        }
+      },
+      "seed": 2,
+      "seed_key": "16384/t1-needle/0.9/2",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t1-needle"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.1,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t2-multikey-d0.100000-s0"
+        ],
+        "request_output_token_ids_sha256": "4410dad9c568f9ec4ce9849033c00e303b9cd82c1ce7e45f72d542292aa00db6",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "SIENNA-796",
+      "output_text_sha256": "25265d1ff334aa0bb4c3cc539767966815cd7c9719cafa9b814c723bb0212900",
+      "output_token_ids": [
+        5491,
+        1439,
+        4383,
+        236772,
+        236832,
+        236819,
+        236825,
+        106,
+        106,
+        106,
+        1,
+        106,
+        1,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "bb7b754a44801a6ad0e3eaeb27beecb1bfb5d40889b3ec0d29153beea7ec2acf",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "bb7b754a44801a6ad0e3eaeb27beecb1bfb5d40889b3ec0d29153beea7ec2acf",
+      "req_id": "quality-c16384-t2-multikey-d0.100000-s0",
+      "request_output_token_ids_sha256": "4410dad9c568f9ec4ce9849033c00e303b9cd82c1ce7e45f72d542292aa00db6",
+      "score": 1.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 7,
+      "scorer_metadata": {
+        "source": "scorer.meta",
+        "value": {
+          "facts": [
+            "The code for project Aurora is SIENNA-796. ",
+            "The code for project Bastion is AMBER-478. ",
+            "The code for project Cascade is COBALT-302. ",
+            "The code for project Driftwood is SIENNA-396. ",
+            "The code for project Ember is COBALT-403. ",
+            "The code for project Falcon is COBALT-733. ",
+            "The code for project Glacier is COBALT-637. ",
+            "The code for project Harbor is CRIMSON-889. "
+          ],
+          "target": "Aurora",
+          "values": {
+            "Aurora": "SIENNA-796",
+            "Bastion": "AMBER-478",
+            "Cascade": "COBALT-302",
+            "Driftwood": "SIENNA-396",
+            "Ember": "COBALT-403",
+            "Falcon": "COBALT-733",
+            "Glacier": "COBALT-637",
+            "Harbor": "CRIMSON-889"
+          }
+        }
+      },
+      "seed": 0,
+      "seed_key": "16384/t2-multikey/0.1/0",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t2-multikey"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.1,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t2-multikey-d0.100000-s1"
+        ],
+        "request_output_token_ids_sha256": "049a1d2a36c1d4ad9652cc42dacdb93f7c08744e2efc9f69944c4eb3fa935661",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "AMBER-313",
+      "output_text_sha256": "bdf31f63f20a2c4efce217f9dc880b06e2038732d5ceb040f1c66aa291a6abf5",
+      "output_token_ids": [
+        1936,
+        11471,
+        236772,
+        236800,
+        236770,
+        236800,
+        106,
+        106,
+        106,
+        1,
+        106,
+        1,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "783b7d1b034302fb80d45a822b8417209af751148a17d19b52b31fd73a36959b",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "783b7d1b034302fb80d45a822b8417209af751148a17d19b52b31fd73a36959b",
+      "req_id": "quality-c16384-t2-multikey-d0.100000-s1",
+      "request_output_token_ids_sha256": "049a1d2a36c1d4ad9652cc42dacdb93f7c08744e2efc9f69944c4eb3fa935661",
+      "score": 1.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 6,
+      "scorer_metadata": {
+        "source": "scorer.meta",
+        "value": {
+          "facts": [
+            "The code for project Aurora is AMBER-313. ",
+            "The code for project Bastion is COBALT-693. ",
+            "The code for project Cascade is CRIMSON-227. ",
+            "The code for project Driftwood is TEAL-236. ",
+            "The code for project Ember is AZURE-653. ",
+            "The code for project Falcon is CRIMSON-329. ",
+            "The code for project Glacier is SIENNA-479. ",
+            "The code for project Harbor is SIENNA-961. "
+          ],
+          "target": "Aurora",
+          "values": {
+            "Aurora": "AMBER-313",
+            "Bastion": "COBALT-693",
+            "Cascade": "CRIMSON-227",
+            "Driftwood": "TEAL-236",
+            "Ember": "AZURE-653",
+            "Falcon": "CRIMSON-329",
+            "Glacier": "SIENNA-479",
+            "Harbor": "SIENNA-961"
+          }
+        }
+      },
+      "seed": 1,
+      "seed_key": "16384/t2-multikey/0.1/1",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t2-multikey"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.1,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t2-multikey-d0.100000-s2"
+        ],
+        "request_output_token_ids_sha256": "954a669f82eb33ec9f2e3bf70ec5ba36341a36efaccee12ae30f49249bb63d2b",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "COBALT-529",
+      "output_text_sha256": "c0786fa6e4b652590d69fcbd5d55a0a697f3c583684b97ed1bf185a76ac0d8ac",
+      "output_token_ids": [
+        2457,
+        36269,
+        236774,
+        236772,
+        236810,
+        236778,
+        236819,
+        106,
+        106,
+        106,
+        1,
+        106,
+        1,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "6cae3cefac2ae1afd28fecfe4ab69540c705bfaf52f7f0f7479cf4301807b4e1",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "6cae3cefac2ae1afd28fecfe4ab69540c705bfaf52f7f0f7479cf4301807b4e1",
+      "req_id": "quality-c16384-t2-multikey-d0.100000-s2",
+      "request_output_token_ids_sha256": "954a669f82eb33ec9f2e3bf70ec5ba36341a36efaccee12ae30f49249bb63d2b",
+      "score": 1.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 7,
+      "scorer_metadata": {
+        "source": "scorer.meta",
+        "value": {
+          "facts": [
+            "The code for project Aurora is COBALT-529. ",
+            "The code for project Bastion is SIENNA-965. ",
+            "The code for project Cascade is SIENNA-835. ",
+            "The code for project Driftwood is SIENNA-936. ",
+            "The code for project Ember is VIOLET-529. ",
+            "The code for project Falcon is VIOLET-896. ",
+            "The code for project Glacier is IVORY-978. ",
+            "The code for project Harbor is CRIMSON-499. "
+          ],
+          "target": "Aurora",
+          "values": {
+            "Aurora": "COBALT-529",
+            "Bastion": "SIENNA-965",
+            "Cascade": "SIENNA-835",
+            "Driftwood": "SIENNA-936",
+            "Ember": "VIOLET-529",
+            "Falcon": "VIOLET-896",
+            "Glacier": "IVORY-978",
+            "Harbor": "CRIMSON-499"
+          }
+        }
+      },
+      "seed": 2,
+      "seed_key": "16384/t2-multikey/0.1/2",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t2-multikey"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.3,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t2-multikey-d0.300000-s0"
+        ],
+        "request_output_token_ids_sha256": "4b2b00422331df2df1d43c036da2443e3c59148a6ac5b3a6b9d234dc56106e83",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "AMBER-827",
+      "output_text_sha256": "626036f6364795aa24fda8bd00b2b7016278d76bf8ac01ec365fb50a600d54de",
+      "output_token_ids": [
+        1936,
+        11471,
+        236772,
+        236828,
+        236778,
+        236832,
+        106,
+        106,
+        106,
+        1,
+        106,
+        1,
+        1,
+        1,
+        1,
+        106,
+        1,
+        106,
+        1,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "73d72355241a485e0e67cf96f3c95e8b2443e5f4b98f8c0c104e6cd717f77e31",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "73d72355241a485e0e67cf96f3c95e8b2443e5f4b98f8c0c104e6cd717f77e31",
+      "req_id": "quality-c16384-t2-multikey-d0.300000-s0",
+      "request_output_token_ids_sha256": "4b2b00422331df2df1d43c036da2443e3c59148a6ac5b3a6b9d234dc56106e83",
+      "score": 1.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 6,
+      "scorer_metadata": {
+        "source": "scorer.meta",
+        "value": {
+          "facts": [
+            "The code for project Aurora is COBALT-776. ",
+            "The code for project Bastion is SIENNA-663. ",
+            "The code for project Cascade is AMBER-827. ",
+            "The code for project Driftwood is TEAL-681. ",
+            "The code for project Ember is IVORY-687. ",
+            "The code for project Falcon is AZURE-932. ",
+            "The code for project Glacier is AZURE-756. ",
+            "The code for project Harbor is AMBER-312. "
+          ],
+          "target": "Cascade",
+          "values": {
+            "Aurora": "COBALT-776",
+            "Bastion": "SIENNA-663",
+            "Cascade": "AMBER-827",
+            "Driftwood": "TEAL-681",
+            "Ember": "IVORY-687",
+            "Falcon": "AZURE-932",
+            "Glacier": "AZURE-756",
+            "Harbor": "AMBER-312"
+          }
+        }
+      },
+      "seed": 0,
+      "seed_key": "16384/t2-multikey/0.3/0",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t2-multikey"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.3,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t2-multikey-d0.300000-s1"
+        ],
+        "request_output_token_ids_sha256": "afe2ea25401e1cc61568808bebedccaa33a1434bfc9832e5f557042e6510182c",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "VIOLET-210",
+      "output_text_sha256": "ea16879eb2e25871835654c6085aa61478240d6001f987f27645724c9a9d9984",
+      "output_token_ids": [
+        236847,
+        6462,
+        25515,
+        236772,
+        236778,
+        236770,
+        236771,
+        106,
+        106,
+        106,
+        1,
+        1,
+        1,
+        1,
+        106,
+        818,
+        3393,
+        573,
+        2203,
+        111855,
+        563,
+        782,
+        6462,
+        25515,
+        236772,
+        236778,
+        236770,
+        236771,
+        236761,
+        106,
+        106,
+        106
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "ab0710f289ba66146abcd2baae785d93c494113caa86a97cd4213b2834ea9c8b",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "ab0710f289ba66146abcd2baae785d93c494113caa86a97cd4213b2834ea9c8b",
+      "req_id": "quality-c16384-t2-multikey-d0.300000-s1",
+      "request_output_token_ids_sha256": "afe2ea25401e1cc61568808bebedccaa33a1434bfc9832e5f557042e6510182c",
+      "score": 1.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 7,
+      "scorer_metadata": {
+        "source": "scorer.meta",
+        "value": {
+          "facts": [
+            "The code for project Aurora is AZURE-871. ",
+            "The code for project Bastion is AMBER-865. ",
+            "The code for project Cascade is VIOLET-210. ",
+            "The code for project Driftwood is IVORY-311. ",
+            "The code for project Ember is SIENNA-308. ",
+            "The code for project Falcon is TEAL-721. ",
+            "The code for project Glacier is COBALT-563. ",
+            "The code for project Harbor is SIENNA-342. "
+          ],
+          "target": "Cascade",
+          "values": {
+            "Aurora": "AZURE-871",
+            "Bastion": "AMBER-865",
+            "Cascade": "VIOLET-210",
+            "Driftwood": "IVORY-311",
+            "Ember": "SIENNA-308",
+            "Falcon": "TEAL-721",
+            "Glacier": "COBALT-563",
+            "Harbor": "SIENNA-342"
+          }
+        }
+      },
+      "seed": 1,
+      "seed_key": "16384/t2-multikey/0.3/1",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t2-multikey"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.3,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t2-multikey-d0.300000-s2"
+        ],
+        "request_output_token_ids_sha256": "8ba1a84b740f7f46489d48259e9a883ba8997fb19f086c3a6763de1a24276a90",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "AZURE-644",
+      "output_text_sha256": "cf72ce5b1bacc9c6eebd3f6af14c2a864c979c03d0fe366485f709332e03eb11",
+      "output_token_ids": [
+        25862,
+        7218,
+        236772,
+        236825,
+        236812,
+        236812,
+        106,
+        106,
+        106,
+        106,
+        1,
+        1,
+        1,
+        1,
+        106,
+        818,
+        3393,
+        573,
+        2203,
+        111855,
+        563,
+        45108,
+        7218,
+        236772,
+        236825,
+        236812,
+        236812,
+        236761,
+        106,
+        106,
+        106,
+        106
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "104cddfaa5caf93e7d3486927211a64e409e3f5d13a8253ae6e246c078674807",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "104cddfaa5caf93e7d3486927211a64e409e3f5d13a8253ae6e246c078674807",
+      "req_id": "quality-c16384-t2-multikey-d0.300000-s2",
+      "request_output_token_ids_sha256": "8ba1a84b740f7f46489d48259e9a883ba8997fb19f086c3a6763de1a24276a90",
+      "score": 1.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 6,
+      "scorer_metadata": {
+        "source": "scorer.meta",
+        "value": {
+          "facts": [
+            "The code for project Aurora is SIENNA-656. ",
+            "The code for project Bastion is TEAL-469. ",
+            "The code for project Cascade is AZURE-644. ",
+            "The code for project Driftwood is AMBER-732. ",
+            "The code for project Ember is AZURE-886. ",
+            "The code for project Falcon is CRIMSON-347. ",
+            "The code for project Glacier is VIOLET-345. ",
+            "The code for project Harbor is SIENNA-840. "
+          ],
+          "target": "Cascade",
+          "values": {
+            "Aurora": "SIENNA-656",
+            "Bastion": "TEAL-469",
+            "Cascade": "AZURE-644",
+            "Driftwood": "AMBER-732",
+            "Ember": "AZURE-886",
+            "Falcon": "CRIMSON-347",
+            "Glacier": "VIOLET-345",
+            "Harbor": "SIENNA-840"
+          }
+        }
+      },
+      "seed": 2,
+      "seed_key": "16384/t2-multikey/0.3/2",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t2-multikey"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.5,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t2-multikey-d0.500000-s0"
+        ],
+        "request_output_token_ids_sha256": "526c1ed6f0abe0ab7aa7c372e08e4cadd707a19a67fc85a8c7e2fe33301b4ba4",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "SIENNA-844",
+      "output_text_sha256": "1a0227df33659c694c499404d3db6faba6581bb2e0466100c5e788b9ec0ca096",
+      "output_token_ids": [
+        5491,
+        1439,
+        4383,
+        236772,
+        236828,
+        236812,
+        236812,
+        106,
+        106,
+        106,
+        106,
+        1,
+        1,
+        1,
+        1,
+        106,
+        818,
+        3393,
+        573,
+        2203,
+        120555,
+        5168,
+        563,
+        24732,
+        1439,
+        4383,
+        236772,
+        236828,
+        236812,
+        236812,
+        236761,
+        106
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "1f345826116dcb6a968cfc8a52b43c6acf00b32f1b0189d59692fadf512ffb34",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "1f345826116dcb6a968cfc8a52b43c6acf00b32f1b0189d59692fadf512ffb34",
+      "req_id": "quality-c16384-t2-multikey-d0.500000-s0",
+      "request_output_token_ids_sha256": "526c1ed6f0abe0ab7aa7c372e08e4cadd707a19a67fc85a8c7e2fe33301b4ba4",
+      "score": 1.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 7,
+      "scorer_metadata": {
+        "source": "scorer.meta",
+        "value": {
+          "facts": [
+            "The code for project Aurora is TEAL-837. ",
+            "The code for project Bastion is CRIMSON-731. ",
+            "The code for project Cascade is COBALT-144. ",
+            "The code for project Driftwood is SIENNA-844. ",
+            "The code for project Ember is TEAL-498. ",
+            "The code for project Falcon is AZURE-892. ",
+            "The code for project Glacier is AMBER-338. ",
+            "The code for project Harbor is AMBER-273. "
+          ],
+          "target": "Driftwood",
+          "values": {
+            "Aurora": "TEAL-837",
+            "Bastion": "CRIMSON-731",
+            "Cascade": "COBALT-144",
+            "Driftwood": "SIENNA-844",
+            "Ember": "TEAL-498",
+            "Falcon": "AZURE-892",
+            "Glacier": "AMBER-338",
+            "Harbor": "AMBER-273"
+          }
+        }
+      },
+      "seed": 0,
+      "seed_key": "16384/t2-multikey/0.5/0",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t2-multikey"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.5,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t2-multikey-d0.500000-s1"
+        ],
+        "request_output_token_ids_sha256": "5361df3f793f130b9834ea91e2096be8c115d1e218b83e469f13b40b401e9047",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "AZURE-591",
+      "output_text_sha256": "b6c96a10a4113fc00c73c0046f353b34b8c24f9fc5e9cc9a732e5f1aa285bfe1",
+      "output_token_ids": [
+        25862,
+        7218,
+        236772,
+        236810,
+        236819,
+        236770,
+        106,
+        106,
+        106,
+        106,
+        1,
+        1,
+        1,
+        1,
+        106,
+        818,
+        3393,
+        573,
+        2203,
+        120555,
+        5168,
+        563,
+        45108,
+        7218,
+        236772,
+        236810,
+        236819,
+        236770,
+        236761,
+        106,
+        106,
+        106
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "32f5e727d6e682cc963b1fc1831e10204cdb25b6db7a294833561ba062dcee53",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "32f5e727d6e682cc963b1fc1831e10204cdb25b6db7a294833561ba062dcee53",
+      "req_id": "quality-c16384-t2-multikey-d0.500000-s1",
+      "request_output_token_ids_sha256": "5361df3f793f130b9834ea91e2096be8c115d1e218b83e469f13b40b401e9047",
+      "score": 1.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 6,
+      "scorer_metadata": {
+        "source": "scorer.meta",
+        "value": {
+          "facts": [
+            "The code for project Aurora is COBALT-441. ",
+            "The code for project Bastion is AMBER-696. ",
+            "The code for project Cascade is CRIMSON-416. ",
+            "The code for project Driftwood is AZURE-591. ",
+            "The code for project Ember is AMBER-745. ",
+            "The code for project Falcon is COBALT-882. ",
+            "The code for project Glacier is COBALT-682. ",
+            "The code for project Harbor is TEAL-242. "
+          ],
+          "target": "Driftwood",
+          "values": {
+            "Aurora": "COBALT-441",
+            "Bastion": "AMBER-696",
+            "Cascade": "CRIMSON-416",
+            "Driftwood": "AZURE-591",
+            "Ember": "AMBER-745",
+            "Falcon": "COBALT-882",
+            "Glacier": "COBALT-682",
+            "Harbor": "TEAL-242"
+          }
+        }
+      },
+      "seed": 1,
+      "seed_key": "16384/t2-multikey/0.5/1",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t2-multikey"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.5,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t2-multikey-d0.500000-s2"
+        ],
+        "request_output_token_ids_sha256": "b27d23aa389d088413089d14883cb7e56362831cadae7df27c6961ff2ef60bd2",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "CRIMSON-983",
+      "output_text_sha256": "b4fdb2fc81653ab2e72bdc8f60de12d8f0f149a2e540220089fdb585052942d7",
+      "output_token_ids": [
+        6459,
+        2783,
+        5430,
+        236772,
+        236819,
+        236828,
+        236800,
+        106,
+        106,
+        106,
+        1,
+        106,
+        107,
+        1,
+        5610,
+        1989,
+        236772,
+        236810,
+        236810,
+        236810,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "abad54ef6c16040f44fb60e817cd2c104468286075bd7fb173998b533920d3d8",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "abad54ef6c16040f44fb60e817cd2c104468286075bd7fb173998b533920d3d8",
+      "req_id": "quality-c16384-t2-multikey-d0.500000-s2",
+      "request_output_token_ids_sha256": "b27d23aa389d088413089d14883cb7e56362831cadae7df27c6961ff2ef60bd2",
+      "score": 0.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 7,
+      "scorer_metadata": {
+        "source": "scorer.meta",
+        "value": {
+          "facts": [
+            "The code for project Aurora is SIENNA-904. ",
+            "The code for project Bastion is VIOLET-964. ",
+            "The code for project Cascade is CRIMSON-983. ",
+            "The code for project Driftwood is COBALT-929. ",
+            "The code for project Ember is AMBER-534. ",
+            "The code for project Falcon is AMBER-176. ",
+            "The code for project Glacier is AZURE-170. ",
+            "The code for project Harbor is IVORY-811. "
+          ],
+          "target": "Driftwood",
+          "values": {
+            "Aurora": "SIENNA-904",
+            "Bastion": "VIOLET-964",
+            "Cascade": "CRIMSON-983",
+            "Driftwood": "COBALT-929",
+            "Ember": "AMBER-534",
+            "Falcon": "AMBER-176",
+            "Glacier": "AZURE-170",
+            "Harbor": "IVORY-811"
+          }
+        }
+      },
+      "seed": 2,
+      "seed_key": "16384/t2-multikey/0.5/2",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t2-multikey"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.7,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t2-multikey-d0.700000-s0"
+        ],
+        "request_output_token_ids_sha256": "17b8db330a721f1dfecc01fd1445a9ff88491ffadeb144c0b2462f4c62999769",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "TEAL-788",
+      "output_text_sha256": "7655e9888a8bd9032722459bcdf0161263194fcbd12ec1ff0916e70e841dce48",
+      "output_token_ids": [
+        5270,
+        1565,
+        236772,
+        236832,
+        236828,
+        236828,
+        106,
+        106,
+        106,
+        1,
+        106,
+        1,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "2af0def0e805ea6b919b540eb0af4e8b6ebe4f87298a81cf8995bd4ddfda88dc",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "2af0def0e805ea6b919b540eb0af4e8b6ebe4f87298a81cf8995bd4ddfda88dc",
+      "req_id": "quality-c16384-t2-multikey-d0.700000-s0",
+      "request_output_token_ids_sha256": "17b8db330a721f1dfecc01fd1445a9ff88491ffadeb144c0b2462f4c62999769",
+      "score": 1.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 6,
+      "scorer_metadata": {
+        "source": "scorer.meta",
+        "value": {
+          "facts": [
+            "The code for project Aurora is SIENNA-192. ",
+            "The code for project Bastion is VIOLET-515. ",
+            "The code for project Cascade is IVORY-636. ",
+            "The code for project Driftwood is VIOLET-664. ",
+            "The code for project Ember is SIENNA-201. ",
+            "The code for project Falcon is TEAL-788. ",
+            "The code for project Glacier is AMBER-233. ",
+            "The code for project Harbor is SIENNA-685. "
+          ],
+          "target": "Falcon",
+          "values": {
+            "Aurora": "SIENNA-192",
+            "Bastion": "VIOLET-515",
+            "Cascade": "IVORY-636",
+            "Driftwood": "VIOLET-664",
+            "Ember": "SIENNA-201",
+            "Falcon": "TEAL-788",
+            "Glacier": "AMBER-233",
+            "Harbor": "SIENNA-685"
+          }
+        }
+      },
+      "seed": 0,
+      "seed_key": "16384/t2-multikey/0.7/0",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t2-multikey"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.7,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t2-multikey-d0.700000-s1"
+        ],
+        "request_output_token_ids_sha256": "65a22de07307cf925d75076c5536b9feec80057fd175d1f55d352aec0a07b492",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "VIOLET-654",
+      "output_text_sha256": "3049761c1325362178896168cc0883891a510349b3f77a1556b487dd698371d2",
+      "output_token_ids": [
+        236847,
+        6462,
+        25515,
+        236772,
+        236825,
+        236810,
+        236812,
+        106,
+        1,
+        1,
+        1,
+        1,
+        1,
+        106,
+        107,
+        1,
+        106,
+        107,
+        1,
+        106,
+        107,
+        1,
+        106,
+        107,
+        1,
+        106,
+        107,
+        1,
+        106,
+        107,
+        1,
+        106
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "395803951cd00ce04bc7516ee30f7ce78e2e9b254c8560382f606438f27a4231",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "395803951cd00ce04bc7516ee30f7ce78e2e9b254c8560382f606438f27a4231",
+      "req_id": "quality-c16384-t2-multikey-d0.700000-s1",
+      "request_output_token_ids_sha256": "65a22de07307cf925d75076c5536b9feec80057fd175d1f55d352aec0a07b492",
+      "score": 0.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 7,
+      "scorer_metadata": {
+        "source": "scorer.meta",
+        "value": {
+          "facts": [
+            "The code for project Aurora is VIOLET-654. ",
+            "The code for project Bastion is CRIMSON-995. ",
+            "The code for project Cascade is AZURE-657. ",
+            "The code for project Driftwood is AMBER-825. ",
+            "The code for project Ember is AMBER-245. ",
+            "The code for project Falcon is VIOLET-624. ",
+            "The code for project Glacier is COBALT-565. ",
+            "The code for project Harbor is IVORY-407. "
+          ],
+          "target": "Falcon",
+          "values": {
+            "Aurora": "VIOLET-654",
+            "Bastion": "CRIMSON-995",
+            "Cascade": "AZURE-657",
+            "Driftwood": "AMBER-825",
+            "Ember": "AMBER-245",
+            "Falcon": "VIOLET-624",
+            "Glacier": "COBALT-565",
+            "Harbor": "IVORY-407"
+          }
+        }
+      },
+      "seed": 1,
+      "seed_key": "16384/t2-multikey/0.7/1",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t2-multikey"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.7,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t2-multikey-d0.700000-s2"
+        ],
+        "request_output_token_ids_sha256": "bdea4b41dbefc9285a91eca3bddcd9dd7b0c8e337b5cad143e0502360c7ba47a",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "COBALT-464",
+      "output_text_sha256": "73b3040cf6a8e74eda0c9bbadf9c0c109fbfd896e49fa249cd87e8815d7808f5",
+      "output_token_ids": [
+        2457,
+        36269,
+        236774,
+        236772,
+        236812,
+        236825,
+        236812,
+        106,
+        106,
+        106,
+        1,
+        106,
+        1,
+        1,
+        1,
+        1,
+        106,
+        1,
+        106,
+        1,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "09211609da38af68a16a224a69366acdbc0096938c10db8a76c24b5dbcf83b27",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "09211609da38af68a16a224a69366acdbc0096938c10db8a76c24b5dbcf83b27",
+      "req_id": "quality-c16384-t2-multikey-d0.700000-s2",
+      "request_output_token_ids_sha256": "bdea4b41dbefc9285a91eca3bddcd9dd7b0c8e337b5cad143e0502360c7ba47a",
+      "score": 1.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 7,
+      "scorer_metadata": {
+        "source": "scorer.meta",
+        "value": {
+          "facts": [
+            "The code for project Aurora is CRIMSON-841. ",
+            "The code for project Bastion is SIENNA-463. ",
+            "The code for project Cascade is SIENNA-648. ",
+            "The code for project Driftwood is TEAL-432. ",
+            "The code for project Ember is TEAL-133. ",
+            "The code for project Falcon is COBALT-464. ",
+            "The code for project Glacier is IVORY-858. ",
+            "The code for project Harbor is AMBER-484. "
+          ],
+          "target": "Falcon",
+          "values": {
+            "Aurora": "CRIMSON-841",
+            "Bastion": "SIENNA-463",
+            "Cascade": "SIENNA-648",
+            "Driftwood": "TEAL-432",
+            "Ember": "TEAL-133",
+            "Falcon": "COBALT-464",
+            "Glacier": "IVORY-858",
+            "Harbor": "AMBER-484"
+          }
+        }
+      },
+      "seed": 2,
+      "seed_key": "16384/t2-multikey/0.7/2",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t2-multikey"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.9,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t2-multikey-d0.900000-s0"
+        ],
+        "request_output_token_ids_sha256": "a269161f63d0ed848f389833277781548490763b9069d6ed02a191c326616b76",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "AZURE-217",
+      "output_text_sha256": "e4393f4f55581db85c3430935f0c94ff4ec8f2ebbab082195dec6a3f6bfb3189",
+      "output_token_ids": [
+        25862,
+        7218,
+        236772,
+        236778,
+        236770,
+        236832,
+        106,
+        106,
+        106,
+        1,
+        106,
+        1,
+        1,
+        1,
+        1,
+        106,
+        1,
+        106,
+        1,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106,
+        106
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "2bfe872cfa3ae8fbf5400ded2641a43a10abad14fba25e41990d6c6fc4ce8a93",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "2bfe872cfa3ae8fbf5400ded2641a43a10abad14fba25e41990d6c6fc4ce8a93",
+      "req_id": "quality-c16384-t2-multikey-d0.900000-s0",
+      "request_output_token_ids_sha256": "a269161f63d0ed848f389833277781548490763b9069d6ed02a191c326616b76",
+      "score": 1.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 6,
+      "scorer_metadata": {
+        "source": "scorer.meta",
+        "value": {
+          "facts": [
+            "The code for project Aurora is AMBER-192. ",
+            "The code for project Bastion is IVORY-424. ",
+            "The code for project Cascade is SIENNA-619. ",
+            "The code for project Driftwood is VIOLET-690. ",
+            "The code for project Ember is VIOLET-692. ",
+            "The code for project Falcon is AZURE-973. ",
+            "The code for project Glacier is IVORY-680. ",
+            "The code for project Harbor is AZURE-217. "
+          ],
+          "target": "Harbor",
+          "values": {
+            "Aurora": "AMBER-192",
+            "Bastion": "IVORY-424",
+            "Cascade": "SIENNA-619",
+            "Driftwood": "VIOLET-690",
+            "Ember": "VIOLET-692",
+            "Falcon": "AZURE-973",
+            "Glacier": "IVORY-680",
+            "Harbor": "AZURE-217"
+          }
+        }
+      },
+      "seed": 0,
+      "seed_key": "16384/t2-multikey/0.9/0",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t2-multikey"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.9,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t2-multikey-d0.900000-s1"
+        ],
+        "request_output_token_ids_sha256": "11f4491e50c8d8a9f7ece589c1bd06585d35bd741ea9732962101b67b0f7ba08",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "IVORY-174",
+      "output_text_sha256": "ccdb657f5424681bfe047cedfaaa23701c86f8cbc101922d8459547e5941e147",
+      "output_token_ids": [
+        3767,
+        15681,
+        236772,
+        236770,
+        236832,
+        236812,
+        106,
+        106,
+        106,
+        106,
+        1,
+        106,
+        1,
+        1,
+        1,
+        106,
+        236786,
+        106,
+        236786,
+        106,
+        236786,
+        106,
+        236786,
+        106,
+        236786,
+        106,
+        236786,
+        106,
+        236786,
+        106,
+        236786,
+        106
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "4fe2e45c76662cf9d4e36ae2bbfd75d7a6d16ef9eafc74a472abd37ac9fd6a2c",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "4fe2e45c76662cf9d4e36ae2bbfd75d7a6d16ef9eafc74a472abd37ac9fd6a2c",
+      "req_id": "quality-c16384-t2-multikey-d0.900000-s1",
+      "request_output_token_ids_sha256": "11f4491e50c8d8a9f7ece589c1bd06585d35bd741ea9732962101b67b0f7ba08",
+      "score": 1.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 6,
+      "scorer_metadata": {
+        "source": "scorer.meta",
+        "value": {
+          "facts": [
+            "The code for project Aurora is TEAL-497. ",
+            "The code for project Bastion is SIENNA-901. ",
+            "The code for project Cascade is CRIMSON-585. ",
+            "The code for project Driftwood is VIOLET-792. ",
+            "The code for project Ember is VIOLET-419. ",
+            "The code for project Falcon is AMBER-445. ",
+            "The code for project Glacier is IVORY-447. ",
+            "The code for project Harbor is IVORY-174. "
+          ],
+          "target": "Harbor",
+          "values": {
+            "Aurora": "TEAL-497",
+            "Bastion": "SIENNA-901",
+            "Cascade": "CRIMSON-585",
+            "Driftwood": "VIOLET-792",
+            "Ember": "VIOLET-419",
+            "Falcon": "AMBER-445",
+            "Glacier": "IVORY-447",
+            "Harbor": "IVORY-174"
+          }
+        }
+      },
+      "seed": 1,
+      "seed_key": "16384/t2-multikey/0.9/1",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t2-multikey"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.9,
+      "generated_output_fingerprint": {
+        "output_token_count": 32,
+        "output_token_counts": [
+          32
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t2-multikey-d0.900000-s2"
+        ],
+        "request_output_token_ids_sha256": "fe79118b947daa0fc64507cc0c552ac884a919fb9ed70dc7505bac01fca7f49a",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 32,
+      "output_text": "AMBER-515",
+      "output_text_sha256": "47560e7841d4cce23976f32b7dc92ecdd2c072e8c4a162bb5f9eca525b0f4d77",
+      "output_token_ids": [
+        1936,
+        11471,
+        236772,
+        236810,
+        236770,
+        236810,
+        106,
+        106,
+        106,
+        106,
+        1,
+        1,
+        1,
+        1,
+        106,
+        818,
+        3393,
+        573,
+        2203,
+        38406,
+        563,
+        8151,
+        11471,
+        236772,
+        236810,
+        236770,
+        236810,
+        236761,
+        106,
+        106,
+        106,
+        106
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "89cddcb9871ae5762c6bd7abfd9360d4d81073def3b37b7d9aaac5559343c330",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "89cddcb9871ae5762c6bd7abfd9360d4d81073def3b37b7d9aaac5559343c330",
+      "req_id": "quality-c16384-t2-multikey-d0.900000-s2",
+      "request_output_token_ids_sha256": "fe79118b947daa0fc64507cc0c552ac884a919fb9ed70dc7505bac01fca7f49a",
+      "score": 1.0,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 6,
+      "scorer_metadata": {
+        "source": "scorer.meta",
+        "value": {
+          "facts": [
+            "The code for project Aurora is COBALT-922. ",
+            "The code for project Bastion is IVORY-969. ",
+            "The code for project Cascade is VIOLET-991. ",
+            "The code for project Driftwood is COBALT-227. ",
+            "The code for project Ember is AZURE-533. ",
+            "The code for project Falcon is CRIMSON-799. ",
+            "The code for project Glacier is COBALT-652. ",
+            "The code for project Harbor is AMBER-515. "
+          ],
+          "target": "Harbor",
+          "values": {
+            "Aurora": "COBALT-922",
+            "Bastion": "IVORY-969",
+            "Cascade": "VIOLET-991",
+            "Driftwood": "COBALT-227",
+            "Ember": "AZURE-533",
+            "Falcon": "CRIMSON-799",
+            "Glacier": "COBALT-652",
+            "Harbor": "AMBER-515"
+          }
+        }
+      },
+      "seed": 2,
+      "seed_key": "16384/t2-multikey/0.9/2",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t2-multikey"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.1,
+      "generated_output_fingerprint": {
+        "output_token_count": 48,
+        "output_token_counts": [
+          48
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t3-aggregate-d0.100000-s0"
+        ],
+        "request_output_token_ids_sha256": "2cc8d3d70b3141baf35b04b9efad83bf1f29805356b060382d3d3f8e1deba4b8",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 48,
+      "output_text": "The items on the expedition checklist mentioned in the text are:\n\n1. **theremin**\n2. **sextant**\n3. **chalice**\n4. **astrolabe**\n5. **abacus**",
+      "output_text_sha256": "3ded4eb9adf0ae99792665627b8ca3f2b1afc15751c3511d1c0c84923ba4c62d",
+      "output_token_ids": [
+        818,
+        4852,
+        580,
+        506,
+        46574,
+        60218,
+        6950,
+        528,
+        506,
+        1816,
+        659,
+        236787,
+        108,
+        236770,
+        236761,
+        5213,
+        839,
+        31127,
+        1018,
+        107,
+        236778,
+        236761,
+        5213,
+        175048,
+        638,
+        1018,
+        107,
+        236800,
+        236761,
+        5213,
+        73770,
+        762,
+        1018,
+        107,
+        236812,
+        236761,
+        5213,
+        752,
+        1427,
+        7964,
+        1018,
+        107,
+        236810,
+        236761,
+        5213,
+        596,
+        76215,
+        1018
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "80bf45cd133367c89168e57a25dfcdac6fd604a69fdce2a1e7b57fe0f3366d65",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "80bf45cd133367c89168e57a25dfcdac6fd604a69fdce2a1e7b57fe0f3366d65",
+      "req_id": "quality-c16384-t3-aggregate-d0.100000-s0",
+      "request_output_token_ids_sha256": "2cc8d3d70b3141baf35b04b9efad83bf1f29805356b060382d3d3f8e1deba4b8",
+      "score": 0.8333333333333334,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 48,
+      "scorer_metadata": {
+        "source": "scorer.closure",
+        "value": {
+          "items": [
+            "theremin",
+            "sextant",
+            "chalice",
+            "astrolabe",
+            "abacus",
+            "monocle"
+          ]
+        }
+      },
+      "seed": 0,
+      "seed_key": "16384/t3-aggregate/0.1/0",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t3-aggregate"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.3,
+      "generated_output_fingerprint": {
+        "output_token_count": 48,
+        "output_token_counts": [
+          48
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t3-aggregate-d0.300000-s0"
+        ],
+        "request_output_token_ids_sha256": "fbe46d282e66707ca95f2c59a4cf7d2390f274d1f9962048d39b66f18e37519d",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 48,
+      "output_text": "The items on the expedition checklist mentioned in the text are:\n\n1. **abacus**\n2. **spyglass**\n3. **theremin**\n4. **gyroscope**\n5. **astrolabe**",
+      "output_text_sha256": "61c3a62a923ff95dbdb45d4e62bd4d340a6525c81da8192d4bf5c1469ee27003",
+      "output_token_ids": [
+        818,
+        4852,
+        580,
+        506,
+        46574,
+        60218,
+        6950,
+        528,
+        506,
+        1816,
+        659,
+        236787,
+        108,
+        236770,
+        236761,
+        5213,
+        596,
+        76215,
+        1018,
+        107,
+        236778,
+        236761,
+        5213,
+        38401,
+        22667,
+        1018,
+        107,
+        236800,
+        236761,
+        5213,
+        839,
+        31127,
+        1018,
+        107,
+        236812,
+        236761,
+        5213,
+        177308,
+        10470,
+        1018,
+        107,
+        236810,
+        236761,
+        5213,
+        752,
+        1427,
+        7964,
+        1018
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "24d2614310c55569dec0d5178d9741b3b0fc127881c33a83bd7f4b6130d253f8",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "24d2614310c55569dec0d5178d9741b3b0fc127881c33a83bd7f4b6130d253f8",
+      "req_id": "quality-c16384-t3-aggregate-d0.300000-s0",
+      "request_output_token_ids_sha256": "fbe46d282e66707ca95f2c59a4cf7d2390f274d1f9962048d39b66f18e37519d",
+      "score": 0.8333333333333334,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 48,
+      "scorer_metadata": {
+        "source": "scorer.closure",
+        "value": {
+          "items": [
+            "abacus",
+            "spyglass",
+            "theremin",
+            "sextant",
+            "gyroscope",
+            "astrolabe"
+          ]
+        }
+      },
+      "seed": 0,
+      "seed_key": "16384/t3-aggregate/0.3/0",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t3-aggregate"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.5,
+      "generated_output_fingerprint": {
+        "output_token_count": 48,
+        "output_token_counts": [
+          48
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t3-aggregate-d0.500000-s0"
+        ],
+        "request_output_token_ids_sha256": "f7fa5e46a7c49447630d5f818059bec89bc4178f835ad06fc4c902d86092ff7a",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 48,
+      "output_text": "The items on the expedition checklist mentioned in the text are:\n\n1. **gyroscope**\n2. **hourglass**\n3. **theremin**\n4. **abacus**\n5. **theremin** (listed",
+      "output_text_sha256": "2e5b8eb366b3031d82eaa4c3eca6d6d5eb52e8e82882a729084f9ca1063c400b",
+      "output_token_ids": [
+        818,
+        4852,
+        580,
+        506,
+        46574,
+        60218,
+        6950,
+        528,
+        506,
+        1816,
+        659,
+        236787,
+        108,
+        236770,
+        236761,
+        5213,
+        177308,
+        10470,
+        1018,
+        107,
+        236778,
+        236761,
+        5213,
+        81176,
+        1018,
+        107,
+        236800,
+        236761,
+        5213,
+        839,
+        31127,
+        1018,
+        107,
+        236812,
+        236761,
+        5213,
+        596,
+        76215,
+        1018,
+        107,
+        236810,
+        236761,
+        5213,
+        839,
+        31127,
+        1018,
+        568,
+        34807
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "62d014e76750c368125c444a118dc5e02fb350a22f6913fa2c972d1afcc7eeca",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "62d014e76750c368125c444a118dc5e02fb350a22f6913fa2c972d1afcc7eeca",
+      "req_id": "quality-c16384-t3-aggregate-d0.500000-s0",
+      "request_output_token_ids_sha256": "f7fa5e46a7c49447630d5f818059bec89bc4178f835ad06fc4c902d86092ff7a",
+      "score": 0.6666666666666666,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 48,
+      "scorer_metadata": {
+        "source": "scorer.closure",
+        "value": {
+          "items": [
+            "gyroscope",
+            "chalice",
+            "hourglass",
+            "barometer",
+            "theremin",
+            "abacus"
+          ]
+        }
+      },
+      "seed": 0,
+      "seed_key": "16384/t3-aggregate/0.5/0",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t3-aggregate"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.7,
+      "generated_output_fingerprint": {
+        "output_token_count": 48,
+        "output_token_counts": [
+          48
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t3-aggregate-d0.700000-s0"
+        ],
+        "request_output_token_ids_sha256": "8254993a883b241d1541c34f2c34b95d86c163e8d6a81ebd27792ed3dfc2f688",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 48,
+      "output_text": "The items on the expedition checklist mentioned in the text are:\n\n1. **astrolabe**\n2. **theremin**\n3. **chalice**\n4. **abacus**\n5. **Item 6",
+      "output_text_sha256": "44c193a27ee303a77c729b29347e020564914fba98252de2174d9dc742270270",
+      "output_token_ids": [
+        818,
+        4852,
+        580,
+        506,
+        46574,
+        60218,
+        6950,
+        528,
+        506,
+        1816,
+        659,
+        236787,
+        108,
+        236770,
+        236761,
+        5213,
+        752,
+        1427,
+        7964,
+        1018,
+        107,
+        236778,
+        236761,
+        5213,
+        839,
+        31127,
+        1018,
+        107,
+        236800,
+        236761,
+        5213,
+        73770,
+        762,
+        1018,
+        107,
+        236812,
+        236761,
+        5213,
+        596,
+        76215,
+        1018,
+        107,
+        236810,
+        236761,
+        5213,
+        2912,
+        236743,
+        236825
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "457cc38cdcc9750fb3275cf24cd003f306cd88348a1156dd23e9fd8dd0047f40",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "457cc38cdcc9750fb3275cf24cd003f306cd88348a1156dd23e9fd8dd0047f40",
+      "req_id": "quality-c16384-t3-aggregate-d0.700000-s0",
+      "request_output_token_ids_sha256": "8254993a883b241d1541c34f2c34b95d86c163e8d6a81ebd27792ed3dfc2f688",
+      "score": 0.6666666666666666,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 48,
+      "scorer_metadata": {
+        "source": "scorer.closure",
+        "value": {
+          "items": [
+            "astrolabe",
+            "theremin",
+            "chalice",
+            "abacus",
+            "hourglass",
+            "barometer"
+          ]
+        }
+      },
+      "seed": 0,
+      "seed_key": "16384/t3-aggregate/0.7/0",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t3-aggregate"
+    },
+    {
+      "context_tokens": 16384,
+      "depth": 0.9,
+      "generated_output_fingerprint": {
+        "output_token_count": 48,
+        "output_token_counts": [
+          48
+        ],
+        "request_count": 1,
+        "request_ids": [
+          "quality-c16384-t3-aggregate-d0.900000-s0"
+        ],
+        "request_output_token_ids_sha256": "f89c84d956a2780fac6fb9499ebc82cf0ff4001eb97f6e636e70ed38fd4afb05",
+        "schema": "wkvm.generated_output_token_ids.sha256.v1"
+      },
+      "max_new_tokens": 48,
+      "output_text": "The items on the expedition checklist mentioned in the text are:\n\n1. **astrolabe**\n2. **chalice**\n3. **gyroscope**\n4. **barometer**\n5. **spyglass**",
+      "output_text_sha256": "82e62542a851188955f62430f31153a69c2d29648da0cf06f46fc0a7e22646d4",
+      "output_token_ids": [
+        818,
+        4852,
+        580,
+        506,
+        46574,
+        60218,
+        6950,
+        528,
+        506,
+        1816,
+        659,
+        236787,
+        108,
+        236770,
+        236761,
+        5213,
+        752,
+        1427,
+        7964,
+        1018,
+        107,
+        236778,
+        236761,
+        5213,
+        73770,
+        762,
+        1018,
+        107,
+        236800,
+        236761,
+        5213,
+        177308,
+        10470,
+        1018,
+        107,
+        236812,
+        236761,
+        5213,
+        2230,
+        12923,
+        1018,
+        107,
+        236810,
+        236761,
+        5213,
+        38401,
+        22667,
+        1018
+      ],
+      "prompt_fingerprint": {
+        "prompt_count": 1,
+        "prompt_lengths": [
+          16384
+        ],
+        "prompt_token_ids_sha256": "617f4e622cfc12dc225aa1f6155ac2d01e7c6adc4b9c7f2fa40dc3b80fd58b3f",
+        "prompt_token_source": "hf_tokenizer",
+        "prompt_total_tokens": 16384,
+        "schema": "wkvm.prompt_token_ids.sha256.v1"
+      },
+      "prompt_token_ids_sha256": "617f4e622cfc12dc225aa1f6155ac2d01e7c6adc4b9c7f2fa40dc3b80fd58b3f",
+      "req_id": "quality-c16384-t3-aggregate-d0.900000-s0",
+      "request_output_token_ids_sha256": "f89c84d956a2780fac6fb9499ebc82cf0ff4001eb97f6e636e70ed38fd4afb05",
+      "score": 0.8333333333333334,
+      "score_error": null,
+      "score_stop_token_ids": [
+        1,
+        106
+      ],
+      "scored_output_token_count": 48,
+      "scorer_metadata": {
+        "source": "scorer.closure",
+        "value": {
+          "items": [
+            "astrolabe",
+            "chalice",
+            "gyroscope",
+            "barometer",
+            "spyglass",
+            "abacus"
+          ]
+        }
+      },
+      "seed": 0,
+      "seed_key": "16384/t3-aggregate/0.9/0",
+      "status": "finished_length",
+      "successful": true,
+      "task": "t3-aggregate"
+    }
+  ],
+  "runtime_seconds": 89.4246368439999,
+  "runtime_validation": {
+    "batched_prefill_expected": true,
+    "batched_prefill_observed": true,
+    "benchmark_shape_observed": true,
+    "benchmark_shape_required": false,
+    "fold_expected": true,
+    "fold_observed": true,
+    "native_checkpoint_and_forward_proven": true,
+    "passed": true,
+    "pending_tail_bounded": true,
+    "request_trace_contract_observed": true,
+    "violations": [],
+    "winning_path_configured": true
+  },
+  "schema": "wkvm.native_gemma_quality.v1",
+  "scoring": {
+    "generation": "greedy_fixed_length",
+    "method": "legacy_substring_scorers",
+    "score_stop_token_ids": [
+      1,
+      106
+    ]
+  },
+  "summary": {
+    "by_task": {
+      "t1-needle": {
+        "case_count": 15,
+        "mean_score": 1.0,
+        "minimum_score": 1.0,
+        "scored_count": 15,
+        "successful_count": 15
+      },
+      "t2-multikey": {
+        "case_count": 15,
+        "mean_score": 0.8666666666666667,
+        "minimum_score": 0.0,
+        "scored_count": 15,
+        "successful_count": 15
+      },
+      "t3-aggregate": {
+        "case_count": 5,
+        "mean_score": 0.7666666666666667,
+        "minimum_score": 0.6666666666666666,
+        "scored_count": 5,
+        "successful_count": 5
+      }
+    },
+    "case_count": 35,
+    "cell_count": 15,
+    "cells": [
+      {
+        "case_count": 3,
+        "context_tokens": 16384,
+        "depth": 0.1,
+        "mean_score": 1.0,
+        "minimum_score": 1.0,
+        "scored_count": 3,
+        "successful_count": 3,
+        "task": "t1-needle"
+      },
+      {
+        "case_count": 3,
+        "context_tokens": 16384,
+        "depth": 0.3,
+        "mean_score": 1.0,
+        "minimum_score": 1.0,
+        "scored_count": 3,
+        "successful_count": 3,
+        "task": "t1-needle"
+      },
+      {
+        "case_count": 3,
+        "context_tokens": 16384,
+        "depth": 0.5,
+        "mean_score": 1.0,
+        "minimum_score": 1.0,
+        "scored_count": 3,
+        "successful_count": 3,
+        "task": "t1-needle"
+      },
+      {
+        "case_count": 3,
+        "context_tokens": 16384,
+        "depth": 0.7,
+        "mean_score": 1.0,
+        "minimum_score": 1.0,
+        "scored_count": 3,
+        "successful_count": 3,
+        "task": "t1-needle"
+      },
+      {
+        "case_count": 3,
+        "context_tokens": 16384,
+        "depth": 0.9,
+        "mean_score": 1.0,
+        "minimum_score": 1.0,
+        "scored_count": 3,
+        "successful_count": 3,
+        "task": "t1-needle"
+      },
+      {
+        "case_count": 3,
+        "context_tokens": 16384,
+        "depth": 0.1,
+        "mean_score": 1.0,
+        "minimum_score": 1.0,
+        "scored_count": 3,
+        "successful_count": 3,
+        "task": "t2-multikey"
+      },
+      {
+        "case_count": 3,
+        "context_tokens": 16384,
+        "depth": 0.3,
+        "mean_score": 1.0,
+        "minimum_score": 1.0,
+        "scored_count": 3,
+        "successful_count": 3,
+        "task": "t2-multikey"
+      },
+      {
+        "case_count": 3,
+        "context_tokens": 16384,
+        "depth": 0.5,
+        "mean_score": 0.6666666666666666,
+        "minimum_score": 0.0,
+        "scored_count": 3,
+        "successful_count": 3,
+        "task": "t2-multikey"
+      },
+      {
+        "case_count": 3,
+        "context_tokens": 16384,
+        "depth": 0.7,
+        "mean_score": 0.6666666666666666,
+        "minimum_score": 0.0,
+        "scored_count": 3,
+        "successful_count": 3,
+        "task": "t2-multikey"
+      },
+      {
+        "case_count": 3,
+        "context_tokens": 16384,
+        "depth": 0.9,
+        "mean_score": 1.0,
+        "minimum_score": 1.0,
+        "scored_count": 3,
+        "successful_count": 3,
+        "task": "t2-multikey"
+      },
+      {
+        "case_count": 1,
+        "context_tokens": 16384,
+        "depth": 0.1,
+        "mean_score": 0.8333333333333334,
+        "minimum_score": 0.8333333333333334,
+        "scored_count": 1,
+        "successful_count": 1,
+        "task": "t3-aggregate"
+      },
+      {
+        "case_count": 1,
+        "context_tokens": 16384,
+        "depth": 0.3,
+        "mean_score": 0.8333333333333334,
+        "minimum_score": 0.8333333333333334,
+        "scored_count": 1,
+        "successful_count": 1,
+        "task": "t3-aggregate"
+      },
+      {
+        "case_count": 1,
+        "context_tokens": 16384,
+        "depth": 0.5,
+        "mean_score": 0.6666666666666666,
+        "minimum_score": 0.6666666666666666,
+        "scored_count": 1,
+        "successful_count": 1,
+        "task": "t3-aggregate"
+      },
+      {
+        "case_count": 1,
+        "context_tokens": 16384,
+        "depth": 0.7,
+        "mean_score": 0.6666666666666666,
+        "minimum_score": 0.6666666666666666,
+        "scored_count": 1,
+        "successful_count": 1,
+        "task": "t3-aggregate"
+      },
+      {
+        "case_count": 1,
+        "context_tokens": 16384,
+        "depth": 0.9,
+        "mean_score": 0.8333333333333334,
+        "minimum_score": 0.8333333333333334,
+        "scored_count": 1,
+        "successful_count": 1,
+        "task": "t3-aggregate"
+      }
+    ],
+    "overall_cell_mean_score": 0.8777777777777778,
+    "overall_mean_score": 0.9095238095238095,
+    "scored_cell_count": 15,
+    "scored_count": 35,
+    "successful_count": 35
+  },
+  "task_builder_source": "experiments/quality_eval.py:TASKS",
+  "token_pool_triton": {
+    "attempts": 2618,
+    "auto_default_enabled": false,
+    "auto_enabled_calls": 0,
+    "calls": 2618,
+    "disabled_shape_count": 0,
+    "disabled_shape_skips": 0,
+    "dot_dtype_policy": "auto_float32_fp32_low_precision_native",
+    "effective_disabled_calls": 0,
+    "effective_enabled": true,
+    "effective_enabled_calls": 2618,
+    "env_disabled": false,
+    "env_disabled_calls": 0,
+    "env_enabled": true,
+    "env_enabled_calls": 2618,
+    "fallback_reasons": {},
+    "import_error_fallbacks": 0,
+    "input_precision_policy": "auto_float32_ieee_low_precision_tf32",
+    "nonrecoverable_runtime_errors": 0,
+    "paged_attempts": 2590,
+    "paged_enabled_calls": 2618,
+    "paged_request_table_attempts": 2590,
+    "paged_request_table_split_attempts": 0,
+    "paged_request_table_split_successes": 0,
+    "paged_request_table_successes": 2590,
+    "paged_split_attempts": 0,
+    "paged_split_enabled": true,
+    "paged_split_enabled_calls": 2618,
+    "paged_split_skips_by_min_splits": 2590,
+    "paged_split_successes": 0,
+    "paged_successes": 2590,
+    "recoverable_runtime_fallbacks": 0,
+    "runtime_errors": 0,
+    "split_attempts": 0,
+    "split_enabled": false,
+    "split_enabled_calls": 0,
+    "split_min_splits": 4,
+    "split_size": 512,
+    "split_skips_by_min_splits": 2590,
+    "split_successes": 0,
+    "successes": 2618
+  },
+  "workload": {
+    "case_count": 35,
+    "contexts": [
+      16384
+    ],
+    "depths": [
+      0.1,
+      0.3,
+      0.5,
+      0.7,
+      0.9
+    ],
+    "t12_seeds": 3,
+    "t3_seeds": 1
+  }
+}

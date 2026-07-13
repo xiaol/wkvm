@@ -1,0 +1,7 @@
+commit 59f736b9b80a2c54c397a481775cb008dc2ce2ef
+Author:     xiaol <xiaol@users.noreply.github.com>
+AuthorDate: Sat Jul 11 03:15:05 2026 +0800
+Commit:     xiaol <xiaol@users.noreply.github.com>
+CommitDate: Sat Jul 11 03:15:05 2026 +0800
+
+    Reject rowless prompt fingerprint reports

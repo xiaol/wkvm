@@ -270,10 +270,11 @@ Benchmark report must include:
 - Aggregate decode tok/s and end-to-end output tok/s.
 - GPU peak allocated/reserved/device-used memory.
 - Native setup provenance: `uses_hf_tokenizer`, `uses_hf_config`, `native_gemma_config_loader`, `uses_hf_model_construction`, `uses_hf_transformer_forward`, `native_gemma_checkpoint_loader`, and `native_no_hf_requirement`.
-- Scheduler/engine evidence: max waiting/running/runnable rows, resident state slots, backpressure/retraction counts, graph capture/replay/skip counts, graph-shape reuse/mismatch counts.
+- Scheduler/engine evidence: max waiting/running/runnable rows, resident state slots, backpressure/retraction counts, graph capture/cache-hit/replay/skip counts, graph-shape reuse/mismatch counts.
 - Whether each row is under the 19 GiB cap with 1 GiB headroom.
 - Comparison rows for vLLM and SGLang must state when they are nearest existing full-KV runs rather than identical semantics.
-- Strict same-workload reports should be rendered with `experiments/gemma_bench_report.py --require-same-shape --require-same-prompt-fingerprint --require-native-no-hf`.
+- Strict same-workload reports should be rendered with `experiments/gemma_bench_report.py --require-same-shape --require-same-prompt-fingerprint --require-native-no-hf --require-comparable`.
+- Strict HTTP reports additionally require `--require-comparable`, a complete shared concurrency ladder, explicit semantic labels, disjoint prompt rows, exact output-token accounting, and identical request/warmup/sampling policies.
 
 ### N8. README and Demo Update
 

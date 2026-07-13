@@ -11,6 +11,9 @@ import time
 from typing import Any
 
 _TOKEN_POOL_ATTENTION_BACKEND = None
+_NATIVE_GEMMA_FUSED_OPS = None
+_NATIVE_GEMMA_FUSED_OPS_UNAVAILABLE = False
+_NATIVE_GEMMA_FUSED_RMS_NORM_ENABLED = None
 
 
 _NATIVE_FORWARD_TIMING_STATS: dict[str, float | int] = {
@@ -294,6 +297,69 @@ def _rms_norm(hidden_states, norm) -> Any:
     if weight is not None:
         weight = _tensor_on_device(weight, hidden_states)
     return F.rms_norm(hidden_states, (hidden_states.shape[-1],), weight, norm.eps)
+
+
+def _native_gemma_fused_ops():
+    global _NATIVE_GEMMA_FUSED_OPS, _NATIVE_GEMMA_FUSED_OPS_UNAVAILABLE
+    if _NATIVE_GEMMA_FUSED_OPS is not None:
+        return _NATIVE_GEMMA_FUSED_OPS
+    if _NATIVE_GEMMA_FUSED_OPS_UNAVAILABLE:
+        return None
+    try:
+        from wkvm.runner.gemma_fused_ops import rms_norm_residual_scalar
+    except Exception:
+        _NATIVE_GEMMA_FUSED_OPS_UNAVAILABLE = True
+        return None
+    _NATIVE_GEMMA_FUSED_OPS = rms_norm_residual_scalar
+    return _NATIVE_GEMMA_FUSED_OPS
+
+
+def _native_gemma_fused_rms_norm_enabled() -> bool:
+    global _NATIVE_GEMMA_FUSED_RMS_NORM_ENABLED
+    if _NATIVE_GEMMA_FUSED_RMS_NORM_ENABLED is None:
+        enabled = _env_bool("WKVM_ENABLE_NATIVE_GEMMA_FUSED_RMS_NORM")
+        if enabled is None:
+            enabled = True
+        if _env_bool("WKVM_DISABLE_NATIVE_GEMMA_FUSED_RMS_NORM") is True:
+            enabled = False
+        _NATIVE_GEMMA_FUSED_RMS_NORM_ENABLED = bool(enabled)
+    return bool(_NATIVE_GEMMA_FUSED_RMS_NORM_ENABLED)
+
+
+def _rms_norm_residual_scalar(hidden_states, norm, residual, scalar):
+    global _NATIVE_GEMMA_FUSED_OPS, _NATIVE_GEMMA_FUSED_OPS_UNAVAILABLE
+
+    torch = _torch()
+    weight = getattr(norm, "weight", None)
+    width = int(hidden_states.shape[-1])
+    if (
+        _native_gemma_fused_rms_norm_enabled()
+        and bool(getattr(hidden_states, "is_cuda", False))
+        and not torch.is_grad_enabled()
+        and not bool(getattr(hidden_states, "requires_grad", False))
+        and weight is not None
+        and scalar is not None
+        and hidden_states.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and hidden_states.dtype == residual.dtype == weight.dtype == scalar.dtype
+        and hidden_states.device == residual.device == weight.device == scalar.device
+        and tuple(hidden_states.shape) == tuple(residual.shape)
+        and int(weight.numel()) == width
+        and int(scalar.numel()) == 1
+        and hidden_states.is_contiguous()
+        and residual.is_contiguous()
+        and weight.is_contiguous()
+        and scalar.is_contiguous()
+        and 0 < width <= 8192
+    ):
+        fused_op = _native_gemma_fused_ops()
+        if fused_op is not None:
+            try:
+                return fused_op(hidden_states, weight, residual, scalar, norm.eps)
+            except Exception:
+                _NATIVE_GEMMA_FUSED_OPS = None
+                _NATIVE_GEMMA_FUSED_OPS_UNAVAILABLE = True
+    hidden_states = _rms_norm(hidden_states, norm)
+    return (hidden_states + residual) * _tensor_on_device(scalar, hidden_states)
 
 
 def _linear(x, linear) -> Any:
@@ -620,6 +686,10 @@ class _NativeGemma4TextConfig:
         self._values = dict(values)
         for key, value in values.items():
             setattr(self, key, value)
+        self._attn_implementation = str(
+            values.get("_attn_implementation", "eager")
+        )
+        self._attn_implementation_internal = self._attn_implementation
 
     def get_text_config(self, decoder: bool = True):
         return self
@@ -1448,9 +1518,14 @@ def _attention_forward_manual_gqa(attn, query_states, key_states, value_states, 
         raise ValueError("query head count must be divisible by key/value head count")
     groups = query_heads // kv_heads
     query = query_states.reshape(batch, kv_heads, groups, query_length, head_dim)
-    key = key_states[:, :, None, :, :]
-    value = value_states[:, :, None, :, :]
-    attn_weights = torch.matmul(query, key.transpose(-2, -1)) * attn.scaling
+    key_transposed = key_states.transpose(-2, -1)
+    attn_weights = torch.stack(
+        [
+            torch.matmul(query[:, :, group], key_transposed)
+            for group in range(groups)
+        ],
+        dim=2,
+    ) * attn.scaling
     if attention_mask is not None:
         mask = attention_mask
         if mask.ndim == 4:
@@ -1458,11 +1533,20 @@ def _attention_forward_manual_gqa(attn, query_states, key_states, value_states, 
         else:
             while mask.ndim < attn_weights.ndim:
                 mask = mask.unsqueeze(1)
-        attn_weights = attn_weights + mask
+        if mask.dtype == torch.bool:
+            attn_weights = attn_weights.masked_fill(~mask, float("-inf"))
+        else:
+            attn_weights = attn_weights + mask
     attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
     if attn.training and attn.attention_dropout:
         attn_weights = F.dropout(attn_weights, p=attn.attention_dropout, training=True)
-    attn_output = torch.matmul(attn_weights, value)
+    attn_output = torch.stack(
+        [
+            torch.matmul(attn_weights[:, :, group], value_states)
+            for group in range(groups)
+        ],
+        dim=2,
+    )
     attn_output = attn_output.reshape(batch, query_heads, query_length, head_dim)
     attn_weights = attn_weights.reshape(batch, query_heads, query_length, key_length)
     return attn_output.transpose(1, 2).contiguous(), attn_weights
@@ -1598,7 +1682,6 @@ def _attention_forward(
         raise RuntimeError("dense attention fallback requires key/value states")
     if backend == "manual_gqa" or (
         backend == "sdpa_single_gqa"
-        and query_states.shape[0] == 1
         and query_states.shape[2] == 1
         and attn.num_key_value_groups > 1
     ):
@@ -1646,7 +1729,13 @@ def _attention_forward(
 
     attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * attn.scaling
     if attention_mask is not None:
-        attn_weights = attn_weights + attention_mask
+        if attention_mask.dtype == torch.bool:
+            attn_weights = attn_weights.masked_fill(
+                ~attention_mask,
+                float("-inf"),
+            )
+        else:
+            attn_weights = attn_weights + attention_mask
     attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
     if attn.training and attn.attention_dropout:
         attn_weights = F.dropout(attn_weights, p=attn.attention_dropout, training=True)
@@ -2338,15 +2427,14 @@ class NativeGemma4TextDecoderLayer:
         if timing_enabled:
             _record_native_timing("layer_mlp_wall_s", time.perf_counter() - phase_start)
             phase_start = time.perf_counter()
-        hidden_states = _rms_norm(hidden_states, self.post_feedforward_layernorm)
-        if timing_enabled:
-            _record_native_timing(
-                "layer_post_feedforward_norm_wall_s",
-                time.perf_counter() - phase_start,
-            )
-        hidden_states = residual + hidden_states
-
         if self.hidden_size_per_layer_input:
+            hidden_states = _rms_norm(hidden_states, self.post_feedforward_layernorm)
+            if timing_enabled:
+                _record_native_timing(
+                    "layer_post_feedforward_norm_wall_s",
+                    time.perf_counter() - phase_start,
+                )
+            hidden_states = residual + hidden_states
             if per_layer_input is None:
                 raise ValueError("per_layer_input is required for Gemma4 PLE layers")
             phase_start = time.perf_counter() if timing_enabled else 0.0
@@ -2355,15 +2443,30 @@ class NativeGemma4TextDecoderLayer:
             hidden_states = _activation(self.config.hidden_activation, hidden_states)
             hidden_states = hidden_states * per_layer_input
             hidden_states = _linear(hidden_states, self.per_layer_projection)
-            hidden_states = _rms_norm(hidden_states, self.post_per_layer_input_norm)
-            hidden_states = residual + hidden_states
+            hidden_states = _rms_norm_residual_scalar(
+                hidden_states,
+                self.post_per_layer_input_norm,
+                residual,
+                self.layer_scalar,
+            )
             if timing_enabled:
                 _record_native_timing("layer_ple_wall_s", time.perf_counter() - phase_start)
+        else:
+            hidden_states = _rms_norm_residual_scalar(
+                hidden_states,
+                self.post_feedforward_layernorm,
+                residual,
+                self.layer_scalar,
+            )
+            if timing_enabled:
+                _record_native_timing(
+                    "layer_post_feedforward_norm_wall_s",
+                    time.perf_counter() - phase_start,
+                )
 
-        result = hidden_states * _tensor_on_device(self.layer_scalar, hidden_states)
         if timing_enabled:
             _record_native_timing("layer_forward_wall_s", time.perf_counter() - layer_start)
-        return result
+        return hidden_states
 
     def _self_attention(
         self,
@@ -2615,6 +2718,14 @@ class NativeGemma4TextPrefix:
                     "text_final_norm_wall_s",
                     time.perf_counter() - phase_start,
                 )
+
+        clear_shared_kv_store = getattr(
+            past_key_values,
+            "clear_shared_kv_store",
+            None,
+        )
+        if callable(clear_shared_kv_store):
+            clear_shared_kv_store()
 
         return NativeGemma4PrefixOutput(
             hidden_states=hidden_states,

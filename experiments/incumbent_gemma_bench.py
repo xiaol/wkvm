@@ -31,7 +31,6 @@ import shlex
 import statistics
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -49,7 +48,10 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 from native_gemma_engine_smoke import build_prompt, prompt_lengths
 from native_gemma_smoke import resolve_model_path
 from bench_prompt_utils import (
+    GENERATED_OUTPUT_FINGERPRINT_SCHEMA,
     SyntheticBenchTokenizer,
+    generated_output_fingerprint,
+    generated_output_fingerprint_row_fields,
     prompt_fingerprint_row_fields,
     prompt_set_fingerprint,
 )
@@ -114,6 +116,27 @@ def uses_hf_tokenizer(args) -> bool:
     return prompt_token_source(args) == "hf_tokenizer"
 
 
+def sglang_language_model_override(model_path: str) -> dict[str, Any]:
+    config_path = Path(model_path) / "config.json"
+    config = json.loads(config_path.read_text())
+    text_config = config.get("text_config", config)
+    if not isinstance(text_config, dict):
+        raise ValueError(f"{config_path}: text_config must be an object")
+    override = dict(text_config)
+    if text_config.get("global_head_dim") is not None:
+        override["swa_head_dim"] = text_config["head_dim"]
+        override["swa_v_head_dim"] = text_config["head_dim"]
+        override["head_dim"] = text_config["global_head_dim"]
+        override["v_head_dim"] = text_config["global_head_dim"]
+    if text_config.get("num_global_key_value_heads") is not None:
+        override["swa_num_key_value_heads"] = text_config["num_key_value_heads"]
+        override["num_key_value_heads"] = text_config[
+            "num_global_key_value_heads"
+        ]
+    override["architectures"] = ["Gemma4ForCausalLM"]
+    return override
+
+
 def git_commit() -> str | None:
     try:
         return subprocess.check_output(
@@ -150,30 +173,65 @@ class VramMonitor:
         self.interval_s = interval_s
         self.baseline_mib: int | None = None
         self.peak_mib: int | None = None
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self.sample_count = 0
+        self.query_error_count = 0
+        self.first_error: str | None = None
+        self._process: subprocess.Popen[str] | None = None
 
-    def _run(self) -> None:
-        while not self._stop.is_set():
-            used = gpu_mem_used_mib()
-            if used is not None:
-                if self.peak_mib is None:
-                    self.peak_mib = used
-                else:
-                    self.peak_mib = max(self.peak_mib, used)
-            self._stop.wait(self.interval_s)
+    def _record_samples(self, output: str) -> None:
+        for raw in output.splitlines():
+            value = raw.strip()
+            if not value:
+                continue
+            try:
+                used = int(value)
+            except ValueError:
+                self.query_error_count += 1
+                if self.first_error is None:
+                    self.first_error = f"unexpected nvidia-smi sample {value!r}"
+                continue
+            self.sample_count += 1
+            self.peak_mib = used if self.peak_mib is None else max(self.peak_mib, used)
 
     def __enter__(self):
         self.baseline_mib = gpu_mem_used_mib()
         self.peak_mib = self.baseline_mib
-        self._thread.start()
+        interval_ms = max(1, int(round(self.interval_s * 1000)))
+        try:
+            self._process = subprocess.Popen(
+                [
+                    "nvidia-smi",
+                    "--id=0",
+                    "--query-gpu=memory.used",
+                    "--format=csv,noheader,nounits",
+                    f"--loop-ms={interval_ms}",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except Exception as exc:
+            self.query_error_count += 1
+            self.first_error = str(exc).splitlines()[0]
         return self
 
     def __exit__(self, *exc) -> None:
-        self._stop.set()
-        self._thread.join(timeout=5)
+        process = self._process
+        if process is not None:
+            process.terminate()
+            try:
+                stdout, stderr = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                stdout, stderr = process.communicate(timeout=5)
+            self._record_samples(stdout)
+            if process.returncode not in (0, -15) and stderr.strip():
+                self.query_error_count += 1
+                if self.first_error is None:
+                    self.first_error = stderr.strip().splitlines()[0]
         final = gpu_mem_used_mib()
         if final is not None:
+            self.sample_count += 1
             self.peak_mib = final if self.peak_mib is None else max(self.peak_mib, final)
 
     @property
@@ -182,12 +240,33 @@ class VramMonitor:
             return None
         return max(0, self.peak_mib - self.baseline_mib) / 1024.0
 
+    def result(self) -> dict[str, Any]:
+        peak_delta_mib = None
+        if self.baseline_mib is not None and self.peak_mib is not None:
+            peak_delta_mib = max(0, self.peak_mib - self.baseline_mib)
+        return {
+            "schema": "wkvm.whole_gpu_memory.v1",
+            "scope": "whole_device",
+            "source": "nvidia-smi",
+            "device_selector": "0",
+            "device_index": 0,
+            "device_uuid": None,
+            "sample_interval_s": self.interval_s,
+            "sample_count": self.sample_count,
+            "baseline_used_mib": self.baseline_mib,
+            "peak_used_mib": self.peak_mib,
+            "peak_delta_mib": peak_delta_mib,
+            "query_error_count": self.query_error_count,
+            "error": self.first_error,
+        }
+
 
 def monitor_memory_row(monitor: VramMonitor) -> dict[str, Any]:
     return {
         "baseline_gpu_mib": monitor.baseline_mib,
         "peak_gpu_mib": monitor.peak_mib,
         "peak_engine_delta_gib": round_or_none(monitor.engine_peak_delta_gib),
+        "gpu_memory": monitor.result(),
     }
 
 
@@ -243,6 +322,102 @@ def normalize_vllm_outputs(outputs: list[Any], expected: int) -> list[list[int]]
     return rows
 
 
+def vllm_request_metrics_timing(
+    outputs: list[Any],
+    expected: int,
+) -> dict[str, Any] | None:
+    """Return batch-wide decode timing from one vLLM generation run."""
+
+    if len(outputs) != expected:
+        return None
+    first_token_timestamps: list[float] = []
+    last_token_timestamps: list[float] = []
+    first_token_latencies: list[float] = []
+    for output in outputs:
+        metrics = getattr(output, "metrics", None)
+        first_token_ts = getattr(metrics, "first_token_ts", None)
+        last_token_ts = getattr(metrics, "last_token_ts", None)
+        if (
+            not isinstance(first_token_ts, (int, float))
+            or isinstance(first_token_ts, bool)
+            or not math.isfinite(first_token_ts)
+            or first_token_ts <= 0
+            or not isinstance(last_token_ts, (int, float))
+            or isinstance(last_token_ts, bool)
+            or not math.isfinite(last_token_ts)
+            or last_token_ts < first_token_ts
+        ):
+            return None
+        first_token_timestamps.append(float(first_token_ts))
+        last_token_timestamps.append(float(last_token_ts))
+        first_token_latency = getattr(metrics, "first_token_latency", None)
+        if (
+            isinstance(first_token_latency, (int, float))
+            and not isinstance(first_token_latency, bool)
+            and math.isfinite(first_token_latency)
+            and first_token_latency >= 0
+        ):
+            first_token_latencies.append(float(first_token_latency))
+
+    return {
+        "prefill_plus_first_s": (
+            min(first_token_latencies)
+            if len(first_token_latencies) == expected
+            else None
+        ),
+        "decode_seconds": max(last_token_timestamps) - min(first_token_timestamps),
+        "decode_timing_method": "same_run_request_metrics",
+        "decode_timing_source": (
+            "RequestOutput.metrics.first_token_ts/last_token_ts"
+        ),
+        "decode_timing_comparable": True,
+        "decode_timing_request_count": expected,
+        "decode_timing_note": (
+            "Batch interval is earliest first token to latest last token from "
+            "the measured max_tokens=N run."
+        ),
+    }
+
+
+def measure_vllm_generation(
+    llm: Any,
+    reqs: list[dict[str, Any]],
+    sp1: Any,
+    spn: Any,
+) -> tuple[list[Any], float, dict[str, Any]]:
+    """Measure vLLM, preferring exact timestamps from the full generation."""
+
+    synchronize_cuda()
+    started = time.perf_counter()
+    full = llm.generate(reqs, spn, use_tqdm=False)
+    synchronize_cuda()
+    full_wall_s = time.perf_counter() - started
+
+    timing = vllm_request_metrics_timing(full, len(reqs))
+    if timing is not None:
+        return full, full_wall_s, timing
+
+    synchronize_cuda()
+    started = time.perf_counter()
+    llm.generate(reqs, sp1, use_tqdm=False)
+    synchronize_cuda()
+    first_wall_s = time.perf_counter() - started
+    return full, full_wall_s, {
+        "prefill_plus_first_s": first_wall_s,
+        "decode_seconds": max(full_wall_s - first_wall_s, 0.0),
+        "decode_timing_method": "separate_run_subtraction",
+        "decode_timing_source": (
+            "max_tokens=N wall time minus a separate max_tokens=1 wall time"
+        ),
+        "decode_timing_comparable": False,
+        "decode_timing_request_count": 0,
+        "decode_timing_note": (
+            "Fallback only: separate-run subtraction is not directly comparable "
+            "to same-run first-token-to-finish timing."
+        ),
+    }
+
+
 def sglang_output_ids(obj: Any) -> list[int]:
     if not isinstance(obj, dict):
         raise TypeError(f"unexpected SGLang output item type: {type(obj).__name__}")
@@ -270,17 +445,40 @@ def make_row(
     *,
     B: int,
     prompt_lens: list[int],
-    first_wall_s: float,
+    first_wall_s: float | None,
     full_wall_s: float,
     outputs: list[list[int]],
     mem: dict[str, Any],
     error: str | None = None,
+    decode_seconds: float | None = None,
+    decode_timing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     success_count = sum(1 for ids in outputs if ids)
     latencies = [full_wall_s] * success_count
     output_tokens = sum(len(ids) for ids in outputs)
     decode_tokens = sum(max(0, len(ids) - 1) for ids in outputs)
-    decode_s = max(full_wall_s - first_wall_s, 0.0)
+    decode_s = (
+        max(full_wall_s - first_wall_s, 0.0)
+        if decode_seconds is None and first_wall_s is not None
+        else decode_seconds
+    )
+    timing_fields = decode_timing or {
+        "decode_timing_method": "separate_run_subtraction",
+        "decode_timing_source": (
+            "max_tokens=N wall time minus a separate max_tokens=1 wall time"
+        ),
+        "decode_timing_comparable": False,
+        "decode_timing_request_count": 0,
+        "decode_timing_note": (
+            "Separate-run subtraction is not directly comparable to same-run "
+            "first-token-to-finish timing."
+        ),
+    }
+    timing_fields = {
+        key: value
+        for key, value in timing_fields.items()
+        if key not in {"prefill_plus_first_s", "decode_seconds"}
+    }
     row: dict[str, Any] = {
         "B": B,
         "success_count": success_count,
@@ -290,7 +488,9 @@ def make_row(
         "prefill_plus_first_s": round_or_none(first_wall_s),
         "decode_seconds": round_or_none(decode_s),
         "agg_decode_tok_s": round_or_none(
-            decode_tokens / decode_s if decode_s > 0 else None
+            decode_tokens / decode_s
+            if decode_s is not None and decode_s > 0
+            else None
         ),
         "e2e_output_tok_s": round_or_none(
             output_tokens / full_wall_s if full_wall_s > 0 else None
@@ -299,8 +499,18 @@ def make_row(
         "prompt_lengths": prompt_lens,
         "output_token_counts": [len(ids) for ids in outputs],
         "error": error,
+        **timing_fields,
         **mem,
     }
+    if success_count == B:
+        row.update(
+            generated_output_fingerprint_row_fields(
+                generated_output_fingerprint(
+                    (f"bench-{B}-{row_index}", token_ids)
+                    for row_index, token_ids in enumerate(outputs)
+                )
+            )
+        )
     return row
 
 
@@ -331,13 +541,26 @@ def run_vllm(
     kwargs = {
         "model": args.model_path,
         "max_model_len": max_model_len,
+        "max_num_seqs": max(prompts_by_b),
         "gpu_memory_utilization": args.vllm_gpu_mem_util,
         "enforce_eager": args.enforce_eager,
         "enable_prefix_caching": False,
         "swap_space": 0,
-        "disable_log_stats": True,
+        "disable_log_stats": False,
         "dtype": "bfloat16",
     }
+    if args.vllm_language_model_only:
+        kwargs["language_model_only"] = True
+    compilation_config = None
+    if args.vllm_disable_inductor:
+        capture_sizes = sorted({1, 2, 4, max(prompts_by_b)})
+        compilation_config = {
+            "mode": 0,
+            "cudagraph_mode": "FULL",
+            "cudagraph_capture_sizes": capture_sizes,
+            "max_cudagraph_capture_size": max(capture_sizes),
+        }
+        kwargs["compilation_config"] = compilation_config
     try:
         llm = LLM(**kwargs, limit_mm_per_prompt={"image": 0, "audio": 0})
         mm_note = "limit_mm_per_prompt={image:0,audio:0}"
@@ -372,17 +595,7 @@ def run_vllm(
         )
         try:
             reqs = [{"prompt_token_ids": p} for p in prompts]
-            synchronize_cuda()
-            t0 = time.perf_counter()
-            first = llm.generate(reqs, sp1, use_tqdm=False)
-            synchronize_cuda()
-            t_first = time.perf_counter() - t0
-
-            synchronize_cuda()
-            t0 = time.perf_counter()
-            full = llm.generate(reqs, spn, use_tqdm=False)
-            synchronize_cuda()
-            t_full = time.perf_counter() - t0
+            full, t_full, timing = measure_vllm_generation(llm, reqs, sp1, spn)
             outputs = normalize_vllm_outputs(full, B)
             mem = {
                 "peak_alloc_gib": round_or_none(torch_peak_alloc_gib()),
@@ -392,10 +605,12 @@ def run_vllm(
             row = make_row(
                 B=B,
                 prompt_lens=[len(p) for p in prompts],
-                first_wall_s=t_first,
+                first_wall_s=timing["prefill_plus_first_s"],
                 full_wall_s=t_full,
                 outputs=outputs,
                 mem=mem,
+                decode_seconds=timing["decode_seconds"],
+                decode_timing=timing,
             )
         except Exception as exc:
             row = {
@@ -419,7 +634,13 @@ def run_vllm(
         "gpu_memory_utilization": args.vllm_gpu_mem_util,
         "enforce_eager": args.enforce_eager,
         "max_model_len": max_model_len,
+        "max_num_seqs": max(prompts_by_b),
         "prefix_caching": False,
+        "request_metrics_enabled": True,
+        "decode_timing_preferred_method": "same_run_request_metrics",
+        "decode_timing_fallback_comparable": False,
+        "language_model_only": args.vllm_language_model_only,
+        "compilation_config": compilation_config,
         "mm_note": mm_note,
     }
     with contextlib.suppress(Exception):
@@ -450,6 +671,10 @@ def run_sglang(
     }
     if args.sglang_attention_backend:
         kwargs["attention_backend"] = args.sglang_attention_backend
+    model_override = None
+    if args.sglang_language_model_only:
+        model_override = sglang_language_model_override(args.model_path)
+        kwargs["json_model_override_args"] = json.dumps(model_override)
 
     engine = sgl.Engine(**kwargs)
     sp1 = {"temperature": 0.0, "max_new_tokens": 1, "ignore_eos": True}
@@ -517,6 +742,13 @@ def run_sglang(
         "context_length": args.sglang_context_length,
         "max_total_tokens": args.sglang_max_total_tokens,
         "attention_backend": args.sglang_attention_backend or "default",
+        "language_model_only": args.sglang_language_model_only,
+        "model_override_architectures": (
+            None if model_override is None else model_override["architectures"]
+        ),
+        "model_override_model_type": (
+            None if model_override is None else model_override.get("model_type")
+        ),
         "disable_radix_cache": True,
         "max_running_requests": args.sglang_max_running_requests,
         "cuda_graph_backend_decode": args.sglang_decode_graph,
@@ -540,13 +772,43 @@ def print_row(engine: str, args, row: dict[str, Any]) -> None:
     )
 
 
+def generated_output_fingerprint_summary(
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    successful_rows = [
+        row
+        for row in rows
+        if row.get("success_count") == row.get("B")
+        and row.get("error_count") == 0
+    ]
+    by_batch: dict[str, dict[str, object]] = {}
+    for row in successful_rows:
+        fingerprint = row.get("generated_output_fingerprint")
+        if not isinstance(fingerprint, dict):
+            continue
+        if fingerprint.get("schema") != GENERATED_OUTPUT_FINGERPRINT_SCHEMA:
+            continue
+        digest = fingerprint.get("request_output_token_ids_sha256")
+        if not isinstance(digest, str) or len(digest) != 64:
+            continue
+        by_batch[str(row["B"])] = dict(fingerprint)
+    return {
+        "successful_rows": len(successful_rows),
+        "fingerprinted_successful_rows": len(by_batch),
+        "complete": len(by_batch) == len(successful_rows),
+        "by_batch": by_batch,
+    }
+
+
 def build_payload(args, rows: list[dict[str, Any]], engine_info: dict[str, Any], monitor: VramMonitor) -> dict[str, Any]:
+    gpu_memory = monitor.result()
     for row in rows:
-        if row.get("peak_engine_delta_gib") is None:
-            row["peak_engine_delta_gib"] = round_or_none(monitor.engine_peak_delta_gib)
-            row["baseline_gpu_mib"] = monitor.baseline_mib
-            row["peak_gpu_mib"] = monitor.peak_mib
-            row["green"] = row_green(row, args)
+        row["peak_engine_delta_gib"] = round_or_none(monitor.engine_peak_delta_gib)
+        row["baseline_gpu_mib"] = monitor.baseline_mib
+        row["peak_gpu_mib"] = monitor.peak_mib
+        row["gpu_memory"] = dict(gpu_memory)
+        row["green"] = row_green(row, args)
+    output_fingerprints = generated_output_fingerprint_summary(rows)
     return {
         "schema": "wkvm.incumbent_gemma_bench.v1",
         "engine": args.engine,
@@ -563,11 +825,26 @@ def build_payload(args, rows: list[dict[str, Any]], engine_info: dict[str, Any],
         "launch_command": shlex.join([sys.executable, *sys.argv]),
         "concurrency": args.concurrency,
         "warmup": args.warmup,
+        "generated_output_fingerprint_schema": (
+            GENERATED_OUTPUT_FINGERPRINT_SCHEMA
+        ),
+        "generated_output_fingerprint_coverage": {
+            key: output_fingerprints[key]
+            for key in (
+                "successful_rows",
+                "fingerprinted_successful_rows",
+                "complete",
+            )
+        },
+        "generated_output_fingerprints_by_batch": output_fingerprints[
+            "by_batch"
+        ],
         "engine_config": engine_info,
         "memory": {
             "baseline_gpu_mib": monitor.baseline_mib,
             "peak_gpu_mib": monitor.peak_mib,
             "peak_engine_delta_gib": round_or_none(monitor.engine_peak_delta_gib),
+            "gpu_memory": gpu_memory,
             "green_note": (
                 "green uses peak_engine_delta_gib when available; this is "
                 "whole-GPU peak minus whole-GPU baseline sampled before engine load"
@@ -609,7 +886,29 @@ def run(args) -> dict[str, Any]:
         "sglang": run_sglang,
     }
     with VramMonitor(interval_s=args.mem_sample_interval_s) as monitor:
-        rows, engine_info = runners[args.engine](args, tok, prompts_by_b, monitor)
+        try:
+            rows, engine_info = runners[args.engine](args, tok, prompts_by_b, monitor)
+        except Exception as exc:
+            setup_error = f"{type(exc).__name__}: {str(exc).splitlines()[0]}"
+            rows = []
+            for B, prompts in prompts_by_b.items():
+                rows.append(
+                    {
+                        "B": B,
+                        "success_count": 0,
+                        "error_count": B,
+                        "error": setup_error,
+                        "prompt_lengths": [len(prompt) for prompt in prompts],
+                        "green": False,
+                        **prompt_fingerprint_row_fields(
+                            prompt_set_fingerprint(
+                                prompts,
+                                prompt_token_source=prompt_token_source(args),
+                            )
+                        ),
+                    }
+                )
+            engine_info = {"setup_error": setup_error}
     payload = build_payload(args, rows, engine_info, monitor)
     if args.json:
         atomic_write_json(Path(args.json), payload)
@@ -652,11 +951,18 @@ def main() -> None:
     ap.add_argument("--vllm-gpu-mem-util", type=float, default=0.82)
     ap.add_argument("--max-model-len", type=int, default=None)
     ap.add_argument("--enforce-eager", action="store_true")
+    ap.add_argument("--vllm-language-model-only", action="store_true")
+    ap.add_argument(
+        "--vllm-disable-inductor",
+        action="store_true",
+        help="Disable Inductor compilation while retaining full CUDA graphs.",
+    )
 
     ap.add_argument("--sglang-mem-fraction", type=float, default=0.88)
     ap.add_argument("--sglang-context-length", type=int, default=None)
     ap.add_argument("--sglang-max-total-tokens", type=int, default=None)
     ap.add_argument("--sglang-attention-backend", default="triton")
+    ap.add_argument("--sglang-language-model-only", action="store_true")
     ap.add_argument("--sglang-max-running-requests", type=int, default=64)
     ap.add_argument("--sglang-decode-graph", default="full")
     ap.add_argument("--sglang-prefill-graph", default="disabled")

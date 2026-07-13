@@ -45,6 +45,7 @@ class GemmaRoutedSpanConfig:
             "ring_tokens",
             "routed_slots",
             "reps_per_slot",
+            "span_budget_tokens",
             "pending_tokens",
             "sliding_window",
             "max_span_tokens",
@@ -96,17 +97,50 @@ class GemmaRoutedSpanConfig:
     def routed_materialized_tokens(self) -> int:
         """Maximum readout tokens per routed full-attention layer."""
 
+        return self.routed_authoritative_tokens + self.routed_slots
+
+    @property
+    def routed_retained_tokens_per_slot(self) -> int:
+        return max(
+            self.span_budget_tokens,
+            self.max_span_tokens,
+        )
+
+    @property
+    def routed_authoritative_tokens(self) -> int:
+        """Maximum real KV tokens retained behind one routed layer."""
+
         return (
             self.sink_tokens
             + self.ring_tokens
             + self.pending_tokens
-            + self.routed_slots * (1 + self.reps_per_slot)
+            - 1
+            + self.routed_slots * self.routed_retained_tokens_per_slot
         )
 
     @property
-    def routed_layer_bytes(self) -> int:
-        # key + value
+    def routed_readout_layer_bytes(self) -> int:
         return 2 * self.routed_materialized_tokens * self.kv_shape_per_token * self.bytes_per_elem
+
+    @property
+    def routed_authoritative_layer_bytes(self) -> int:
+        return 2 * self.routed_authoritative_tokens * self.kv_shape_per_token * self.bytes_per_elem
+
+    @property
+    def routed_slot_summary_layer_bytes(self) -> int:
+        return 2 * self.routed_slots * self.kv_shape_per_token * 4
+
+    @property
+    def routed_leader_state_bytes(self) -> int:
+        return (self.routed_slots + 1) * self.kv_shape_per_token * 4
+
+    @property
+    def routed_layer_bytes(self) -> int:
+        return (
+            self.routed_readout_layer_bytes
+            + self.routed_authoritative_layer_bytes
+            + self.routed_slot_summary_layer_bytes
+        )
 
     @property
     def sliding_layer_bytes(self) -> int:
@@ -139,7 +173,10 @@ class GemmaRoutedSpanConfig:
             families.append(
                 StateFamilySpec(
                     name="gemma_routed_span",
-                    bytes_per_slot=len(self.full_kv_layers) * self.routed_layer_bytes,
+                    bytes_per_slot=(
+                        len(self.full_kv_layers) * self.routed_layer_bytes
+                        + self.routed_leader_state_bytes
+                    ),
                     layer_ids=self.full_kv_layers,
                 )
             )

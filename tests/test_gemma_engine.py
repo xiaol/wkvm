@@ -159,6 +159,43 @@ class TestGemmaSchedulerAssumptions(unittest.TestCase):
         self.assertFalse(summary["uses_hf_model_construction"])
         self.assertTrue(summary["native_gemma_checkpoint_loader"])
 
+    def test_native_bench_whole_gpu_memory_sets_comparable_green(self) -> None:
+        from experiments.native_gemma_bench import finalize_whole_gpu_memory
+
+        class FakeMonitor:
+            def __init__(self) -> None:
+                self.exited = False
+
+            def __exit__(self, *args) -> None:
+                self.exited = True
+
+            def result(self):
+                return {
+                    "schema": "wkvm.whole_gpu_memory.v1",
+                    "scope": "whole_device",
+                    "baseline_used_mib": 1024,
+                    "peak_used_mib": 19_456,
+                    "peak_delta_mib": 18_432,
+                }
+
+        monitor = FakeMonitor()
+        rows = [{"green": True}]
+        result = finalize_whole_gpu_memory(
+            monitor,
+            rows,
+            SimpleNamespace(mem_cap_gib=19.0, headroom_gib=1.0),
+        )
+
+        self.assertTrue(monitor.exited)
+        self.assertEqual(result["peak_delta_mib"], 18_432)
+        self.assertEqual(rows[0]["peak_engine_delta_gib"], 18.0)
+        self.assertTrue(rows[0]["torch_reserved_green"])
+        self.assertTrue(rows[0]["green"])
+        self.assertEqual(
+            rows[0]["gpu_memory"]["schema"],
+            "wkvm.whole_gpu_memory.v1",
+        )
+
     def test_native_bench_no_hf_requirement_reports_violations(self) -> None:
         from experiments.native_gemma_bench import native_no_hf_requirement_report
 
@@ -351,6 +388,62 @@ class TestGemmaSchedulerAssumptions(unittest.TestCase):
             first["prompt_token_ids_sha256"],
         )
 
+    def test_generated_output_fingerprint_is_canonical_and_exact(self) -> None:
+        from experiments.bench_prompt_utils import (
+            GENERATED_OUTPUT_FINGERPRINT_SCHEMA,
+            generated_output_fingerprint,
+            generated_output_fingerprint_row_fields,
+        )
+
+        outputs = [
+            ("bench-2-1", [17, 23]),
+            ("bench-2-0", [5, 11, 13]),
+        ]
+        fingerprint = generated_output_fingerprint(outputs)
+        reordered = generated_output_fingerprint(reversed(outputs))
+        changed_token = generated_output_fingerprint(
+            [("bench-2-1", [17, 29]), ("bench-2-0", [5, 11, 13])]
+        )
+        changed_request_id = generated_output_fingerprint(
+            [("bench-2-2", [17, 23]), ("bench-2-0", [5, 11, 13])]
+        )
+        fields = generated_output_fingerprint_row_fields(fingerprint)
+
+        self.assertEqual(fingerprint, reordered)
+        self.assertEqual(fingerprint["schema"], GENERATED_OUTPUT_FINGERPRINT_SCHEMA)
+        self.assertEqual(fingerprint["request_ids"], ["bench-2-0", "bench-2-1"])
+        self.assertEqual(fingerprint["output_token_counts"], [3, 2])
+        self.assertEqual(fingerprint["output_token_count"], 5)
+        self.assertEqual(
+            fingerprint["request_output_token_ids_sha256"],
+            "7602407e37f25ea06956b1d49d7e467d63063d060332548dc077e0e9d7e457d1",
+        )
+        self.assertNotEqual(
+            fingerprint["request_output_token_ids_sha256"],
+            changed_token["request_output_token_ids_sha256"],
+        )
+        self.assertNotEqual(
+            fingerprint["request_output_token_ids_sha256"],
+            changed_request_id["request_output_token_ids_sha256"],
+        )
+        self.assertEqual(fields["generated_output_fingerprint"], fingerprint)
+        self.assertEqual(
+            fields["request_output_token_ids_sha256"],
+            fingerprint["request_output_token_ids_sha256"],
+        )
+
+    def test_generated_output_fingerprint_rejects_ambiguous_inputs(self) -> None:
+        from experiments.bench_prompt_utils import generated_output_fingerprint
+
+        with self.assertRaisesRegex(ValueError, "request IDs must be unique"):
+            generated_output_fingerprint([("request", [1]), ("request", [2])])
+        with self.assertRaisesRegex(ValueError, "integers, not bools"):
+            generated_output_fingerprint([("request", [True])])
+        with self.assertRaisesRegex(ValueError, "must be integers"):
+            generated_output_fingerprint([("request", [1.5])])
+        with self.assertRaisesRegex(ValueError, "signed 64-bit"):
+            generated_output_fingerprint([("request", [1 << 63])])
+
     def test_native_bench_no_hf_preflight_runs_before_tokenizer_load(self) -> None:
         import json
         import tempfile
@@ -429,6 +522,76 @@ class TestGemmaSchedulerAssumptions(unittest.TestCase):
         self.assertEqual(payload["config"]["synthetic_vocab_size"], 128)
         self.assertFalse(payload["config"]["uses_hf_config"])
         self.assertTrue(payload["config"]["native_gemma_config_loader"])
+
+    def test_native_bench_payload_indexes_output_fingerprints_by_batch(self) -> None:
+        from experiments.bench_prompt_utils import (
+            GENERATED_OUTPUT_FINGERPRINT_SCHEMA,
+            generated_output_fingerprint,
+            generated_output_fingerprint_row_fields,
+        )
+        from experiments.native_gemma_bench import build_benchmark_payload
+
+        args = self.native_bench_payload_args(
+            synthetic_prompts=True,
+            synthetic_vocab_size=128,
+        )
+        fingerprint = generated_output_fingerprint(
+            [("bench-2-0", [5, 11]), ("bench-2-1", [17, 23])]
+        )
+        rows = [
+            {
+                "B": 2,
+                "success_count": 2,
+                "error_count": 0,
+                "green": True,
+                **generated_output_fingerprint_row_fields(fingerprint),
+            },
+            {
+                "B": 4,
+                "success_count": 3,
+                "error_count": 1,
+                "green": False,
+            },
+        ]
+
+        payload = build_benchmark_payload(
+            args,
+            path="/models/gemma",
+            rows=rows,
+            usable_gib=7.5,
+            token_pool_triton_env={},
+        )
+
+        self.assertEqual(
+            payload["generated_output_fingerprint_schema"],
+            GENERATED_OUTPUT_FINGERPRINT_SCHEMA,
+        )
+        self.assertEqual(
+            payload["generated_output_fingerprint_coverage"],
+            {
+                "successful_rows": 1,
+                "fingerprinted_successful_rows": 1,
+                "complete": True,
+            },
+        )
+        self.assertEqual(
+            payload["generated_output_fingerprints_by_batch"],
+            {"2": fingerprint},
+        )
+
+    def test_native_output_fingerprint_coverage_detects_missing_success(self) -> None:
+        from experiments.native_gemma_bench import (
+            generated_output_fingerprint_summary,
+        )
+
+        summary = generated_output_fingerprint_summary(
+            [{"B": 2, "success_count": 2, "error_count": 0}]
+        )
+
+        self.assertEqual(summary["successful_rows"], 1)
+        self.assertEqual(summary["fingerprinted_successful_rows"], 0)
+        self.assertFalse(summary["complete"])
+        self.assertEqual(summary["by_batch"], {})
 
     def test_native_bench_payload_records_hf_config_for_hf_loader(self) -> None:
         from experiments.native_gemma_bench import build_benchmark_payload
@@ -860,6 +1023,49 @@ class FakeFailingContinuationPrefillRunner(FakeBatchRunner):
         )
 
 
+class FakeAuthoritativePrefillRunner(FakeBatchRunner):
+    def __init__(self, model, hf_config, native_config) -> None:
+        super().__init__()
+        self.model = model
+        self.hf_config = hf_config
+        self.native_config = native_config
+        self.last_cache = None
+        self.last_keys = None
+        self.last_values = None
+
+    def build_cache(self, slots):
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+
+        self.caches_built += 1
+        cache = NativeGemmaRoutedCache(self.hf_config, self.native_config)
+        self.last_cache = cache
+        return cache
+
+    def prefill_chunk_step(self, cache, token_ids, slots, *, start_pos, break_mask=None):
+        import torch
+
+        self.prefill_chunk_calls.append((list(token_ids), int(start_pos)))
+        self.prefill_chunk_cache_ids.append(id(cache))
+        width = len(token_ids)
+        start = int(start_pos) * 4
+        keys = torch.arange(
+            start,
+            start + width * 4,
+            dtype=torch.float32,
+        ).reshape(1, 1, width, 4)
+        values = keys + 1000
+        returned_k, returned_v = cache.layers[0].update(keys, values)
+        cache.store_shared_kv(
+            layer_idx=0,
+            layer_type="sliding_attention",
+            key_states=returned_k,
+            value_states=returned_v,
+        )
+        self.last_keys = keys
+        self.last_values = values
+        return FakeLogits([100 + len(self.prefill_chunk_calls)])
+
+
 class FakeModel:
     device = "cpu"
 
@@ -1118,6 +1324,57 @@ class FakeGraphMismatchPersistentPaddedBatchRunner(FakePersistentPaddedBatchRunn
 
 
 class TestGemmaRoutedSpanRunner(unittest.TestCase):
+    @staticmethod
+    def _graph_cache_context(*, kv_pool, attention_workspace, kv_indices: int = 6):
+        from wkvm.runner.gemma_token_pool import (
+            DecodeBatchMetadata,
+            TokenPoolDecodeContext,
+        )
+
+        class FakeCudaTensor:
+            is_cuda = True
+            dtype = "torch.int32"
+            device = "cuda:0"
+
+            def __init__(self, shape) -> None:
+                self.shape = tuple(shape)
+
+            def numel(self) -> int:
+                total = 1
+                for dim in self.shape:
+                    total *= int(dim)
+                return total
+
+        rows = 2
+        metadata = DecodeBatchMetadata(
+            req_pool_indices=FakeCudaTensor((rows,)),
+            seq_lens=FakeCudaTensor((rows,)),
+            logical_seq_lens=FakeCudaTensor((rows,)),
+            out_cache_loc=FakeCudaTensor((rows,)),
+            kv_indptr=FakeCudaTensor((rows + 1,)),
+            kv_indices=FakeCudaTensor((kv_indices,)),
+        )
+        return TokenPoolDecodeContext(
+            metadata_by_layer_type={"sliding_attention": metadata},
+            kv_pool=kv_pool,
+            attention_workspace=attention_workspace,
+            metadata_by_layer_id={0: metadata},
+            covered_layer_types=frozenset({"sliding_attention"}),
+        )
+
+    @staticmethod
+    def _graph_cache_cohort(torch, hf_config, native_config, offset: int):
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+
+        caches = []
+        for row in range(2):
+            cache = NativeGemmaRoutedCache(hf_config, native_config)
+            key = torch.full((1, 1, 3, 2), float(offset + row + 1))
+            value = torch.full((1, 1, 3, 2), float(offset + row + 11))
+            cache.update(key, value, layer_idx=0)
+            caches.append(cache)
+        return caches
+
     def test_prefill_chunk_step_passes_explicit_position_ids(self) -> None:
         from wkvm.runner.gemma_runner import GemmaRoutedSpanRunner
 
@@ -1289,6 +1546,341 @@ class TestGemmaRoutedSpanRunner(unittest.TestCase):
         self.assertIs(call["attention_mask"]["full_attention"], cache.full_mask)
         self.assertIs(call["attention_mask"]["sliding_attention"], cache.sliding_mask)
 
+    def test_persistent_padded_graph_skips_partial_token_pool_coverage(self) -> None:
+        import torch
+        from unittest.mock import patch
+
+        from wkvm.models.gemma import gemma4_e4b_routed_span_config
+        from wkvm.runner.gemma_runner import GemmaRoutedSpanRunner, NativeGemmaRoutedCache
+
+        hf_config = SimpleNamespace(
+            num_hidden_layers=2,
+            num_kv_shared_layers=0,
+            layer_types=("sliding_attention", "full_attention"),
+            sliding_window=8,
+        )
+        native_config = gemma4_e4b_routed_span_config(
+            num_hidden_layers=2,
+            num_kv_shared_layers=0,
+            layer_types=("sliding_attention", "full_attention"),
+            sink_tokens=1,
+            ring_tokens=8,
+            pending_tokens=8,
+            routed_slots=2,
+            reps_per_slot=1,
+            span_budget_tokens=4,
+            max_span_tokens=3,
+            sliding_window=8,
+        )
+
+        class RecordingNativeModel:
+            device = "cpu"
+            config = hf_config
+            wkvm_no_hf_transformer_forward = True
+
+            def __init__(self) -> None:
+                self.calls = []
+
+            def __call__(self, **kwargs):
+                self.calls.append(kwargs)
+                batch = int(kwargs["input_ids"].shape[0])
+                return SimpleNamespace(logits=torch.zeros(batch, 1, 3))
+
+        caches = []
+        for row in range(2):
+            cache = NativeGemmaRoutedCache(hf_config, native_config)
+            for layer_idx in range(2):
+                key = torch.full((1, 1, 3, 2), float(10 * layer_idx + row + 1))
+                cache.update(key, key + 100, layer_idx=layer_idx)
+            caches.append(cache)
+
+        model = RecordingNativeModel()
+        runner = GemmaRoutedSpanRunner(
+            model,
+            FakeRunnerBank(),
+            persistent_padded_decode_cuda_graph=True,
+        )
+        runner._can_cuda_graph_decode = lambda: True
+        context = self._graph_cache_context(
+            kv_pool=object(),
+            attention_workspace=object(),
+        )
+
+        with patch("wkvm.runner.gemma_runner._GraphedPaddedDecodeStep") as graph_step:
+            _logits, merged_cache = runner.decode_batch_padded_persistent(
+                caches,
+                [11, 12],
+                position_ids=[3, 3],
+                reserve_steps=2,
+                token_pool_decode=context,
+            )
+
+        graph_step.assert_not_called()
+        self.assertFalse(hasattr(merged_cache, "_padded_decode_graph"))
+        self.assertFalse(merged_cache.static_padded_decode)
+        self.assertFalse(runner._token_pool_decode_graph_cache)
+        self.assertEqual(len(model.calls), 1)
+        self.assertIs(model.calls[0]["wkvm_token_pool_decode"], context)
+        self.assertIsNone(model.calls[0]["attention_mask"]["sliding_attention"])
+        self.assertIsNotNone(model.calls[0]["attention_mask"]["full_attention"])
+        self.assertEqual(
+            runner.last_decode_batch_info["persistent_padded_decode_cuda_graph_skip"],
+            "partial_token_pool_coverage",
+        )
+        self.assertEqual(
+            runner.last_decode_batch_info["persistent_padded_decode_cuda_graph"],
+            0,
+        )
+        self.assertNotIn(
+            "persistent_padded_decode_cuda_graph_captured",
+            runner.last_decode_batch_info,
+        )
+        self.assertNotIn("cuda_graph_replay", runner.last_decode_batch_info)
+
+    def test_token_pool_graph_cache_reuses_graph_across_request_cohorts(self) -> None:
+        import torch
+        from unittest.mock import patch
+
+        from wkvm.models.gemma import gemma4_e4b_routed_span_config
+        from wkvm.runner.gemma_runner import GemmaRoutedSpanRunner
+
+        hf_config = SimpleNamespace(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("sliding_attention",),
+            sliding_window=16,
+        )
+        native_config = gemma4_e4b_routed_span_config(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("sliding_attention",),
+            sliding_window=16,
+        )
+        model = SimpleNamespace(
+            device="cpu",
+            config=hf_config,
+            wkvm_no_hf_transformer_forward=True,
+        )
+        runner = GemmaRoutedSpanRunner(
+            model,
+            FakeRunnerBank(),
+            persistent_padded_decode_cuda_graph=True,
+        )
+        runner._can_cuda_graph_decode = lambda: True
+        seen_graphs = []
+
+        def fake_decode(cache, last_tokens, *, position_ids=None, token_pool_decode=None):
+            seen_graphs.append(cache._padded_decode_graph)
+            runner.last_decode_batch_info = {"cuda_graph_replay": 1}
+            return torch.zeros(len(last_tokens), 3)
+
+        runner._decode_padded_cache = fake_decode
+        created = []
+
+        class FakeGraph:
+            def __init__(self, model, cache, batch_size, **kwargs) -> None:
+                self.model = model
+                self.cache = cache
+                self.batch_size = batch_size
+                created.append(self)
+
+        kv_pool = object()
+        attention_workspace = object()
+        first_context = self._graph_cache_context(
+            kv_pool=kv_pool,
+            attention_workspace=attention_workspace,
+        )
+        second_context = self._graph_cache_context(
+            kv_pool=kv_pool,
+            attention_workspace=attention_workspace,
+        )
+
+        with patch("wkvm.runner.gemma_runner._GraphedPaddedDecodeStep", FakeGraph):
+            _first_logits, first_cache = runner.decode_batch_padded_persistent(
+                self._graph_cache_cohort(torch, hf_config, native_config, 0),
+                [11, 12],
+                position_ids=[3, 3],
+                reserve_steps=4,
+                token_pool_decode=first_context,
+            )
+            first_info = dict(runner.last_decode_batch_info)
+            _second_logits, second_cache = runner.decode_batch_padded_persistent(
+                self._graph_cache_cohort(torch, hf_config, native_config, 100),
+                [21, 22],
+                position_ids=[7, 7],
+                reserve_steps=4,
+                token_pool_decode=second_context,
+            )
+            second_info = dict(runner.last_decode_batch_info)
+
+        self.assertEqual(len(created), 1)
+        self.assertIsNot(first_cache, second_cache)
+        self.assertIs(seen_graphs[0], seen_graphs[1])
+        self.assertEqual(first_info["persistent_padded_decode_cuda_graph_captured"], 1)
+        self.assertEqual(first_info["persistent_padded_decode_cuda_graph_cache_hit"], 0)
+        self.assertEqual(second_info["persistent_padded_decode_cuda_graph_captured"], 0)
+        self.assertEqual(second_info["persistent_padded_decode_cuda_graph_cache_hit"], 1)
+
+    def test_dense_padded_decode_skips_cuda_graphs(self) -> None:
+        import torch
+        from unittest.mock import patch
+
+        from wkvm.models.gemma import gemma4_e4b_routed_span_config
+        from wkvm.runner.gemma_runner import GemmaRoutedSpanRunner
+
+        hf_config = SimpleNamespace(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("sliding_attention",),
+            sliding_window=16,
+        )
+        native_config = gemma4_e4b_routed_span_config(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("sliding_attention",),
+            sliding_window=16,
+        )
+        model = SimpleNamespace(device="cpu", config=hf_config)
+        runner = GemmaRoutedSpanRunner(
+            model,
+            FakeRunnerBank(),
+            persistent_padded_decode_cuda_graph=True,
+        )
+        runner._can_cuda_graph_decode = lambda: True
+
+        eager_calls = []
+
+        def fake_decode(cache, last_tokens, *, position_ids=None, token_pool_decode=None):
+            eager_calls.append(cache)
+            runner.last_decode_batch_info = {}
+            return torch.zeros(len(last_tokens), 3)
+
+        runner._decode_padded_cache = fake_decode
+        created = []
+
+        class FakeGraph:
+            def __init__(self, model, cache, batch_size, **kwargs) -> None:
+                created.append(self)
+
+        with patch("wkvm.runner.gemma_runner._GraphedPaddedDecodeStep", FakeGraph):
+            runner.decode_batch_padded_persistent(
+                self._graph_cache_cohort(torch, hf_config, native_config, 0),
+                [11, 12],
+                position_ids=[3, 3],
+                reserve_steps=4,
+            )
+            runner.decode_batch_padded_persistent(
+                self._graph_cache_cohort(torch, hf_config, native_config, 100),
+                [21, 22],
+                position_ids=[7, 7],
+                reserve_steps=4,
+            )
+
+        self.assertEqual(len(created), 0)
+        self.assertEqual(len(eager_calls), 2)
+        self.assertEqual(
+            runner.last_decode_batch_info["persistent_padded_decode_cuda_graph_skip"],
+            "unavailable",
+        )
+        self.assertFalse(runner._token_pool_decode_graph_cache)
+
+    def test_graph_replay_bookkeeping_updates_current_cohort_cache(self) -> None:
+        import torch
+
+        from wkvm.runner.gemma_runner import GemmaRoutedSpanRunner
+
+        model = SimpleNamespace(device="cpu", config=SimpleNamespace())
+        runner = GemmaRoutedSpanRunner(model, FakeRunnerBank())
+
+        class RecordingCache:
+            def __init__(self) -> None:
+                self.static_replays = 0
+                self.token_pool_steps = 0
+
+            def get_seq_length(self) -> int:
+                return 17
+
+            def record_static_padded_decode_replay(self) -> None:
+                self.static_replays += 1
+
+            def record_token_pool_covered_decode_step(self) -> None:
+                self.token_pool_steps += 1
+
+        original_cache = RecordingCache()
+        current_cache = RecordingCache()
+
+        class FakeGraph:
+            records_token_pool_decode_steps = True
+            last_decode_info = {}
+
+            def __init__(self) -> None:
+                self.position_ids = None
+
+            def decode(self, last_tokens, *, position_ids=None, token_pool_decode=None):
+                self.position_ids = position_ids
+                return torch.zeros(len(last_tokens), 3)
+
+        graph = FakeGraph()
+        graph.cache = original_cache
+        current_cache._padded_decode_graph = graph
+
+        runner._decode_padded_cache(
+            current_cache,
+            [11, 12],
+            token_pool_decode=object(),
+        )
+
+        self.assertEqual(current_cache.static_replays, 1)
+        self.assertEqual(current_cache.token_pool_steps, 1)
+        self.assertEqual(original_cache.static_replays, 0)
+        self.assertEqual(original_cache.token_pool_steps, 0)
+        self.assertEqual(graph.position_ids, [17, 17])
+
+    def test_token_pool_graph_cache_is_bounded_lru(self) -> None:
+        from wkvm.runner.gemma_runner import (
+            GemmaRoutedSpanRunner,
+            _TOKEN_POOL_DECODE_GRAPH_CACHE_MAX_ENTRIES,
+        )
+
+        runner = GemmaRoutedSpanRunner(
+            SimpleNamespace(device="cpu", config=SimpleNamespace()),
+            FakeRunnerBank(),
+        )
+        graphs = [object() for _ in range(_TOKEN_POOL_DECODE_GRAPH_CACHE_MAX_ENTRIES + 2)]
+        for index, graph in enumerate(graphs[:-1]):
+            runner._cache_token_pool_decode_graph((index,), graph)
+
+        self.assertEqual(
+            len(runner._token_pool_decode_graph_cache),
+            _TOKEN_POOL_DECODE_GRAPH_CACHE_MAX_ENTRIES,
+        )
+        self.assertNotIn((0,), runner._token_pool_decode_graph_cache)
+        self.assertIs(runner._cached_token_pool_decode_graph((1,)), graphs[1])
+
+        runner._cache_token_pool_decode_graph(
+            (_TOKEN_POOL_DECODE_GRAPH_CACHE_MAX_ENTRIES + 1,),
+            graphs[-1],
+        )
+
+        self.assertIn((1,), runner._token_pool_decode_graph_cache)
+        self.assertNotIn((2,), runner._token_pool_decode_graph_cache)
+
+    def test_token_pool_graph_cache_can_be_cleared_at_cohort_boundary(self) -> None:
+        from wkvm.runner.gemma_runner import GemmaRoutedSpanRunner
+
+        runner = GemmaRoutedSpanRunner(
+            SimpleNamespace(device="cpu", config=SimpleNamespace()),
+            FakeRunnerBank(),
+        )
+        runner._cache_token_pool_decode_graph((1,), object())
+        runner._cache_token_pool_decode_graph((2,), object())
+
+        evicted = runner.clear_token_pool_decode_graph_cache()
+
+        self.assertEqual(evicted, 2)
+        self.assertFalse(runner._token_pool_decode_graph_cache)
+        self.assertEqual(runner.clear_token_pool_decode_graph_cache(), 0)
+
 
 class FakeTensorShape:
     def __init__(
@@ -1325,6 +1917,7 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         *,
         req_id: str = "full",
         prompt_token_ids: list[int] | None = None,
+        num_slots: int = 1,
         token_pool_capacity: int = 64,
         token_pool_paged_block_size: int | None = None,
     ):
@@ -1388,7 +1981,7 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         engine = GemmaNativeEngine(
             model=FakeNativeTokenPoolModel(),
             config=cfg,
-            num_slots=1,
+            num_slots=num_slots,
             enable_token_pool_attention=True,
             token_pool_max_context_len=8,
             token_pool_capacity=token_pool_capacity,
@@ -1573,6 +2166,9 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
 
         engine._record_decode_timing_info(
             {
+                "persistent_padded_decode_cuda_graph_captured": 1,
+                "persistent_padded_decode_cuda_graph_cache_hit": 1,
+                "cuda_graph_replay": 1,
                 "cuda_memory": {
                     "after_padded_attention_mask": {
                         "allocated_bytes": 100,
@@ -1608,6 +2204,9 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
             engine.metrics.decode_cuda_peak_reserved_advances_by_phase,
             {"after_padded_attention_mask": 220, "after_padded_model_forward": 300},
         )
+        self.assertEqual(engine.metrics.persistent_padded_decode_cuda_graph_captures, 1)
+        self.assertEqual(engine.metrics.persistent_padded_decode_cuda_graph_cache_hits, 1)
+        self.assertEqual(engine.metrics.persistent_padded_decode_cuda_graph_replays, 1)
 
     def test_chunked_prefill_advances_existing_cache_until_gap_closes(self) -> None:
         from wkvm.gemma_engine import GemmaNativeEngine
@@ -1875,6 +2474,177 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         self.assertEqual(page_table_tensor[req_slot, :1].tolist(), [0])
         engine._token_pool_release_request(req.req_id)
         self.assertEqual(page_table_tensor[req_slot, :1].tolist(), [-1])
+
+    def test_one_shot_prefill_uses_authoritative_sliding_pool_path(self) -> None:
+        import torch
+        from wkvm.gemma_engine import GemmaNativeEngine
+        from wkvm.models.gemma import gemma4_e4b_routed_span_config
+
+        class FakeNativeTokenPoolModel:
+            wkvm_no_hf_transformer_forward = True
+
+            def __init__(self) -> None:
+                self._param = torch.empty((), dtype=torch.float32)
+                self.config = SimpleNamespace(num_attention_heads=2)
+                attn = SimpleNamespace(
+                    layer_type="sliding_attention",
+                    is_kv_shared_layer=False,
+                    num_key_value_groups=2,
+                    head_dim=4,
+                )
+                self.text_prefix = SimpleNamespace(
+                    layers=[SimpleNamespace(layer_idx=0, attn_meta=attn)]
+                )
+
+            def parameters(self):
+                return iter([self._param])
+
+        cfg = gemma4_e4b_routed_span_config(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("sliding_attention",),
+            num_kv_heads=1,
+            head_dim=4,
+            sliding_window=4,
+        )
+        model = FakeNativeTokenPoolModel()
+        engine = GemmaNativeEngine(
+            model=model,
+            config=cfg,
+            num_slots=1,
+            enable_token_pool_attention=True,
+            token_pool_max_context_len=8,
+            token_pool_capacity=32,
+        )
+        hf_config = SimpleNamespace(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("sliding_attention",),
+            sliding_window=4,
+        )
+        runner = FakeAuthoritativePrefillRunner(model, hf_config, cfg)
+        engine.runner = runner
+        backend = engine._token_pool_decode_backend
+        self.assertIsNotNone(backend)
+
+        def fail_backfill(*args, **kwargs):
+            raise AssertionError("one-shot authoritative prefill must not backfill")
+
+        backend.backfill_prefill_tokens = fail_backfill  # type: ignore[method-assign,union-attr]
+        req = Request(
+            prompt_token_ids=[1, 2, 3, 4, 5],
+            max_new_tokens=2,
+            req_id="one-shot",
+        )
+        engine.add_request(req)
+
+        engine.step()
+
+        cache = runner.last_cache
+        self.assertIsNotNone(cache)
+        self.assertEqual(engine.metrics.token_pool_authoritative_prefill_requests, 1)
+        self.assertEqual(engine.metrics.token_pool_authoritative_prefill_tokens, 5)
+        self.assertEqual(engine.metrics.token_pool_authoritative_prefill_layer_writes, 1)
+        self.assertEqual(
+            engine._token_table.slots_for("one-shot").tolist(),
+            [-1, -1, 2, 3, 4],
+        )
+        pooled_k, pooled_v = engine._token_kv_pool.gather_kv(0, [2, 3, 4])
+        self.assertTrue(
+            torch.equal(
+                pooled_k,
+                runner.last_keys[0, :, -3:, :].permute(1, 0, 2),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                pooled_v,
+                runner.last_values[0, :, -3:, :].permute(1, 0, 2),
+            )
+        )
+        self.assertIsNone(cache.layers[0].keys)
+        self.assertIsNone(cache.layers[0].values)
+        self.assertEqual(cache._shared_kv_by_layer, {})
+        self.assertEqual(cache._shared_kv_by_type, {})
+        self.assertEqual(cache.state_bytes(), 0)
+
+    def test_chunked_prefill_keeps_authoritative_metric_zero(self) -> None:
+        import torch
+        from wkvm.gemma_engine import GemmaNativeEngine
+        from wkvm.models.gemma import gemma4_e4b_routed_span_config
+
+        class FakeNativeTokenPoolModel:
+            wkvm_no_hf_transformer_forward = True
+
+            def __init__(self) -> None:
+                self._param = torch.empty((), dtype=torch.float32)
+                self.config = SimpleNamespace(num_attention_heads=2)
+                attn = SimpleNamespace(
+                    layer_type="sliding_attention",
+                    is_kv_shared_layer=False,
+                    num_key_value_groups=2,
+                    head_dim=4,
+                )
+                self.text_prefix = SimpleNamespace(
+                    layers=[SimpleNamespace(layer_idx=0, attn_meta=attn)]
+                )
+
+            def parameters(self):
+                return iter([self._param])
+
+        cfg = gemma4_e4b_routed_span_config(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("sliding_attention",),
+            num_kv_heads=1,
+            head_dim=4,
+            sliding_window=4,
+        )
+        model = FakeNativeTokenPoolModel()
+        engine = GemmaNativeEngine(
+            model=model,
+            config=cfg,
+            num_slots=1,
+            prefill_chunk=3,
+            enable_token_pool_attention=True,
+            token_pool_max_context_len=8,
+            token_pool_capacity=32,
+        )
+        hf_config = SimpleNamespace(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("sliding_attention",),
+            sliding_window=4,
+        )
+        runner = FakeAuthoritativePrefillRunner(model, hf_config, cfg)
+        engine.runner = runner
+        backend = engine._token_pool_decode_backend
+        self.assertIsNotNone(backend)
+        original_backfill = backend.backfill_prefill_tokens
+        backfill_calls = 0
+
+        def count_backfill(*args, **kwargs):
+            nonlocal backfill_calls
+            backfill_calls += 1
+            return original_backfill(*args, **kwargs)
+
+        backend.backfill_prefill_tokens = count_backfill  # type: ignore[method-assign,union-attr]
+        req = Request(
+            prompt_token_ids=[1, 2, 3, 4, 5],
+            max_new_tokens=2,
+            req_id="chunked",
+        )
+        engine.add_request(req)
+
+        engine.step()
+        self.assertEqual(engine.metrics.token_pool_authoritative_prefill_requests, 0)
+        self.assertIsNotNone(runner.last_cache.layers[0].keys)
+        engine.step()
+
+        self.assertEqual(engine.metrics.token_pool_authoritative_prefill_requests, 0)
+        self.assertEqual(engine.metrics.token_pool_authoritative_prefill_tokens, 0)
+        self.assertEqual(engine.metrics.token_pool_authoritative_prefill_layer_writes, 0)
+        self.assertEqual(backfill_calls, 2)
 
     def test_token_pool_attention_pages_mid_block_sliding_tail(self) -> None:
         import torch
@@ -2361,7 +3131,8 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         self.assertIs(sliding_metadata, context.metadata_by_layer_type["sliding_attention"])  # type: ignore[union-attr]
         full_layer = cache.layers[1]
         materialized_width = full_layer.materialized_tokens()
-        self.assertGreater(materialized_width, req.num_prompt_tokens)
+        self.assertGreater(materialized_width, 0)
+        self.assertLessEqual(materialized_width, req.num_prompt_tokens)
         self.assertEqual(full_metadata.seq_lens.tolist(), [materialized_width + 1])
         self.assertEqual(full_metadata.logical_seq_lens.tolist(), [req.num_prompt_tokens + 1])
         self.assertEqual(full_metadata.out_cache_loc.tolist(), [5])
@@ -2456,11 +3227,13 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         self.assertEqual(full_metadata.seq_lens.tolist(), [materialized_width + 1])
         first_full_slot = reservations[0].full_attention_token_slot
         self.assertIsNotNone(first_full_slot)
-        self.assertNotEqual(first_full_slot, reservations[0].token_slot)
+        self.assertEqual(first_full_slot, reservations[0].token_slot)
         self.assertEqual(full_metadata.out_cache_loc.tolist(), [first_full_slot])
         self.assertEqual(engine.metrics.token_pool_full_attention_row_rebuilds, 1)
         self.assertEqual(engine.metrics.token_pool_full_attention_row_reuses, 0)
         self.assertEqual(engine.metrics.token_pool_full_attention_row_appends, 0)
+        self.assertIsNone(full_layer.keys)
+        self.assertIsNone(full_layer.values)
 
         decode_key = torch.tensor([[[301.0, 302.0]]])
         engine._token_kv_pool.set_kv(  # type: ignore[union-attr]
@@ -2470,10 +3243,14 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
             decode_key + 100,
         )
         engine._token_pool_commit_decode_reservations(reservations)
+        self.assertIsNone(full_layer.keys)
+        self.assertIsNone(full_layer.values)
 
         row = engine._token_pool_full_attention_rows["persist"]
-        self.assertEqual(len(row.owned_slots), materialized_width + 2)
-        self.assertEqual(len(row.append_slots), 1)
+        self.assertEqual(row.owned_slots, [])
+        self.assertEqual(row.append_slots, [])
+        self.assertEqual(row.borrowed_slots, row.row_slots)
+        self.assertEqual(row.borrowed_append_slots_remaining, 1)
         self.assertEqual(len(row.row_slots), materialized_width + 1)
         self.assertEqual(row.row_slots[-1], first_full_slot)
         self.assertEqual(engine._token_pool_full_attention_slots, {})
@@ -2492,7 +3269,7 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         reused_row = engine._token_pool_full_attention_rows["persist"]
         reused_full_slot = reused_reservations[0].full_attention_token_slot
         self.assertIsNotNone(reused_full_slot)
-        self.assertNotEqual(reused_full_slot, reused_reservations[0].token_slot)
+        self.assertEqual(reused_full_slot, reused_reservations[0].token_slot)
         self.assertEqual(reused_full.out_cache_loc.tolist(), [reused_full_slot])
 
         self.assertEqual(
@@ -2503,6 +3280,8 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         self.assertEqual(reused_row.row_slots[-2], first_full_slot)
         self.assertEqual(reused_row.row_slots[-1], reused_full_slot)
         self.assertEqual(reused_row.append_slots, [])
+        self.assertEqual(reused_row.borrowed_slots, reused_row.row_slots)
+        self.assertEqual(reused_row.borrowed_append_slots_remaining, 0)
         self.assertEqual(reused_full.seq_lens.tolist(), [materialized_width + 2])
         for name, ptr in first_metadata_ptrs.items():
             self.assertEqual(int(getattr(reused_full, name).data_ptr()), ptr)
@@ -2515,6 +3294,110 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         self.assertEqual(engine.metrics.token_pool_full_attention_row_appends, 1)
 
         engine._token_pool_discard_decode_reservations(reused_reservations)
+        engine._token_pool_release_request(req.req_id)
+        self.assertEqual(engine.stats()["token_pool"]["allocated_token_slots"], 0)
+
+    def test_full_attention_prepare_rollback_rematerializes_released_rows(self) -> None:
+        import torch
+
+        from wkvm.core.request import Request
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+
+        engine, first_req, first_cache = self._make_full_attention_token_pool_fixture(
+            req_id="first",
+            num_slots=2,
+            token_pool_capacity=128,
+        )
+        second_req = Request(
+            prompt_token_ids=[4, 5, 6],
+            max_new_tokens=4,
+            req_id="second",
+        )
+        second_cache = NativeGemmaRoutedCache(first_cache.hf_config, engine.config)
+        sliding_keys = torch.arange(6, dtype=torch.float32).reshape(1, 1, 3, 2) + 40
+        full_keys = torch.arange(6, dtype=torch.float32).reshape(1, 1, 3, 2) + 80
+        second_cache.update(sliding_keys, sliding_keys + 100, layer_idx=0)
+        second_cache.update(full_keys, full_keys + 100, layer_idx=1)
+        engine._caches[second_req.req_id] = second_cache
+        engine._token_pool_commit_prefill_tokens(
+            second_req,
+            second_req.num_prompt_tokens,
+            cache=second_cache,
+            final_prefill=True,
+        )
+        second_req.num_computed_tokens = second_req.num_prompt_tokens
+        second_req.output_token_ids.append(78)
+
+        second_full_layer = second_cache.layers[1]
+
+        def fail_second_row_write(*args, **kwargs):
+            raise RuntimeError("forced second-row full-attention preparation failure")
+
+        second_full_layer.write_materialized_readout_to_token_pool = (
+            fail_second_row_write
+        )
+        prepared = engine._token_pool_prepare_decode_batch(
+            [first_req, second_req],
+            full_attention_kv_indices_padding_steps=1,
+            persistent_full_attention_rows=True,
+        )
+        context = engine._token_pool_decode_context(prepared)
+
+        self.assertIsNotNone(context)
+        self.assertEqual(
+            context.covered_layer_types,
+            frozenset({"sliding_attention"}),
+        )
+        self.assertEqual(engine._token_pool_full_attention_rows, {})
+        first_full_layer = first_cache.layers[1]
+        self.assertIsNotNone(first_full_layer.keys)
+        self.assertIsNotNone(first_full_layer.values)
+        self.assertFalse(first_full_layer._dense_storage_released)
+
+        merged, info = NativeGemmaRoutedCache.merge_padded_decode(
+            [first_cache, second_cache],
+            decode_steps=2,
+            persistent=True,
+            graph_static=True,
+            token_pool_covered_layer_types=context.covered_layer_types,
+        )
+        self.assertEqual(info["merge"], "padded_valid_mask_concat")
+        self.assertIsNotNone(merged.layers[1].keys)
+        self.assertIsNotNone(merged.layers[1].values)
+
+        engine._token_pool_discard_decode_reservations(prepared)
+        engine._token_pool_release_request(first_req.req_id)
+        engine._token_pool_release_request(second_req.req_id)
+        self.assertEqual(engine.stats()["token_pool"]["allocated_token_slots"], 0)
+
+    def test_persistent_full_attention_row_aliases_stable_suffix_only(self) -> None:
+        engine, req, cache = self._make_full_attention_token_pool_fixture(
+            req_id="persist-fallback"
+        )
+        materialized_width = cache.layers[1].materialized_tokens()
+        allocated_before = engine.stats()["token_pool"]["allocated_token_slots"]
+
+        reservations = engine._token_pool_prepare_decode_batch(
+            [req],
+            full_attention_kv_indices_padding_steps=5,
+            persistent_full_attention_rows=True,
+        )
+
+        row = engine._token_pool_full_attention_rows[req.req_id]
+        self.assertGreater(materialized_width + 6, engine.config.sliding_window)
+        self.assertEqual(
+            reservations[0].full_attention_token_slot,
+            reservations[0].token_slot,
+        )
+        self.assertEqual(len(row.borrowed_slots), 3)
+        self.assertEqual(row.borrowed_append_slots_remaining, 5)
+        self.assertEqual(len(row.owned_slots), materialized_width - 2)
+        self.assertEqual(
+            engine.stats()["token_pool"]["allocated_token_slots"],
+            allocated_before + materialized_width - 2,
+        )
+
+        engine._token_pool_discard_decode_reservations(reservations)
         engine._token_pool_release_request(req.req_id)
         self.assertEqual(engine.stats()["token_pool"]["allocated_token_slots"], 0)
 
@@ -2720,7 +3603,7 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         self.assertEqual(engine._token_pool_full_attention_slots, {})
         self.assertEqual(
             engine.stats()["token_pool"]["allocated_token_slots"],
-            allocated_with_row - materialized_width - 1,
+            allocated_with_row,
         )
         self.assertEqual(engine.metrics.token_pool_full_attention_row_invalidations, 0)
 

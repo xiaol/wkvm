@@ -29,10 +29,14 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 from native_gemma_engine_smoke import build_prompt, chunked_scheduler_config, prompt_lengths
 from native_gemma_smoke import break_mask_for, load_model, resolve_model_path
 from bench_prompt_utils import (
+    GENERATED_OUTPUT_FINGERPRINT_SCHEMA,
     SyntheticBenchTokenizer,
+    generated_output_fingerprint,
+    generated_output_fingerprint_row_fields,
     prompt_fingerprint_row_fields,
     prompt_set_fingerprint,
 )
+from wkvm_serving_bench import WholeGpuMemoryMonitor
 
 from wkvm.core.request import Request
 from wkvm.gemma_engine import GemmaNativeEngine
@@ -88,6 +92,30 @@ def round_or_none(x: float | None, ndigits: int = 3) -> float | None:
     if x is None or not math.isfinite(x):
         return None
     return round(x, ndigits)
+
+
+def finalize_whole_gpu_memory(
+    monitor: WholeGpuMemoryMonitor | None,
+    rows: list[dict[str, Any]],
+    args,
+) -> dict[str, Any] | None:
+    if monitor is None:
+        return None
+    monitor.__exit__(None, None, None)
+    result = monitor.result()
+    peak_delta_mib = result.get("peak_delta_mib")
+    peak_engine_delta_gib = (
+        None if peak_delta_mib is None else float(peak_delta_mib) / 1024.0
+    )
+    for row in rows:
+        row["gpu_memory"] = dict(result)
+        row["peak_engine_delta_gib"] = round_or_none(peak_engine_delta_gib)
+        row["torch_reserved_green"] = row.get("green")
+        if peak_engine_delta_gib is not None:
+            row["green"] = bool(
+                peak_engine_delta_gib <= args.mem_cap_gib - args.headroom_gib
+            )
+    return result
 
 
 def summarize_request_traces(traces: Iterable[Any]) -> dict[str, Any]:
@@ -233,6 +261,34 @@ def native_no_hf_requirement_report(
         "checked_successful_rows": checked_rows,
         "passed": not violations,
         "violations": violations,
+    }
+
+
+def generated_output_fingerprint_summary(
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    successful_rows = [
+        row
+        for row in rows
+        if row.get("success_count") == row.get("B")
+        and row.get("error_count") == 0
+    ]
+    by_batch: dict[str, dict[str, object]] = {}
+    for row in successful_rows:
+        fingerprint = row.get("generated_output_fingerprint")
+        if not isinstance(fingerprint, dict):
+            continue
+        if fingerprint.get("schema") != GENERATED_OUTPUT_FINGERPRINT_SCHEMA:
+            continue
+        digest = fingerprint.get("request_output_token_ids_sha256")
+        if not isinstance(digest, str) or len(digest) != 64:
+            continue
+        by_batch[str(row["B"])] = dict(fingerprint)
+    return {
+        "successful_rows": len(successful_rows),
+        "fingerprinted_successful_rows": len(by_batch),
+        "complete": len(by_batch) == len(successful_rows),
+        "by_batch": by_batch,
     }
 
 
@@ -435,9 +491,11 @@ def build_benchmark_payload(
     rows: list[dict[str, Any]],
     usable_gib: float | None,
     token_pool_triton_env: dict[str, str | None],
+    whole_gpu_memory: dict[str, Any] | None = None,
     fatal_error: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     hf_boundary = hf_boundary_summary(rows, args)
+    output_fingerprints = generated_output_fingerprint_summary(rows)
     native_no_hf_requirement = native_no_hf_requirement_report(
         rows,
         required=args.require_native_no_hf,
@@ -451,6 +509,7 @@ def build_benchmark_payload(
         "decode_tokens_per_session": args.out,
         "mem_cap_gib": args.mem_cap_gib,
         "headroom_gib": args.headroom_gib,
+        "gpu_memory": whole_gpu_memory,
         "torch_usable_gib": round_or_none(usable_gib),
         "model_path": path,
         "prompt_token_source": prompt_token_source(args),
@@ -470,6 +529,20 @@ def build_benchmark_payload(
         ],
         "hf_boundary": hf_boundary,
         "native_no_hf_requirement": native_no_hf_requirement,
+        "generated_output_fingerprint_schema": (
+            GENERATED_OUTPUT_FINGERPRINT_SCHEMA
+        ),
+        "generated_output_fingerprint_coverage": {
+            key: output_fingerprints[key]
+            for key in (
+                "successful_rows",
+                "fingerprinted_successful_rows",
+                "complete",
+            )
+        },
+        "generated_output_fingerprints_by_batch": output_fingerprints[
+            "by_batch"
+        ],
         "native_gemma_attention_backend": args.native_gemma_attention_backend,
         "native_gemma_projection_backend": args.native_gemma_projection_backend,
         "native_gemma_weight_backend": args.native_gemma_weight_backend,
@@ -488,6 +561,7 @@ def build_benchmark_payload(
             "m_slots": args.m_slots,
             "route_chunk": args.route_chunk,
             "chunk": args.chunk,
+            "prefill_microbatch_rows": getattr(args, "prefill_microbatch_rows", 1),
             "decode_microbatch_rows": args.decode_microbatch_rows,
             "decode_microbatch_bytes": args.decode_microbatch_bytes,
             "decode_batch_planner": args.decode_batch_planner,
@@ -612,6 +686,7 @@ def make_engine(model, cfg, prompts: list[list[int]], args) -> GemmaNativeEngine
         num_slots=slots,
         scheduler_config=sched_cfg,
         prefill_chunk=args.chunk,
+        prefill_microbatch_rows=getattr(args, "prefill_microbatch_rows", 1),
         decode_microbatch_rows=args.decode_microbatch_rows,
         decode_microbatch_bytes=args.decode_microbatch_bytes,
         decode_batch_planner=args.decode_batch_planner,
@@ -681,7 +756,8 @@ def run_row(model, tok, cfg, B: int, args, usable_gib: float | None) -> dict[str
     triton_stats_before = token_pool_triton_stats_snapshot()
     native_timing_before = native_forward_timing_stats_snapshot()
     native_decode_timing_before: dict[str, Any] | None = None
-    started = time.perf_counter()
+    setup_started = time.perf_counter()
+    started: float | None = None
     engine: GemmaNativeEngine | None = None
     try:
         lengths = bench_prompt_lengths(args.ctx, B, args.prompt_lengths)
@@ -699,6 +775,7 @@ def run_row(model, tok, cfg, B: int, args, usable_gib: float | None) -> dict[str
             Request(prompt_token_ids=prompt, max_new_tokens=args.out, req_id=f"bench-{B}-{i}")
             for i, prompt in enumerate(prompts)
         ]
+        started = time.perf_counter()
         for req, prompt in zip(reqs, prompts):
             engine.add_request(req, break_mask=break_mask_for(tok, prompt))
 
@@ -814,6 +891,15 @@ def run_row(model, tok, cfg, B: int, args, usable_gib: float | None) -> dict[str
                 "token_pool_decode_metadata_rows": (
                     engine.metrics.token_pool_decode_metadata_rows
                 ),
+                "token_pool_authoritative_prefill_requests": (
+                    engine.metrics.token_pool_authoritative_prefill_requests
+                ),
+                "token_pool_authoritative_prefill_tokens": (
+                    engine.metrics.token_pool_authoritative_prefill_tokens
+                ),
+                "token_pool_authoritative_prefill_layer_writes": (
+                    engine.metrics.token_pool_authoritative_prefill_layer_writes
+                ),
                 "token_pool_decode_covered_layer_type_batches": dict(
                     engine.metrics.token_pool_decode_covered_layer_type_batches
                 ),
@@ -854,6 +940,13 @@ def run_row(model, tok, cfg, B: int, args, usable_gib: float | None) -> dict[str
                 "token_pool_slot_high_watermark": (
                     engine.metrics.token_pool_slot_high_watermark
                 ),
+                "prefill_calls": engine.metrics.prefill_calls,
+                "prefill_model_calls": engine.metrics.prefill_model_calls,
+                "batched_prefill_model_calls": (
+                    engine.metrics.batched_prefill_model_calls
+                ),
+                "batched_prefill_rows": engine.metrics.batched_prefill_rows,
+                "max_prefill_batch_rows": engine.metrics.max_prefill_batch_rows,
                 "steps": engine.metrics.steps,
                 "max_waiting": engine.metrics.max_waiting,
                 "max_running": engine.metrics.max_running,
@@ -941,6 +1034,9 @@ def run_row(model, tok, cfg, B: int, args, usable_gib: float | None) -> dict[str
                 "persistent_padded_decode_cuda_graph_captures": (
                     engine.metrics.persistent_padded_decode_cuda_graph_captures
                 ),
+                "persistent_padded_decode_cuda_graph_cache_hits": (
+                    engine.metrics.persistent_padded_decode_cuda_graph_cache_hits
+                ),
                 "persistent_padded_decode_cuda_graph_replays": (
                     engine.metrics.persistent_padded_decode_cuda_graph_replays
                 ),
@@ -1000,10 +1096,21 @@ def run_row(model, tok, cfg, B: int, args, usable_gib: float | None) -> dict[str
                 ),
             }
         )
+        if row["success_count"] == B and row["error_count"] == 0:
+            row.update(
+                generated_output_fingerprint_row_fields(
+                    generated_output_fingerprint(
+                        (req.req_id, req.output_token_ids) for req in successes
+                    )
+                )
+            )
     except Exception as exc:
         row["error_count"] = max(B - row["success_count"], 1)
         row["error"] = str(exc).splitlines()[0]
-        row["elapsed_s"] = round(time.perf_counter() - started, 3)
+        row["elapsed_s"] = round(
+            time.perf_counter() - (started if started is not None else setup_started),
+            3,
+        )
         row["peak_reserved_gib"] = round_or_none(cuda_peak_reserved_gib())
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1036,6 +1143,13 @@ def run(args) -> dict[str, Any]:
     path = resolve_model_path(args.model_path)
     rows = []
     usable_gib: float | None = None
+    memory_monitor = None
+    if getattr(args, "gpu_memory_device", None) is not None:
+        memory_monitor = WholeGpuMemoryMonitor(
+            str(args.gpu_memory_device),
+            float(args.gpu_memory_sample_interval_s),
+        )
+        memory_monitor.__enter__()
     setup_phase = "setup"
     try:
         setup_phase = "torch_memory_probe"
@@ -1122,12 +1236,14 @@ def run(args) -> dict[str, Any]:
             if row.get("error") and args.stop_on_failure:
                 break
     except Exception as exc:
+        whole_gpu_memory = finalize_whole_gpu_memory(memory_monitor, rows, args)
         payload = build_benchmark_payload(
             args,
             path=path,
             rows=rows,
             usable_gib=usable_gib,
             token_pool_triton_env=token_pool_triton_env,
+            whole_gpu_memory=whole_gpu_memory,
             fatal_error=benchmark_fatal_error(exc, phase=setup_phase),
         )
         emit_benchmark_payload(args, payload)
@@ -1135,12 +1251,14 @@ def run(args) -> dict[str, Any]:
             torch.cuda.empty_cache()
         raise
 
+    whole_gpu_memory = finalize_whole_gpu_memory(memory_monitor, rows, args)
     payload = build_benchmark_payload(
         args,
         path=path,
         rows=rows,
         usable_gib=usable_gib,
         token_pool_triton_env=token_pool_triton_env,
+        whole_gpu_memory=whole_gpu_memory,
     )
     emit_benchmark_payload(args, payload)
     if torch.cuda.is_available():
@@ -1176,10 +1294,18 @@ def main() -> None:
     )
     ap.add_argument("--mem-cap-gib", type=float, default=float(os.environ.get("WKVM_MEM_CAP_GIB", 19)))
     ap.add_argument("--headroom-gib", type=float, default=1.0)
+    ap.add_argument("--gpu-memory-device", default=None)
+    ap.add_argument("--gpu-memory-sample-interval-s", type=float, default=0.1)
     ap.add_argument("--json", default=None)
     ap.add_argument("--slots", type=int, default=None)
     ap.add_argument("--token-budget", type=int, default=None)
     ap.add_argument("--chunk", type=int, default=2048)
+    ap.add_argument(
+        "--prefill-microbatch-rows",
+        type=int,
+        default=1,
+        help="Equal-width prompt rows per native model call; 1 disables batching, 0 is unlimited.",
+    )
     ap.add_argument("--decode-microbatch-rows", type=int, default=16)
     ap.add_argument("--decode-microbatch-bytes", type=int, default=None)
     ap.add_argument("--decode-workspace-bytes", type=int, default=None)

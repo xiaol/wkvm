@@ -108,6 +108,128 @@ def _token_pool_backend_decode(
 
 
 class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
+    def test_sdpa_single_gqa_decode_fallback_does_not_expand_batched_kv(self) -> None:
+        from types import SimpleNamespace
+
+        import torch
+        from wkvm.runner import gemma_native_forward as native_forward
+
+        torch.manual_seed(61)
+        attention = SimpleNamespace(
+            num_key_value_groups=2,
+            scaling=0.5,
+            attention_dropout=0.0,
+            training=False,
+        )
+        query_states = torch.randn(3, 4, 1, 4)
+        key_states = torch.randn(3, 2, 7, 4)
+        value_states = torch.randn(3, 2, 7, 4)
+        attention_mask = torch.ones(3, 1, 1, 7, dtype=torch.bool)
+        expected, expected_weights = native_forward._attention_forward_manual_gqa(
+            attention,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+        )
+        original_repeat_kv = native_forward._repeat_kv
+
+        def reject_expansion(*_args, **_kwargs):
+            raise AssertionError("batched decode fallback expanded grouped KV")
+
+        native_forward._repeat_kv = reject_expansion
+        try:
+            actual, actual_weights = native_forward._attention_forward(
+                attention,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                backend="sdpa_single_gqa",
+            )
+        finally:
+            native_forward._repeat_kv = original_repeat_kv
+
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertTrue(torch.equal(actual_weights, expected_weights))
+
+    def test_rms_norm_residual_scalar_cpu_fallback_matches_composition(self) -> None:
+        from types import SimpleNamespace
+
+        import torch
+        import torch.nn.functional as F
+        from wkvm.runner.gemma_native_forward import _rms_norm_residual_scalar
+
+        torch.manual_seed(53)
+        hidden_states = torch.randn(3, 5, 16)
+        residual = torch.randn_like(hidden_states)
+        weight = torch.randn(16)
+        scalar = torch.tensor([0.75])
+        norm = SimpleNamespace(weight=weight, eps=1e-6)
+        expected = (
+            F.rms_norm(hidden_states, (16,), weight, norm.eps) + residual
+        ) * scalar
+
+        with torch.inference_mode():
+            actual = _rms_norm_residual_scalar(
+                hidden_states,
+                norm,
+                residual,
+                scalar,
+            )
+
+        self.assertTrue(torch.equal(actual, expected))
+
+    def test_fused_rms_norm_residual_scalar_matches_bfloat16_cuda(self) -> None:
+        from types import SimpleNamespace
+
+        import torch
+        import torch.nn.functional as F
+
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for fused Gemma RMSNorm")
+        try:
+            from wkvm.runner.gemma_fused_ops import rms_norm_residual_scalar
+        except ImportError:
+            self.skipTest("Triton is required for fused Gemma RMSNorm")
+        from wkvm.runner import gemma_native_forward as native_forward
+
+        torch.manual_seed(59)
+        hidden_states = torch.randn(
+            8,
+            1,
+            2560,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        residual = torch.randn_like(hidden_states)
+        weight = torch.randn(2560, dtype=torch.bfloat16, device="cuda")
+        scalar = torch.tensor([0.75], dtype=torch.bfloat16, device="cuda")
+        norm = SimpleNamespace(weight=weight, eps=1e-6)
+        expected = (
+            F.rms_norm(hidden_states, (2560,), weight, norm.eps) + residual
+        ) * scalar
+
+        with torch.inference_mode():
+            direct = rms_norm_residual_scalar(
+                hidden_states,
+                weight,
+                residual,
+                scalar,
+                norm.eps,
+            )
+            actual = native_forward._rms_norm_residual_scalar(
+                hidden_states,
+                norm,
+                residual,
+                scalar,
+            )
+        torch.cuda.synchronize()
+
+        tolerance = torch.finfo(torch.bfloat16).eps
+        self.assertLessEqual((direct - expected).abs().max().item(), tolerance)
+        self.assertLessEqual((actual - expected).abs().max().item(), tolerance)
+
     def test_native_checkpoint_config_loader_reads_local_text_config(self) -> None:
         import json
         import tempfile
@@ -166,6 +288,8 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
         self.assertEqual(cfg.vocab_size, 128)
         self.assertEqual(cfg.layer_types, ["sliding_attention", "full_attention"])
         self.assertEqual(cfg.rope_parameters["full_attention"]["rope_type"], "proportional")
+        self.assertEqual(cfg._attn_implementation, "eager")
+        self.assertEqual(cfg._attn_implementation_internal, "eager")
         self.assertIs(cfg.get_text_config(decoder=True), cfg)
         self.assertEqual(cfg.to_dict()["hidden_size"], 16)
         self.assertIsNone(cfg.standardize_rope_params())
@@ -2083,6 +2207,132 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
 
         self.assertLess((expected - actual).abs().max().item(), 1e-6)
 
+    def test_authoritative_sliding_prefill_matches_dense_and_releases_all_cache_kv(self) -> None:
+        from types import SimpleNamespace
+
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import (
+            Gemma4TextDecoderLayer,
+            Gemma4TextRotaryEmbedding,
+        )
+        from wkvm.models.gemma import GemmaRoutedSpanConfig
+        from wkvm.runner.gemma_native_forward import NativeGemma4TextDecoderLayer
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenKVLayerSpec,
+            TokenKVPool,
+            TokenPoolBlockTables,
+            TokenPoolDecodeBackendState,
+        )
+
+        torch.manual_seed(41)
+        cfg = _tiny_config()
+        hf_layer = Gemma4TextDecoderLayer(cfg, layer_idx=0).eval()
+        dense_layer = NativeGemma4TextDecoderLayer(
+            hf_layer,
+            native_attention_backend="manual_gqa",
+        )
+        authoritative_layer = NativeGemma4TextDecoderLayer(
+            hf_layer,
+            native_attention_backend="manual_gqa",
+        )
+        rotary = Gemma4TextRotaryEmbedding(cfg)
+        native_cfg = GemmaRoutedSpanConfig(
+            num_hidden_layers=cfg.num_hidden_layers,
+            num_kv_shared_layers=cfg.num_kv_shared_layers,
+            layer_types=tuple(cfg.layer_types),
+            num_kv_heads=cfg.num_key_value_heads,
+            head_dim=cfg.head_dim,
+            sliding_window=cfg.sliding_window,
+        )
+        dense_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+        authoritative_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+        pool = TokenKVPool(
+            capacity=12,
+            layer_specs=[
+                TokenKVLayerSpec(
+                    layer_id=0,
+                    num_kv_heads=cfg.num_key_value_heads,
+                    head_dim=cfg.head_dim,
+                    dtype=torch.float32,
+                )
+            ],
+            dtype=torch.float32,
+            defer_buffer_allocation=True,
+        )
+        backend = TokenPoolDecodeBackendState(
+            table=ReqToTokenTable(max_requests=1, max_context_len=12),
+            allocator=pool,
+            kv_pool=pool,
+            block_tables=TokenPoolBlockTables(
+                max_requests=1,
+                max_context_len=12,
+                block_size=4,
+            ),
+            block_size=4,
+        )
+        reservation = backend.prepare_authoritative_prefill(
+            SimpleNamespace(req_id="prefill"),
+            10,
+            expected_length=0,
+            cache=authoritative_cache,
+            sliding_window=cfg.sliding_window,
+            final_prefill=True,
+        )
+        self.assertIsNotNone(reservation)
+
+        hidden = torch.randn(1, 10, cfg.hidden_size)
+        per_layer_input = torch.randn(1, 10, cfg.hidden_size_per_layer_input)
+        position_ids = torch.arange(10).unsqueeze(0)
+        position_embeddings = rotary(hidden, position_ids, "sliding_attention")
+        attention_mask = _causal_mask(
+            1,
+            10,
+            dtype=hidden.dtype,
+            device=hidden.device,
+        )
+        with torch.inference_mode():
+            expected = dense_layer(
+                hidden,
+                per_layer_input,
+                shared_kv_states=UserDict(),
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=dense_cache,
+            )
+            actual = authoritative_layer(
+                hidden,
+                per_layer_input,
+                shared_kv_states=UserDict(),
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=authoritative_cache,
+            )
+
+        self.assertLess((expected - actual).abs().max().item(), 1e-6)
+        self.assertIn("sliding_attention", authoritative_cache._shared_kv_by_type)
+        result = backend.commit_authoritative_prefill(
+            reservation,
+            cache=authoritative_cache,
+        )
+        backend.release_prefill_sliding_storage(authoritative_cache)
+
+        self.assertTrue(result.authoritative)
+        self.assertEqual(result.kept_tokens, cfg.sliding_window - 1)
+        pooled_k, pooled_v = pool.gather_kv(0, reservation.token_slot_ids)
+        dense_k = dense_cache.layers[0].keys[0].permute(1, 0, 2)
+        dense_v = dense_cache.layers[0].values[0].permute(1, 0, 2)
+        self.assertLess((pooled_k - dense_k).abs().max().item(), 1e-6)
+        self.assertLess((pooled_v - dense_v).abs().max().item(), 1e-6)
+        self.assertIsNone(authoritative_cache.layers[0].keys)
+        self.assertIsNone(authoritative_cache.layers[0].values)
+        self.assertEqual(authoritative_cache._shared_kv_by_layer, {})
+        self.assertEqual(authoritative_cache._shared_kv_by_type, {})
+        self.assertEqual(authoritative_cache.state_bytes(), 0)
+
     def test_shared_kv_token_pool_binding_does_not_store_current_kv(self) -> None:
         import torch
         from transformers.models.gemma4.modeling_gemma4 import (
@@ -2693,6 +2943,8 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
 
         self.assertLess((hf_prefill.logits - native_prefill.logits).abs().max().item(), 5e-6)
         self.assertLess((hf_decode.logits - native_decode.logits).abs().max().item(), 5e-6)
+        self.assertEqual(native_cache._shared_kv_by_layer, {})
+        self.assertEqual(native_cache._shared_kv_by_type, {})
         self.assertEqual(len(hf_cache.layers), 2)
         self.assertEqual(len(native_cache.layers), 2)
         for layer_idx in range(2):

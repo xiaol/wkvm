@@ -1,0 +1,54 @@
+ M README.md
+ M docs/NATIVE_ENGINE_PLAN.md
+ M experiments/bench_prompt_utils.py
+ M experiments/gemma_bench_report.py
+ M experiments/incumbent_gemma_bench.py
+ M experiments/native_gemma_bench.py
+ M experiments/wkvm_serving_bench.py
+ M pyproject.toml
+ M tests/test_gemma_bench_report.py
+ M tests/test_gemma_engine.py
+ M tests/test_gemma_native_forward.py
+ M tests/test_gemma_routed_cache.py
+ M tests/test_gemma_server.py
+ M tests/test_gemma_token_pool.py
+ M tests/test_wkvm_serving_bench.py
+ M wkvm/gemma_engine.py
+ M wkvm/gemma_server.py
+ M wkvm/models/gemma.py
+ M wkvm/runner/gemma_native_forward.py
+ M wkvm/runner/gemma_runner.py
+ M wkvm/runner/gemma_state.py
+ M wkvm/runner/gemma_token_pool.py
+?? experiments/benchmark_contract.py
+?? experiments/native_gemma_fused_residual_bench.py
+?? experiments/native_gemma_quality.py
+?? experiments/results/gemma_b16_architecture_ctx16384_strict_20260713.md
+?? experiments/results/gemma_b16_architecture_ctx32768_strict_20260713.md
+?? experiments/results/gemma_b16_architecture_win_20260713.md
+?? experiments/results/gemma_b16_evidence_audit_20260713.md
+?? experiments/results/gemma_serving_stage1_strict_20260711.md
+?? experiments/results/gemma_wkvm_style_frames/t08.png
+?? experiments/results/gemma_wkvm_style_frames/t20.png
+?? experiments/results/gemma_wkvm_style_frames/t36.png
+?? experiments/results/gemma_wkvm_style_frames/t50.png
+?? experiments/results/sglang_gemma_textonly_fullgraph_ctx16384_out128_uniform_b16_cap19_20260713.json
+?? experiments/results/sglang_gemma_textonly_fullgraph_ctx32768_out128_uniform_b16_cap19_20260713.json
+?? experiments/results/vllm_gemma_textonly_noinductor_fullgraph_ctx16384_out128_uniform_b16_cap19_20260713.json
+?? experiments/results/vllm_gemma_textonly_noinductor_fullgraph_ctx32768_out128_uniform_b16_cap19_20260713.json
+?? experiments/results/wkvm_demo.mp4
+?? experiments/results/wkvm_demo_events.json
+?? experiments/results/wkvm_demo_phase1.json
+?? experiments/results/wkvm_demo_phase2.json
+?? experiments/results/wkvm_gemma_alias_ctx16384_out128_uniform_b16_cap19_20260713.json
+?? experiments/results/wkvm_gemma_alias_ctx32768_out128_uniform_b16_cap19_20260713.json
+?? experiments/token_pool_graph_reuse_smoke.py
+?? pytest/__init__.py
+?? pytest/__main__.py
+?? tests/test_benchmark_contract.py
+?? tests/test_gemma_prefill_batch.py
+?? tests/test_incumbent_gemma_bench.py
+?? tests/test_native_gemma_quality.py
+?? tests/test_packaging.py
+?? tests/test_token_pool_graph_reuse_smoke.py
+?? wkvm/runner/gemma_fused_ops.py

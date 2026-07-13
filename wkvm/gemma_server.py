@@ -8,12 +8,20 @@ SGLang benchmarks, limited to single-prompt greedy token-id requests.
 from __future__ import annotations
 
 import json
+import math
+import signal
 import threading
 import time
 from collections import deque
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Iterator
 from urllib.parse import unquote, urlparse
+
+
+DEFAULT_MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024
+DEFAULT_REQUEST_READ_TIMEOUT_S = 30.0
+_REQUEST_BODY_READ_CHUNK_BYTES = 64 * 1024
 
 
 class BoundedGemmaService:
@@ -28,8 +36,10 @@ class BoundedGemmaService:
     ) -> None:
         if max_queue < 1:
             raise ValueError("max_queue must be >= 1")
-        if request_timeout_s is not None and request_timeout_s <= 0:
-            raise ValueError("request_timeout_s must be > 0 or None")
+        if request_timeout_s is not None:
+            request_timeout_s = float(request_timeout_s)
+            if not math.isfinite(request_timeout_s) or request_timeout_s <= 0:
+                raise ValueError("request_timeout_s must be finite and > 0 or None")
         if max_completed_requests is not None and max_completed_requests < 1:
             raise ValueError("max_completed_requests must be >= 1 or None")
         self.engine = engine
@@ -67,9 +77,11 @@ class BoundedGemmaService:
         from wkvm.core.request import Request
 
         started = time.perf_counter()
-        effective_timeout = self.request_timeout_s if timeout_s is None else timeout_s
-        if effective_timeout is not None and effective_timeout <= 0:
-            raise ValueError("timeout_s must be > 0 or None")
+        effective_timeout = self.request_timeout_s if timeout_s is None else float(timeout_s)
+        if effective_timeout is not None and (
+            not math.isfinite(effective_timeout) or effective_timeout <= 0
+        ):
+            raise ValueError("timeout_s must be finite and > 0 or None")
         deadline = None if effective_timeout is None else started + effective_timeout
         with self.cv:
             request = self._enqueue_locked(
@@ -80,17 +92,26 @@ class BoundedGemmaService:
                 ),
                 break_mask=break_mask,
             )
-            while not request.status.is_finished:
+        while not request.status.is_finished:
+            timed_out = False
+            with self.cv:
+                if request.status.is_finished:
+                    break
                 wait_s = 0.25
                 if deadline is not None:
                     remaining = deadline - time.perf_counter()
                     if remaining <= 0:
-                        self._cancel_locked(request.req_id, timed_out=True)
-                        raise TimeoutError(f"request {request.req_id} timed out")
-                    wait_s = min(wait_s, remaining)
-                self.cv.wait(timeout=wait_s)
-                if self.closed:
-                    raise RuntimeError("service is closed")
+                        timed_out = True
+                    else:
+                        wait_s = min(wait_s, remaining)
+                if not timed_out:
+                    self.cv.wait(timeout=wait_s)
+                    if self.closed:
+                        raise RuntimeError("service is closed")
+            if timed_out:
+                if self._timeout_request(request.req_id):
+                    raise TimeoutError(f"request {request.req_id} timed out")
+        with self.cv:
             with self.engine_lock:
                 trace = self.engine.finished_traces.get(request.req_id)
             payload = {
@@ -114,9 +135,11 @@ class BoundedGemmaService:
     ) -> dict[str, Any]:
         from wkvm.core.request import Request
 
-        effective_timeout = self.request_timeout_s if timeout_s is None else timeout_s
-        if effective_timeout is not None and effective_timeout <= 0:
-            raise ValueError("timeout_s must be > 0 or None")
+        effective_timeout = self.request_timeout_s if timeout_s is None else float(timeout_s)
+        if effective_timeout is not None and (
+            not math.isfinite(effective_timeout) or effective_timeout <= 0
+        ):
+            raise ValueError("timeout_s must be finite and > 0 or None")
         deadline = None if effective_timeout is None else time.perf_counter() + effective_timeout
         with self.cv:
             request = self._enqueue_locked(
@@ -143,9 +166,11 @@ class BoundedGemmaService:
         from wkvm.core.request import Request
 
         started = time.perf_counter()
-        effective_timeout = self.request_timeout_s if timeout_s is None else timeout_s
-        if effective_timeout is not None and effective_timeout <= 0:
-            raise ValueError("timeout_s must be > 0 or None")
+        effective_timeout = self.request_timeout_s if timeout_s is None else float(timeout_s)
+        if effective_timeout is not None and (
+            not math.isfinite(effective_timeout) or effective_timeout <= 0
+        ):
+            raise ValueError("timeout_s must be finite and > 0 or None")
         deadline = None if effective_timeout is None else started + effective_timeout
         with self.cv:
             request = self._enqueue_locked(
@@ -161,6 +186,7 @@ class BoundedGemmaService:
         yield {"type": "queued", "req_id": request.req_id}
         try:
             while True:
+                timed_out = False
                 with self.cv:
                     while (
                         len(request.output_token_ids) == emitted
@@ -170,26 +196,40 @@ class BoundedGemmaService:
                         if deadline is not None:
                             remaining = deadline - time.perf_counter()
                             if remaining <= 0:
-                                self._cancel_locked(request.req_id, timed_out=True)
-                                raise TimeoutError(f"request {request.req_id} timed out")
-                            wait_s = min(wait_s, remaining)
+                                timed_out = True
+                                break
+                            else:
+                                wait_s = min(wait_s, remaining)
                         self.cv.wait(timeout=wait_s)
                         if self.closed:
                             raise RuntimeError("service is closed")
 
-                    tokens = request.output_token_ids[emitted:]
-                    start_index = emitted
-                    emitted = len(request.output_token_ids)
-                    finished = request.status.is_finished
-                    finish_reason = (
-                        request.status.name.removeprefix("FINISHED_").lower()
-                        if finished
-                        else None
-                    )
-                    with self.engine_lock:
-                        trace = self.engine.finished_traces.get(request.req_id)
-                    error = None if trace is None else trace.error
-                    metrics = trace.as_dict() if trace is not None else None
+                    if timed_out:
+                        tokens = []
+                        start_index = emitted
+                        finished = False
+                        finish_reason = None
+                        error = None
+                        metrics = None
+                    else:
+                        tokens = request.output_token_ids[emitted:]
+                        start_index = emitted
+                        emitted = len(request.output_token_ids)
+                        finished = request.status.is_finished
+                        finish_reason = (
+                            request.status.name.removeprefix("FINISHED_").lower()
+                            if finished
+                            else None
+                        )
+                        with self.engine_lock:
+                            trace = self.engine.finished_traces.get(request.req_id)
+                        error = None if trace is None else trace.error
+                        metrics = trace.as_dict() if trace is not None else None
+
+                if timed_out:
+                    if self._timeout_request(request.req_id):
+                        raise TimeoutError(f"request {request.req_id} timed out")
+                    continue
 
                 for offset, token in enumerate(tokens):
                     yield {
@@ -209,9 +249,8 @@ class BoundedGemmaService:
                     }
                     return
         finally:
-            with self.cv:
-                if not request.status.is_finished:
-                    self._cancel_locked(request.req_id)
+            if not request.status.is_finished:
+                self._cancel_request(request.req_id)
 
     def status(self, req_id: str) -> dict[str, Any]:
         with self.cv:
@@ -235,37 +274,52 @@ class BoundedGemmaService:
             }
 
     def cancel(self, req_id: str) -> dict[str, Any]:
+        cancelled = self._cancel_request(req_id)
         with self.cv:
-            self._cancel_locked(req_id)
-            self.total_cancelled += 1
+            if cancelled:
+                self.total_cancelled += 1
             self.cv.notify_all()
-            return {"cancelled": req_id}
+            return {"req_id": req_id, "cancelled": cancelled}
+
+    def _timeout_request(self, req_id: str) -> bool:
+        cancelled = self._cancel_request(req_id)
+        with self.cv:
+            if cancelled:
+                self.total_timed_out += 1
+            self.cv.notify_all()
+        return cancelled
 
     def health(self) -> dict[str, Any]:
         with self.lock:
+            worker_alive = self._worker.is_alive()
+            ready = self.ready and not self.closed and worker_alive
             pending = len(self._pending)
             with self.engine_lock:
                 waiting = len(self.engine.scheduler.waiting)
                 running = len(self.engine.scheduler.running)
                 free_state_slots = self.engine.arena.num_free_slots()
             return {
-                "ok": self.ready,
+                "ok": ready,
                 "queue_depth": pending + waiting,
                 "pending_queue_depth": pending,
                 "running": running,
                 "free_state_slots": free_state_slots,
                 "timed_out_requests": self.total_timed_out,
+                "worker_alive": worker_alive,
                 "last_error": self.last_error,
             }
 
     def metrics(self) -> dict[str, Any]:
         with self.lock:
+            worker_alive = self._worker.is_alive()
+            ready = self.ready and not self.closed and worker_alive
             pending = len(self._pending)
             with self.engine_lock:
                 engine_stats = self.engine.stats()
             return {
                 "server": {
-                    "ready": self.ready,
+                    "ready": ready,
+                    "closed": self.closed,
                     "total_requests": self.total_requests,
                     "total_errors": self.total_errors,
                     "total_cancelled": self.total_cancelled,
@@ -277,20 +331,63 @@ class BoundedGemmaService:
                     "pending_queue_depth": pending,
                     "tracked_requests": len(self._requests),
                     "completed_tracked_requests": len(self._completed_order),
-                    "worker_alive": self._worker.is_alive(),
+                    "worker_alive": worker_alive,
                     "last_error": self.last_error,
                 },
                 "engine": engine_stats,
             }
 
-    def close(self) -> None:
+    def close(self, *, timeout_s: float = 5.0) -> None:
+        timeout_s = float(timeout_s)
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("timeout_s must be finite and > 0")
         with self.cv:
             self.closed = True
             self.ready = False
             self.cv.notify_all()
-        self._worker.join(timeout=5)
+        if threading.current_thread() is self._worker:
+            raise RuntimeError("engine worker cannot close its own service")
+        self._worker.join(timeout=timeout_s)
+        if self._worker.is_alive():
+            raise RuntimeError(
+                f"engine worker did not stop within {timeout_s:g} seconds"
+            )
+        with self.cv:
+            self._fail_unfinished_locked("service is closed")
+            self.cv.notify_all()
 
     def _run_engine(self) -> None:
+        try:
+            self._run_engine_loop()
+        except BaseException as exc:
+            error = f"worker terminated: {type(exc).__name__}: {exc}"
+            with self.cv:
+                self.ready = False
+                self.total_errors += 1
+                self.last_error = error
+                try:
+                    self._fail_unfinished_locked(error)
+                except BaseException as cleanup_exc:
+                    self.last_error = (
+                        f"{error}; request cleanup failed: "
+                        f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+                    )
+                    self._deadlines.clear()
+                    for request in self._requests.values():
+                        if request.status.is_finished:
+                            continue
+                        status_type = type(request.status)
+                        request.status = getattr(
+                            status_type,
+                            "FINISHED_ERROR",
+                            status_type.FINISHED_ABORTED,
+                        )
+                    self._record_completed_locked()
+                    self._trim_completed_locked()
+                finally:
+                    self.cv.notify_all()
+
+    def _run_engine_loop(self) -> None:
         while True:
             with self.cv:
                 while (
@@ -307,6 +404,8 @@ class BoundedGemmaService:
                     and self._pending
                 ):
                     self.cv.wait(timeout=self.batch_wait_s)
+                    if self.closed:
+                        return
                 self._expire_deadlines_locked()
                 pending = list(self._pending)
                 self._pending.clear()
@@ -314,6 +413,7 @@ class BoundedGemmaService:
                 with self.engine_lock:
                     for request, break_mask in pending:
                         if request.req_id in self.cancelled:
+                            self.cancelled.discard(request.req_id)
                             request.status = type(request.status).FINISHED_ABORTED
                             continue
                         self.engine.add_request(request, break_mask=break_mask)
@@ -333,6 +433,13 @@ class BoundedGemmaService:
                     self.cv.notify_all()
 
     def _enqueue_locked(self, request, *, break_mask: list[bool] | None):
+        if self.closed:
+            self.total_errors += 1
+            raise ServiceUnavailable("service is closed")
+        if not self.ready or not self._worker.is_alive():
+            self.total_errors += 1
+            detail = self.last_error or "engine worker is not running"
+            raise ServiceUnavailable(f"service is not ready: {detail}")
         if request.req_id in self._requests:
             self.total_errors += 1
             raise ValueError(f"duplicate req_id {request.req_id}")
@@ -347,9 +454,14 @@ class BoundedGemmaService:
         self.cv.notify_all()
         return request
 
-    def _cancel_locked(self, req_id: str, *, timed_out: bool = False) -> None:
+    def _cancel_locked(self, req_id: str, *, timed_out: bool = False) -> bool:
         request = self._requests.get(req_id)
-        was_finished = True if request is None else request.status.is_finished
+        if request is None:
+            raise KeyError(f"unknown req_id {req_id}")
+        if request.status.is_finished:
+            self.cancelled.discard(req_id)
+            self._deadlines.pop(req_id, None)
+            return False
         self.cancelled.add(req_id)
         self._deadlines.pop(req_id, None)
         for item in list(self._pending):
@@ -357,20 +469,71 @@ class BoundedGemmaService:
             if pending_request.req_id == req_id:
                 self._pending.remove(item)
                 pending_request.status = type(pending_request.status).FINISHED_ABORTED
+                self.cancelled.discard(req_id)
                 self._record_completed_locked(req_id)
                 self._trim_completed_locked()
-                if timed_out and not was_finished:
+                if timed_out:
                     self.total_timed_out += 1
-                return
+                return True
         with self.engine_lock:
+            if request.status.is_finished:
+                self.cancelled.discard(req_id)
+                self._record_completed_locked(req_id)
+                self._trim_completed_locked()
+                return False
             self.engine.abort_request(req_id)
-        if request is not None and request.status.is_finished:
+        if request.status.is_finished:
+            self.cancelled.discard(req_id)
             self._record_completed_locked(req_id)
             self._trim_completed_locked()
-        if timed_out and not was_finished and request is not None:
+        if timed_out:
             self.total_timed_out += 1
+        return True
+
+    def _cancel_request(self, req_id: str) -> bool:
+        with self.cv:
+            request = self._requests.get(req_id)
+            if request is None:
+                raise KeyError(f"unknown req_id {req_id}")
+            if request.status.is_finished:
+                self.cancelled.discard(req_id)
+                self._deadlines.pop(req_id, None)
+                return False
+            self._deadlines.pop(req_id, None)
+            for item in list(self._pending):
+                pending_request, _ = item
+                if pending_request.req_id != req_id:
+                    continue
+                self._pending.remove(item)
+                pending_request.status = type(
+                    pending_request.status
+                ).FINISHED_ABORTED
+                self.cancelled.discard(req_id)
+                self._record_completed_locked(req_id)
+                self._trim_completed_locked()
+                return True
+            self.cancelled.add(req_id)
+
+        with self.engine_lock:
+            if request.status.is_finished:
+                cancelled = request.status.name == "FINISHED_ABORTED"
+            else:
+                self.engine.abort_request(req_id)
+                cancelled = (
+                    not request.status.is_finished
+                    or request.status.name == "FINISHED_ABORTED"
+                )
+
+        with self.cv:
+            if request.status.is_finished:
+                self.cancelled.discard(req_id)
+                self._record_completed_locked(req_id)
+                self._trim_completed_locked()
+            self.cv.notify_all()
+        return cancelled
 
     def _fail_unfinished_locked(self, error: str) -> None:
+        self._pending.clear()
         with self.engine_lock:
             fail_unfinished = getattr(self.engine, "fail_unfinished", None)
             if callable(fail_unfinished):
@@ -395,6 +558,7 @@ class BoundedGemmaService:
             request = self._requests.get(rid)
             if request is not None and request.status.is_finished and rid not in known:
                 self._completed_order.append(rid)
+                self.cancelled.discard(rid)
                 self._deadlines.pop(rid, None)
                 known.add(rid)
 
@@ -417,6 +581,10 @@ class BoundedGemmaService:
 
 
 class QueueFull(RuntimeError):
+    pass
+
+
+class ServiceUnavailable(RuntimeError):
     pass
 
 
@@ -550,8 +718,29 @@ def _openai_error(message: str, code: str = "server_error") -> dict[str, Any]:
     return {"error": {"message": message, "type": code, "code": code}}
 
 
-def build_app(service: BoundedGemmaService):
+class _RequestBodyError(Exception):
+    def __init__(self, status: HTTPStatus, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def build_app(
+    service: BoundedGemmaService,
+    *,
+    max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES,
+    request_read_timeout_s: float = DEFAULT_REQUEST_READ_TIMEOUT_S,
+):
+    if max_request_body_bytes < 1:
+        raise ValueError("max_request_body_bytes must be >= 1")
+    request_read_timeout_s = float(request_read_timeout_s)
+    if not math.isfinite(request_read_timeout_s) or request_read_timeout_s <= 0:
+        raise ValueError("request_read_timeout_s must be finite and > 0")
+
     class Handler(BaseHTTPRequestHandler):
+        def setup(self) -> None:
+            super().setup()
+            self.connection.settimeout(request_read_timeout_s)
+
         def _json(self, code: int, payload) -> None:
             body = json.dumps(payload).encode()
             self.send_response(code)
@@ -561,8 +750,71 @@ def build_app(service: BoundedGemmaService):
             self.wfile.write(body)
 
         def _body(self) -> dict:
-            n = int(self.headers.get("Content-Length", 0))
-            return json.loads(self.rfile.read(n) or b"{}")
+            if self.headers.get_all("Transfer-Encoding", []):
+                raise _RequestBodyError(
+                    HTTPStatus.BAD_REQUEST,
+                    "Transfer-Encoding is not supported; use Content-Length",
+                )
+            content_lengths = self.headers.get_all("Content-Length", [])
+            if not content_lengths:
+                raise _RequestBodyError(
+                    HTTPStatus.LENGTH_REQUIRED,
+                    "Content-Length header is required",
+                )
+            if len(content_lengths) != 1:
+                raise _RequestBodyError(
+                    HTTPStatus.BAD_REQUEST,
+                    "exactly one Content-Length header is required",
+                )
+            raw_content_length = content_lengths[0].strip()
+            if not raw_content_length.isdecimal():
+                raise _RequestBodyError(
+                    HTTPStatus.BAD_REQUEST,
+                    "Content-Length header must be a non-negative integer",
+                )
+            content_length = int(raw_content_length)
+            if content_length > max_request_body_bytes:
+                raise _RequestBodyError(
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                    f"request body exceeds {max_request_body_bytes} bytes",
+                )
+
+            deadline = time.monotonic() + request_read_timeout_s
+            body = bytearray()
+            read = getattr(self.rfile, "read1", self.rfile.read)
+            try:
+                while len(body) < content_length:
+                    remaining_s = deadline - time.monotonic()
+                    if remaining_s <= 0:
+                        raise TimeoutError
+                    self.connection.settimeout(remaining_s)
+                    chunk = read(
+                        min(
+                            content_length - len(body),
+                            _REQUEST_BODY_READ_CHUNK_BYTES,
+                        )
+                    )
+                    if not chunk:
+                        raise _RequestBodyError(
+                            HTTPStatus.BAD_REQUEST,
+                            "request body ended before Content-Length bytes were received",
+                        )
+                    body.extend(chunk)
+            except TimeoutError as exc:
+                raise _RequestBodyError(
+                    HTTPStatus.REQUEST_TIMEOUT,
+                    (
+                        "request body was not received within "
+                        f"{request_read_timeout_s:g} seconds"
+                    ),
+                ) from exc
+            finally:
+                self.connection.settimeout(request_read_timeout_s)
+
+            payload = json.loads(body or b"{}")
+            if not isinstance(payload, dict):
+                raise ValueError("request body must be a JSON object")
+            return payload
 
         def _sse_event(self, event: dict[str, Any] | str) -> None:
             if isinstance(event, str):
@@ -578,7 +830,8 @@ def build_app(service: BoundedGemmaService):
         def do_GET(self) -> None:
             path = urlparse(self.path).path
             if path == "/health":
-                self._json(200, service.health())
+                health = service.health()
+                self._json(200 if health["ok"] else 503, health)
             elif path == "/metrics":
                 self._json(200, service.metrics())
             elif path.startswith("/v1/status/"):
@@ -677,11 +930,22 @@ def build_app(service: BoundedGemmaService):
                         ),
                     )
                 elif path == "/v1/cancel":
-                    self._json(200, service.cancel(str(body["req_id"])))
+                    req_id = str(body["req_id"])
+                    try:
+                        result = service.cancel(req_id)
+                    except KeyError as exc:
+                        self._json(404, {"error": str(exc)})
+                    else:
+                        self._json(200, result)
                 elif path == "/v1/completions":
                     self._handle_openai_completion(body)
                 else:
                     self._json(404, {"error": "not found"})
+            except _RequestBodyError as exc:
+                self.close_connection = True
+                self._json(int(exc.status), {"error": str(exc)})
+            except ServiceUnavailable as exc:
+                self._json(503, {"error": str(exc)})
             except QueueFull as exc:
                 self._json(429, {"error": str(exc)})
             except TimeoutError as exc:
@@ -796,9 +1060,47 @@ def build_app(service: BoundedGemmaService):
     return Handler
 
 
-def serve(service: BoundedGemmaService, *, host: str = "127.0.0.1", port: int = 8000):
-    server = ThreadingHTTPServer((host, port), build_app(service))
+def serve(
+    service: BoundedGemmaService,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES,
+    request_read_timeout_s: float = DEFAULT_REQUEST_READ_TIMEOUT_S,
+):
+    server = ThreadingHTTPServer(
+        (host, port),
+        build_app(
+            service,
+            max_request_body_bytes=max_request_body_bytes,
+            request_read_timeout_s=request_read_timeout_s,
+        ),
+    )
     return server
+
+
+def run_server(service: BoundedGemmaService, server) -> None:
+    install_sigterm_handler = threading.current_thread() is threading.main_thread()
+    previous_sigterm_handler = None
+
+    def terminate(_signum, _frame) -> None:
+        raise KeyboardInterrupt
+
+    if install_sigterm_handler:
+        previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, terminate)
+    try:
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+    finally:
+        if install_sigterm_handler:
+            signal.signal(signal.SIGTERM, previous_sigterm_handler)
+        try:
+            service.close()
+        finally:
+            server.server_close()
 
 
 def apply_native_gemma_production_profile(args) -> None:
@@ -849,12 +1151,38 @@ def engine_kwargs_from_args(args) -> dict[str, Any]:
         "persistent_padded_decode_graph_warmup_iters": (
             args.persistent_padded_decode_graph_warmup_iters
         ),
+        "persistent_padded_sliding_metadata_padding": getattr(
+            args,
+            "persistent_padded_sliding_metadata_padding",
+            False,
+        ),
         "use_native_gemma_forward": args.use_native_gemma_forward,
         "native_gemma_attention_backend": args.native_gemma_attention_backend,
         "native_gemma_projection_backend": args.native_gemma_projection_backend,
         "native_gemma_weight_backend": args.native_gemma_weight_backend,
         "native_gemma_release_hf_decoder_layers": (
             args.native_gemma_release_hf_decoder_layers
+        ),
+        "enable_token_pool_metadata": getattr(
+            args,
+            "enable_token_pool_metadata",
+            None,
+        ),
+        "enable_token_pool_attention": getattr(
+            args,
+            "enable_token_pool_attention",
+            False,
+        ),
+        "token_pool_max_context_len": getattr(
+            args,
+            "token_pool_max_context_len",
+            None,
+        ),
+        "token_pool_capacity": getattr(args, "token_pool_capacity", None),
+        "token_pool_paged_block_size": getattr(
+            args,
+            "token_pool_paged_block_size",
+            None,
         ),
         "finished_trace_limit": args.max_completed_requests,
     }
@@ -863,20 +1191,24 @@ def engine_kwargs_from_args(args) -> dict[str, Any]:
 def main() -> None:
     import argparse
 
-    from transformers import AutoConfig
-    from transformers.models.gemma4 import Gemma4ForCausalLM
-    import torch
-
-    from wkvm.core.config import SchedulerConfig
-    from wkvm.gemma_engine import GemmaNativeEngine
-    from wkvm.models.gemma import gemma4_e4b_routed_span_config
-
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True)
     ap.add_argument("--slots", type=int, default=4)
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--max-queue", type=int, default=64)
     ap.add_argument("--request-timeout-s", type=float, default=None)
+    ap.add_argument(
+        "--max-request-body-bytes",
+        type=int,
+        default=DEFAULT_MAX_REQUEST_BODY_BYTES,
+        help="Reject HTTP request bodies larger than this many bytes (default: 8 MiB).",
+    )
+    ap.add_argument(
+        "--request-read-timeout-s",
+        type=float,
+        default=DEFAULT_REQUEST_READ_TIMEOUT_S,
+        help="Maximum wall-clock seconds to receive one HTTP request body (default: 30).",
+    )
     ap.add_argument("--max-completed-requests", type=int, default=4096)
     ap.add_argument("--decode-microbatch-rows", type=int, default=16)
     ap.add_argument("--decode-microbatch-bytes", type=int, default=None)
@@ -887,6 +1219,25 @@ def main() -> None:
     ap.add_argument("--persistent-padded-decode-steps", type=int, default=8)
     ap.add_argument("--persistent-padded-decode-cuda-graph", action="store_true")
     ap.add_argument("--persistent-padded-decode-graph-warmup-iters", type=int, default=3)
+    ap.add_argument(
+        "--persistent-padded-sliding-metadata-padding",
+        action="store_true",
+        help="Pad sliding token-pool metadata to graph-stable shapes.",
+    )
+    ap.add_argument(
+        "--enable-token-pool-metadata",
+        action="store_true",
+        default=None,
+        help="Build request/token metadata even when token-pool attention is disabled.",
+    )
+    ap.add_argument(
+        "--enable-token-pool-attention",
+        action="store_true",
+        help="Use the native token-pool attention path; implies native Gemma forward.",
+    )
+    ap.add_argument("--token-pool-max-context-len", type=int, default=None)
+    ap.add_argument("--token-pool-capacity", type=int, default=None)
+    ap.add_argument("--token-pool-paged-block-size", type=int, default=None)
     ap.add_argument("--sink", type=int, default=16)
     ap.add_argument("--window", type=int, default=1024)
     ap.add_argument("--m-slots", type=int, default=64)
@@ -958,7 +1309,43 @@ def main() -> None:
     ap.add_argument("--attn", choices=["eager", "sdpa"], default="sdpa")
     args = ap.parse_args()
 
+    if args.max_request_body_bytes < 1:
+        ap.error("--max-request-body-bytes must be >= 1")
+    if args.request_timeout_s is not None and (
+        not math.isfinite(args.request_timeout_s) or args.request_timeout_s <= 0
+    ):
+        ap.error("--request-timeout-s must be finite and > 0")
+    if (
+        not math.isfinite(args.request_read_timeout_s)
+        or args.request_read_timeout_s <= 0
+    ):
+        ap.error("--request-read-timeout-s must be finite and > 0")
+    for option, value in (
+        ("--token-pool-max-context-len", args.token_pool_max_context_len),
+        ("--token-pool-capacity", args.token_pool_capacity),
+        ("--token-pool-paged-block-size", args.token_pool_paged_block_size),
+    ):
+        if value is not None and value < 1:
+            ap.error(f"{option} must be >= 1")
+
+    try:
+        import torch
+        from transformers import AutoConfig
+        from transformers.models.gemma4 import Gemma4ForCausalLM
+    except ImportError as exc:
+        ap.error(
+            "Gemma serving dependencies are unavailable; install "
+            "wkvm[gemma-server] (or .[gemma-server] from a checkout): "
+            f"{exc}"
+        )
+
+    from wkvm.core.config import SchedulerConfig
+    from wkvm.gemma_engine import GemmaNativeEngine
+    from wkvm.models.gemma import gemma4_e4b_routed_span_config
+
     apply_native_gemma_production_profile(args)
+    if args.enable_token_pool_attention:
+        args.use_native_gemma_forward = True
     validate_native_gemma_loader_args(args)
 
     if args.native_gemma_checkpoint_loader:
@@ -1014,7 +1401,12 @@ def main() -> None:
         request_timeout_s=args.request_timeout_s,
         max_completed_requests=args.max_completed_requests,
     )
-    server = serve(service, port=args.port)
+    server = serve(
+        service,
+        port=args.port,
+        max_request_body_bytes=args.max_request_body_bytes,
+        request_read_timeout_s=args.request_read_timeout_s,
+    )
     stats = engine.stats()
     print(
         "native Gemma wkvm serving on "
@@ -1023,7 +1415,7 @@ def main() -> None:
         f"uses_hf_transformer_forward={stats.get('uses_hf_transformer_forward')} "
         f"uses_hf_model_construction={stats.get('uses_hf_model_construction')}"
     )
-    server.serve_forever()
+    run_server(service, server)
 
 
 if __name__ == "__main__":

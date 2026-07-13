@@ -21,6 +21,7 @@ class TokenKVLayerSpec:
     head_dim: int
     dtype: Any | None = None
     kv_share_target_layer: int | None = None
+    initial_capacity: int | None = None
 
 
 @dataclass(frozen=True)
@@ -143,9 +144,83 @@ class TokenPoolPrefillCommitResult:
     padded_tokens: int
     allocated_token_slots: tuple[int, ...] = ()
     backfilled: bool = False
+    authoritative: bool = False
     prefix_clear_result: TokenPoolRequestPrefixClearResult = field(
         default_factory=TokenPoolRequestPrefixClearResult
     )
+
+
+@dataclass
+class TokenPoolAuthoritativePrefillReservation:
+    req_id: str
+    req_slot: int
+    previous_length: int
+    new_length: int
+    kept_tokens: int
+    padded_tokens: int
+    token_slots: Any
+    token_slot_ids: tuple[int, ...]
+    expected_layer_ids: tuple[int, ...]
+    kv_pool: Any = field(repr=False)
+    page_state_snapshot: TokenPoolRequestPageStateSnapshot | None = field(
+        default=None,
+        repr=False,
+    )
+    written_layer_ids: set[int] = field(default_factory=set, repr=False)
+    pending_layer_kv: dict[int, tuple[Any, Any]] = field(
+        default_factory=dict,
+        repr=False,
+    )
+    active: bool = True
+
+    def write_layer_kv(self, layer_id: int, key_states: Any, value_states: Any) -> None:
+        layer_id = int(layer_id)
+        if not self.active:
+            raise RuntimeError("authoritative prefill reservation is no longer active")
+        if layer_id not in self.expected_layer_ids:
+            raise KeyError(f"layer {layer_id} is not reserved for authoritative prefill")
+        if layer_id in self.written_layer_ids:
+            raise RuntimeError(f"layer {layer_id} wrote authoritative prefill KV twice")
+        if getattr(key_states, "ndim", None) != 4 or getattr(value_states, "ndim", None) != 4:
+            raise ValueError("authoritative prefill KV must have shape [1, H, T, D]")
+        if tuple(key_states.shape) != tuple(value_states.shape):
+            raise ValueError("authoritative prefill key/value shapes must match")
+        if int(key_states.shape[0]) != 1:
+            raise ValueError("authoritative prefill currently requires one request row")
+        chunk_tokens = int(key_states.shape[2])
+        if chunk_tokens != self.new_length - self.previous_length:
+            raise ValueError("authoritative prefill KV width does not match reservation")
+        if self.kept_tokens < 1 or self.kept_tokens > chunk_tokens:
+            raise ValueError("authoritative prefill kept-token count is invalid")
+        key_tail = key_states[:, :, -self.kept_tokens :, :].clone().contiguous()
+        value_tail = value_states[:, :, -self.kept_tokens :, :].clone().contiguous()
+        self.pending_layer_kv[layer_id] = (key_tail, value_tail)
+        self.written_layer_ids.add(layer_id)
+
+    def flush_staged_kv(self) -> None:
+        if not self.active:
+            raise RuntimeError("authoritative prefill reservation is no longer active")
+        for layer_id in self.expected_layer_ids:
+            staged = self.pending_layer_kv.get(int(layer_id))
+            if staged is None:
+                raise RuntimeError(
+                    f"layer {int(layer_id)} has no staged authoritative prefill KV"
+                )
+            key_states, value_states = staged
+            if int(key_states.shape[2]) != self.kept_tokens:
+                raise RuntimeError("staged authoritative prefill KV tail width changed")
+            key_rows = key_states[0].permute(1, 0, 2).contiguous()
+            value_rows = value_states[0].permute(1, 0, 2).contiguous()
+            self.kv_pool.set_kv(
+                int(layer_id),
+                list(self.token_slot_ids),
+                key_rows,
+                value_rows,
+            )
+        self.pending_layer_kv.clear()
+
+    def clear_staged_kv(self) -> None:
+        self.pending_layer_kv.clear()
 
 
 class TokenPoolAttentionWorkspace:
@@ -414,6 +489,8 @@ class TokenPoolFullAttentionRow:
     row_slots: list[int]
     owned_slots: list[int]
     append_slots: list[int] = field(default_factory=list)
+    borrowed_slots: list[int] = field(default_factory=list)
+    borrowed_append_slots_remaining: int | None = None
     page_aligned: bool = False
 
 
@@ -563,10 +640,24 @@ class TokenPoolFullAttentionRowManager:
         req_id: str,
         *,
         append_reserve_slots: int,
+        borrowed_slot: int | None = None,
     ) -> TokenPoolFullAttentionRowAppend | None:
         row = self.rows.get(str(req_id))
         if row is None:
             return None
+        if borrowed_slot is not None:
+            remaining = row.borrowed_append_slots_remaining
+            if remaining is None or remaining < 1:
+                return None
+            full_token_slot = int(borrowed_slot)
+            row.row_slots.append(full_token_slot)
+            row.borrowed_slots.append(full_token_slot)
+            row.borrowed_append_slots_remaining = remaining - 1
+            return TokenPoolFullAttentionRowAppend(
+                row=row,
+                full_token_slot=full_token_slot,
+                reused_existing_row=True,
+            )
         append_reserve_slots = max(1, int(append_reserve_slots))
         if row.append_slots:
             full_token_slot = int(row.append_slots.pop(0))
@@ -685,6 +776,8 @@ class TokenPoolFullAttentionRowManager:
         build_paged_rows: bool,
         append_reserve_slots: int,
         device: Any,
+        borrowed_materialized_slots: Any | None = None,
+        borrowed_materialized_slot_ids: list[int] | None = None,
     ) -> TokenPoolFullAttentionPreparedDecodeRow:
         import torch
 
@@ -702,40 +795,97 @@ class TokenPoolFullAttentionRowManager:
                 append = self.append_existing_row(
                     req_key,
                     append_reserve_slots=append_reserve_slots,
-                )
-                if append is None:
-                    raise RuntimeError("existing full-attention row disappeared")
-                empty_slots = torch.empty(0, dtype=torch.int32, device=device)
-                paged_row = (
-                    list(append.row.row_slots)
-                    if build_paged_rows and append.row.page_aligned
-                    else None
-                )
-                return TokenPoolFullAttentionPreparedDecodeRow(
-                    row_chunks=TokenSlotRowChunks(
-                        (
-                            torch.as_tensor(
-                                append.row.row_slots,
-                                dtype=torch.int32,
-                                device=device,
-                            ),
-                        ),
-                        trusted=True,
+                    borrowed_slot=(
+                        int(decode_token_slot)
+                        if existing_row.borrowed_append_slots_remaining is not None
+                        else None
                     ),
-                    full_token_slot=append.full_token_slot,
-                    materialized_slots=empty_slots,
-                    materialized_slot_ids=[],
-                    materialized_slots_long=empty_slots.to(dtype=torch.long),
-                    persistent_row=append.row,
-                    paged_row=paged_row,
-                    reused_existing_row=True,
-                    appended_existing_row=True,
-                    invalidated_existing_rows=invalidated,
                 )
+                if append is not None:
+                    empty_slots = torch.empty(0, dtype=torch.int32, device=device)
+                    paged_row = (
+                        list(append.row.row_slots)
+                        if build_paged_rows and append.row.page_aligned
+                        else None
+                    )
+                    return TokenPoolFullAttentionPreparedDecodeRow(
+                        row_chunks=TokenSlotRowChunks(
+                            (
+                                torch.as_tensor(
+                                    append.row.row_slots,
+                                    dtype=torch.int32,
+                                    device=device,
+                                ),
+                            ),
+                            trusted=True,
+                        ),
+                        full_token_slot=append.full_token_slot,
+                        materialized_slots=empty_slots,
+                        materialized_slot_ids=[],
+                        materialized_slots_long=empty_slots.to(dtype=torch.long),
+                        persistent_row=append.row,
+                        paged_row=paged_row,
+                        reused_existing_row=True,
+                        appended_existing_row=True,
+                        invalidated_existing_rows=invalidated,
+                    )
             invalidated += self.invalidate([req_key])
 
         persistent_row: TokenPoolFullAttentionRow | None = None
-        if persistent_rows and build_paged_rows:
+        if (
+            persistent_rows
+            and not build_paged_rows
+            and borrowed_materialized_slot_ids is not None
+        ):
+            borrowed_materialized_slot_ids = [
+                int(slot) for slot in borrowed_materialized_slot_ids
+            ]
+            if len(borrowed_materialized_slot_ids) > materialized_width:
+                raise ValueError(
+                    "borrowed full-attention slots exceed materialized width"
+                )
+            borrowed_materialized_slots = torch.as_tensor(
+                borrowed_materialized_slots,
+                dtype=torch.int32,
+                device=device,
+            ).reshape(-1)
+            if int(borrowed_materialized_slots.numel()) != len(
+                borrowed_materialized_slot_ids
+            ):
+                raise ValueError(
+                    "borrowed full-attention slot tensor does not match borrowed IDs"
+                )
+            owned_width = materialized_width - len(borrowed_materialized_slot_ids)
+            if owned_width:
+                owned_materialized_slots, owned_materialized_slot_ids = (
+                    self.allocator.alloc_slots_with_ids(owned_width)
+                )
+                materialized_slots = torch.cat(
+                    (owned_materialized_slots, borrowed_materialized_slots)
+                )
+            else:
+                owned_materialized_slot_ids = []
+                materialized_slots = borrowed_materialized_slots
+            materialized_slot_ids = [
+                *owned_materialized_slot_ids,
+                *borrowed_materialized_slot_ids,
+            ]
+            full_token_slot = int(decode_token_slot)
+            borrowed_slots = [*borrowed_materialized_slot_ids, full_token_slot]
+            persistent_row = TokenPoolFullAttentionRow(
+                row_slots=[*materialized_slot_ids, full_token_slot],
+                owned_slots=list(owned_materialized_slot_ids),
+                borrowed_slots=list(borrowed_slots),
+                borrowed_append_slots_remaining=max(0, append_reserve_slots - 1),
+                page_aligned=False,
+            )
+            self.rows[req_key] = persistent_row
+            decode_slot = self._normalized_decode_slot_tensor(
+                decode_token_slot_tensor,
+                full_token_slot=full_token_slot,
+                device=device,
+            )
+        elif persistent_rows and build_paged_rows:
             materialized_slots, materialized_slot_ids, append = (
                 self.start_page_aligned_persistent_row(
                     req_key,
@@ -2229,6 +2379,7 @@ class TokenPoolDecodeGraphBuffer:
                 for layer_type, metadata in token_pool_decode.metadata_by_layer_type.items()
             },
             kv_pool=token_pool_decode.kv_pool,
+            attention_workspace=token_pool_decode.attention_workspace,
             metadata_by_layer_id={
                 int(layer_id): copy_metadata(metadata)
                 for layer_id, metadata in (
@@ -2269,6 +2420,8 @@ class TokenPoolDecodeGraphBuffer:
             raise ValueError("graph token-pool metadata is required for replay")
         if self.context.kv_pool is not token_pool_decode.kv_pool:
             raise ValueError("token-pool graph kv_pool changed")
+        if self.context.attention_workspace is not token_pool_decode.attention_workspace:
+            raise ValueError("token-pool graph attention_workspace changed")
         if self.context.covered_layer_types != token_pool_decode.covered_layer_types:
             raise ValueError("token-pool graph covered layer types changed")
         if (
@@ -2365,6 +2518,8 @@ class TokenPoolDecodeGraphBuffer:
             return None
         if self.context.kv_pool is not token_pool_decode.kv_pool:
             return None
+        if self.context.attention_workspace is not token_pool_decode.attention_workspace:
+            return None
         if self.context.covered_layer_types != token_pool_decode.covered_layer_types:
             return None
         if (
@@ -2417,6 +2572,8 @@ class TokenPoolDecodeGraphBuffer:
             return "graph token-pool metadata is required for replay"
         if self.context.kv_pool is not token_pool_decode.kv_pool:
             return "kv_pool changed"
+        if self.context.attention_workspace is not token_pool_decode.attention_workspace:
+            return "attention_workspace changed"
         if self.context.covered_layer_types != token_pool_decode.covered_layer_types:
             return "covered_layer_types changed"
         if (
@@ -2615,6 +2772,8 @@ class TokenPoolDecodeGraphBuffer:
         return (
             id(self.context.kv_pool),
             id(token_pool_decode.kv_pool),
+            id(self.context.attention_workspace),
+            id(token_pool_decode.attention_workspace),
             self.context.covered_layer_types,
             token_pool_decode.covered_layer_types,
             self.context.layer_id_metadata_only_types,
@@ -6387,6 +6546,16 @@ class TokenPoolDecodeBackendState:
             "kv_pool_layers": 0 if kv_pool is None else len(kv_pool.layer_specs),
         }
         if kv_pool is not None:
+            layer_buffer_capacities = getattr(
+                kv_pool,
+                "layer_buffer_capacities",
+                None,
+            )
+            if layer_buffer_capacities is not None:
+                stats["kv_pool_layer_capacities"] = layer_buffer_capacities
+                stats["kv_pool_buffer_generation"] = int(
+                    getattr(kv_pool, "buffer_generation", 0)
+                )
             stats.update(
                 {
                     "kv_set_calls": int(getattr(kv_pool, "kv_set_calls", 0)),
@@ -6640,6 +6809,19 @@ class TokenPoolDecodeBackendState:
             int(getattr(reservation, "previous_length")) + 1
             for reservation in reservation_tuple
         ]
+        required_sliding_capacity = max(out_cache_loc) + 1
+        ensure_layer_slot_capacity = getattr(
+            self.kv_pool,
+            "ensure_layer_slot_capacity",
+            None,
+        )
+        if ensure_layer_slot_capacity is not None:
+            for layer_id, layer_type in (layer_type_by_layer_id or {}).items():
+                if layer_type == "sliding_attention":
+                    ensure_layer_slot_capacity(
+                        int(layer_id),
+                        required_sliding_capacity,
+                    )
         page_tables = None
         if self.page_table_tensor is None:
             page_tables = self.page_tables_for_requests(
@@ -6715,6 +6897,180 @@ class TokenPoolDecodeBackendState:
             self.table.free(req_id)
             self.request_slots.pop(req_id, None)
         return (None if req_slot is None else int(req_slot)), page_slots, token_slots
+
+    def prepare_authoritative_prefill(
+        self,
+        request: Any,
+        n: int,
+        *,
+        expected_length: int,
+        cache: Any,
+        sliding_window: int,
+        final_prefill: bool,
+    ) -> TokenPoolAuthoritativePrefillReservation | None:
+        pool = self.kv_pool
+        if (
+            pool is None
+            or cache is None
+            or not bool(final_prefill)
+            or int(expected_length) != 0
+        ):
+            return None
+        bind = getattr(cache, "bind_token_pool_authoritative_prefill", None)
+        if bind is None:
+            return None
+        layers = getattr(cache, "layers", None)
+        if layers is None:
+            return None
+
+        expected_layer_ids = [
+            int(layer_id)
+            for layer_id, layer in enumerate(layers)
+            if bool(getattr(layer, "is_sliding", False))
+        ]
+        if not expected_layer_ids:
+            return None
+        layer_specs = getattr(pool, "layer_specs", {})
+        for layer_id in expected_layer_ids:
+            if layer_id not in layer_specs or pool.target_layer(layer_id) != layer_id:
+                return None
+            layer = layers[layer_id]
+            can_bind = getattr(layer, "can_bind_token_pool_authoritative_prefill", None)
+            if can_bind is None or not bool(can_bind()):
+                return None
+        sliding_window = int(sliding_window)
+        if sliding_window <= 1:
+            return None
+
+        req_id = str(getattr(request, "req_id", request))
+        req_slot = self.admit_request(req_id)
+        current = self.request_length(req_slot)
+        if current != int(expected_length):
+            raise RuntimeError(
+                f"{req_id}: token table length {current} does not match "
+                f"computed tokens {int(expected_length)}"
+            )
+        n = int(n)
+        if n < 1:
+            raise ValueError("authoritative prefill requires at least one token")
+        new_length = current + n
+        self.ensure_context_len(new_length)
+        kept_tokens = min(n, sliding_window - 1)
+        padded_tokens = n - kept_tokens
+        page_state_snapshot = self.snapshot_request_page_state(req_id, req_slot)
+        try:
+            token_slots, token_slot_ids = self.allocate_page_aligned_slots(
+                req_id,
+                current + padded_tokens,
+                kept_tokens,
+                req_slot=req_slot,
+            )
+            reservation = TokenPoolAuthoritativePrefillReservation(
+                req_id=req_id,
+                req_slot=int(req_slot),
+                previous_length=int(current),
+                new_length=int(new_length),
+                kept_tokens=int(kept_tokens),
+                padded_tokens=int(padded_tokens),
+                token_slots=token_slots,
+                token_slot_ids=tuple(int(slot) for slot in token_slot_ids),
+                expected_layer_ids=tuple(expected_layer_ids),
+                kv_pool=pool,
+                page_state_snapshot=page_state_snapshot,
+            )
+            bind(reservation)
+            return reservation
+        except Exception:
+            self.restore_request_page_state(page_state_snapshot)
+            raise
+
+    def commit_authoritative_prefill(
+        self,
+        reservation: TokenPoolAuthoritativePrefillReservation,
+        *,
+        cache: Any,
+    ) -> TokenPoolPrefillCommitResult:
+        if not reservation.active:
+            raise RuntimeError("authoritative prefill reservation is no longer active")
+        missing = set(reservation.expected_layer_ids) - reservation.written_layer_ids
+        unexpected = reservation.written_layer_ids - set(reservation.expected_layer_ids)
+        if missing or unexpected:
+            self.discard_authoritative_prefill(reservation, cache=cache)
+            raise RuntimeError(
+                "authoritative prefill layer writes do not match reservation: "
+                f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
+            )
+        if self.request_length(reservation.req_slot) != reservation.previous_length:
+            self.discard_authoritative_prefill(reservation, cache=cache)
+            raise RuntimeError("authoritative prefill token-table length changed before commit")
+
+        try:
+            reservation.flush_staged_kv()
+            append_values = []
+            if reservation.padded_tokens:
+                import torch
+
+                append_values.append(
+                    torch.full(
+                        (reservation.padded_tokens,),
+                        self.table.padding_token,
+                        dtype=self.table.dtype,
+                        device=self.table.req_to_token.device,
+                    )
+                )
+            append_values.append(reservation.token_slots)
+            if len(append_values) == 1:
+                appended = append_values[0]
+            else:
+                import torch
+
+                appended = torch.cat(append_values)
+            self.append_table_slots(reservation.req_slot, appended)
+            unbind = getattr(cache, "unbind_token_pool_authoritative_prefill", None)
+            if unbind is None:
+                raise RuntimeError("cache cannot unbind authoritative prefill")
+            unbind(reservation, rollback=False)
+        except Exception:
+            self.discard_authoritative_prefill(reservation, cache=cache)
+            raise
+
+        reservation.active = False
+        return TokenPoolPrefillCommitResult(
+            req_id=reservation.req_id,
+            req_slot=int(reservation.req_slot),
+            previous_length=int(reservation.previous_length),
+            new_length=int(reservation.new_length),
+            kept_tokens=int(reservation.kept_tokens),
+            padded_tokens=int(reservation.padded_tokens),
+            allocated_token_slots=tuple(reservation.token_slot_ids),
+            backfilled=False,
+            authoritative=True,
+        )
+
+    def discard_authoritative_prefill(
+        self,
+        reservation: TokenPoolAuthoritativePrefillReservation | None,
+        *,
+        cache: Any,
+    ) -> None:
+        if reservation is None or not reservation.active:
+            return
+        try:
+            current_length = self.request_length(reservation.req_slot)
+            if current_length != reservation.previous_length:
+                self.truncate_table_row(
+                    reservation.req_slot,
+                    reservation.previous_length,
+                )
+            self.restore_request_page_state(reservation.page_state_snapshot)
+        finally:
+            try:
+                unbind = getattr(cache, "unbind_token_pool_authoritative_prefill", None)
+                if unbind is not None:
+                    unbind(reservation, rollback=True)
+            finally:
+                reservation.clear_staged_kv()
+                reservation.active = False
 
     def commit_prefill_tokens(
         self,
@@ -7074,6 +7430,58 @@ class TokenPoolDecodeBackendState:
 
     def page_owned_slots_for_request(self, req_id: str) -> set[int]:
         return self.request_page_owned_slots.get(str(req_id), set())
+
+    def borrow_stable_request_suffix_slots(
+        self,
+        req_id: str,
+        req_slot: int,
+        *,
+        previous_length: int,
+        materialized_width: int,
+        reserve_steps: int,
+        sliding_window: int,
+    ) -> tuple[Any, list[int]] | None:
+        """Return request-owned slot IDs that remain live for a decode horizon."""
+
+        import torch
+
+        req_id = str(req_id)
+        req_slot = int(req_slot)
+        previous_length = int(previous_length)
+        materialized_width = max(0, int(materialized_width))
+        reserve_steps = max(1, int(reserve_steps))
+        sliding_window = max(1, int(sliding_window))
+        if self.request_length(req_slot) != previous_length + 1:
+            return None
+
+        if reserve_steps > sliding_window:
+            return None
+        stable_start = max(0, previous_length + reserve_steps - sliding_window)
+        borrow_width = min(
+            materialized_width,
+            max(0, previous_length - stable_start),
+        )
+        borrow_start = previous_length - borrow_width
+
+        page_table = self.page_table_for_request(req_id)
+        owned_slots = self.page_owned_slots_for_request(req_id)
+        slot_ids: list[int] = []
+        for logical_pos in range(borrow_start, previous_length):
+            physical_block = page_table.get(logical_pos // self.block_size)
+            if physical_block is None:
+                return None
+            slot = int(physical_block) * self.block_size + (
+                logical_pos % self.block_size
+            )
+            if slot not in owned_slots:
+                return None
+            slot_ids.append(slot)
+        if len(slot_ids) != borrow_width or len(set(slot_ids)) != len(slot_ids):
+            return None
+        return (
+            torch.as_tensor(slot_ids, dtype=torch.int32, device=self.device),
+            slot_ids,
+        )
 
     def allocate_page_aligned_slots(
         self,
@@ -7444,6 +7852,8 @@ class TokenPoolDecodeBackendState:
         kv_indices_padding_steps: int = 0,
         persistent_rows: bool = False,
         build_paged_rows: bool = False,
+        sliding_window: int | None = None,
+        allow_request_slot_aliasing: bool = False,
     ) -> TokenPoolFullAttentionPreparedBatch:
         pool = self.kv_pool
         row_manager = self.full_attention_rows
@@ -7512,6 +7922,28 @@ class TokenPoolDecodeBackendState:
                 routed_layers.append((layer_id, layer, writer))
             materialized_width = int(materialized_width or 0)
 
+            borrowed_materialized_slots = None
+            borrowed_materialized_slot_ids = None
+            if (
+                persistent_rows
+                and not build_paged_rows
+                and sliding_window is not None
+                and allow_request_slot_aliasing
+            ):
+                borrowed = self.borrow_stable_request_suffix_slots(
+                    req_id,
+                    int(getattr(reservation, "req_slot")),
+                    previous_length=int(getattr(reservation, "previous_length")),
+                    materialized_width=materialized_width,
+                    reserve_steps=append_reserve_slots,
+                    sliding_window=int(sliding_window),
+                )
+                if borrowed is not None:
+                    (
+                        borrowed_materialized_slots,
+                        borrowed_materialized_slot_ids,
+                    ) = borrowed
+
             prepared_row = row_manager.prepare_decode_row(
                 req_id,
                 materialized_width=materialized_width,
@@ -7521,6 +7953,8 @@ class TokenPoolDecodeBackendState:
                 build_paged_rows=build_paged_rows,
                 append_reserve_slots=append_reserve_slots,
                 device=pool.device,
+                borrowed_materialized_slots=borrowed_materialized_slots,
+                borrowed_materialized_slot_ids=borrowed_materialized_slot_ids,
             )
             full_token_slot = int(prepared_row.full_token_slot)
             if persistent_rows:
@@ -7535,6 +7969,15 @@ class TokenPoolDecodeBackendState:
                         token_slots_long=prepared_row.materialized_slots_long,
                         token_slot_ids=prepared_row.materialized_slot_ids,
                     )
+                if persistent_rows:
+                    for _layer_id, layer, _writer in routed_layers:
+                        release = getattr(
+                            layer,
+                            "release_dense_materialized_storage",
+                            None,
+                        )
+                        if release is not None:
+                            release(reserve_steps=append_reserve_slots)
 
             rows.append(prepared_row.row_chunks)
             req_slots.append(int(getattr(reservation, "req_slot")))
@@ -7585,6 +8028,7 @@ class TokenPoolDecodeBackendState:
         kv_indices_padding_steps: int = 0,
         persistent_rows: bool = False,
         build_paged_rows: bool = False,
+        sliding_window: int | None = None,
         recoverable_errors: tuple[type[BaseException], ...] = (
             RuntimeError,
             ValueError,
@@ -7595,9 +8039,41 @@ class TokenPoolDecodeBackendState:
             return None
         if not layer_plan.supports_full_attention_decode_metadata:
             return None
+        targets_by_type: dict[str, set[int]] = {}
+        for layer_id, layer_type in layer_plan.layer_type_by_layer_id.items():
+            if layer_id not in self.kv_pool.layer_specs:
+                continue
+            targets_by_type.setdefault(str(layer_type), set()).add(
+                int(self.kv_pool.target_layer(layer_id))
+            )
+        full_targets = targets_by_type.get("full_attention", set())
+        sliding_targets = targets_by_type.get("sliding_attention", set())
+        allow_request_slot_aliasing = bool(
+            full_targets
+            and sliding_targets
+            and full_targets.isdisjoint(sliding_targets)
+        )
         request_list = list(requests)
         reservation_list = list(reservations)
         req_ids = [str(getattr(request, "req_id", request)) for request in request_list]
+        owner_layer_ids = tuple(layer_plan.full_attention_owner_layer_ids)
+        released_before: dict[tuple[str, int], bool] = {}
+        for req_id in req_ids:
+            if hasattr(caches_by_req_id, "get"):
+                cache = caches_by_req_id.get(req_id)
+            else:
+                cache = caches_by_req_id[req_id]
+            cache_layers = getattr(cache, "layers", ()) if cache is not None else ()
+            for layer_id in owner_layer_ids:
+                if int(layer_id) >= len(cache_layers):
+                    continue
+                released_before[(req_id, int(layer_id))] = bool(
+                    getattr(
+                        cache_layers[int(layer_id)],
+                        "_dense_storage_released",
+                        False,
+                    )
+                )
         if not persistent_rows:
             self.clear_full_attention_rows(req_ids)
         try:
@@ -7609,9 +8085,29 @@ class TokenPoolDecodeBackendState:
                 kv_indices_padding_steps=kv_indices_padding_steps,
                 persistent_rows=persistent_rows,
                 build_paged_rows=build_paged_rows,
+                sliding_window=sliding_window,
+                allow_request_slot_aliasing=allow_request_slot_aliasing,
             )
         except recoverable_errors:
             self.clear_full_attention_rows(req_ids)
+            for req_id in req_ids:
+                if hasattr(caches_by_req_id, "get"):
+                    cache = caches_by_req_id.get(req_id)
+                else:
+                    cache = caches_by_req_id[req_id]
+                cache_layers = getattr(cache, "layers", ()) if cache is not None else ()
+                for layer_id in owner_layer_ids:
+                    if int(layer_id) >= len(cache_layers):
+                        continue
+                    if released_before.get((req_id, int(layer_id)), False):
+                        continue
+                    restore = getattr(
+                        cache_layers[int(layer_id)],
+                        "restore_dense_materialized_storage",
+                        None,
+                    )
+                    if restore is not None:
+                        restore()
             return None
 
     def commit_full_attention_decode_to_caches(
@@ -7854,6 +8350,7 @@ class TokenKVPool:
         self._defer_buffer_allocation = bool(defer_buffer_allocation)
         self.validate_slot_writes = bool(validate_slot_writes)
         self._attention_workspace = TokenPoolAttentionWorkspace()
+        self.buffer_generation = 0
         self.kv_set_calls = 0
         self.kv_set_tokens = 0
         self.kv_set_index_copy_calls = 0
@@ -7958,6 +8455,24 @@ class TokenKVPool:
         else:
             start_slot, slot_count = slot_span
             slots = None
+        required_capacity = None
+        if slot_span is not None:
+            required_capacity = int(start_slot) + int(slot_count)
+        elif not bool(getattr(slots, "is_cuda", False)):
+            required_capacity = (
+                0 if slot_count < 1 else int(slots.max().item()) + 1
+            )
+        else:
+            try:
+                if not torch.cuda.is_current_stream_capturing():
+                    required_capacity = (
+                        0 if slot_count < 1 else int(slots.max().item()) + 1
+                    )
+            except Exception:
+                required_capacity = None
+        if required_capacity is not None:
+            self.ensure_layer_slot_capacity(layer_id, required_capacity)
+            keys, values = self._buffers[target]
         if slot_count != int(key_states.shape[0]) or slot_count != int(value_states.shape[0]):
             raise ValueError("slot_ids length must match key/value batch")
         if slot_span is not None and (
@@ -8071,6 +8586,37 @@ class TokenKVPool:
         if target not in self._buffers:
             self._allocate_layer_buffer(target)
 
+    def ensure_layer_slot_capacity(self, layer_id: int, required_capacity: int) -> None:
+        import torch
+
+        target = self._target_layers[int(layer_id)]
+        required_capacity = int(required_capacity)
+        if required_capacity < 0 or required_capacity > self.capacity:
+            raise IndexError("required token slot capacity exceeds token KV pool capacity")
+        if target not in self._buffers:
+            self._allocate_layer_buffer(target, min_capacity=required_capacity)
+            return
+        keys, values = self._buffers[target]
+        current_capacity = int(keys.shape[0])
+        if required_capacity <= current_capacity:
+            return
+        grown_capacity = min(
+            self.capacity,
+            max(required_capacity, current_capacity * 2),
+        )
+        spec = self.layer_specs[target]
+        new_shape = (
+            grown_capacity,
+            int(spec.num_kv_heads),
+            int(spec.head_dim),
+        )
+        new_keys = torch.empty(new_shape, dtype=keys.dtype, device=keys.device)
+        new_values = torch.empty(new_shape, dtype=values.dtype, device=values.device)
+        new_keys[:current_capacity].copy_(keys)
+        new_values[:current_capacity].copy_(values)
+        self._buffers[target] = (new_keys, new_values)
+        self.buffer_generation += 1
+
     @property
     def allocated_count(self) -> int:
         return len(self._allocated_slots)
@@ -8094,17 +8640,36 @@ class TokenKVPool:
     def allocated_layer_count(self) -> int:
         return len(self._buffers)
 
-    def _allocate_layer_buffer(self, layer_id: int) -> None:
+    @property
+    def layer_buffer_capacities(self) -> dict[int, int]:
+        return {
+            int(layer_id): int(keys.shape[0])
+            for layer_id, (keys, _values) in self._buffers.items()
+        }
+
+    def _allocate_layer_buffer(
+        self,
+        layer_id: int,
+        *,
+        min_capacity: int = 0,
+    ) -> None:
         import torch
 
         layer_id = int(layer_id)
         spec = self.layer_specs[layer_id]
         layer_dtype = spec.dtype if spec.dtype is not None else self.dtype
-        shape = (self.capacity, int(spec.num_kv_heads), int(spec.head_dim))
+        initial_capacity = (
+            self.capacity
+            if spec.initial_capacity is None
+            else max(1, min(self.capacity, int(spec.initial_capacity)))
+        )
+        layer_capacity = max(initial_capacity, int(min_capacity))
+        shape = (layer_capacity, int(spec.num_kv_heads), int(spec.head_dim))
         self._buffers[layer_id] = (
             torch.empty(shape, dtype=layer_dtype, device=self.device),
             torch.empty(shape, dtype=layer_dtype, device=self.device),
         )
+        self.buffer_generation += 1
 
     def _resolve_target_layer(self, layer_id: int) -> int:
         seen: set[int] = set()

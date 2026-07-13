@@ -124,6 +124,82 @@ class TestGemmaBenchReport(unittest.TestCase):
         self.assertIn("| vllm | ctx=512 out=8 prompt=uniform", text)
         self.assertIn("- | - | - | - | - | - | n/a", text)
 
+    def test_render_exposes_serving_provenance_and_whole_gpu_caveat(self) -> None:
+        payload = {
+            "schema": "wkvm.serving_bench.v1",
+            "engine": "vllm-http-stream",
+            "launch_command": "python experiments/wkvm_serving_bench.py --engine vllm-http-stream",
+            "context_tokens_per_session": 512,
+            "decode_tokens_per_session": 8,
+            "prompt_lengths_mode": "uniform",
+            "provenance": {
+                "schema": "wkvm.serving_bench.provenance.v2",
+                "engine": {
+                    "label": "vllm-http-stream",
+                    "version": "0.24.0",
+                    "version_source": "server_environment",
+                },
+                "target_server": {
+                    "launch_command": "vllm serve /models/gemma --port 8001",
+                    "launch_command_source": "operator_supplied",
+                    "config": {
+                        "max_model_len": 13824,
+                        "tensor_parallel_size": 1,
+                    },
+                    "config_source": "operator_supplied",
+                },
+                "client_environment": {
+                    "python_version": "3.12.1",
+                    "packages": {"wkvm": "0.0.1", "torch": "2.10.0"},
+                },
+                "gpu": {
+                    "index": 0,
+                    "uuid": "GPU-test",
+                    "name": "Test GPU",
+                    "driver_version": "595.71.05",
+                    "memory_total_mib": 24576,
+                },
+            },
+            "rows": [
+                {
+                    "B": 2,
+                    "request_count": 2,
+                    "success_count": 2,
+                    "request_output_tok_s": 100.0,
+                    "gpu_memory": {
+                        "schema": "wkvm.whole_gpu_memory.v1",
+                        "scope": "whole_device",
+                        "source": "nvidia-smi",
+                        "sample_count": 4,
+                        "baseline_used_mib": 12000,
+                        "peak_used_mib": 12544,
+                        "peak_delta_mib": 544,
+                    },
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            result = self.write_payload(tmp, "serving.json", payload)
+            text = gemma_bench_report.render([result])
+
+        self.assertIn("## Environment Provenance", text)
+        self.assertIn("0.24.0 | server_environment", text)
+        self.assertIn("Test GPU (index 0) | 595.71.05 | 24.000 GiB", text)
+        self.assertIn("Python 3.12.1; wkvm 0.0.1; torch 2.10.0", text)
+        self.assertIn("12.250 GiB (baseline 11.719 GiB", text)
+        self.assertIn("whole GPU peak", text)
+        self.assertIn("includes every process", text)
+        self.assertIn("## Launch Provenance", text)
+        self.assertIn("vllm serve /models/gemma --port 8001", text)
+        self.assertIn(
+            '{"max_model_len":13824,"tensor_parallel_size":1}', text
+        )
+        self.assertIn(
+            "python experiments/wkvm_serving_bench.py --engine vllm-http-stream",
+            text,
+        )
+
     def test_require_same_shape_rejects_mixed_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)

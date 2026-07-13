@@ -1,17 +1,25 @@
 import unittest
+import http.client
+import io
+import signal
 import threading
 import time
 import urllib.error
 import urllib.request
 import json
+import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from experiments.wkvm_serving_bench import stream_request_openai_completions
 from wkvm.gemma_server import (
     BoundedGemmaService,
     QueueFull,
+    ServiceUnavailable,
     apply_native_gemma_production_profile,
     engine_kwargs_from_args,
+    main,
+    run_server,
     serve,
     validate_native_gemma_loader_args,
 )
@@ -84,6 +92,41 @@ class ErrorEngine(FakeEngine):
         raise RuntimeError("synthetic engine failure")
 
 
+class FatalAfterStepEngine(FakeEngine):
+    def __init__(self):
+        super().__init__()
+        self.fail_worker = False
+
+    @property
+    def has_unfinished(self):
+        if self.fail_worker:
+            raise RuntimeError("synthetic worker failure")
+        return super().has_unfinished
+
+    def step(self):
+        self.fail_worker = True
+
+
+class FinishWhileCancelWaitsEngine(FakeEngine):
+    def __init__(self):
+        super().__init__()
+        self.step_started = threading.Event()
+        self.release_step = threading.Event()
+        self.abort_calls = 0
+
+    def step(self):
+        self.step_started.set()
+        if not self.release_step.wait(timeout=2):
+            raise RuntimeError("test did not release engine step")
+        req = next(req for req, _ in self.added if not req.status.is_finished)
+        req.output_token_ids.append(7)
+        req.status = type(req.status).FINISHED_LENGTH
+
+    def abort_request(self, req_id):
+        self.abort_calls += 1
+        super().abort_request(req_id)
+
+
 class FullQueue(FakeQueue):
     def __len__(self):
         return 1
@@ -93,6 +136,20 @@ class FullEngine(FakeEngine):
     def __init__(self):
         super().__init__()
         self.scheduler.waiting = FullQueue()
+
+
+class SigtermServer:
+    def __init__(self):
+        self.server_close_calls = 0
+
+    def serve_forever(self):
+        handler = signal.getsignal(signal.SIGTERM)
+        if not callable(handler):
+            raise AssertionError("SIGTERM handler was not installed")
+        handler(signal.SIGTERM, None)
+
+    def server_close(self):
+        self.server_close_calls += 1
 
 
 class TestGemmaServerEngineArgs(unittest.TestCase):
@@ -108,11 +165,17 @@ class TestGemmaServerEngineArgs(unittest.TestCase):
             persistent_padded_decode_steps=128,
             persistent_padded_decode_cuda_graph=True,
             persistent_padded_decode_graph_warmup_iters=5,
+            persistent_padded_sliding_metadata_padding=True,
             use_native_gemma_forward=True,
             native_gemma_attention_backend="sdpa",
             native_gemma_projection_backend="separate",
             native_gemma_weight_backend="hf_live",
             native_gemma_release_hf_decoder_layers=False,
+            enable_token_pool_metadata=True,
+            enable_token_pool_attention=True,
+            token_pool_max_context_len=16_384,
+            token_pool_capacity=49_152,
+            token_pool_paged_block_size=64,
             max_completed_requests=128,
         )
 
@@ -128,11 +191,17 @@ class TestGemmaServerEngineArgs(unittest.TestCase):
         self.assertEqual(kwargs["persistent_padded_decode_steps"], 128)
         self.assertTrue(kwargs["persistent_padded_decode_cuda_graph"])
         self.assertEqual(kwargs["persistent_padded_decode_graph_warmup_iters"], 5)
+        self.assertTrue(kwargs["persistent_padded_sliding_metadata_padding"])
         self.assertTrue(kwargs["use_native_gemma_forward"])
         self.assertEqual(kwargs["native_gemma_attention_backend"], "sdpa")
         self.assertEqual(kwargs["native_gemma_projection_backend"], "separate")
         self.assertEqual(kwargs["native_gemma_weight_backend"], "hf_live")
         self.assertFalse(kwargs["native_gemma_release_hf_decoder_layers"])
+        self.assertTrue(kwargs["enable_token_pool_metadata"])
+        self.assertTrue(kwargs["enable_token_pool_attention"])
+        self.assertEqual(kwargs["token_pool_max_context_len"], 16_384)
+        self.assertEqual(kwargs["token_pool_capacity"], 49_152)
+        self.assertEqual(kwargs["token_pool_paged_block_size"], 64)
         self.assertEqual(kwargs["finished_trace_limit"], 128)
 
     def test_production_profile_enables_checkpoint_native_graph_profile(self) -> None:
@@ -192,6 +261,47 @@ class TestGemmaServerEngineArgs(unittest.TestCase):
 
 
 class TestBoundedGemmaService(unittest.TestCase):
+    def test_run_server_closes_service_and_restores_sigterm_handler(self) -> None:
+        service = BoundedGemmaService(FakeEngine(), max_queue=2, batch_wait_s=0.0)
+        server = SigtermServer()
+        previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
+
+        run_server(service, server)
+
+        self.assertTrue(service.closed)
+        self.assertFalse(service._worker.is_alive())
+        self.assertEqual(server.server_close_calls, 1)
+        self.assertIs(signal.getsignal(signal.SIGTERM), previous_sigterm_handler)
+        service.close()
+
+    def test_close_fails_pending_requests_after_worker_stops(self) -> None:
+        service = BoundedGemmaService(FakeEngine(), max_queue=2, batch_wait_s=60.0)
+        service.submit(prompt_ids=[1], max_tokens=1, req_id="pending-close")
+
+        service.close(timeout_s=1.0)
+
+        self.assertFalse(service._worker.is_alive())
+        self.assertEqual(len(service._pending), 0)
+        status = service.status("pending-close")
+        self.assertTrue(status["finished"])
+        self.assertEqual(status["finish_reason"], "error")
+
+    def test_close_reports_worker_that_does_not_stop_within_bound(self) -> None:
+        engine = FinishWhileCancelWaitsEngine()
+        service = BoundedGemmaService(engine, max_queue=2, batch_wait_s=0.0)
+        service.submit(prompt_ids=[1], max_tokens=1, req_id="blocked-close")
+        self.assertTrue(engine.step_started.wait(timeout=2))
+
+        started = time.perf_counter()
+        with self.assertRaisesRegex(RuntimeError, "did not stop within"):
+            service.close(timeout_s=0.01)
+        self.assertLess(time.perf_counter() - started, 0.5)
+        self.assertTrue(service._worker.is_alive())
+
+        engine.release_step.set()
+        service.close(timeout_s=2.0)
+        self.assertFalse(service._worker.is_alive())
+
     def test_generate_returns_tokens(self) -> None:
         service = BoundedGemmaService(FakeEngine(), max_queue=2)
         try:
@@ -200,6 +310,71 @@ class TestBoundedGemmaService(unittest.TestCase):
             self.assertEqual(out["finish_reason"], "length")
         finally:
             service.close()
+
+    def test_nonfinite_timeouts_are_rejected_before_admission(self) -> None:
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(default=value), self.assertRaisesRegex(
+                ValueError,
+                "finite",
+            ):
+                BoundedGemmaService(FakeEngine(), request_timeout_s=value)
+
+        service = BoundedGemmaService(FakeEngine(), max_queue=2)
+        try:
+            for value in (float("nan"), float("inf"), float("-inf")):
+                with self.subTest(generate=value), self.assertRaisesRegex(
+                    ValueError,
+                    "finite",
+                ):
+                    service.generate(
+                        prompt_ids=[1],
+                        max_tokens=1,
+                        req_id=f"generate-{value}",
+                        timeout_s=value,
+                    )
+                with self.subTest(submit=value), self.assertRaisesRegex(
+                    ValueError,
+                    "finite",
+                ):
+                    service.submit(
+                        prompt_ids=[1],
+                        max_tokens=1,
+                        req_id=f"submit-{value}",
+                        timeout_s=value,
+                    )
+                with self.subTest(stream=value), self.assertRaisesRegex(
+                    ValueError,
+                    "finite",
+                ):
+                    next(
+                        service.stream(
+                            prompt_ids=[1],
+                            max_tokens=1,
+                            req_id=f"stream-{value}",
+                            timeout_s=value,
+                        )
+                    )
+            self.assertEqual(service.total_requests, 0)
+        finally:
+            service.close()
+
+    def test_cli_rejects_nonfinite_request_timeout_before_optional_imports(self) -> None:
+        stderr = io.StringIO()
+        with patch.object(sys, "stderr", stderr), patch.object(
+            sys,
+            "argv",
+            [
+                "wkvm-gemma-server",
+                "--model",
+                "unused",
+                "--request-timeout-s",
+                "nan",
+            ],
+        ), self.assertRaises(SystemExit) as cm:
+            main()
+
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("--request-timeout-s must be finite and > 0", stderr.getvalue())
 
     def test_submit_status_returns_stepwise_tokens(self) -> None:
         service = BoundedGemmaService(FakeEngine(), max_queue=2, batch_wait_s=0.0)
@@ -224,6 +399,215 @@ class TestBoundedGemmaService(unittest.TestCase):
                 service.generate(prompt_ids=[1, 2], max_tokens=1)
         finally:
             service.close()
+
+    def test_cancel_unknown_does_not_poison_future_request_id(self) -> None:
+        service = BoundedGemmaService(FakeEngine(), max_queue=2, batch_wait_s=0.0)
+        try:
+            with self.assertRaisesRegex(KeyError, "unknown req_id future-request"):
+                service.cancel("future-request")
+
+            self.assertNotIn("future-request", service.cancelled)
+            out = service.generate(
+                prompt_ids=[1, 2],
+                max_tokens=1,
+                req_id="future-request",
+            )
+            self.assertEqual(out["tokens"], [7])
+            self.assertEqual(out["finish_reason"], "length")
+            self.assertNotIn("future-request", service.cancelled)
+        finally:
+            service.close()
+
+    def test_cancelled_request_does_not_retain_tombstone(self) -> None:
+        service = BoundedGemmaService(FakeEngine(), max_queue=2, batch_wait_s=0.05)
+        try:
+            service.submit(prompt_ids=[1, 2], max_tokens=1, req_id="cancel-me")
+            self.assertEqual(
+                service.cancel("cancel-me"),
+                {"req_id": "cancel-me", "cancelled": True},
+            )
+
+            deadline = time.perf_counter() + 2
+            status = service.status("cancel-me")
+            while not status["finished"] and time.perf_counter() < deadline:
+                time.sleep(0.01)
+                status = service.status("cancel-me")
+            self.assertTrue(status["finished"])
+            self.assertEqual(status["finish_reason"], "aborted")
+            self.assertNotIn("cancel-me", service.cancelled)
+            self.assertEqual(service.total_cancelled, 1)
+        finally:
+            service.close()
+
+    def test_cancel_rechecks_request_after_inflight_step(self) -> None:
+        engine = FinishWhileCancelWaitsEngine()
+        service = BoundedGemmaService(engine, max_queue=2, batch_wait_s=0.0)
+        cancel_result = {}
+
+        def cancel_request() -> None:
+            cancel_result.update(service.cancel("race"))
+
+        try:
+            service.submit(prompt_ids=[1, 2], max_tokens=1, req_id="race")
+            self.assertTrue(engine.step_started.wait(timeout=2))
+            thread = threading.Thread(target=cancel_request)
+            thread.start()
+            deadline = time.perf_counter() + 2
+            while "race" not in service.cancelled and time.perf_counter() < deadline:
+                time.sleep(0.005)
+            self.assertIn("race", service.cancelled)
+
+            self.assertTrue(service.lock.acquire(timeout=0.1))
+            service.lock.release()
+            engine.release_step.set()
+            thread.join(timeout=2)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(cancel_result, {"req_id": "race", "cancelled": False})
+            self.assertEqual(service.status("race")["finish_reason"], "length")
+            self.assertEqual(service.total_cancelled, 0)
+            self.assertEqual(engine.abort_calls, 0)
+            self.assertNotIn("race", service.cancelled)
+        finally:
+            engine.release_step.set()
+            service.close()
+
+    def test_http_cancel_unknown_returns_not_found(self) -> None:
+        service = BoundedGemmaService(FakeEngine(), max_queue=2, batch_wait_s=0.0)
+        server = serve(service, port=0)
+        host, port = server.server_address
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            req = urllib.request.Request(
+                f"http://{host}:{port}/v1/cancel",
+                data=json.dumps({"req_id": "missing"}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                urllib.request.urlopen(req, timeout=5)
+            self.assertEqual(cm.exception.code, 404)
+            with cm.exception as response:
+                response.read()
+            self.assertNotIn("missing", service.cancelled)
+        finally:
+            service.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_http_post_requires_content_length(self) -> None:
+        service = BoundedGemmaService(FakeEngine(), max_queue=2, batch_wait_s=0.0)
+        server = serve(service, port=0)
+        host, port = server.server_address
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        connection = http.client.HTTPConnection(host, port, timeout=2)
+        try:
+            connection.putrequest("POST", "/v1/submit")
+            connection.putheader("Content-Type", "application/json")
+            connection.endheaders()
+            with connection.getresponse() as response:
+                self.assertEqual(response.status, 411)
+                payload = json.loads(response.read() or b"{}")
+            self.assertIn("Content-Length", payload["error"])
+            self.assertEqual(service.total_requests, 0)
+        finally:
+            connection.close()
+            service.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_http_post_rejects_content_length_with_transfer_encoding(self) -> None:
+        service = BoundedGemmaService(FakeEngine(), max_queue=2, batch_wait_s=0.0)
+        server = serve(service, port=0)
+        host, port = server.server_address
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        connection = http.client.HTTPConnection(host, port, timeout=2)
+        try:
+            connection.putrequest("POST", "/v1/submit")
+            connection.putheader("Content-Type", "application/json")
+            connection.putheader("Content-Length", "2")
+            connection.putheader("Transfer-Encoding", "chunked")
+            connection.endheaders()
+            with connection.getresponse() as response:
+                self.assertEqual(response.status, 400)
+                payload = json.loads(response.read() or b"{}")
+            self.assertIn("Transfer-Encoding", payload["error"])
+            self.assertEqual(service.total_requests, 0)
+        finally:
+            connection.close()
+            service.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_http_post_rejects_oversized_body_before_reading(self) -> None:
+        body = json.dumps(
+            {"prompt_ids": [1], "max_tokens": 1, "req_id": "bounded-body"},
+            separators=(",", ":"),
+        ).encode()
+        service = BoundedGemmaService(FakeEngine(), max_queue=2, batch_wait_s=0.0)
+        server = serve(service, port=0, max_request_body_bytes=len(body))
+        host, port = server.server_address
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        connection = http.client.HTTPConnection(host, port, timeout=2)
+        try:
+            connection.putrequest("POST", "/v1/submit")
+            connection.putheader("Content-Type", "application/json")
+            connection.putheader("Content-Length", str(len(body) + 1))
+            connection.endheaders()
+            with connection.getresponse() as response:
+                self.assertEqual(response.status, 413)
+                payload = json.loads(response.read() or b"{}")
+            self.assertIn("exceeds", payload["error"])
+            self.assertEqual(service.total_requests, 0)
+
+            request = urllib.request.Request(
+                f"http://{host}:{port}/v1/submit",
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=2) as response:
+                self.assertEqual(response.status, 202)
+                response.read()
+            self.assertEqual(service.total_requests, 1)
+        finally:
+            connection.close()
+            service.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_http_post_body_read_timeout_returns_request_timeout(self) -> None:
+        body = b'{"prompt_ids":[1],"max_tokens":1}'
+        service = BoundedGemmaService(FakeEngine(), max_queue=2, batch_wait_s=0.0)
+        server = serve(service, port=0, request_read_timeout_s=0.05)
+        host, port = server.server_address
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        connection = http.client.HTTPConnection(host, port, timeout=2)
+        try:
+            connection.putrequest("POST", "/v1/submit")
+            connection.putheader("Content-Type", "application/json")
+            connection.putheader("Content-Length", str(len(body)))
+            connection.endheaders(body[:1])
+            with connection.getresponse() as response:
+                self.assertEqual(response.status, 408)
+                payload = json.loads(response.read() or b"{}")
+            self.assertIn("not received", payload["error"])
+            self.assertEqual(service.total_requests, 0)
+        finally:
+            connection.close()
+            service.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
     def test_http_submit_and_status_routes(self) -> None:
         service = BoundedGemmaService(FakeEngine(), max_queue=2, batch_wait_s=0.0)
@@ -521,6 +905,69 @@ class TestBoundedGemmaService(unittest.TestCase):
         finally:
             service.close()
 
+    def test_generate_timeout_loses_race_to_completed_request(self) -> None:
+        service = BoundedGemmaService(
+            NeverFinishEngine(),
+            max_queue=2,
+            batch_wait_s=0.0,
+        )
+        original_timeout_request = service._timeout_request
+
+        def finish_before_cancel(req_id: str) -> bool:
+            with service.cv:
+                request = service._requests[req_id]
+                request.output_token_ids.append(7)
+                request.status = type(request.status).FINISHED_LENGTH
+            return original_timeout_request(req_id)
+
+        service._timeout_request = finish_before_cancel
+        try:
+            out = service.generate(
+                prompt_ids=[1, 2],
+                max_tokens=1,
+                req_id="timeout-race",
+                timeout_s=0.001,
+            )
+
+            self.assertEqual(out["tokens"], [7])
+            self.assertEqual(out["finish_reason"], "length")
+            self.assertEqual(service.total_timed_out, 0)
+        finally:
+            service.close()
+
+    def test_stream_timeout_loses_race_to_completed_request(self) -> None:
+        service = BoundedGemmaService(
+            NeverFinishEngine(),
+            max_queue=2,
+            batch_wait_s=0.0,
+        )
+        original_timeout_request = service._timeout_request
+
+        def finish_before_cancel(req_id: str) -> bool:
+            with service.cv:
+                request = service._requests[req_id]
+                request.output_token_ids.append(7)
+                request.status = type(request.status).FINISHED_LENGTH
+            return original_timeout_request(req_id)
+
+        service._timeout_request = finish_before_cancel
+        try:
+            events = list(
+                service.stream(
+                    prompt_ids=[1, 2],
+                    max_tokens=1,
+                    req_id="stream-timeout-race",
+                    timeout_s=0.001,
+                )
+            )
+
+            self.assertEqual([event["type"] for event in events], ["queued", "token", "finish"])
+            self.assertEqual(events[1]["token"], 7)
+            self.assertEqual(events[2]["finish_reason"], "length")
+            self.assertEqual(service.total_timed_out, 0)
+        finally:
+            service.close()
+
     def test_submit_timeout_expires_pending_request(self) -> None:
         service = BoundedGemmaService(
             FakeEngine(),
@@ -574,6 +1021,84 @@ class TestBoundedGemmaService(unittest.TestCase):
             self.assertEqual(service.total_errors, 1)
         finally:
             service.close()
+
+    def test_fatal_worker_failure_fails_request_and_disables_admission(self) -> None:
+        service = BoundedGemmaService(
+            FatalAfterStepEngine(), max_queue=2, batch_wait_s=0.0
+        )
+        try:
+            out = service.generate(prompt_ids=[1, 2], max_tokens=1, req_id="fatal")
+            self.assertEqual(out["finish_reason"], "error")
+
+            deadline = time.perf_counter() + 2
+            while service._worker.is_alive() and time.perf_counter() < deadline:
+                time.sleep(0.01)
+            self.assertFalse(service._worker.is_alive())
+            health = service.health()
+            self.assertFalse(health["ok"])
+            self.assertFalse(health["worker_alive"])
+            self.assertIn("synthetic worker failure", health["last_error"] or "")
+            with self.assertRaisesRegex(ServiceUnavailable, "service is not ready"):
+                service.submit(prompt_ids=[1], max_tokens=1, req_id="rejected")
+            self.assertNotIn("rejected", service._requests)
+        finally:
+            service.close()
+
+    def test_fatal_worker_failure_releases_queued_waiter(self) -> None:
+        service = BoundedGemmaService(FakeEngine(), max_queue=2, batch_wait_s=0.0)
+
+        def fail_before_pending_drain() -> None:
+            raise RuntimeError("synthetic pending-drain failure")
+
+        service._expire_deadlines_locked = fail_before_pending_drain
+        try:
+            out = service.generate(prompt_ids=[1, 2], max_tokens=1, req_id="queued")
+            self.assertEqual(out["finish_reason"], "error")
+            self.assertEqual(len(service._pending), 0)
+
+            deadline = time.perf_counter() + 2
+            while service._worker.is_alive() and time.perf_counter() < deadline:
+                time.sleep(0.01)
+            health = service.health()
+            self.assertFalse(health["ok"])
+            self.assertEqual(health["pending_queue_depth"], 0)
+            self.assertIn("pending-drain failure", health["last_error"] or "")
+        finally:
+            service.close()
+
+    def test_http_health_and_admission_return_503_after_close(self) -> None:
+        service = BoundedGemmaService(FakeEngine(), max_queue=2, batch_wait_s=0.0)
+        server = serve(service, port=0)
+        host, port = server.server_address
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            service.close()
+            with self.assertRaises(urllib.error.HTTPError) as health_error:
+                urllib.request.urlopen(f"http://{host}:{port}/health", timeout=5)
+            self.assertEqual(health_error.exception.code, 503)
+            with health_error.exception as response:
+                health = json.loads(response.read() or b"{}")
+            self.assertFalse(health["ok"])
+            self.assertFalse(health["worker_alive"])
+
+            request = urllib.request.Request(
+                f"http://{host}:{port}/v1/submit",
+                data=json.dumps({"prompt_ids": [1], "max_tokens": 1}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as submit_error:
+                urllib.request.urlopen(request, timeout=5)
+            self.assertEqual(submit_error.exception.code, 503)
+            with submit_error.exception as response:
+                response.read()
+            self.assertEqual(service.total_requests, 0)
+        finally:
+            service.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
     def test_completed_request_retention_is_bounded(self) -> None:
         service = BoundedGemmaService(

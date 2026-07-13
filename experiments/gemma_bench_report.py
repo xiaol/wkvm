@@ -5,9 +5,24 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any
+
+try:
+    from .benchmark_contract import ComparisonContractResult, validate_comparable
+except ImportError:  # Direct script execution.
+    from benchmark_contract import ComparisonContractResult, validate_comparable
+
+
+SERVING_PROVENANCE_SCHEMAS = frozenset(
+    {
+        "wkvm.serving_bench.provenance.v1",
+        "wkvm.serving_bench.provenance.v2",
+    }
+)
+
 
 def atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -42,6 +57,16 @@ def fmt_bytes(x: Any) -> str:
     if mib >= 1:
         return f"{mib:.1f} MiB"
     return f"{value} B"
+
+
+def fmt_mib_as_gib(value: Any) -> str:
+    if isinstance(value, bool):
+        return "-"
+    try:
+        gib = float(value) / 1024.0
+    except (TypeError, ValueError):
+        return "-"
+    return f"{gib:.3f} GiB" if math.isfinite(gib) else "-"
 
 
 def load_payloads(paths: list[Path]) -> list[tuple[Path, dict[str, Any]]]:
@@ -246,6 +271,83 @@ def engine_label(data: dict[str, Any]) -> str:
     return str(engine)
 
 
+def structured_provenance(data: dict[str, Any]) -> dict[str, Any] | None:
+    provenance = data.get("provenance")
+    if (
+        isinstance(provenance, dict)
+        and provenance.get("schema") in SERVING_PROVENANCE_SCHEMAS
+    ):
+        return provenance
+    return None
+
+
+def engine_version_summary(data: dict[str, Any]) -> tuple[str, str]:
+    provenance = structured_provenance(data)
+    if provenance is not None:
+        engine = provenance.get("engine")
+        if isinstance(engine, dict) and engine.get("version"):
+            return str(engine["version"]), str(engine.get("version_source") or "-")
+    config = data.get("engine_config")
+    if isinstance(config, dict):
+        for key in ("vllm_version", "sglang_version", "engine_version"):
+            if config.get(key):
+                return str(config[key]), f"engine_config.{key}"
+    return "-", "-"
+
+
+def gpu_provenance_summary(data: dict[str, Any]) -> tuple[str, str, str]:
+    provenance = structured_provenance(data)
+    gpu = provenance.get("gpu") if provenance is not None else None
+    if not isinstance(gpu, dict):
+        return "-", "-", "-"
+    identity = str(gpu.get("name") or "-")
+    if gpu.get("index") is not None:
+        identity += f" (index {gpu['index']})"
+    total_mib = gpu.get("memory_total_mib")
+    total = fmt_mib_as_gib(total_mib)
+    return identity, str(gpu.get("driver_version") or "-"), total
+
+
+def client_runtime_summary(data: dict[str, Any]) -> str:
+    provenance = structured_provenance(data)
+    client = provenance.get("client_environment") if provenance is not None else None
+    if not isinstance(client, dict):
+        return "-"
+    parts = []
+    if client.get("python_version"):
+        parts.append(f"Python {client['python_version']}")
+    packages = client.get("packages")
+    if isinstance(packages, dict):
+        parts.extend(
+            f"{name} {version}"
+            for name, version in packages.items()
+            if version is not None
+        )
+    return "; ".join(parts) or "-"
+
+
+def target_server_summary(data: dict[str, Any]) -> tuple[str, str, str]:
+    provenance = structured_provenance(data)
+    target_server = (
+        provenance.get("target_server") if provenance is not None else None
+    )
+    if not isinstance(target_server, dict):
+        return "-", "-", "-"
+    launch_command = str(target_server.get("launch_command") or "-")
+    launch_source = str(target_server.get("launch_command_source") or "-")
+    config = target_server.get("config")
+    config_summary = (
+        json.dumps(config, sort_keys=True, separators=(",", ":"))
+        if isinstance(config, dict)
+        else "-"
+    )
+    return launch_command, launch_source, config_summary
+
+
+def markdown_cell(value: Any) -> str:
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
 def row_or_payload_value(
     data: dict[str, Any], row: dict[str, Any], key: str
 ) -> Any:
@@ -272,6 +374,25 @@ def no_hf_guard_summary(data: dict[str, Any], row: dict[str, Any]) -> str:
 
 
 def row_memory(row: dict[str, Any]) -> tuple[str, str]:
+    gpu_memory = row.get("gpu_memory")
+    if (
+        isinstance(gpu_memory, dict)
+        and gpu_memory.get("schema") == "wkvm.whole_gpu_memory.v1"
+        and gpu_memory.get("scope") == "whole_device"
+    ):
+        peak_mib = gpu_memory.get("peak_used_mib")
+        baseline_mib = gpu_memory.get("baseline_used_mib")
+        delta_mib = gpu_memory.get("peak_delta_mib")
+        samples = gpu_memory.get("sample_count")
+        if peak_mib is None:
+            return "whole GPU", f"unavailable ({fmt(samples)} samples)"
+        detail = fmt_mib_as_gib(peak_mib)
+        if baseline_mib is not None and delta_mib is not None:
+            detail += (
+                f" (baseline {fmt_mib_as_gib(baseline_mib)}, "
+                f"delta {fmt_mib_as_gib(delta_mib)}, {fmt(samples)} samples)"
+            )
+        return "whole GPU peak", detail
     if row.get("peak_engine_delta_gib") is not None:
         return "engine delta", fmt(row.get("peak_engine_delta_gib"), " GiB")
     if row.get("peak_reserved_gib") is not None:
@@ -356,6 +477,10 @@ def request_timing_summary(row: dict[str, Any]) -> str:
         "first_token_latency_p95_s",
         "first_token_latency_s_p95",
     )
+    if ttft50 is None:
+        ttft50 = row.get("p50_ttft_s")
+    if ttft95 is None:
+        ttft95 = row.get("p95_ttft_s")
     decode50 = _summary_value(row, summary, "decode_time_p50_s", "decode_time_s_p50")
     decode95 = _summary_value(row, summary, "decode_time_p95_s", "decode_time_s_p95")
     if all(
@@ -367,6 +492,35 @@ def request_timing_summary(row: dict[str, Any]) -> str:
         f"q {fmt(q50)}/{fmt(q95)}; "
         f"ttft {fmt(ttft50)}/{fmt(ttft95)}; "
         f"dec {fmt(decode50)}/{fmt(decode95)}"
+    )
+
+
+def itl_validity_summary(row: dict[str, Any]) -> str:
+    valid_requests = row.get("itl_valid_request_count")
+    request_count = row.get("request_count")
+    sample_count = row.get("itl_sample_count")
+    p50 = row.get("p50_itl_s")
+    p95 = row.get("p95_itl_s")
+    exact_counts = row.get("output_token_count_exact_requests")
+    sources = row.get("output_token_count_sources")
+    if all(
+        value is None
+        for value in (
+            valid_requests,
+            request_count,
+            sample_count,
+            p50,
+            p95,
+            exact_counts,
+            sources,
+        )
+    ):
+        return "-"
+    source_text = ",".join(str(value) for value in sources) if sources else "-"
+    return (
+        f"{fmt(valid_requests)}/{fmt(request_count)} req; "
+        f"{fmt(sample_count)} samples; p50/p95 {fmt(p50)}/{fmt(p95)}; "
+        f"count {fmt(exact_counts)}/{fmt(request_count)} exact ({source_text})"
     )
 
 
@@ -387,6 +541,7 @@ def scheduler_summary(row: dict[str, Any]) -> str:
 def graph_summary(row: dict[str, Any]) -> str:
     cuda_keys = (
         "persistent_padded_decode_cuda_graph_captures",
+        "persistent_padded_decode_cuda_graph_cache_hits",
         "persistent_padded_decode_cuda_graph_replays",
         "persistent_padded_decode_cuda_graph_skips",
     )
@@ -400,6 +555,7 @@ def graph_summary(row: dict[str, Any]) -> str:
     return (
         "cuda cap "
         f"{fmt(row.get('persistent_padded_decode_cuda_graph_captures'))} / "
+        f"hit {fmt(row.get('persistent_padded_decode_cuda_graph_cache_hits'))} / "
         f"replay {fmt(row.get('persistent_padded_decode_cuda_graph_replays'))} / "
         f"skip {fmt(row.get('persistent_padded_decode_cuda_graph_skips'))}; "
         "pool start "
@@ -455,6 +611,7 @@ def load_rows(path: Path, data: dict[str, Any]) -> list[dict[str, Any]]:
                 "schema": data.get("schema"),
                 "engine": engine_label(data),
                 "shape": fmt_shape(shape_key(data)),
+                "semantics": data.get("semantics") or "-",
                 "ctx": data.get("context_tokens_per_session"),
                 "out": data.get("decode_tokens_per_session"),
                 "prompt_mode": data.get("prompt_lengths_mode"),
@@ -482,11 +639,15 @@ def load_rows(path: Path, data: dict[str, Any]) -> list[dict[str, Any]]:
                 ),
                 "no_hf_guard": no_hf_guard_summary(data, row),
                 "B": row.get("B"),
-                "success": f"{row.get('success_count', 0)}/{fmt(row.get('B'))}",
+                "success": (
+                    f"{row.get('success_count', 0)}/"
+                    f"{fmt(row.get('request_count', row.get('B')))}"
+                ),
                 "green": row.get("green"),
                 "agg_decode": agg_decode,
                 "decode_timing": decode_timing_summary(row),
                 "request_timing": request_timing_summary(row),
+                "itl_validity": itl_validity_summary(row),
                 "scheduler": scheduler_summary(row),
                 "graph": graph_summary(row),
                 "e2e_output": row.get("e2e_output_tok_s"),
@@ -509,8 +670,12 @@ def render(
     require_same_shape: bool = False,
     require_same_prompt_fingerprint: bool = False,
     require_native_no_hf: bool = False,
+    require_comparable: bool = False,
 ) -> str:
     payloads = load_payloads(paths)
+    contract: ComparisonContractResult | None = None
+    if require_comparable:
+        contract = validate_comparable(payloads)
     if require_same_shape:
         validate_same_shape(payloads)
     if require_same_prompt_fingerprint:
@@ -537,11 +702,82 @@ def render(
         "Only rows with the same `ctx`, `out`, prompt mode, and benchmark path should be treated as same-shape comparisons. "
         "When present, `prompt fingerprint` is a SHA-256 over the exact prompt token IDs for the row. "
         "The native no-HF columns are applicable to wkvm-native rows and are `n/a` for incumbent engines. "
-        "`request timing s` reports p50/p95 queue, first-token, and decode timings when present.",
-        "",
-        "| engine | shape | B | success | green | agg decode tok/s | prompt fingerprint | forward backend | HF fwd | HF construct | HF tok | HF cfg | native cfg | native ckpt | no-HF guard | decode timing s | request timing s | scheduler | graph | e2e output tok/s | p50 s | p95 s | memory | max model batch | padded temp | persistent padded | error | source |",
-        "|---|---|---:|---:|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---|---|---|---|---|---:|---:|---:|---|---|---|---|---|---|",
+        "`request timing s` reports p50/p95 queue, first-token, and decode timings when present. "
+        "Memory labelled `whole GPU peak` is opt-in `nvidia-smi` instrumentation: it includes every process "
+        "on the selected device, and its baseline/delta are not process-attributed.",
     ]
+    if contract is not None:
+        lines.extend(["", contract.markdown_summary()])
+    lines.extend(
+        [
+            "",
+            "## Environment Provenance",
+            "",
+            "Engine versions are target-server values reported by the benchmark operator; client package versions describe only the benchmark process.",
+            "",
+            "| engine | engine version | version source | GPU | driver | GPU memory | client runtime | source |",
+            "|---|---|---|---|---|---:|---|---|",
+        ]
+    )
+    for path, data in payloads:
+        version, version_source = engine_version_summary(data)
+        gpu, driver, gpu_memory = gpu_provenance_summary(data)
+        source = f"[json]({path.as_posix()})"
+        lines.append(
+            "| "
+            + " | ".join(
+                markdown_cell(value)
+                for value in (
+                    engine_label(data),
+                    version,
+                    version_source,
+                    gpu,
+                    driver,
+                    gpu_memory,
+                    client_runtime_summary(data),
+                    source,
+                )
+            )
+            + " |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Launch Provenance",
+            "",
+            "Target-server commands and configurations are operator supplied and recorded verbatim; benchmark-client commands reproduce the measurement harness invocation.",
+            "",
+            "| engine | target server launch | launch source | server config | benchmark client launch | source |",
+            "|---|---|---|---|---|---|",
+        ]
+    )
+    for path, data in payloads:
+        server_launch, launch_source, server_config = target_server_summary(data)
+        source = f"[json]({path.as_posix()})"
+        lines.append(
+            "| "
+            + " | ".join(
+                markdown_cell(value)
+                for value in (
+                    engine_label(data),
+                    server_launch,
+                    launch_source,
+                    server_config,
+                    data.get("launch_command") or "-",
+                    source,
+                )
+            )
+            + " |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Benchmark Rows",
+            "",
+            "| engine | shape | semantics | B | success | green | agg decode tok/s | prompt fingerprint | forward backend | HF fwd | HF construct | HF tok | HF cfg | native cfg | native ckpt | no-HF guard | decode timing s | request timing s | ITL exact | scheduler | graph | e2e output tok/s | p50 s | p95 s | memory | max model batch | padded temp | persistent padded | error | source |",
+            "|---|---|---|---:|---:|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---|---|---|---|---|---|---:|---:|---:|---|---|---|---|---|---|",
+        ]
+    )
     for row in rows:
         path = row["path"]
         source = f"[json]({path.as_posix()})"
@@ -556,6 +792,7 @@ def render(
                 [
                     str(row["engine"]),
                     row["shape"],
+                    row["semantics"],
                     fmt(row["B"]),
                     str(row["success"]),
                     fmt(row["green"]),
@@ -571,6 +808,7 @@ def render(
                     row["no_hf_guard"],
                     row["decode_timing"],
                     row["request_timing"],
+                    row["itl_validity"],
                     row["scheduler"],
                     row["graph"],
                     fmt(row["e2e_output"]),
@@ -615,12 +853,22 @@ def main() -> None:
             "construction, and native checkpoint/config loading"
         ),
     )
+    ap.add_argument(
+        "--require-comparable",
+        action="store_true",
+        help=(
+            "fail unless existing artifact fields prove a shared benchmark path, "
+            "shape, batch size, prompt lengths, successful outputs, throughput, "
+            "and baseline provenance"
+        ),
+    )
     args = ap.parse_args()
     text = render(
         args.json_files,
         require_same_shape=args.require_same_shape,
         require_same_prompt_fingerprint=args.require_same_prompt_fingerprint,
         require_native_no_hf=args.require_native_no_hf,
+        require_comparable=args.require_comparable,
     )
     if args.out:
         atomic_write_text(args.out, text)

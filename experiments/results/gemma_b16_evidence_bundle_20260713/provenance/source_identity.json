@@ -1,0 +1,18 @@
+{
+  "schema": "wkvm.source_identity.v1",
+  "captured_utc": "2026-07-13T07:43:57Z",
+  "repo_root": "/home/xiaol/X/wkvm",
+  "git_commit": "59f736b9b80a2c54c397a481775cb008dc2ce2ef",
+  "git_head_tree": "3a842679b91a2ecde2acb5ecad34a3b9d04ee6e0",
+  "git_branch": "main",
+  "git_worktree_clean": false,
+  "status_line_count": 54,
+  "git_status_sha256": "62d7e9b6c9ab198e1448a02293002ef24c5a1dafb40cba8baa92c04eb8bdb805",
+  "git_tracked_diff_sha256": "5f66d0430e171bd2bb4a9f4ea53542ac0dc0ee4e3e08227275faf2b45af2472d",
+  "worktree_files_manifest_sha256": "c79b8752a7195639ee68b09dcb5606a1bb086b3874a2dc0011f9450ea9cdcadd",
+  "worktree_file_count": 183,
+  "final_quality_runtime_source_identity": "3be6a1b031fdcec8630c30a6f9bc6f03f16efbb723bf3bf3b49eae4fa7b38d9c",
+  "manifest_scope": "git tracked plus untracked/non-ignored regular files, SHA-256 and size, bundle directory excluded",
+  "untracked_source_archive": "untracked_source/ contains untracked Python source and tests; non-source result/media files are hash-identified but not copied",
+  "snapshot_note": "Post-run final report-time source snapshot. Final quality payloads independently record unchanged pre/post runtime-source identity; performance payloads record only committed HEAD."
+}

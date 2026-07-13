@@ -135,19 +135,37 @@ class RoutedSpanLayerState:
         for i, pos in enumerate(chunk):
             if pos < len(break_mask) and break_mask[pos]:
                 last = i
-        return last + 1
+        return len(chunk) if last < 0 else last + 1
 
     def _split_spans(self, positions: list[int], break_mask: list[bool] | None) -> list[list[int]]:
+        breaks: list[int] = []
+        for i, pos in enumerate(positions):
+            if break_mask is not None and pos < len(break_mask):
+                if break_mask[pos]:
+                    breaks.append(i)
+            elif (i + 1) % 24 == 0:
+                breaks.append(i)
+        fallback_span = min(24, self.config.max_span_tokens)
+        if not breaks:
+            return [
+                positions[start : start + fallback_span]
+                for start in range(0, len(positions), fallback_span)
+            ]
+
         spans: list[list[int]] = []
-        current: list[int] = []
-        for pos in positions:
-            current.append(pos)
-            is_break = bool(break_mask and pos < len(break_mask) and break_mask[pos])
-            if is_break or len(current) >= self.config.max_span_tokens:
-                spans.append(current)
-                current = []
-        if current:
-            spans.append(current)
+        start = 0
+        for break_idx in breaks:
+            end = break_idx + 1
+            while end - start > self.config.max_span_tokens:
+                split = start + self.config.max_span_tokens
+                spans.append(positions[start:split])
+                start = split
+            spans.append(positions[start:end])
+            start = end
+        spans.extend(
+            positions[tail : tail + fallback_span]
+            for tail in range(start, len(positions), fallback_span)
+        )
         return spans
 
     def _value_route_slot(self, positions: list[int]) -> int:
@@ -159,7 +177,7 @@ class RoutedSpanLayerState:
     def _enforce_span_budget(self, spans: list[SpanRecord]) -> None:
         budget = self.config.span_budget_tokens
         used = sum(span.n_tokens for span in spans)
-        while spans and used > budget:
+        while len(spans) > 1 and used > budget:
             dropped = spans.pop(0)
             used -= dropped.n_tokens
 

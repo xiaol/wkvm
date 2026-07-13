@@ -34,6 +34,7 @@ from wkvm.runner.gemma_token_pool import (
     TokenKVLayerSpec,
     TokenKVPool,
     TokenPoolBlockTables,
+    TokenPoolAuthoritativePrefillReservation,
     TokenPoolDecodeBackendState,
     TokenPoolDecodeBatchState,
     TokenPoolDecodeContext,
@@ -132,6 +133,10 @@ class GemmaEngineMetrics:
     finished_requests: int = 0
     error_count: int = 0
     prefill_calls: int = 0
+    prefill_model_calls: int = 0
+    batched_prefill_model_calls: int = 0
+    batched_prefill_rows: int = 0
+    max_prefill_batch_rows: int = 0
     decode_batches: int = 0
     decode_rows: int = 0
     decode_model_calls: int = 0
@@ -177,6 +182,7 @@ class GemmaEngineMetrics:
     persistent_padded_decode_splits: int = 0
     persistent_padded_decode_rows: int = 0
     persistent_padded_decode_cuda_graph_captures: int = 0
+    persistent_padded_decode_cuda_graph_cache_hits: int = 0
     persistent_padded_decode_cuda_graph_replays: int = 0
     persistent_padded_decode_cuda_graph_skips: int = 0
     persistent_padded_decode_cuda_graph_skip_reasons: dict[str, int] = field(
@@ -184,6 +190,9 @@ class GemmaEngineMetrics:
     )
     token_pool_decode_metadata_batches: int = 0
     token_pool_decode_metadata_rows: int = 0
+    token_pool_authoritative_prefill_requests: int = 0
+    token_pool_authoritative_prefill_tokens: int = 0
+    token_pool_authoritative_prefill_layer_writes: int = 0
     token_pool_decode_covered_layer_type_batches: dict[str, int] = field(
         default_factory=dict
     )
@@ -200,6 +209,8 @@ class GemmaEngineMetrics:
     token_pool_decode_graph_metadata_tensor_copies: int = 0
     token_pool_decode_graph_metadata_tensor_copy_skips: int = 0
     token_pool_decode_graph_metadata_alias_fastpath_metadata_skips: int = 0
+    token_pool_decode_graph_prefill_cache_clears: int = 0
+    token_pool_decode_graph_prefill_cache_evictions: int = 0
     token_pool_full_attention_row_rebuilds: int = 0
     token_pool_full_attention_row_reuses: int = 0
     token_pool_full_attention_row_appends: int = 0
@@ -239,6 +250,10 @@ class GemmaEngineMetrics:
             "finished_requests": self.finished_requests,
             "error_count": self.error_count,
             "prefill_calls": self.prefill_calls,
+            "prefill_model_calls": self.prefill_model_calls,
+            "batched_prefill_model_calls": self.batched_prefill_model_calls,
+            "batched_prefill_rows": self.batched_prefill_rows,
+            "max_prefill_batch_rows": self.max_prefill_batch_rows,
             "decode_batches": self.decode_batches,
             "decode_rows": self.decode_rows,
             "decode_model_calls": self.decode_model_calls,
@@ -286,6 +301,7 @@ class GemmaEngineMetrics:
             "persistent_padded_decode_splits": self.persistent_padded_decode_splits,
             "persistent_padded_decode_rows": self.persistent_padded_decode_rows,
             "persistent_padded_decode_cuda_graph_captures": self.persistent_padded_decode_cuda_graph_captures,
+            "persistent_padded_decode_cuda_graph_cache_hits": self.persistent_padded_decode_cuda_graph_cache_hits,
             "persistent_padded_decode_cuda_graph_replays": self.persistent_padded_decode_cuda_graph_replays,
             "persistent_padded_decode_cuda_graph_skips": self.persistent_padded_decode_cuda_graph_skips,
             "persistent_padded_decode_cuda_graph_skip_reasons": dict(
@@ -293,6 +309,15 @@ class GemmaEngineMetrics:
             ),
             "token_pool_decode_metadata_batches": self.token_pool_decode_metadata_batches,
             "token_pool_decode_metadata_rows": self.token_pool_decode_metadata_rows,
+            "token_pool_authoritative_prefill_requests": (
+                self.token_pool_authoritative_prefill_requests
+            ),
+            "token_pool_authoritative_prefill_tokens": (
+                self.token_pool_authoritative_prefill_tokens
+            ),
+            "token_pool_authoritative_prefill_layer_writes": (
+                self.token_pool_authoritative_prefill_layer_writes
+            ),
             "token_pool_decode_covered_layer_type_batches": dict(
                 self.token_pool_decode_covered_layer_type_batches
             ),
@@ -322,6 +347,12 @@ class GemmaEngineMetrics:
             ),
             "token_pool_decode_graph_metadata_alias_fastpath_metadata_skips": (
                 self.token_pool_decode_graph_metadata_alias_fastpath_metadata_skips
+            ),
+            "token_pool_decode_graph_prefill_cache_clears": (
+                self.token_pool_decode_graph_prefill_cache_clears
+            ),
+            "token_pool_decode_graph_prefill_cache_evictions": (
+                self.token_pool_decode_graph_prefill_cache_evictions
             ),
             "token_pool_full_attention_row_rebuilds": (
                 self.token_pool_full_attention_row_rebuilds
@@ -442,6 +473,7 @@ class GemmaNativeEngine:
         scheduler_config: SchedulerConfig | None = None,
         stop_token_ids: frozenset[int] = frozenset(),
         prefill_chunk: int = 2048,
+        prefill_microbatch_rows: int | None = 1,
         decode_microbatch_rows: int | None = 16,
         decode_microbatch_bytes: int | None = None,
         decode_batch_planner: Literal["scheduler", "length_bucketed"] = "scheduler",
@@ -478,6 +510,10 @@ class GemmaNativeEngine:
         collect_cuda_memory_phase_metrics: bool = False,
         finished_trace_limit: int | None = 4096,
     ) -> None:
+        if prefill_microbatch_rows == 0:
+            prefill_microbatch_rows = None
+        if prefill_microbatch_rows is not None and prefill_microbatch_rows < 1:
+            raise ValueError("prefill_microbatch_rows must be >= 1, 0, or None")
         if decode_microbatch_rows == 0:
             decode_microbatch_rows = None
         if decode_microbatch_rows is not None and decode_microbatch_rows < 1:
@@ -592,6 +628,7 @@ class GemmaNativeEngine:
             collect_cuda_memory_phase_metrics=collect_cuda_memory_phase_metrics,
         )
         self.stop_token_ids = stop_token_ids
+        self.prefill_microbatch_rows = prefill_microbatch_rows
         self.decode_microbatch_rows = decode_microbatch_rows
         self.decode_microbatch_bytes = decode_microbatch_bytes
         self.decode_batch_planner = decode_batch_planner
@@ -653,6 +690,7 @@ class GemmaNativeEngine:
         self._caches: dict[str, NativeGemmaRoutedCache] = {}
         self._persistent_exact_decode_groups: dict[tuple[str, ...], NativeGemmaRoutedCache] = {}
         self._persistent_padded_decode_groups: dict[tuple[str, ...], NativeGemmaRoutedCache] = {}
+        self._token_pool_decode_graph_gc_pending = False
         self._token_pool_decode_graph_signature_fallback = (
             TokenPoolDecodeGraphSignatureTracker()
         )
@@ -827,6 +865,7 @@ class GemmaNativeEngine:
             "free_state_slots": self.arena.num_free_slots(),
             "active_cache_bytes": self._active_cache_bytes(),
             "state_bytes_per_request": self.config.state_spec().bytes_per_request,
+            "prefill_microbatch_rows": self.prefill_microbatch_rows,
             "decode_microbatch_rows": self.decode_microbatch_rows,
             "decode_microbatch_bytes": self.decode_microbatch_bytes,
             "decode_batch_planner": self.decode_batch_planner,
@@ -881,14 +920,15 @@ class GemmaNativeEngine:
 
     def _execute(self, out: SchedulerOutput) -> dict[str, list[int]]:
         decode_reqs: list[Request] = []
+        prefill_work: list[tuple[Request, int, bool]] = []
         sampled: dict[str, list[int]] = {}
 
         for req_id, n in out.num_scheduled_tokens.items():
             req = self.scheduler.requests[req_id]
             if req.req_id not in self._caches:
-                sampled.update(self._execute_prefill_chunk(req, n, initial=True))
+                prefill_work.append((req, n, True))
             elif req.num_computed_tokens < req.num_prompt_tokens:
-                sampled.update(self._execute_prefill_chunk(req, n, initial=False))
+                prefill_work.append((req, n, False))
             elif n == 1:
                 decode_reqs.append(req)
             else:
@@ -896,8 +936,156 @@ class GemmaNativeEngine:
                     "GemmaNativeEngine does not support multi-token decode steps"
                 )
 
+        if prefill_work:
+            sampled.update(self._execute_prefill_work(prefill_work))
         if decode_reqs:
             sampled.update(self._execute_decode_batch(decode_reqs))
+        return sampled
+
+    def _execute_prefill_work(
+        self,
+        work: list[tuple[Request, int, bool]],
+    ) -> dict[str, list[int]]:
+        if (
+            self._token_pool_decode_graph_gc_pending
+            and not self._persistent_padded_decode_groups
+        ):
+            clear_graphs = getattr(
+                self.runner,
+                "clear_token_pool_decode_graph_cache",
+                None,
+            )
+            if clear_graphs is not None:
+                evicted = int(clear_graphs() or 0)
+                self.metrics.token_pool_decode_graph_prefill_cache_clears += 1
+                self.metrics.token_pool_decode_graph_prefill_cache_evictions += evicted
+            self._token_pool_decode_graph_gc_pending = False
+        batch_step = getattr(self.runner, "prefill_batch_step", None)
+        row_limit = self.prefill_microbatch_rows
+        if batch_step is None or row_limit == 1:
+            sampled: dict[str, list[int]] = {}
+            for req, n, initial in work:
+                sampled.update(
+                    self._execute_prefill_chunk(req, n, initial=initial)
+                )
+            return sampled
+
+        by_width: dict[int, list[tuple[Request, int, bool]]] = {}
+        for item in work:
+            by_width.setdefault(int(item[1]), []).append(item)
+        sampled: dict[str, list[int]] = {}
+        for items in by_width.values():
+            limit = len(items) if row_limit is None else int(row_limit)
+            for start in range(0, len(items), limit):
+                batch = items[start : start + limit]
+                if len(batch) == 1:
+                    req, n, initial = batch[0]
+                    sampled.update(
+                        self._execute_prefill_chunk(req, n, initial=initial)
+                    )
+                else:
+                    sampled.update(self._execute_prefill_batch(batch))
+        return sampled
+
+    def _execute_prefill_batch(
+        self,
+        work: list[tuple[Request, int, bool]],
+    ) -> dict[str, list[int]]:
+        if len(work) < 2:
+            raise ValueError("prefill batch requires at least two rows")
+        widths = {int(n) for _req, n, _initial in work}
+        if len(widths) != 1:
+            raise ValueError("prefill batch requires equal scheduled widths")
+
+        prepared: list[tuple[Request, int, Any, bool, Any]] = []
+        try:
+            for req, n, initial in work:
+                if n < 1:
+                    raise ValueError("prefill chunk must contain at least one token")
+                if req.num_computed_tokens >= req.num_prompt_tokens:
+                    raise AssertionError(f"{req.req_id}: prefill scheduled after prompt")
+                if req.num_computed_tokens + n > req.num_prompt_tokens:
+                    raise AssertionError(
+                        f"{req.req_id}: prefill chunk crosses prompt boundary"
+                    )
+                if initial:
+                    if req.num_computed_tokens != 0:
+                        raise AssertionError(
+                            f"{req.req_id}: initial prefill from nonzero offset"
+                        )
+                    cache = self.runner.build_cache(req.slots)
+                    self._caches[req.req_id] = cache
+                else:
+                    cache = self._caches[req.req_id]
+                trace = self._traces.get(req.req_id)
+                if trace is not None and trace.prefill_start is None:
+                    trace.prefill_start = time.perf_counter()
+                final_prefill = req.num_computed_tokens + n >= req.num_prompt_tokens
+                authoritative_prefill = self._token_pool_prepare_authoritative_prefill(
+                    req,
+                    n,
+                    cache=cache,
+                    initial=initial,
+                    final_prefill=final_prefill,
+                )
+                prepared.append(
+                    (req, n, cache, final_prefill, authoritative_prefill)
+                )
+            self._record_cuda_memory_phase("prefill_cache_build")
+            logits = self.runner.prefill_batch_step(
+                [item[2] for item in prepared],
+                [self._feed_tokens(item[0], item[1]) for item in prepared],
+                [item[0].slots for item in prepared],
+                start_positions=[item[0].num_computed_tokens for item in prepared],
+                break_masks=[self._break_masks.get(item[0].req_id) for item in prepared],
+            )
+            self._record_cuda_memory_phase("prefill_forward")
+            for req, n, cache, final_prefill, authoritative_prefill in prepared:
+                self._token_pool_commit_prefill_tokens(
+                    req,
+                    n,
+                    cache=cache,
+                    final_prefill=final_prefill,
+                    authoritative_prefill=authoritative_prefill,
+                )
+        except Exception:
+            for _req, _n, cache, _final_prefill, authoritative_prefill in prepared:
+                self._token_pool_discard_authoritative_prefill(
+                    authoritative_prefill,
+                    cache=cache,
+                )
+            raise
+
+        self._record_cuda_memory_phase("prefill_token_pool_commit")
+        now = time.perf_counter()
+        for req, _n, cache, final_prefill, _authoritative_prefill in prepared:
+            if final_prefill:
+                self._token_pool_release_prefill_sliding_storage(cache)
+                trace = self._traces.get(req.req_id)
+                if trace is not None:
+                    trace.prefill_end = now
+                    trace.first_token_time = now
+        if any(item[3] for item in prepared):
+            self._record_cuda_memory_phase("prefill_final_release")
+        self.metrics.prefill_calls += len(prepared)
+        self.metrics.prefill_model_calls += 1
+        self.metrics.batched_prefill_model_calls += 1
+        self.metrics.batched_prefill_rows += len(prepared)
+        self.metrics.max_prefill_batch_rows = max(
+            self.metrics.max_prefill_batch_rows,
+            len(prepared),
+        )
+        self._record_cache_bytes()
+        self._record_cuda_memory_phase("prefill_chunk")
+
+        sampled: dict[str, list[int]] = {}
+        sampled_rows = None
+        for row, (req, n, _cache, _final_prefill, _reservation) in enumerate(prepared):
+            if not self._closes_gap(req, n):
+                continue
+            if sampled_rows is None:
+                sampled_rows = _sample_argmax_token_ids(logits, rows=len(prepared))
+            sampled[req.req_id] = [sampled_rows[row]]
         return sampled
 
     def _execute_prefill_chunk(
@@ -924,21 +1112,36 @@ class GemmaNativeEngine:
             cache = self._caches[req.req_id]
         if trace is not None and trace.prefill_start is None:
             trace.prefill_start = time.perf_counter()
-        logits = self.runner.prefill_chunk_step(
-            cache,
-            self._feed_tokens(req, n),
-            req.slots,
-            start_pos=req.num_computed_tokens,
-            break_mask=self._break_masks.get(req.req_id),
-        )
-        self._record_cuda_memory_phase("prefill_forward")
         final_prefill = req.num_computed_tokens + n >= req.num_prompt_tokens
-        self._token_pool_commit_prefill_tokens(
+        authoritative_prefill = self._token_pool_prepare_authoritative_prefill(
             req,
             n,
             cache=cache,
+            initial=initial,
             final_prefill=final_prefill,
         )
+        try:
+            logits = self.runner.prefill_chunk_step(
+                cache,
+                self._feed_tokens(req, n),
+                req.slots,
+                start_pos=req.num_computed_tokens,
+                break_mask=self._break_masks.get(req.req_id),
+            )
+            self._record_cuda_memory_phase("prefill_forward")
+            self._token_pool_commit_prefill_tokens(
+                req,
+                n,
+                cache=cache,
+                final_prefill=final_prefill,
+                authoritative_prefill=authoritative_prefill,
+            )
+        except Exception:
+            self._token_pool_discard_authoritative_prefill(
+                authoritative_prefill,
+                cache=cache,
+            )
+            raise
         self._record_cuda_memory_phase("prefill_token_pool_commit")
         if final_prefill:
             self._token_pool_release_prefill_sliding_storage(cache)
@@ -948,6 +1151,11 @@ class GemmaNativeEngine:
             trace.prefill_end = now
             trace.first_token_time = now
         self.metrics.prefill_calls += 1
+        self.metrics.prefill_model_calls += 1
+        self.metrics.max_prefill_batch_rows = max(
+            self.metrics.max_prefill_batch_rows,
+            1,
+        )
         self._record_cache_bytes()
         self._record_cuda_memory_phase("prefill_chunk")
         if self._closes_gap(req, n):
@@ -1552,6 +1760,8 @@ class GemmaNativeEngine:
                 setattr(self.metrics, metric_name, getattr(self.metrics, metric_name) + value)
         if int(info.get("persistent_padded_decode_cuda_graph_captured", 0) or 0):
             self.metrics.persistent_padded_decode_cuda_graph_captures += 1
+        if int(info.get("persistent_padded_decode_cuda_graph_cache_hit", 0) or 0):
+            self.metrics.persistent_padded_decode_cuda_graph_cache_hits += 1
         if int(info.get("cuda_graph_replay", 0) or 0):
             self.metrics.persistent_padded_decode_cuda_graph_replays += 1
         if info.get("persistent_padded_decode_cuda_graph_skip"):
@@ -1699,6 +1909,7 @@ class GemmaNativeEngine:
         if any(cache is None for cache in caches):
             self._token_pool_clear_full_attention_rows(key)
             return
+        had_graph = getattr(merged_cache, "_padded_decode_graph", None) is not None
         commit_start = time.perf_counter()
         merged_cache.commit_padded_decode_into(caches)  # type: ignore[arg-type]
         commit_wall = time.perf_counter() - commit_start
@@ -1706,6 +1917,16 @@ class GemmaNativeEngine:
         self._record_decode_timing_value("decode_timing_total_s", commit_wall)
         self.metrics.persistent_padded_decode_splits += 1
         self._token_pool_clear_full_attention_rows(key)
+        release_completed = getattr(
+            self.runner,
+            "release_completed_padded_cache",
+            None,
+        )
+        dense_cache_released = bool(
+            release_completed is not None and release_completed(merged_cache)
+        )
+        if had_graph and not dense_cache_released:
+            self._token_pool_decode_graph_gc_pending = True
         self._record_cache_bytes()
         self._record_cuda_memory_phase("persistent_padded_decode_commit")
 
@@ -2066,6 +2287,14 @@ class GemmaNativeEngine:
             return []
 
         supported_layer_types = {"full_attention", "sliding_attention"}
+        block_size = max(1, int(self.token_pool_paged_block_size or 1))
+        sliding_slots_per_request = (
+            int(self.config.sliding_window) + 1 + block_size - 1
+        ) // block_size * block_size
+        sliding_initial_capacity = min(
+            int(self.token_pool_capacity or 2**63 - 1),
+            int(self.arena.num_slots) * sliding_slots_per_request,
+        )
         owner_by_type: dict[str, int] = {}
         for layer in layers:
             attn = getattr(layer, "attn_meta", None)
@@ -2101,6 +2330,11 @@ class GemmaNativeEngine:
                     head_dim=int(attn.head_dim),
                     dtype=dtype,
                     kv_share_target_layer=share_target,
+                    initial_capacity=(
+                        sliding_initial_capacity
+                        if layer_type == "sliding_attention"
+                        else None
+                    ),
                 )
             )
         return specs
@@ -2226,6 +2460,7 @@ class GemmaNativeEngine:
         *,
         cache=None,
         final_prefill: bool = False,
+        authoritative_prefill: TokenPoolAuthoritativePrefillReservation | None = None,
     ) -> None:
         table = self._token_table
         allocator = self._token_slot_allocator
@@ -2234,16 +2469,34 @@ class GemmaNativeEngine:
         self._sync_token_pool_decode_backend_storage()
         backend = self._token_pool_decode_backend
         if backend is not None:
-            result = backend.commit_prefill_tokens(
-                req,
-                n,
-                expected_length=req.num_computed_tokens,
-                cache=cache,
-                sliding_window=self._token_pool_attention_window(),
-                final_prefill=final_prefill,
-            )
+            if authoritative_prefill is None:
+                result = backend.commit_prefill_tokens(
+                    req,
+                    n,
+                    expected_length=req.num_computed_tokens,
+                    cache=cache,
+                    sliding_window=self._token_pool_attention_window(),
+                    final_prefill=final_prefill,
+                )
+            else:
+                result = backend.commit_authoritative_prefill(
+                    authoritative_prefill,
+                    cache=cache,
+                )
             if result.backfilled:
                 self._record_cuda_memory_phase("token_pool_prefill_backfill")
+            if result.authoritative:
+                if authoritative_prefill is None:
+                    raise RuntimeError(
+                        "authoritative prefill result has no matching reservation"
+                    )
+                self.metrics.token_pool_authoritative_prefill_requests += 1
+                self.metrics.token_pool_authoritative_prefill_tokens += int(
+                    result.new_length - result.previous_length
+                )
+                self.metrics.token_pool_authoritative_prefill_layer_writes += len(
+                    authoritative_prefill.expected_layer_ids
+                )
             if result.prefix_clear_result.invalidated_full_attention_rows:
                 self.metrics.token_pool_full_attention_row_invalidations += (
                     result.prefix_clear_result.invalidated_full_attention_rows
@@ -2260,6 +2513,43 @@ class GemmaNativeEngine:
             cache=cache,
             final_prefill=final_prefill,
         )
+
+    def _token_pool_prepare_authoritative_prefill(
+        self,
+        req: Request,
+        n: int,
+        *,
+        cache: Any,
+        initial: bool,
+        final_prefill: bool,
+    ) -> TokenPoolAuthoritativePrefillReservation | None:
+        if not initial or not final_prefill or self._token_kv_pool is None:
+            return None
+        self._sync_token_pool_decode_backend_storage()
+        backend = self._token_pool_decode_backend
+        if backend is None:
+            return None
+        return backend.prepare_authoritative_prefill(
+            req,
+            n,
+            expected_length=req.num_computed_tokens,
+            cache=cache,
+            sliding_window=self.config.sliding_window,
+            final_prefill=final_prefill,
+        )
+
+    def _token_pool_discard_authoritative_prefill(
+        self,
+        reservation: TokenPoolAuthoritativePrefillReservation | None,
+        *,
+        cache: Any,
+    ) -> None:
+        if reservation is None:
+            return
+        backend = self._token_pool_decode_backend
+        if backend is None:
+            return
+        backend.discard_authoritative_prefill(reservation, cache=cache)
 
     def _token_pool_commit_prefill_tokens_legacy(
         self,
@@ -2910,6 +3200,7 @@ class GemmaNativeEngine:
             kv_indices_padding_steps=kv_indices_padding_steps,
             persistent_rows=persistent_rows,
             build_paged_rows=build_paged_rows,
+            sliding_window=self.config.sliding_window,
             recoverable_errors=(
                 DistinctCacheBatchError,
                 RuntimeError,

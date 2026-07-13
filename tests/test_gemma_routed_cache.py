@@ -3,7 +3,12 @@ from types import SimpleNamespace
 
 from wkvm.core.arena import StateArena
 from wkvm.models.gemma import gemma4_e4b_routed_span_config
-from wkvm.runner.gemma_state import GemmaRoutedStateBank, SpanRecord, pad_valid_masks
+from wkvm.runner.gemma_state import (
+    GemmaRoutedStateBank,
+    RoutedSpanLayerState,
+    SpanRecord,
+    pad_valid_masks,
+)
 
 
 class TestGemmaRoutedCache(unittest.TestCase):
@@ -27,6 +32,255 @@ class TestGemmaRoutedCache(unittest.TestCase):
         slots = arena.allocate()
         self.assertIn("gemma_routed_span", slots)
         self.assertNotEqual(slots["gemma_routed_span"], 0)
+
+    def test_routed_materialized_bound_matches_runtime_state(self) -> None:
+        cfg = gemma4_e4b_routed_span_config()
+        expected = (
+            cfg.sink_tokens
+            + cfg.ring_tokens
+            + cfg.pending_tokens
+            - 1
+            + cfg.routed_slots
+            * (1 + max(cfg.span_budget_tokens, cfg.max_span_tokens))
+        )
+        self.assertEqual(cfg.routed_materialized_tokens, expected)
+        self.assertEqual(cfg.routed_materialized_tokens, 10_831)
+
+    def test_state_spec_accounts_for_all_persistent_routed_tensors(self) -> None:
+        cfg = gemma4_e4b_routed_span_config()
+
+        self.assertEqual(cfg.routed_authoritative_tokens, 10_767)
+        self.assertEqual(cfg.routed_readout_layer_bytes, 44_363_776)
+        self.assertEqual(cfg.routed_authoritative_layer_bytes, 44_101_632)
+        self.assertEqual(cfg.routed_slot_summary_layer_bytes, 524_288)
+        self.assertEqual(cfg.routed_leader_state_bytes, 266_240)
+        routed_family = next(
+            family
+            for family in cfg.state_spec().families
+            if family.name == "gemma_routed_span"
+        )
+        self.assertEqual(routed_family.bytes_per_slot, 356_225_024)
+        self.assertEqual(cfg.state_spec().bytes_per_request, 440_168_764)
+
+    def test_explicit_no_break_mask_keeps_pending_state_bounded(self) -> None:
+        cfg = self._config()
+        bank = GemmaRoutedStateBank(cfg, num_slots=1)
+        slots = {"gemma_routed_span": 1}
+        positions = list(range(100))
+        bank.ingest_positions(slots, positions, [False] * len(positions))
+
+        for layer in bank.slot_state(slots).full_layers.values():
+            self.assertLess(len(layer.pending_positions), cfg.pending_tokens)
+            self.assertLessEqual(
+                len(layer.materialized_positions()),
+                cfg.routed_materialized_tokens,
+            )
+
+    def test_metadata_no_break_spans_preserve_native_fallback_semantics(self) -> None:
+        positions = list(range(48))
+        for max_span_tokens, expected_widths in ((48, [24, 24]), (8, [8] * 6)):
+            with self.subTest(max_span_tokens=max_span_tokens):
+                cfg = gemma4_e4b_routed_span_config(
+                    num_hidden_layers=1,
+                    num_kv_shared_layers=0,
+                    layer_types=("full_attention",),
+                    pending_tokens=48,
+                    routed_slots=1,
+                    span_budget_tokens=1,
+                    max_span_tokens=max_span_tokens,
+                )
+                layer = RoutedSpanLayerState(0, cfg)
+                spans = layer._split_spans(positions, [False] * len(positions))
+
+                self.assertEqual([len(span) for span in spans], expected_widths)
+                layer.add_span(tuple(spans[0]), 0)
+                self.assertEqual(layer.bank_occupancy_tokens, expected_widths[0])
+                self.assertEqual(
+                    len(layer.materialized_positions()),
+                    expected_widths[0] + 1,
+                )
+
+    def test_native_no_break_fallback_respects_configured_span_max(self) -> None:
+        from wkvm.runner.gemma_runner import NativeRoutedSpanLayer
+
+        for max_span_tokens, expected_spans in (
+            (48, [(0, 24), (24, 48)]),
+            (8, [(0, 8), (8, 16), (16, 24), (24, 32), (32, 40), (40, 48)]),
+        ):
+            with self.subTest(max_span_tokens=max_span_tokens):
+                cfg = gemma4_e4b_routed_span_config(
+                    num_hidden_layers=1,
+                    num_kv_shared_layers=0,
+                    layer_types=("full_attention",),
+                    pending_tokens=48,
+                    routed_slots=1,
+                    span_budget_tokens=1,
+                    max_span_tokens=max_span_tokens,
+                )
+                layer = NativeRoutedSpanLayer(0, cfg)
+                layer.break_mask = [False] * 48
+
+                spans, routed_tokens = layer._split_spans(0, 48)
+
+                self.assertEqual(spans, expected_spans)
+                self.assertEqual(routed_tokens, 48)
+
+    def test_native_routed_width_respects_bound_below_fallback_span(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+
+        cfg = gemma4_e4b_routed_span_config(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention",),
+            num_kv_heads=1,
+            head_dim=2,
+            sink_tokens=1,
+            ring_tokens=1,
+            pending_tokens=24,
+            routed_slots=1,
+            reps_per_slot=1,
+            span_budget_tokens=1,
+            max_span_tokens=1,
+            sliding_window=1,
+        )
+        hf_cfg = SimpleNamespace(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention",),
+            sliding_window=1,
+        )
+        cache = NativeGemmaRoutedCache(hf_cfg, cfg)
+        cache.set_span_break_mask([False] * 64)
+        first_width = cfg.sink_tokens + cfg.ring_tokens + cfg.pending_tokens
+        first_keys = torch.arange(
+            first_width * cfg.head_dim,
+            dtype=torch.float32,
+        ).reshape(1, 1, first_width, cfg.head_dim)
+        cache.update(first_keys, first_keys + 100, layer_idx=0)
+        layer = cache.layers[0]
+
+        self.assertEqual(
+            [int(span["k"].shape[2]) for span in layer._slot_spans[0]],
+            [1],
+        )
+        self.assertEqual(layer._bank_span_tokens, 1)
+        self.assertEqual(layer._active_span_slots, 1)
+        self.assertEqual(
+            layer.span_storage_bytes(),
+            sum(
+                tensor.numel() * tensor.element_size()
+                for span in layer._slot_spans[0]
+                for tensor in (span["k"], span["v"])
+            ),
+        )
+        self.assertEqual(int(layer._pend_k.shape[2]), 0)
+
+        pending_width = cfg.pending_tokens - 1
+        pending_keys = torch.arange(
+            pending_width * cfg.head_dim,
+            dtype=torch.float32,
+        ).reshape(1, 1, pending_width, cfg.head_dim)
+        cache.update(pending_keys, pending_keys + 200, layer_idx=0)
+
+        self.assertEqual(int(layer._pend_k.shape[2]), pending_width)
+        self.assertEqual(
+            layer.materialized_tokens(),
+            cfg.routed_materialized_tokens,
+        )
+        self.assertLessEqual(
+            layer.materialized_tokens(),
+            cfg.routed_materialized_tokens,
+        )
+
+    def test_routed_decision_coordination_compacts_after_followers(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+
+        cfg = gemma4_e4b_routed_span_config(
+            num_hidden_layers=4,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention",) * 4,
+            num_kv_heads=1,
+            head_dim=2,
+            sink_tokens=1,
+            ring_tokens=1,
+            pending_tokens=2,
+            routed_slots=2,
+            reps_per_slot=1,
+            span_budget_tokens=2,
+            max_span_tokens=1,
+            sliding_window=1,
+        )
+        hf_cfg = SimpleNamespace(
+            num_hidden_layers=4,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention",) * 4,
+            sliding_window=1,
+        )
+        cache = NativeGemmaRoutedCache(hf_cfg, cfg)
+        cache.set_span_break_mask([False] * 16)
+        coordinator = cache.layers[0].coord
+        self.assertIsNotNone(coordinator)
+
+        for offset in (0, 8):
+            keys = torch.arange(8, dtype=torch.float32).reshape(1, 1, 4, 2)
+            keys = keys + offset
+            for layer_idx in range(4):
+                cache.update(keys, keys + 100, layer_idx=layer_idx)
+            self.assertEqual(coordinator.pending_operations, 0)
+
+    def test_state_bytes_includes_authoritative_routed_storage(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+
+        cfg = gemma4_e4b_routed_span_config(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention",),
+            num_kv_heads=1,
+            head_dim=2,
+            sink_tokens=1,
+            ring_tokens=2,
+            pending_tokens=8,
+            routed_slots=2,
+            reps_per_slot=1,
+            span_budget_tokens=2,
+            max_span_tokens=2,
+            sliding_window=2,
+        )
+        hf_cfg = SimpleNamespace(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention",),
+            sliding_window=2,
+        )
+        cache = NativeGemmaRoutedCache(hf_cfg, cfg)
+        keys = torch.arange(12, dtype=torch.float32).reshape(1, 1, 3, 4)[..., :2]
+        cache.update(keys, keys + 100, layer_idx=0)
+        layer = cache.layers[0]
+        dense_bytes = sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in (layer.keys, layer.values)
+        )
+
+        self.assertGreater(cache.state_bytes(), dense_bytes)
+        before_release = cache.state_bytes()
+        self.assertTrue(layer.release_dense_materialized_storage())
+        self.assertLess(cache.state_bytes(), before_release)
+        self.assertGreater(cache.state_bytes(), 0)
 
     def test_ring_capacity_is_constant_after_long_prefill(self) -> None:
         cfg = self._config()
@@ -406,7 +660,8 @@ class TestGemmaRoutedCache(unittest.TestCase):
         cache.update(key, value, layer_idx=0)
         layer = cache.layers[0]
         width = layer.materialized_tokens()
-        self.assertGreater(width, 5)
+        self.assertGreater(width, 0)
+        self.assertLessEqual(width, 5)
 
         pool = TokenKVPool(
             capacity=8,
@@ -416,7 +671,9 @@ class TestGemmaRoutedCache(unittest.TestCase):
             dtype=torch.float32,
         )
         allocated = pool.alloc_slots(8)
-        slot_row = allocated[torch.tensor([5, 2, 4, 1, 0, 7], dtype=torch.long)]
+        slot_row = allocated[
+            torch.tensor([5, 2, 4, 1, 0, 7], dtype=torch.long)
+        ][:width]
         self.assertEqual(int(slot_row.numel()), width)
 
         layer.write_materialized_readout_to_token_pool(pool, slot_row)
@@ -426,6 +683,34 @@ class TestGemmaRoutedCache(unittest.TestCase):
         self.assertTrue(torch.equal(gathered_k, expected_k))
         self.assertTrue(torch.equal(gathered_v, expected_v))
 
+        self.assertFalse(
+            layer.release_dense_materialized_storage(
+                reserve_steps=layer.route_chunk,
+            )
+        )
+        self.assertIsNotNone(layer.keys)
+        self.assertTrue(layer.release_dense_materialized_storage())
+        self.assertIsNone(layer.keys)
+        self.assertIsNone(layer.values)
+        self.assertEqual(layer.materialized_tokens(), width)
+
+        decode_key = torch.tensor([[[[21.0, 22.0]]]])
+        decode_value = decode_key + 100
+        self.assertTrue(layer.commit_decode_token(decode_key, decode_value))
+        self.assertIsNone(layer.keys)
+        self.assertIsNone(layer.values)
+        self.assertEqual(layer.materialized_tokens(), width + 1)
+
+        extended_slot_row = torch.cat((slot_row, allocated[6:7]))
+        layer.write_materialized_readout_to_token_pool(pool, extended_slot_row)
+        gathered_k, gathered_v = pool.gather_kv(0, extended_slot_row)
+        self.assertTrue(
+            torch.equal(gathered_k, layer.keys[0].permute(1, 0, 2).contiguous())
+        )
+        self.assertTrue(
+            torch.equal(gathered_v, layer.values[0].permute(1, 0, 2).contiguous())
+        )
+
         metadata = build_decode_metadata_from_token_slot_rows(
             [slot_row],
             logical_seq_lens=[layer.cumulative_length],
@@ -433,6 +718,97 @@ class TestGemmaRoutedCache(unittest.TestCase):
         )
         self.assertEqual(metadata.kv_indices.tolist(), slot_row.tolist())
         self.assertEqual(metadata.logical_seq_lens.tolist(), [layer.cumulative_length])
+
+    def test_routed_release_guard_covers_exact_512_token_fold_horizon(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+
+        hf_cfg = SimpleNamespace(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention",),
+            sliding_window=1024,
+        )
+        cfg = gemma4_e4b_routed_span_config(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention",),
+            sink_tokens=16,
+            ring_tokens=1024,
+            pending_tokens=512,
+            routed_slots=8,
+            reps_per_slot=2,
+            span_budget_tokens=48,
+            max_span_tokens=48,
+            sliding_window=1024,
+        )
+        cache = NativeGemmaRoutedCache(hf_cfg, cfg)
+        break_mask = [False] * 2560
+        break_mask[1151] = True
+        cache.set_span_break_mask(break_mask)
+        keys = torch.arange(5120, dtype=torch.float32).reshape(1, 1, 2560, 2)
+        cache.update(keys, keys + 10_000, layer_idx=0)
+        layer = cache.layers[0]
+
+        self.assertEqual(int(layer._pend_k.shape[2]), 384)
+        self.assertFalse(layer.release_dense_materialized_storage(reserve_steps=128))
+        self.assertIsNotNone(layer.keys)
+        self.assertIsNotNone(layer.values)
+        self.assertFalse(layer._dense_storage_released)
+
+        later_keys = torch.arange(256, dtype=torch.float32).reshape(1, 1, 128, 2)
+        cache.update(later_keys, later_keys + 20_000, layer_idx=0)
+        self.assertEqual(layer.cumulative_length, 2688)
+        self.assertLess(int(layer._pend_k.shape[2]), layer.route_chunk)
+        self.assertIsNotNone(layer.keys)
+        self.assertIsNotNone(layer.values)
+
+    def test_large_prefill_bounds_each_route_fold_to_route_chunk(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+
+        hf_cfg = SimpleNamespace(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention",),
+            sliding_window=1024,
+        )
+        cfg = gemma4_e4b_routed_span_config(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention",),
+            sink_tokens=16,
+            ring_tokens=1024,
+            pending_tokens=512,
+            routed_slots=8,
+            reps_per_slot=2,
+            span_budget_tokens=48,
+            max_span_tokens=48,
+            sliding_window=1024,
+        )
+        cache = NativeGemmaRoutedCache(hf_cfg, cfg)
+        layer = cache.layers[0]
+        original_route_fold = layer._route_fold
+        fold_widths = []
+
+        def record_route_fold(cut_k, cut_v):
+            fold_widths.append(int(cut_k.shape[2]))
+            return original_route_fold(cut_k, cut_v)
+
+        layer._route_fold = record_route_fold
+        keys = torch.arange(5120, dtype=torch.float32).reshape(1, 1, 2560, 2)
+        cache.update(keys, keys + 10_000, layer_idx=0)
+
+        self.assertGreater(len(fold_widths), 1)
+        self.assertLessEqual(max(fold_widths), layer.route_chunk)
 
     def test_persistent_padded_decode_reuses_cache_and_commits_all_steps(self) -> None:
         try:
@@ -491,6 +867,67 @@ class TestGemmaRoutedCache(unittest.TestCase):
         self.assertTrue(torch.equal(caches[0].layers[0].keys[:, :, -1], torch.full((1, 1, 2), 8.0)))
         self.assertTrue(torch.equal(caches[1].layers[0].values[:, :, -2], torch.full((1, 1, 2), 17.0)))
         self.assertTrue(torch.equal(caches[1].layers[0].values[:, :, -1], torch.full((1, 1, 2), 18.0)))
+
+    def test_persistent_padded_routed_commit_survives_released_source_readouts(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+
+        hf_config = SimpleNamespace(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention",),
+            sliding_window=8,
+        )
+        config = gemma4_e4b_routed_span_config(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention",),
+            sink_tokens=1,
+            ring_tokens=2,
+            pending_tokens=8,
+            routed_slots=2,
+            reps_per_slot=1,
+            span_budget_tokens=2,
+            max_span_tokens=2,
+            sliding_window=8,
+        )
+        caches = [NativeGemmaRoutedCache(hf_config, config) for _ in range(2)]
+        for row, cache in enumerate(caches):
+            width = row + 3
+            keys = torch.full((1, 1, width, 2), float(row + 1))
+            cache.update(keys, keys + 10, layer_idx=0)
+
+        merged, _info = NativeGemmaRoutedCache.merge_padded_decode(
+            caches,
+            decode_steps=2,
+            persistent=True,
+        )
+        for cache in caches:
+            self.assertTrue(
+                cache.layers[0].release_dense_materialized_storage(reserve_steps=2)
+            )
+            self.assertIsNone(cache.layers[0].keys)
+        merged.update(
+            torch.full((2, 1, 1, 2), 7.0),
+            torch.full((2, 1, 1, 2), 17.0),
+            layer_idx=0,
+        )
+
+        merged.commit_padded_decode_into(caches)
+
+        self.assertTrue(all(cache.layers[0]._dense_storage_released for cache in caches))
+        self.assertEqual([cache.layers[0].cumulative_length for cache in caches], [4, 5])
+        rematerialized, _info = NativeGemmaRoutedCache.merge_padded_decode(
+            caches,
+            decode_steps=1,
+            persistent=True,
+        )
+        self.assertTrue(all(cache.layers[0].keys is not None for cache in caches))
+        self.assertEqual(int(rematerialized.layers[0].keys.shape[0]), 2)
 
     def test_persistent_padded_sliding_multi_token_commit_skips_update(self) -> None:
         try:
