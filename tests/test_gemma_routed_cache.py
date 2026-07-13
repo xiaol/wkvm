@@ -197,6 +197,70 @@ class TestGemmaRoutedCache(unittest.TestCase):
             cfg.routed_materialized_tokens,
         )
 
+    def test_native_routed_state_is_invariant_to_prefill_chunk_boundaries(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+
+        cfg = gemma4_e4b_routed_span_config(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention",),
+            num_kv_heads=1,
+            head_dim=2,
+            sink_tokens=1,
+            ring_tokens=2,
+            pending_tokens=4,
+            routed_slots=2,
+            reps_per_slot=1,
+            span_budget_tokens=8,
+            max_span_tokens=2,
+            sliding_window=1,
+        )
+        hf_cfg = SimpleNamespace(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention",),
+            sliding_window=1,
+        )
+        keys = torch.arange(20, dtype=torch.float32).reshape(1, 1, 10, 2)
+        values = keys + 100
+        one_chunk = NativeGemmaRoutedCache(hf_cfg, cfg)
+        split_chunks = NativeGemmaRoutedCache(hf_cfg, cfg)
+        one_chunk.set_span_break_mask([False] * 10)
+        split_chunks.set_span_break_mask([False] * 10)
+
+        one_chunk.update(keys, values, layer_idx=0)
+        split_chunks.update(keys[:, :, :7], values[:, :, :7], layer_idx=0)
+        split_chunks.update(keys[:, :, 7:], values[:, :, 7:], layer_idx=0)
+
+        one_layer = one_chunk.layers[0]
+        split_layer = split_chunks.layers[0]
+        self.assertEqual(int(one_layer._pend_k.shape[2]), 3)
+        self.assertEqual(one_layer.cumulative_length, split_layer.cumulative_length)
+        self.assertEqual(one_layer._evicted, split_layer._evicted)
+        self.assertEqual(one_layer._slot_cnt, split_layer._slot_cnt)
+        self.assertEqual(one_layer._slot_span_tokens, split_layer._slot_span_tokens)
+        for name in (
+            "keys",
+            "values",
+            "_sink_k",
+            "_sink_v",
+            "_ring_k",
+            "_ring_v",
+            "_pend_k",
+            "_pend_v",
+            "_slot_mk",
+            "_slot_mv",
+        ):
+            self.assertTrue(
+                torch.equal(getattr(one_layer, name), getattr(split_layer, name)),
+                name,
+            )
+
     def test_routed_decision_coordination_compacts_after_followers(self) -> None:
         try:
             import torch
@@ -661,7 +725,7 @@ class TestGemmaRoutedCache(unittest.TestCase):
         layer = cache.layers[0]
         width = layer.materialized_tokens()
         self.assertGreater(width, 0)
-        self.assertLessEqual(width, 5)
+        self.assertLessEqual(width, cfg.routed_materialized_tokens)
 
         pool = TokenKVPool(
             capacity=8,
@@ -696,14 +760,18 @@ class TestGemmaRoutedCache(unittest.TestCase):
 
         decode_key = torch.tensor([[[[21.0, 22.0]]]])
         decode_value = decode_key + 100
-        self.assertTrue(layer.commit_decode_token(decode_key, decode_value))
-        self.assertIsNone(layer.keys)
-        self.assertIsNone(layer.values)
-        self.assertEqual(layer.materialized_tokens(), width + 1)
+        previous_length = layer.cumulative_length
+        self.assertFalse(layer.commit_decode_token(decode_key, decode_value))
+        layer.update(decode_key, decode_value)
+        self.assertIsNotNone(layer.keys)
+        self.assertIsNotNone(layer.values)
+        self.assertEqual(layer.cumulative_length, previous_length + 1)
+        updated_width = layer.materialized_tokens()
+        self.assertLessEqual(updated_width, cfg.routed_materialized_tokens)
 
-        extended_slot_row = torch.cat((slot_row, allocated[6:7]))
-        layer.write_materialized_readout_to_token_pool(pool, extended_slot_row)
-        gathered_k, gathered_v = pool.gather_kv(0, extended_slot_row)
+        updated_slot_row = allocated[:updated_width]
+        layer.write_materialized_readout_to_token_pool(pool, updated_slot_row)
+        gathered_k, gathered_v = pool.gather_kv(0, updated_slot_row)
         self.assertTrue(
             torch.equal(gathered_k, layer.keys[0].permute(1, 0, 2).contiguous())
         )
@@ -712,11 +780,11 @@ class TestGemmaRoutedCache(unittest.TestCase):
         )
 
         metadata = build_decode_metadata_from_token_slot_rows(
-            [slot_row],
+            [updated_slot_row],
             logical_seq_lens=[layer.cumulative_length],
-            out_cache_loc=[int(slot_row[-1].item())],
+            out_cache_loc=[int(updated_slot_row[-1].item())],
         )
-        self.assertEqual(metadata.kv_indices.tolist(), slot_row.tolist())
+        self.assertEqual(metadata.kv_indices.tolist(), updated_slot_row.tolist())
         self.assertEqual(metadata.logical_seq_lens.tolist(), [layer.cumulative_length])
 
     def test_routed_release_guard_covers_exact_512_token_fold_horizon(self) -> None:
@@ -754,7 +822,7 @@ class TestGemmaRoutedCache(unittest.TestCase):
         cache.update(keys, keys + 10_000, layer_idx=0)
         layer = cache.layers[0]
 
-        self.assertEqual(int(layer._pend_k.shape[2]), 384)
+        self.assertEqual(int(layer._pend_k.shape[2]), 496)
         self.assertFalse(layer.release_dense_materialized_storage(reserve_steps=128))
         self.assertIsNotNone(layer.keys)
         self.assertIsNotNone(layer.values)

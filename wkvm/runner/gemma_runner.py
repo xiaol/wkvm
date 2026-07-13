@@ -471,23 +471,17 @@ class NativeRoutedSpanLayer(_NativeGemmaLayer):
             self._pend_v = _cat_time(self._pend_v, rv[:, :, :cut])
             rk, rv = rk[:, :, cut:], rv[:, :, cut:]
         self._ring_k, self._ring_v = rk.contiguous(), rv.contiguous()
-        routed_pending = False
         while self._pend_k.shape[2] >= self.route_chunk:
             if batched_decode:
                 raise NotImplementedError(
                     "batched routed-span decode cannot route new overflow spans"
                 )
-            routed_pending = True
             n = self._route_fold(
                 self._pend_k[:, :, : self.route_chunk],
                 self._pend_v[:, :, : self.route_chunk],
             )
             if n < 1:
                 break
-            self._pend_k = self._pend_k[:, :, n:].contiguous()
-            self._pend_v = self._pend_v[:, :, n:].contiguous()
-        if routed_pending and self._pend_k.shape[2] > 0:
-            n = self._route_fold(self._pend_k, self._pend_v)
             self._pend_k = self._pend_k[:, :, n:].contiguous()
             self._pend_v = self._pend_v[:, :, n:].contiguous()
         self._materialize()

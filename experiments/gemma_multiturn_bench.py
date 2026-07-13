@@ -933,12 +933,61 @@ def run_wkvm(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[str,
                         strict=True,
                     )
                 ]
+                first_token_exact_rows = [
+                    bool(actual and expected and actual[0] == expected[0])
+                    for actual, expected in zip(
+                        actual_outputs,
+                        expected_outputs,
+                        strict=True,
+                    )
+                ]
+                mismatch_details = []
+                for index, (actual, expected) in enumerate(
+                    zip(actual_outputs, expected_outputs, strict=True)
+                ):
+                    if actual == expected:
+                        continue
+                    mismatch_index = next(
+                        (
+                            token_index
+                            for token_index, (actual_token, expected_token) in enumerate(
+                                zip(actual, expected, strict=True)
+                            )
+                            if actual_token != expected_token
+                        ),
+                        min(len(actual), len(expected)),
+                    )
+                    mismatch_details.append(
+                        {
+                            "session_id": request_ids[index],
+                            "first_mismatch_index": mismatch_index,
+                            "stateful_token": (
+                                expected[mismatch_index]
+                                if mismatch_index < len(expected)
+                                else None
+                            ),
+                            "fresh_token": (
+                                actual[mismatch_index]
+                                if mismatch_index < len(actual)
+                                else None
+                            ),
+                        }
+                    )
                 parity_turns.append(
                     {
                         "turn_index": turn_index,
                         "exact_rows": sum(exact_rows),
+                        "full_sequence_exact_rows": sum(exact_rows),
+                        "first_token_exact_rows": sum(first_token_exact_rows),
                         "request_count": args.sessions,
-                        "passed": all(exact_rows),
+                        "full_sequence_passed": all(exact_rows),
+                        "first_token_passed": all(first_token_exact_rows),
+                        "passed": (
+                            all(exact_rows)
+                            if args.wkvm_fresh_parity_mode == "full-sequence"
+                            else all(first_token_exact_rows)
+                        ),
+                        "mismatches": mismatch_details,
                         "wall_s": round_or_none(parity_wall_s),
                         "prompt_fingerprint": prompt_set_fingerprint(
                             prompts,
@@ -954,7 +1003,14 @@ def run_wkvm(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[str,
                 )
             fresh_parity = {
                 "enabled": True,
+                "mode": args.wkvm_fresh_parity_mode,
                 "passed": all(row["passed"] for row in parity_turns),
+                "full_sequence_passed": all(
+                    row["full_sequence_passed"] for row in parity_turns
+                ),
+                "first_token_passed": all(
+                    row["first_token_passed"] for row in parity_turns
+                ),
                 "turns": parity_turns,
             }
             if not fresh_parity["passed"]:
@@ -1009,6 +1065,7 @@ def run_wkvm(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[str,
         "m_slots": args.m_slots,
         "route_chunk": args.route_chunk,
         "verify_fresh_history_parity": args.wkvm_verify_fresh_parity,
+        "fresh_history_parity_mode": args.wkvm_fresh_parity_mode,
         "request_order_policy": args.request_order_policy,
         "request_order_seed": args.request_order_seed,
         "device": args.device,
@@ -1520,7 +1577,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "After closing parked sessions, rerun every turn from its full "
-            "history and require token-exact outputs. Intended for B1/B3 gates."
+            "history and enforce the selected parity mode. Intended for B1/B3 gates."
+        ),
+    )
+    parser.add_argument(
+        "--wkvm-fresh-parity-mode",
+        choices=["full-sequence", "first-token"],
+        default="full-sequence",
+        help=(
+            "Full-sequence requires every generated token to match; first-token "
+            "checks the continuation boundary and still reports later divergence."
         ),
     )
 

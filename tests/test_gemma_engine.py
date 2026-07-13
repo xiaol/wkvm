@@ -3519,7 +3519,7 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         full_layer = cache.layers[1]
         materialized_width = full_layer.materialized_tokens()
         self.assertGreater(materialized_width, 0)
-        self.assertLessEqual(materialized_width, req.num_prompt_tokens)
+        self.assertLessEqual(materialized_width, cfg.routed_materialized_tokens)
         self.assertEqual(full_metadata.seq_lens.tolist(), [materialized_width + 1])
         self.assertEqual(full_metadata.logical_seq_lens.tolist(), [req.num_prompt_tokens + 1])
         self.assertEqual(full_metadata.out_cache_loc.tolist(), [5])
