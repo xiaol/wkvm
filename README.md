@@ -33,6 +33,20 @@ Uniform B16, 128 fixed output tokens, BF16, greedy decode, and a 19 GiB cap with
 
 See the [`final evidence audit`](experiments/results/gemma_b16_evidence_audit_20260713.md) and [`verified provenance bundle`](experiments/results/gemma_b16_evidence_bundle_20260713/README.md) for ranges, configurations, fingerprints, source identity, raw artifacts, and caveats.
 
+### High-concurrency B32 comparison (2026-07-13)
+
+Direct-engine cohort with 32 uniform 16,384-token prompts and 128 fixed output tokens on the same RTX 4090. Performance cells are `min / mean / max` over two runs. WKVM's resident count is engine-proven; vLLM/SGLang values are offered B32 with much smaller profiled full-length KV capacity and queued waves.
+
+| engine | completion / capacity | E2E output tok/s | comparable decode tok/s | batch-wall p95 | whole-GPU delta | 18 GiB gate |
+|---|---|---:|---:|---:|---:|---|
+| **WKVM current** | **32/32 truly resident**, zero pressure events | 53.991 / **54.757** / 55.522 | 191.148 / **193.236** / 195.323 | 73.722 / **74.769** / 75.816s | 20.255 / **20.859** / 21.463 GiB | fail 2/2 |
+| vLLM 0.24.0 | 32/32 offered; 3.134-3.314 full-length KV equivalents | 58.334 / **61.297** / 64.259 | 59.121 / **62.162** / 65.203 | 63.742 / **66.980** / 70.217s | 18.530 / **18.862** / 19.193 GiB | fail 2/2 |
+| SGLang 0.5.14 | 32/32 offered; 2.995-3.476 full-length KV equivalents | 45.137 / **50.859** / 56.581 | not comparable | 72.392 / **81.569** / 90.746s | 19.131 / **19.145** / 19.159 GiB | fail 2/2 |
+
+**Readout:** WKVM proves the architecture's resident-capacity benefit—32 simultaneous long-context states versus roughly three full-length KV equivalents—but not an overall B32 win. vLLM is 11.9% faster on mean E2E goodput; WKVM is 3.11x faster on the same-run decode interval; WKVM/SGLang E2E ranges overlap. All B32 rows miss the memory gate, while current-source WKVM B16 remains green at 16.797 GiB. SGLang at its lower 0.78 memory fraction passes the memory gate but cannot admit one 16K prompt under the measured desktop baseline.
+
+The experiment also fixed a high-concurrency CUDA-graph bug: lazy token-pool growth could invalidate captured buffer addresses above one decode microbatch. Graph replay now checks the pool generation and safely recaptures; guarded B24/B32 runs complete with unchanged output fingerprints. See the [`high-concurrency audit and raw artifacts`](experiments/results/gemma_high_concurrency_b32_audit_20260713.md) and [`source/artifact provenance`](experiments/results/gemma_high_concurrency_b32_provenance_20260713/README.md) for telemetry, the two-pass measurement method, graph-fault evidence, and limitations. This remains a direct-engine cohort result; a sustained HTTP ladder is still pending.
+
 **Single long prompt + long output**: 13,824-token prompt + 512-token output, greedy decode, `ignore_eos=True`.
 
 | engine | semantics | facts recovered | prefill+1st | full wall | decode tok/s | e2e output tok/s | memory observed | raw result |

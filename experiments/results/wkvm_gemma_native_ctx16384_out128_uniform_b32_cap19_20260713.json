@@ -1,0 +1,148 @@
+{
+  "attn": "sdpa",
+  "concurrency": [
+    32
+  ],
+  "config": {
+    "chunk": 2048,
+    "cuda_phase_metrics": false,
+    "decode_batch_planner": "scheduler",
+    "decode_microbatch_bytes": null,
+    "decode_microbatch_rows": 16,
+    "decode_workspace_bytes": null,
+    "decode_workspace_width_bucket": 16,
+    "enable_token_pool_attention": true,
+    "enable_token_pool_metadata": null,
+    "enable_token_pool_paged_split_triton": true,
+    "enable_token_pool_paged_triton": true,
+    "enable_token_pool_triton": true,
+    "m_slots": 64,
+    "native_gemma_attention_backend": "sdpa_single_gqa",
+    "native_gemma_config_loader": true,
+    "native_gemma_projection_backend": "separate",
+    "native_gemma_release_hf_decoder_layers": false,
+    "native_gemma_weight_backend": "hf_live",
+    "persistent_exact_decode": true,
+    "persistent_padded_decode": true,
+    "persistent_padded_decode_cuda_graph": true,
+    "persistent_padded_decode_graph_warmup_iters": 0,
+    "persistent_padded_decode_steps": 128,
+    "persistent_padded_full_attention_rows": null,
+    "persistent_padded_sliding_metadata_padding": true,
+    "prefill_microbatch_rows": 2,
+    "route_chunk": 512,
+    "sink": 16,
+    "slots": 32,
+    "synthetic_prompts": true,
+    "synthetic_vocab_size": 262144,
+    "token_budget": null,
+    "token_pool_capacity": 65536,
+    "token_pool_max_context_len": 16640,
+    "token_pool_paged_block_size": 16,
+    "token_pool_sliding_paged_metadata_only": true,
+    "token_pool_triton_env": {
+      "WKVM_ENABLE_TOKEN_POOL_PAGED_SPLIT_TRITON": "1",
+      "WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON": "1",
+      "WKVM_ENABLE_TOKEN_POOL_TRITON": "1",
+      "WKVM_TOKEN_POOL_SLIDING_PAGED_METADATA_ONLY": "1",
+      "WKVM_TOKEN_POOL_TRITON_STRICT": "1"
+    },
+    "token_pool_triton_strict": true,
+    "use_native_gemma_forward": true,
+    "uses_hf_config": false,
+    "window": 1024
+  },
+  "context_tokens_per_session": 16384,
+  "cuda_phase_metrics_enabled": false,
+  "decode_tokens_per_session": 128,
+  "device": "cuda",
+  "dtype": "bfloat16",
+  "engine": "wkvm-native",
+  "fatal_error": {
+    "message": "CUDA error: an illegal memory access was encountered",
+    "phase": "run_row_B32",
+    "type": "AcceleratorError"
+  },
+  "generated_output_fingerprint_coverage": {
+    "complete": true,
+    "fingerprinted_successful_rows": 0,
+    "successful_rows": 0
+  },
+  "generated_output_fingerprint_schema": "wkvm.generated_output_token_ids.sha256.v1",
+  "generated_output_fingerprints_by_batch": {},
+  "git_commit": "2b4e642d6f9a2e53287e1755db5d711efcab88f4",
+  "gpu_memory": {
+    "baseline_used_mib": 1953,
+    "device_index": 0,
+    "device_selector": "0",
+    "device_uuid": "GPU-0c31f901-f0f2-8a23-b344-f85d0f07b57d",
+    "error": null,
+    "peak_delta_mib": 20237,
+    "peak_used_mib": 22190,
+    "query_error_count": 0,
+    "sample_count": 616,
+    "sample_interval_s": 0.1,
+    "schema": "wkvm.whole_gpu_memory.v1",
+    "scope": "whole_device",
+    "source": "nvidia-smi"
+  },
+  "headroom_gib": 1.0,
+  "hf_boundary": {
+    "evidence_rows": 0,
+    "intent": {
+      "native_gemma_checkpoint_loader": true,
+      "use_native_gemma_forward": true
+    },
+    "model_forward_backend": "wkvm_native_gemma_forward_bridge",
+    "native_gemma_checkpoint_loader": true,
+    "uses_hf_model_construction": false,
+    "uses_hf_transformer_forward": false
+  },
+  "launch_command": "/home/xiaol/X/HRM-Text/.venv/bin/python experiments/native_gemma_bench.py --model-path /run/media/xiaol/B214449214445C0B/models/gemma/gemma-4-E4B-it --ctx 16384 --out 128 --concurrency 32 --slots 32 --prompt-lengths uniform --synthetic-prompts --native-gemma-checkpoint-loader --native-gemma-attention-backend sdpa_single_gqa --native-gemma-projection-backend separate --enable-token-pool-attention --token-pool-max-context-len 16640 --token-pool-capacity 65536 --token-pool-paged-block-size 16 --enable-token-pool-triton --enable-token-pool-paged-triton --enable-token-pool-paged-split-triton --token-pool-triton-strict --token-pool-sliding-paged-metadata-only --persistent-padded-sliding-metadata-padding --persistent-padded-decode-steps 128 --persistent-padded-decode-cuda-graph --persistent-padded-decode-graph-warmup-iters 0 --sink 16 --window 1024 --m-slots 64 --route-chunk 512 --chunk 2048 --prefill-microbatch-rows 2 --decode-microbatch-rows 16 --mem-cap-gib 19 --headroom-gib 1 --gpu-memory-device 0 --gpu-memory-sample-interval-s 0.1 --require-native-no-hf --stop-on-failure --json experiments/results/wkvm_gemma_native_ctx16384_out128_uniform_b32_cap19_20260713.json",
+  "mem_cap_gib": 19.0,
+  "model_forward_backend": "wkvm_native_gemma_forward_bridge",
+  "model_path": "/run/media/xiaol/B214449214445C0B/models/gemma/gemma-4-E4B-it",
+  "native_gemma_attention_backend": "sdpa_single_gqa",
+  "native_gemma_checkpoint_loader": true,
+  "native_gemma_config_loader": true,
+  "native_gemma_projection_backend": "separate",
+  "native_gemma_release_hf_decoder_layers": false,
+  "native_gemma_weight_backend": "hf_live",
+  "native_no_hf_requirement": {
+    "checked_setup_boundary": true,
+    "checked_successful_rows": 0,
+    "passed": false,
+    "required": true,
+    "setup_problems": [],
+    "violations": [
+      {
+        "B": null,
+        "problems": [
+          "no_successful_rows_to_check"
+        ]
+      }
+    ]
+  },
+  "prompt_lengths_mode": "uniform",
+  "prompt_token_source": "synthetic",
+  "rows": [],
+  "schema": "wkvm.native_gemma_bench.v1",
+  "summary": {
+    "best_green_agg_decode_tok_s": 0.0,
+    "bmax_green": 0,
+    "max_success_B": 0
+  },
+  "token_pool_attention_enabled": true,
+  "token_pool_triton_env": {
+    "WKVM_ENABLE_TOKEN_POOL_PAGED_SPLIT_TRITON": "1",
+    "WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON": "1",
+    "WKVM_ENABLE_TOKEN_POOL_TRITON": "1",
+    "WKVM_TOKEN_POOL_SLIDING_PAGED_METADATA_ONLY": "1",
+    "WKVM_TOKEN_POOL_TRITON_STRICT": "1"
+  },
+  "torch_usable_gib": 19.0,
+  "uses_hf_config": false,
+  "uses_hf_model_construction": false,
+  "uses_hf_tokenizer": false,
+  "uses_hf_transformer_forward": false
+}

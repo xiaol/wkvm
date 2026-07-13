@@ -1,0 +1,40 @@
+ M README.md
+ M experiments/incumbent_gemma_bench.py
+ M tests/test_gemma_token_pool.py
+ M tests/test_incumbent_gemma_bench.py
+ M wkvm/runner/gemma_runner.py
+?? experiments/results/gemma_b16_architecture_ctx16384_strict_20260713.md
+?? experiments/results/gemma_b16_architecture_ctx32768_strict_20260713.md
+?? experiments/results/gemma_b16_architecture_win_20260713.md
+?? experiments/results/gemma_high_concurrency_b32_audit_20260713.md
+?? experiments/results/gemma_wkvm_style_frames/t08.png
+?? experiments/results/gemma_wkvm_style_frames/t20.png
+?? experiments/results/gemma_wkvm_style_frames/t36.png
+?? experiments/results/gemma_wkvm_style_frames/t50.png
+?? experiments/results/sglang_gemma_textonly_fullgraph_ctx16384_out128_uniform_b16_cap19_20260713.json
+?? experiments/results/sglang_gemma_textonly_fullgraph_ctx16384_out128_uniform_b32_cap19_20260713.json
+?? experiments/results/sglang_gemma_textonly_fullgraph_ctx16384_out128_uniform_b32_mem082_cap19_20260713.json
+?? experiments/results/sglang_gemma_textonly_fullgraph_ctx16384_out128_uniform_b32_mem082_cap19_final2_20260713.json
+?? experiments/results/sglang_gemma_textonly_fullgraph_ctx16384_out128_uniform_b32_mem082_cap19_final_20260713.json
+?? experiments/results/sglang_gemma_textonly_fullgraph_ctx32768_out128_uniform_b16_cap19_20260713.json
+?? experiments/results/vllm_gemma_textonly_noinductor_fullgraph_ctx16384_out128_uniform_b16_cap19_20260713.json
+?? experiments/results/vllm_gemma_textonly_noinductor_fullgraph_ctx16384_out128_uniform_b32_cap19_20260713.json
+?? experiments/results/vllm_gemma_textonly_noinductor_fullgraph_ctx16384_out128_uniform_b32_cap19_final2_20260713.json
+?? experiments/results/vllm_gemma_textonly_noinductor_fullgraph_ctx16384_out128_uniform_b32_cap19_final_20260713.json
+?? experiments/results/vllm_gemma_textonly_noinductor_fullgraph_ctx32768_out128_uniform_b16_cap19_20260713.json
+?? experiments/results/wkvm_demo.mp4
+?? experiments/results/wkvm_demo_events.json
+?? experiments/results/wkvm_demo_phase1.json
+?? experiments/results/wkvm_demo_phase2.json
+?? experiments/results/wkvm_gemma_alias_ctx16384_out128_uniform_b16_cap19_20260713.json
+?? experiments/results/wkvm_gemma_alias_ctx32768_out128_uniform_b16_cap19_20260713.json
+?? experiments/results/wkvm_gemma_native_ctx16384_out128_uniform_b32_cap19_20260713.json
+?? experiments/results/wkvm_gemma_native_graphguard_ctx16384_out128_uniform_b16_cap19_20260713.json
+?? experiments/results/wkvm_gemma_native_graphguard_ctx16384_out128_uniform_b24_cap19_20260713.json
+?? experiments/results/wkvm_gemma_native_graphguard_ctx16384_out128_uniform_b32_cap19_20260713.json
+?? experiments/results/wkvm_gemma_native_graphguard_ctx16384_out128_uniform_b32_cap19_repeat2_20260713.json
+?? experiments/results/wkvm_gemma_native_nograph_ctx16384_out128_uniform_b16_cap19_20260713.json
+?? experiments/results/wkvm_gemma_native_nograph_ctx16384_out128_uniform_b24_cap19_20260713.json
+?? experiments/results/wkvm_gemma_native_nograph_ctx16384_out128_uniform_b32_cap19_20260713.json
+?? pytest/__init__.py
+?? pytest/__main__.py

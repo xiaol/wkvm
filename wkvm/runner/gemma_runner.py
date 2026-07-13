@@ -2689,6 +2689,10 @@ class _GraphedPaddedDecodeStep:
             )
         )
         self.token_pool_decode = self._token_pool_metadata.context
+        self._token_pool_kv_pool = getattr(self.token_pool_decode, "kv_pool", None)
+        self._token_pool_kv_pool_generation = int(
+            getattr(self._token_pool_kv_pool, "buffer_generation", 0)
+        )
         self._records_token_pool_decode_steps = bool(
             cache._token_pool_covered_decode_layers()
         )
@@ -2830,6 +2834,17 @@ class _GraphedPaddedDecodeStep:
         return self.logits
 
     def _copy_token_pool_decode_context(self, token_pool_decode) -> dict[str, int]:
+        kv_pool = getattr(token_pool_decode, "kv_pool", None)
+        generation = int(getattr(kv_pool, "buffer_generation", 0))
+        if (
+            kv_pool is not self._token_pool_kv_pool
+            or generation != self._token_pool_kv_pool_generation
+        ):
+            raise DistinctCacheBatchError(
+                "token-pool cuda graph KV pool changed after capture: "
+                f"captured_generation={self._token_pool_kv_pool_generation}, "
+                f"current_generation={generation}"
+            )
         try:
             return self._token_pool_metadata.copy_compatible_from(token_pool_decode)
         except ValueError as exc:

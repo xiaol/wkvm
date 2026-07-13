@@ -1,0 +1,1184 @@
+diff --git a/README.md b/README.md
+index 97f6e3c..ac00095 100644
+--- a/README.md
++++ b/README.md
+@@ -33,6 +33,20 @@ Uniform B16, 128 fixed output tokens, BF16, greedy decode, and a 19 GiB cap with
+ 
+ See the [`final evidence audit`](experiments/results/gemma_b16_evidence_audit_20260713.md) and [`verified provenance bundle`](experiments/results/gemma_b16_evidence_bundle_20260713/README.md) for ranges, configurations, fingerprints, source identity, raw artifacts, and caveats.
+ 
++### High-concurrency B32 comparison (2026-07-13)
++
++Direct-engine cohort with 32 uniform 16,384-token prompts and 128 fixed output tokens on the same RTX 4090. Performance cells are `min / mean / max` over two runs. WKVM's resident count is engine-proven; vLLM/SGLang values are offered B32 with much smaller profiled full-length KV capacity and queued waves.
++
++| engine | completion / capacity | E2E output tok/s | comparable decode tok/s | batch-wall p95 | whole-GPU delta | 18 GiB gate |
++|---|---|---:|---:|---:|---:|---|
++| **WKVM current** | **32/32 truly resident**, zero pressure events | 53.991 / **54.757** / 55.522 | 191.148 / **193.236** / 195.323 | 73.722 / **74.769** / 75.816s | 20.255 / **20.859** / 21.463 GiB | fail 2/2 |
++| vLLM 0.24.0 | 32/32 offered; 3.134-3.314 full-length KV equivalents | 58.334 / **61.297** / 64.259 | 59.121 / **62.162** / 65.203 | 63.742 / **66.980** / 70.217s | 18.530 / **18.862** / 19.193 GiB | fail 2/2 |
++| SGLang 0.5.14 | 32/32 offered; 2.995-3.476 full-length KV equivalents | 45.137 / **50.859** / 56.581 | not comparable | 72.392 / **81.569** / 90.746s | 19.131 / **19.145** / 19.159 GiB | fail 2/2 |
++
++**Readout:** WKVM proves the architecture's resident-capacity benefit—32 simultaneous long-context states versus roughly three full-length KV equivalents—but not an overall B32 win. vLLM is 11.9% faster on mean E2E goodput; WKVM is 3.11x faster on the same-run decode interval; WKVM/SGLang E2E ranges overlap. All B32 rows miss the memory gate, while current-source WKVM B16 remains green at 16.797 GiB. SGLang at its lower 0.78 memory fraction passes the memory gate but cannot admit one 16K prompt under the measured desktop baseline.
++
++The experiment also fixed a high-concurrency CUDA-graph bug: lazy token-pool growth could invalidate captured buffer addresses above one decode microbatch. Graph replay now checks the pool generation and safely recaptures; guarded B24/B32 runs complete with unchanged output fingerprints. See the [`high-concurrency audit and raw artifacts`](experiments/results/gemma_high_concurrency_b32_audit_20260713.md) and [`source/artifact provenance`](experiments/results/gemma_high_concurrency_b32_provenance_20260713/README.md) for telemetry, the two-pass measurement method, graph-fault evidence, and limitations. This remains a direct-engine cohort result; a sustained HTTP ladder is still pending.
++
+ **Single long prompt + long output**: 13,824-token prompt + 512-token output, greedy decode, `ignore_eos=True`.
+ 
+ | engine | semantics | facts recovered | prefill+1st | full wall | decode tok/s | e2e output tok/s | memory observed | raw result |
+diff --git a/experiments/incumbent_gemma_bench.py b/experiments/incumbent_gemma_bench.py
+index 4b07be6..ab6fcd6 100644
+--- a/experiments/incumbent_gemma_bench.py
++++ b/experiments/incumbent_gemma_bench.py
+@@ -31,7 +31,9 @@ import shlex
+ import statistics
+ import subprocess
+ import sys
++import threading
+ import time
++from collections.abc import Callable, Mapping
+ from pathlib import Path
+ from typing import Any
+ 
+@@ -108,6 +110,562 @@ def round_or_none(x: float | None, ndigits: int = 3) -> float | None:
+     return round(x, ndigits)
+ 
+ 
++RESIDENCY_TELEMETRY_SCHEMA = "wkvm.incumbent_residency_telemetry.v1"
++
++
++class TelemetryUnavailable(RuntimeError):
++    pass
++
++
++def telemetry_number(value: Any) -> float | None:
++    if (
++        not isinstance(value, (int, float))
++        or isinstance(value, bool)
++        or not math.isfinite(value)
++    ):
++        return None
++    return float(value)
++
++
++def telemetry_value(obj: Any, *names: str) -> Any:
++    for name in names:
++        if isinstance(obj, Mapping) and name in obj:
++            return obj[name]
++        if hasattr(obj, name):
++            return getattr(obj, name)
++    return None
++
++
++def telemetry_items(value: Any, *container_names: str) -> list[Any]:
++    for name in container_names:
++        nested = telemetry_value(value, name)
++        if nested is not None:
++            return telemetry_items(nested)
++    if isinstance(value, (list, tuple)):
++        return list(value)
++    if value is None:
++        return []
++    return [value]
++
++
++def metric_name_values(snapshot: Any) -> list[tuple[str, float]]:
++    if isinstance(snapshot, Mapping) and telemetry_value(snapshot, "name") is None:
++        direct = []
++        for name, value in snapshot.items():
++            number = telemetry_number(value)
++            if isinstance(name, str) and number is not None:
++                direct.append((name, number))
++        if direct:
++            return direct
++    points: list[tuple[str, float]] = []
++    for metric in telemetry_items(snapshot, "metrics", "data"):
++        name = telemetry_value(metric, "name")
++        value = telemetry_number(telemetry_value(metric, "value"))
++        if isinstance(name, str) and value is not None:
++            points.append((name, value))
++            continue
++        for sample in telemetry_items(telemetry_value(metric, "samples")):
++            sample_name = telemetry_value(sample, "name")
++            sample_value = telemetry_number(telemetry_value(sample, "value"))
++            if isinstance(sample_name, str) and sample_value is not None:
++                points.append((sample_name, sample_value))
++    return points
++
++
++def normalized_metric_name(name: str) -> str:
++    for suffix in ("_total", "_created"):
++        if name.endswith(suffix):
++            return name[: -len(suffix)]
++    return name
++
++
++def summed_metric(
++    points: list[tuple[str, float]], aliases: set[str]
++) -> float | None:
++    values = [
++        value
++        for name, value in points
++        if normalized_metric_name(name) in aliases
++    ]
++    return sum(values) if values else None
++
++
++def vllm_capacity_telemetry(
++    llm: Any,
++    *,
++    max_model_len: int | None = None,
++) -> dict[str, Any]:
++    llm_engine = getattr(llm, "llm_engine", llm)
++    vllm_config = getattr(llm_engine, "vllm_config", None)
++    candidates = [
++        ("llm.llm_engine.vllm_config.cache_config", getattr(vllm_config, "cache_config", None)),
++        ("llm.llm_engine.cache_config", getattr(llm_engine, "cache_config", None)),
++        ("llm.cache_config", getattr(llm, "cache_config", None)),
++    ]
++    for source, cache_config in candidates:
++        if cache_config is None:
++            continue
++        capacity = telemetry_number(
++            telemetry_value(cache_config, "kv_cache_size_tokens")
++        )
++        max_concurrency = telemetry_number(
++            telemetry_value(cache_config, "kv_cache_max_concurrency")
++        )
++        estimated = False
++        if capacity is None:
++            num_blocks = telemetry_number(
++                telemetry_value(cache_config, "num_gpu_blocks")
++            )
++            block_size = telemetry_number(telemetry_value(cache_config, "block_size"))
++            if num_blocks is not None and block_size is not None:
++                capacity = num_blocks * block_size
++                estimated = True
++        model_len = max_model_len
++        if model_len is None:
++            model_config = getattr(vllm_config, "model_config", None)
++            model_len_value = telemetry_number(
++                telemetry_value(model_config, "max_model_len")
++            )
++            model_len = None if model_len_value is None else int(model_len_value)
++        if max_concurrency is None and capacity is not None and model_len:
++            max_concurrency = capacity / model_len
++            estimated = True
++        if capacity is not None or max_concurrency is not None:
++            return {
++                "kv_token_capacity": (
++                    None if capacity is None else int(capacity)
++                ),
++                "kv_max_concurrency": max_concurrency,
++                "capacity_source": source,
++                "capacity_estimated": estimated,
++            }
++    return {
++        "kv_token_capacity": None,
++        "kv_max_concurrency": None,
++        "capacity_source": None,
++        "capacity_estimated": None,
++    }
++
++
++def vllm_runtime_telemetry_sample(llm: Any) -> dict[str, Any]:
++    get_metrics = getattr(llm, "get_metrics", None)
++    source = "llm.get_metrics"
++    if not callable(get_metrics):
++        llm_engine = getattr(llm, "llm_engine", None)
++        get_metrics = getattr(llm_engine, "get_metrics", None)
++        source = "llm.llm_engine.get_metrics"
++    if not callable(get_metrics):
++        raise TelemetryUnavailable("vLLM metrics snapshot API is unavailable")
++    points = metric_name_values(get_metrics())
++    if not points:
++        raise TelemetryUnavailable("vLLM metrics snapshot contained no numeric metrics")
++    return {
++        "source": source,
++        "running_requests": summed_metric(
++            points,
++            {
++                "vllm:num_requests_running",
++                "vllm:num_running_requests",
++                "num_requests_running",
++                "num_running_requests",
++            },
++        ),
++        "waiting_requests": summed_metric(
++            points,
++            {
++                "vllm:num_requests_waiting",
++                "vllm:num_waiting_requests",
++                "num_requests_waiting",
++                "num_waiting_requests",
++            },
++        ),
++        "preemptions_total": summed_metric(
++            points,
++            {
++                "vllm:num_preemptions",
++                "vllm:num_preempted_requests",
++                "num_preemptions",
++                "num_preempted_requests",
++            },
++        ),
++    }
++
++
++def sglang_capacity_telemetry(engine: Any) -> dict[str, Any]:
++    get_server_info = getattr(engine, "get_server_info", None)
++    if not callable(get_server_info):
++        return {
++            "effective_token_capacity": None,
++            "configured_max_running_requests": None,
++            "capacity_source": None,
++            "capacity_error": "SGLang get_server_info API is unavailable",
++        }
++    try:
++        info = get_server_info()
++    except Exception as exc:
++        return {
++            "effective_token_capacity": None,
++            "configured_max_running_requests": None,
++            "capacity_source": None,
++            "capacity_error": str(exc).splitlines()[0],
++        }
++    capacity = telemetry_number(
++        telemetry_value(
++            info,
++            "max_total_num_tokens",
++            "max_total_tokens",
++            "token_capacity",
++        )
++    )
++    max_running = telemetry_number(
++        telemetry_value(
++            info,
++            "effective_max_running_requests_per_dp",
++            "max_running_requests",
++        )
++    )
++    source = "engine.get_server_info"
++    internal_states = telemetry_items(info, "internal_states")
++    if capacity is None:
++        capacities = []
++        for state in internal_states:
++            memory = telemetry_value(state, "memory_usage", "memory")
++            value = telemetry_number(
++                telemetry_value(
++                    memory,
++                    "token_capacity",
++                    "max_total_num_tokens",
++                )
++            )
++            if value is not None:
++                capacities.append(value)
++        if capacities:
++            capacity = sum(capacities)
++            source = "engine.get_server_info.internal_states[].memory_usage"
++    if max_running is None:
++        running_limits = [
++            value
++            for state in internal_states
++            if (
++                value := telemetry_number(
++                    telemetry_value(
++                        state,
++                        "effective_max_running_requests_per_dp",
++                        "max_running_requests",
++                    )
++                )
++            )
++            is not None
++        ]
++        if running_limits:
++            max_running = sum(running_limits)
++    return {
++        "effective_token_capacity": (
++            None if capacity is None else int(capacity)
++        ),
++        "configured_max_running_requests": (
++            None if max_running is None else int(max_running)
++        ),
++        "capacity_source": source if capacity is not None else None,
++        "capacity_error": None,
++    }
++
++
++def sglang_runtime_telemetry_sample(engine: Any) -> dict[str, Any]:
++    tokenizer_manager = getattr(engine, "tokenizer_manager", None)
++    reader = getattr(tokenizer_manager, "load_snapshot_reader", None)
++    read_all = getattr(reader, "read_all", None)
++    if not callable(read_all):
++        raise TelemetryUnavailable(
++            "SGLang shared load-snapshot API is unavailable"
++        )
++    snapshots = telemetry_items(read_all(), "loads", "snapshots", "data")
++    if not snapshots:
++        raise RuntimeError("SGLang load-snapshot API returned no snapshots")
++
++    def total(*names: str) -> float | None:
++        values = [
++            value
++            for snapshot in snapshots
++            if (value := telemetry_number(telemetry_value(snapshot, *names)))
++            is not None
++        ]
++        return sum(values) if values else None
++
++    return {
++        "source": "engine.tokenizer_manager.load_snapshot_reader.read_all",
++        "running_requests": total("num_running_reqs", "num_running_requests"),
++        "waiting_requests": total(
++            "num_waiting_reqs",
++            "num_queue_reqs",
++            "num_waiting_requests",
++        ),
++        "used_tokens": total("num_used_tokens", "used_tokens"),
++    }
++
++
++def sglang_output_retractions(obj: Any, expected: int) -> tuple[int | None, int]:
++    if expected == 1 and isinstance(obj, Mapping):
++        items = [obj]
++    elif isinstance(obj, list) and len(obj) == expected:
++        items = obj
++    else:
++        return None, 0
++    total = 0
++    captured = 0
++    for item in items:
++        meta = telemetry_value(item, "meta_info", "meta")
++        value = telemetry_value(
++            meta,
++            "num_retractions",
++            "retraction_count",
++            "retraction_counts",
++        )
++        if value is None:
++            value = telemetry_value(
++                item,
++                "num_retractions",
++                "retraction_count",
++                "retraction_counts",
++            )
++        values = value if isinstance(value, (list, tuple)) else [value]
++        numbers = [telemetry_number(entry) for entry in values]
++        if not numbers or any(number is None for number in numbers):
++            return None, captured
++        total += sum(int(number) for number in numbers if number is not None)
++        captured += 1
++    return total, captured
++
++
++class ResidencyTelemetryMonitor:
++    def __init__(
++        self,
++        *,
++        engine: str,
++        capacity: dict[str, Any],
++        sampler: Callable[[], dict[str, Any]],
++        required_fields: tuple[str, ...],
++        interval_s: float = 0.05,
++    ) -> None:
++        self.engine = engine
++        self.capacity = dict(capacity)
++        self.sampler = sampler
++        self.required_fields = required_fields
++        self.interval_s = interval_s
++        self.sample_count = 0
++        self.active_sample_count = 0
++        self.periodic_sample_count = 0
++        self.active_periodic_sample_count = 0
++        self.error_count = 0
++        self.first_error: str | None = None
++        self.sources: set[str] = set()
++        capacity_source = capacity.get("capacity_source")
++        if isinstance(capacity_source, str):
++            self.sources.add(capacity_source)
++        self.peak_running_requests: int | None = None
++        self.peak_waiting_requests: int | None = None
++        self.peak_used_tokens: int | None = None
++        self.preemptions_start: int | None = None
++        self.preemptions_peak: int | None = None
++        self.output_retractions: int | None = None
++        self.output_retraction_request_count = 0
++        self._stop = threading.Event()
++        self._thread: threading.Thread | None = None
++        self._sampling_disabled = False
++
++    def _record_error(self, exc: Exception) -> None:
++        self.error_count += 1
++        if self.first_error is None:
++            self.first_error = str(exc).splitlines()[0]
++        if isinstance(exc, TelemetryUnavailable):
++            self._sampling_disabled = True
++
++    def _sample_once(self, *, periodic: bool = False) -> None:
++        if self._sampling_disabled:
++            return
++        try:
++            sample = self.sampler()
++        except Exception as exc:
++            self._record_error(exc)
++            return
++        source = sample.get("source")
++        if isinstance(source, str):
++            self.sources.add(source)
++        self.sample_count += 1
++        active = any(
++            (telemetry_number(sample.get(key)) or 0) > 0
++            for key in ("running_requests", "waiting_requests", "used_tokens")
++        )
++        if active:
++            self.active_sample_count += 1
++        if periodic:
++            self.periodic_sample_count += 1
++            if active:
++                self.active_periodic_sample_count += 1
++        for key, attribute in (
++            ("running_requests", "peak_running_requests"),
++            ("waiting_requests", "peak_waiting_requests"),
++            ("used_tokens", "peak_used_tokens"),
++        ):
++            value = telemetry_number(sample.get(key))
++            if value is None:
++                continue
++            current = getattr(self, attribute)
++            setattr(
++                self,
++                attribute,
++                int(value) if current is None else max(current, int(value)),
++            )
++        preemptions = telemetry_number(sample.get("preemptions_total"))
++        if preemptions is not None:
++            count = int(preemptions)
++            if self.preemptions_start is None:
++                self.preemptions_start = count
++            self.preemptions_peak = (
++                count
++                if self.preemptions_peak is None
++                else max(self.preemptions_peak, count)
++            )
++
++    def _sample_loop(self) -> None:
++        while not self._stop.wait(self.interval_s):
++            self._sample_once(periodic=True)
++            if self._sampling_disabled:
++                return
++
++    def __enter__(self):
++        self._sample_once()
++        if not self._sampling_disabled:
++            self._thread = threading.Thread(
++                target=self._sample_loop,
++                name=f"{self.engine}-residency-telemetry",
++                daemon=True,
++            )
++            self._thread.start()
++        return self
++
++    def __exit__(self, *exc) -> None:
++        self._stop.set()
++        if self._thread is not None:
++            self._thread.join(timeout=max(1.0, self.interval_s * 4))
++            if self._thread.is_alive():
++                self._record_error(
++                    RuntimeError("residency telemetry sampler did not stop")
++                )
++                return
++        self._sample_once()
++
++    def record_output_retractions(
++        self,
++        value: int | None,
++        request_count: int,
++    ) -> None:
++        self.output_retractions = value
++        self.output_retraction_request_count = request_count
++        if value is not None:
++            self.sources.add("SGLang output meta_info.num_retractions")
++
++    def result(self) -> dict[str, Any]:
++        preemption_events = None
++        if self.preemptions_start is not None and self.preemptions_peak is not None:
++            preemption_events = max(
++                0, self.preemptions_peak - self.preemptions_start
++            )
++        result = {
++            "schema": RESIDENCY_TELEMETRY_SCHEMA,
++            "engine": self.engine,
++            "sample_interval_s": self.interval_s,
++            "sample_count": self.sample_count,
++            "active_sample_count": self.active_sample_count,
++            "periodic_sample_count": self.periodic_sample_count,
++            "active_periodic_sample_count": self.active_periodic_sample_count,
++            "error_count": self.error_count,
++            "error": self.first_error or self.capacity.get("capacity_error"),
++            "sources": sorted(self.sources),
++            "kv_token_capacity": self.capacity.get("kv_token_capacity"),
++            "kv_max_concurrency": self.capacity.get("kv_max_concurrency"),
++            "effective_token_capacity": self.capacity.get(
++                "effective_token_capacity"
++            ),
++            "configured_max_running_requests": self.capacity.get(
++                "configured_max_running_requests"
++            ),
++            "capacity_estimated": self.capacity.get("capacity_estimated"),
++            "peak_running_requests": self.peak_running_requests,
++            "peak_waiting_requests": self.peak_waiting_requests,
++            "peak_used_tokens": self.peak_used_tokens,
++            "preemption_events": preemption_events,
++            "output_retractions": self.output_retractions,
++            "output_retraction_request_count": (
++                self.output_retraction_request_count
++            ),
++        }
++        required_unavailable = [
++            field for field in self.required_fields if result.get(field) is None
++        ]
++        unavailable = list(required_unavailable)
++        runtime_fields = {
++            "peak_running_requests",
++            "peak_waiting_requests",
++            "peak_used_tokens",
++            "preemption_events",
++            "output_retractions",
++        }
++        if (
++            runtime_fields.intersection(self.required_fields)
++            and not self._sampling_disabled
++            and not self.active_periodic_sample_count
++        ):
++            unavailable.append("active_periodic_sample_coverage")
++        available_count = len(self.required_fields) - len(required_unavailable)
++        status = (
++            "complete"
++            if not unavailable
++            else "partial"
++            if available_count
++            else "unavailable"
++        )
++        result.update(
++            {
++                "status": status,
++                "available": status != "unavailable",
++                "complete": status == "complete",
++                "unavailable_fields": unavailable,
++            }
++        )
++        return result
++
++
++def residency_telemetry_row_fields(
++    telemetry: dict[str, Any],
++    *,
++    tokens_per_request: int | None = None,
++) -> dict[str, Any]:
++    token_capacity = telemetry.get("kv_token_capacity")
++    if token_capacity is None:
++        token_capacity = telemetry.get("effective_token_capacity")
++    full_length_context_capacity = None
++    if token_capacity is not None and tokens_per_request:
++        full_length_context_capacity = float(token_capacity) / float(
++            tokens_per_request
++        )
++    return {
++        "residency_telemetry_status": telemetry["status"],
++        "residency_telemetry": telemetry,
++        "token_capacity": token_capacity,
++        "kv_max_concurrency": telemetry.get("kv_max_concurrency"),
++        "configured_max_running_requests": telemetry.get(
++            "configured_max_running_requests"
++        ),
++        "full_length_context_capacity": full_length_context_capacity,
++        "max_running": telemetry.get("peak_running_requests"),
++        "max_waiting": telemetry.get("peak_waiting_requests"),
++        "max_used_tokens": telemetry.get("peak_used_tokens"),
++        "preemption_events": telemetry.get("preemption_events"),
++        "retraction_events": telemetry.get("output_retractions"),
++    }
++
++
+ def prompt_token_source(args) -> str:
+     return "synthetic" if getattr(args, "synthetic_prompts", False) else "hf_tokenizer"
+ 
+@@ -384,14 +942,17 @@ def measure_vllm_generation(
+     reqs: list[dict[str, Any]],
+     sp1: Any,
+     spn: Any,
++    telemetry_monitor: ResidencyTelemetryMonitor | None = None,
+ ) -> tuple[list[Any], float, dict[str, Any]]:
+     """Measure vLLM, preferring exact timestamps from the full generation."""
+ 
+-    synchronize_cuda()
+-    started = time.perf_counter()
+-    full = llm.generate(reqs, spn, use_tqdm=False)
+-    synchronize_cuda()
+-    full_wall_s = time.perf_counter() - started
++    telemetry_context = telemetry_monitor or contextlib.nullcontext()
++    with telemetry_context:
++        synchronize_cuda()
++        started = time.perf_counter()
++        full = llm.generate(reqs, spn, use_tqdm=False)
++        synchronize_cuda()
++        full_wall_s = time.perf_counter() - started
+ 
+     timing = vllm_request_metrics_timing(full, len(reqs))
+     if timing is not None:
+@@ -515,6 +1076,12 @@ def make_row(
+ 
+ 
+ def row_green(row: dict[str, Any], args) -> bool:
++    if (
++        row.get("success_count") != row.get("B")
++        or row.get("error_count") != 0
++        or row.get("error") is not None
++    ):
++        return False
+     candidates = [
+         row.get("peak_engine_delta_gib"),
+         row.get("peak_reserved_gib"),
+@@ -584,6 +1151,10 @@ def run_vllm(
+                 use_tqdm=False,
+             )
+ 
++    capacity_telemetry = vllm_capacity_telemetry(
++        llm,
++        max_model_len=max_model_len,
++    )
+     rows: list[dict[str, Any]] = []
+     reset_torch_peak()
+     for B, prompts in prompts_by_b.items():
+@@ -593,9 +1164,28 @@ def run_vllm(
+                 prompt_token_source=prompt_token_source(args),
+             )
+         )
++        row_telemetry = ResidencyTelemetryMonitor(
++            engine="vllm",
++            capacity=capacity_telemetry,
++            sampler=lambda: vllm_runtime_telemetry_sample(llm),
++            required_fields=(
++                "kv_token_capacity",
++                "kv_max_concurrency",
++                "peak_running_requests",
++                "peak_waiting_requests",
++                "preemption_events",
++            ),
++            interval_s=getattr(args, "telemetry_sample_interval_s", 0.05),
++        )
+         try:
+             reqs = [{"prompt_token_ids": p} for p in prompts]
+-            full, t_full, timing = measure_vllm_generation(llm, reqs, sp1, spn)
++            full, t_full, timing = measure_vllm_generation(
++                llm,
++                reqs,
++                sp1,
++                spn,
++                telemetry_monitor=row_telemetry,
++            )
+             outputs = normalize_vllm_outputs(full, B)
+             mem = {
+                 "peak_alloc_gib": round_or_none(torch_peak_alloc_gib()),
+@@ -622,6 +1212,12 @@ def run_vllm(
+                 "peak_alloc_gib": round_or_none(torch_peak_alloc_gib()),
+                 "peak_reserved_gib": round_or_none(torch_peak_reserved_gib()),
+             }
++        row.update(
++            residency_telemetry_row_fields(
++                row_telemetry.result(),
++                tokens_per_request=max(len(prompt) for prompt in prompts) + args.out,
++            )
++        )
+         row.update(fingerprint_fields)
+         row["green"] = row_green(row, args)
+         rows.append(row)
+@@ -642,6 +1238,7 @@ def run_vllm(
+         "language_model_only": args.vllm_language_model_only,
+         "compilation_config": compilation_config,
+         "mm_note": mm_note,
++        "residency_telemetry_capacity": capacity_telemetry,
+     }
+     with contextlib.suppress(Exception):
+         del llm
+@@ -677,6 +1274,7 @@ def run_sglang(
+         kwargs["json_model_override_args"] = json.dumps(model_override)
+ 
+     engine = sgl.Engine(**kwargs)
++    capacity_telemetry = sglang_capacity_telemetry(engine)
+     sp1 = {"temperature": 0.0, "max_new_tokens": 1, "ignore_eos": True}
+     spn = {
+         "temperature": 0.0,
+@@ -699,6 +1297,19 @@ def run_sglang(
+                 prompt_token_source=prompt_token_source(args),
+             )
+         )
++        row_telemetry = ResidencyTelemetryMonitor(
++            engine="sglang",
++            capacity=capacity_telemetry,
++            sampler=lambda: sglang_runtime_telemetry_sample(engine),
++            required_fields=(
++                "effective_token_capacity",
++                "peak_running_requests",
++                "peak_waiting_requests",
++                "peak_used_tokens",
++                "output_retractions",
++            ),
++            interval_s=getattr(args, "telemetry_sample_interval_s", 0.05),
++        )
+         try:
+             synchronize_cuda()
+             t0 = time.perf_counter()
+@@ -707,12 +1318,21 @@ def run_sglang(
+             t_first = time.perf_counter() - t0
+             normalize_sglang_outputs(first, B)
+ 
+-            synchronize_cuda()
+-            t0 = time.perf_counter()
+-            full = engine.generate(input_ids=prompts, sampling_params=spn)
+-            synchronize_cuda()
+-            t_full = time.perf_counter() - t0
++            with row_telemetry:
++                synchronize_cuda()
++                t0 = time.perf_counter()
++                full = engine.generate(input_ids=prompts, sampling_params=spn)
++                synchronize_cuda()
++                t_full = time.perf_counter() - t0
+             outputs = normalize_sglang_outputs(full, B)
++            output_retractions, captured_requests = sglang_output_retractions(
++                full,
++                B,
++            )
++            row_telemetry.record_output_retractions(
++                output_retractions,
++                captured_requests,
++            )
+             row = make_row(
+                 B=B,
+                 prompt_lens=[len(p) for p in prompts],
+@@ -729,6 +1349,12 @@ def run_sglang(
+                 "error": str(exc).splitlines()[0],
+                 "prompt_lengths": [len(p) for p in prompts],
+             }
++        row.update(
++            residency_telemetry_row_fields(
++                row_telemetry.result(),
++                tokens_per_request=max(len(prompt) for prompt in prompts) + args.out,
++            )
++        )
+         row.update(fingerprint_fields)
+         row["green"] = row_green(row, args)
+         rows.append(row)
+@@ -753,6 +1379,7 @@ def run_sglang(
+         "max_running_requests": args.sglang_max_running_requests,
+         "cuda_graph_backend_decode": args.sglang_decode_graph,
+         "cuda_graph_backend_prefill": args.sglang_prefill_graph,
++        "residency_telemetry_capacity": capacity_telemetry,
+     }
+     with contextlib.suppress(Exception):
+         engine.shutdown()
+@@ -943,6 +1570,7 @@ def main() -> None:
+     ap.add_argument("--mem-cap-gib", type=float, default=float(os.environ.get("WKVM_MEM_CAP_GIB", 19)))
+     ap.add_argument("--headroom-gib", type=float, default=1.0)
+     ap.add_argument("--mem-sample-interval-s", type=float, default=0.1)
++    ap.add_argument("--telemetry-sample-interval-s", type=float, default=0.05)
+     ap.add_argument("--json", default=None)
+     ap.add_argument("--model-path", default=None)
+     ap.add_argument("--warmup", action=argparse.BooleanOptionalAction, default=True)
+diff --git a/tests/test_gemma_token_pool.py b/tests/test_gemma_token_pool.py
+index f4984d6..418118c 100644
+--- a/tests/test_gemma_token_pool.py
++++ b/tests/test_gemma_token_pool.py
+@@ -6820,6 +6820,8 @@ class TestGemmaTokenPool(unittest.TestCase):
+         )
+         step = object.__new__(_GraphedPaddedDecodeStep)
+         step._token_pool_metadata = graph_metadata
++        step._token_pool_kv_pool = kv_pool
++        step._token_pool_kv_pool_generation = 0
+ 
+         compatible_type_metadata = build_decode_metadata_from_token_slot_rows(
+             [[8, 9]],
+@@ -6848,6 +6850,52 @@ class TestGemmaTokenPool(unittest.TestCase):
+             [0, 1],
+         )
+ 
++    def test_graphed_decode_step_rejects_grown_token_pool_buffers(self) -> None:
++        from types import SimpleNamespace
++
++        try:
++            import torch  # noqa: F401
++        except ImportError:
++            self.skipTest("torch unavailable")
++
++        from wkvm.runner.gemma_runner import (
++            DistinctCacheBatchError,
++            _GraphedPaddedDecodeStep,
++        )
++        from wkvm.runner.gemma_token_pool import (
++            build_decode_metadata_from_token_slot_rows,
++            TokenPoolDecodeBackendState,
++            TokenPoolDecodeContext,
++        )
++
++        kv_pool = SimpleNamespace(buffer_generation=3)
++        metadata = build_decode_metadata_from_token_slot_rows(
++            [[0, 1]],
++            out_cache_loc=[1],
++        )
++        captured_context = TokenPoolDecodeContext(
++            metadata_by_layer_type={"sliding_attention": metadata},
++            metadata_by_layer_id={0: metadata},
++            kv_pool=kv_pool,
++            covered_layer_types=frozenset({"sliding_attention"}),
++        )
++        step = object.__new__(_GraphedPaddedDecodeStep)
++        step._token_pool_metadata = (
++            TokenPoolDecodeBackendState.capture_graph_decode_metadata(
++                captured_context,
++                clone_tensors=True,
++            )
++        )
++        step._token_pool_kv_pool = kv_pool
++        step._token_pool_kv_pool_generation = 3
++
++        kv_pool.buffer_generation = 4
++        with self.assertRaisesRegex(
++            DistinctCacheBatchError,
++            "token-pool cuda graph KV pool changed after capture",
++        ):
++            step._copy_token_pool_decode_context(captured_context)
++
+     def test_graph_metadata_facade_aliases_workspace_metadata_and_skips_copies(self) -> None:
+         try:
+             import torch
+diff --git a/tests/test_incumbent_gemma_bench.py b/tests/test_incumbent_gemma_bench.py
+index 0b963d5..72d95a9 100644
+--- a/tests/test_incumbent_gemma_bench.py
++++ b/tests/test_incumbent_gemma_bench.py
+@@ -8,11 +8,20 @@ from types import SimpleNamespace
+ from unittest import mock
+ 
+ from experiments.incumbent_gemma_bench import (
++    ResidencyTelemetryMonitor,
++    TelemetryUnavailable,
+     VramMonitor,
+     make_row,
+     measure_vllm_generation,
++    residency_telemetry_row_fields,
++    row_green,
++    sglang_capacity_telemetry,
+     sglang_language_model_override,
++    sglang_output_retractions,
++    sglang_runtime_telemetry_sample,
++    vllm_capacity_telemetry,
+     vllm_request_metrics_timing,
++    vllm_runtime_telemetry_sample,
+ )
+ 
+ 
+@@ -192,6 +201,275 @@ class TestIncumbentGemmaBench(unittest.TestCase):
+         self.assertEqual(row["generated_output_token_counts"], [2, 2])
+         self.assertEqual(len(row["request_output_token_ids_sha256"]), 64)
+ 
++    def test_vllm_capacity_uses_group_aware_cache_fields(self) -> None:
++        cache_config = SimpleNamespace(
++            kv_cache_size_tokens=131_072,
++            kv_cache_max_concurrency=7.75,
++            num_gpu_blocks=1,
++            block_size=16,
++        )
++        llm = SimpleNamespace(
++            llm_engine=SimpleNamespace(
++                vllm_config=SimpleNamespace(cache_config=cache_config)
++            )
++        )
++
++        telemetry = vllm_capacity_telemetry(llm, max_model_len=16_384)
++
++        self.assertEqual(telemetry["kv_token_capacity"], 131_072)
++        self.assertEqual(telemetry["kv_max_concurrency"], 7.75)
++        self.assertFalse(telemetry["capacity_estimated"])
++        self.assertEqual(
++            telemetry["capacity_source"],
++            "llm.llm_engine.vllm_config.cache_config",
++        )
++
++    def test_vllm_capacity_falls_back_to_blocks_and_model_length(self) -> None:
++        cache_config = SimpleNamespace(
++            num_gpu_blocks=8_192,
++            block_size=16,
++        )
++        llm = SimpleNamespace(
++            llm_engine=SimpleNamespace(cache_config=cache_config)
++        )
++
++        telemetry = vllm_capacity_telemetry(llm, max_model_len=16_384)
++
++        self.assertEqual(telemetry["kv_token_capacity"], 131_072)
++        self.assertEqual(telemetry["kv_max_concurrency"], 8.0)
++        self.assertTrue(telemetry["capacity_estimated"])
++
++    def test_vllm_runtime_sample_accepts_metric_objects_and_total_suffix(self) -> None:
++        llm = SimpleNamespace(
++            get_metrics=lambda: [
++                SimpleNamespace(name="vllm:num_requests_running", value=3),
++                SimpleNamespace(name="vllm:num_requests_running", value=2),
++                SimpleNamespace(name="vllm:num_requests_waiting", value=4),
++                SimpleNamespace(name="vllm:num_preemptions_total", value=7),
++            ]
++        )
++
++        sample = vllm_runtime_telemetry_sample(llm)
++
++        self.assertEqual(sample["running_requests"], 5.0)
++        self.assertEqual(sample["waiting_requests"], 4.0)
++        self.assertEqual(sample["preemptions_total"], 7.0)
++        self.assertEqual(sample["source"], "llm.get_metrics")
++
++    def test_residency_monitor_tracks_peaks_and_preemption_delta(self) -> None:
++        samples = iter(
++            [
++                {
++                    "source": "mock.metrics",
++                    "running_requests": 0,
++                    "waiting_requests": 0,
++                    "preemptions_total": 11,
++                },
++                {
++                    "source": "mock.metrics",
++                    "running_requests": 16,
++                    "waiting_requests": 3,
++                    "preemptions_total": 13,
++                },
++                {
++                    "source": "mock.metrics",
++                    "running_requests": 0,
++                    "waiting_requests": 0,
++                    "preemptions_total": 13,
++                },
++            ]
++        )
++        monitor = ResidencyTelemetryMonitor(
++            engine="vllm",
++            capacity={
++                "kv_token_capacity": 131_072,
++                "kv_max_concurrency": 8.0,
++                "capacity_source": "mock.cache",
++            },
++            sampler=lambda: next(samples),
++            required_fields=(
++                "kv_token_capacity",
++                "kv_max_concurrency",
++                "peak_running_requests",
++                "peak_waiting_requests",
++                "preemption_events",
++            ),
++            interval_s=60.0,
++        )
++
++        with monitor:
++            monitor._sample_once(periodic=True)
++        result = monitor.result()
++
++        self.assertEqual(result["status"], "complete")
++        self.assertEqual(result["peak_running_requests"], 16)
++        self.assertEqual(result["peak_waiting_requests"], 3)
++        self.assertEqual(result["preemption_events"], 2)
++        self.assertEqual(result["sample_count"], 3)
++        self.assertEqual(result["periodic_sample_count"], 1)
++        self.assertEqual(result["active_periodic_sample_count"], 1)
++        self.assertEqual(result["active_sample_count"], 1)
++        self.assertEqual(result["sources"], ["mock.cache", "mock.metrics"])
++
++    def test_residency_monitor_requires_active_sample_coverage(self) -> None:
++        monitor = ResidencyTelemetryMonitor(
++            engine="vllm",
++            capacity={
++                "kv_token_capacity": 131_072,
++                "kv_max_concurrency": 8.0,
++                "capacity_source": "mock.cache",
++            },
++            sampler=lambda: {
++                "source": "mock.metrics",
++                "running_requests": 0,
++                "waiting_requests": 0,
++                "preemptions_total": 0,
++            },
++            required_fields=(
++                "kv_token_capacity",
++                "kv_max_concurrency",
++                "peak_running_requests",
++                "peak_waiting_requests",
++                "preemption_events",
++            ),
++            interval_s=60.0,
++        )
++
++        with monitor:
++            pass
++        result = monitor.result()
++
++        self.assertEqual(result["status"], "partial")
++        self.assertEqual(result["active_sample_count"], 0)
++        self.assertEqual(result["active_periodic_sample_count"], 0)
++        self.assertIn(
++            "active_periodic_sample_coverage",
++            result["unavailable_fields"],
++        )
++
++    def test_residency_monitor_marks_missing_api_unavailable(self) -> None:
++        def unavailable() -> dict[str, object]:
++            raise TelemetryUnavailable("metrics not exposed")
++
++        monitor = ResidencyTelemetryMonitor(
++            engine="vllm",
++            capacity={},
++            sampler=unavailable,
++            required_fields=("peak_running_requests", "preemption_events"),
++        )
++
++        with monitor:
++            pass
++        result = monitor.result()
++
++        self.assertEqual(result["status"], "unavailable")
++        self.assertFalse(result["available"])
++        self.assertEqual(result["sample_count"], 0)
++        self.assertEqual(result["error_count"], 1)
++        self.assertEqual(
++            result["unavailable_fields"],
++            ["peak_running_requests", "preemption_events"],
++        )
++
++    def test_sglang_capacity_falls_back_to_internal_state(self) -> None:
++        engine = SimpleNamespace(
++            get_server_info=lambda: {
++                "internal_states": [
++                    {
++                        "memory_usage": {"token_capacity": 65_536},
++                        "effective_max_running_requests_per_dp": 32,
++                    },
++                    {
++                        "memory_usage": {"token_capacity": 65_536},
++                        "effective_max_running_requests_per_dp": 32,
++                    },
++                ]
++            }
++        )
++
++        telemetry = sglang_capacity_telemetry(engine)
++
++        self.assertEqual(telemetry["effective_token_capacity"], 131_072)
++        self.assertEqual(telemetry["configured_max_running_requests"], 64)
++        self.assertIn("internal_states", telemetry["capacity_source"])
++
++    def test_sglang_runtime_sample_sums_load_snapshots(self) -> None:
++        reader = SimpleNamespace(
++            read_all=lambda: [
++                SimpleNamespace(
++                    num_running_reqs=5,
++                    num_waiting_reqs=2,
++                    num_used_tokens=20_000,
++                ),
++                {
++                    "num_running_reqs": 7,
++                    "num_queue_reqs": 3,
++                    "num_used_tokens": 25_000,
++                },
++            ]
++        )
++        engine = SimpleNamespace(
++            tokenizer_manager=SimpleNamespace(load_snapshot_reader=reader)
++        )
++
++        sample = sglang_runtime_telemetry_sample(engine)
++
++        self.assertEqual(sample["running_requests"], 12.0)
++        self.assertEqual(sample["waiting_requests"], 5.0)
++        self.assertEqual(sample["used_tokens"], 45_000.0)
++
++    def test_sglang_output_retractions_uses_per_request_metadata(self) -> None:
++        outputs = [
++            {"meta_info": {"num_retractions": 0}},
++            {"meta_info": {"num_retractions": 2}},
++            {"meta": {"retraction_count": 1}},
++        ]
++
++        retractions, captured = sglang_output_retractions(outputs, expected=3)
++
++        self.assertEqual(retractions, 3)
++        self.assertEqual(captured, 3)
++
++    def test_residency_row_fields_separate_capacity_and_scheduler_limit(self) -> None:
++        fields = residency_telemetry_row_fields(
++            {
++                "status": "complete",
++                "kv_token_capacity": None,
++                "effective_token_capacity": 90_000,
++                "kv_max_concurrency": None,
++                "configured_max_running_requests": 64,
++                "peak_running_requests": 32,
++                "peak_waiting_requests": 4,
++                "peak_used_tokens": 80_000,
++                "preemption_events": None,
++                "output_retractions": 2,
++            },
++            tokens_per_request=18_000,
++        )
++
++        self.assertEqual(fields["token_capacity"], 90_000)
++        self.assertIsNone(fields["kv_max_concurrency"])
++        self.assertEqual(fields["configured_max_running_requests"], 64)
++        self.assertEqual(fields["full_length_context_capacity"], 5.0)
++        self.assertEqual(fields["max_running"], 32)
++        self.assertEqual(fields["max_waiting"], 4)
++        self.assertNotIn("max_resident_state_slots", fields)
++        self.assertEqual(fields["retraction_events"], 2)
++
++    def test_green_requires_full_success_and_memory_gate(self) -> None:
++        args = SimpleNamespace(mem_cap_gib=19.0, headroom_gib=1.0)
++        complete = {
++            "B": 32,
++            "success_count": 32,
++            "error_count": 0,
++            "error": None,
++            "peak_engine_delta_gib": 17.5,
++        }
++
++        self.assertTrue(row_green(complete, args))
++        self.assertFalse(row_green({**complete, "success_count": 0}, args))
++        self.assertFalse(row_green({**complete, "peak_engine_delta_gib": 18.1}, args))
++
+     def test_sglang_language_model_override_promotes_text_config(self) -> None:
+         with tempfile.TemporaryDirectory() as tmpdir:
+             model_path = Path(tmpdir)
+diff --git a/wkvm/runner/gemma_runner.py b/wkvm/runner/gemma_runner.py
+index 4835cfa..206bdc1 100644
+--- a/wkvm/runner/gemma_runner.py
++++ b/wkvm/runner/gemma_runner.py
+@@ -2689,6 +2689,10 @@ class _GraphedPaddedDecodeStep:
+             )
+         )
+         self.token_pool_decode = self._token_pool_metadata.context
++        self._token_pool_kv_pool = getattr(self.token_pool_decode, "kv_pool", None)
++        self._token_pool_kv_pool_generation = int(
++            getattr(self._token_pool_kv_pool, "buffer_generation", 0)
++        )
+         self._records_token_pool_decode_steps = bool(
+             cache._token_pool_covered_decode_layers()
+         )
+@@ -2830,6 +2834,17 @@ class _GraphedPaddedDecodeStep:
+         return self.logits
+ 
+     def _copy_token_pool_decode_context(self, token_pool_decode) -> dict[str, int]:
++        kv_pool = getattr(token_pool_decode, "kv_pool", None)
++        generation = int(getattr(kv_pool, "buffer_generation", 0))
++        if (
++            kv_pool is not self._token_pool_kv_pool
++            or generation != self._token_pool_kv_pool_generation
++        ):
++            raise DistinctCacheBatchError(
++                "token-pool cuda graph KV pool changed after capture: "
++                f"captured_generation={self._token_pool_kv_pool_generation}, "
++                f"current_generation={generation}"
++            )
+         try:
+             return self._token_pool_metadata.copy_compatible_from(token_pool_decode)
+         except ValueError as exc:

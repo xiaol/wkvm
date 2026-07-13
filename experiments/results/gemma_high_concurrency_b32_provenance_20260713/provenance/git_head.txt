@@ -1,0 +1,4 @@
+commit 2b4e642d6f9a2e53287e1755db5d711efcab88f4
+tree de255939a23af3824d80639d8a854dfc2d6105cf
+branch HEAD -> main, origin/main, origin/HEAD
+subject Add bounded Gemma architecture evidence

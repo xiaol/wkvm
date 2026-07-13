@@ -6820,6 +6820,8 @@ class TestGemmaTokenPool(unittest.TestCase):
         )
         step = object.__new__(_GraphedPaddedDecodeStep)
         step._token_pool_metadata = graph_metadata
+        step._token_pool_kv_pool = kv_pool
+        step._token_pool_kv_pool_generation = 0
 
         compatible_type_metadata = build_decode_metadata_from_token_slot_rows(
             [[8, 9]],
@@ -6847,6 +6849,52 @@ class TestGemmaTokenPool(unittest.TestCase):
             ].kv_indices.tolist(),
             [0, 1],
         )
+
+    def test_graphed_decode_step_rejects_grown_token_pool_buffers(self) -> None:
+        from types import SimpleNamespace
+
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_runner import (
+            DistinctCacheBatchError,
+            _GraphedPaddedDecodeStep,
+        )
+        from wkvm.runner.gemma_token_pool import (
+            build_decode_metadata_from_token_slot_rows,
+            TokenPoolDecodeBackendState,
+            TokenPoolDecodeContext,
+        )
+
+        kv_pool = SimpleNamespace(buffer_generation=3)
+        metadata = build_decode_metadata_from_token_slot_rows(
+            [[0, 1]],
+            out_cache_loc=[1],
+        )
+        captured_context = TokenPoolDecodeContext(
+            metadata_by_layer_type={"sliding_attention": metadata},
+            metadata_by_layer_id={0: metadata},
+            kv_pool=kv_pool,
+            covered_layer_types=frozenset({"sliding_attention"}),
+        )
+        step = object.__new__(_GraphedPaddedDecodeStep)
+        step._token_pool_metadata = (
+            TokenPoolDecodeBackendState.capture_graph_decode_metadata(
+                captured_context,
+                clone_tensors=True,
+            )
+        )
+        step._token_pool_kv_pool = kv_pool
+        step._token_pool_kv_pool_generation = 3
+
+        kv_pool.buffer_generation = 4
+        with self.assertRaisesRegex(
+            DistinctCacheBatchError,
+            "token-pool cuda graph KV pool changed after capture",
+        ):
+            step._copy_token_pool_decode_context(captured_context)
 
     def test_graph_metadata_facade_aliases_workspace_metadata_and_skips_copies(self) -> None:
         try:

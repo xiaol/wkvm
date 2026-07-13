@@ -1,0 +1,17 @@
+{
+  "schema": "wkvm.high_concurrency_source_identity.v1",
+  "captured_utc": "2026-07-13T10:38:27Z",
+  "repo_root": "/home/xiaol/X/wkvm",
+  "git_commit": "2b4e642d6f9a2e53287e1755db5d711efcab88f4",
+  "git_head_tree": "de255939a23af3824d80639d8a854dfc2d6105cf",
+  "git_branch": "main",
+  "git_worktree_clean": false,
+  "status_line_count": 40,
+  "git_status_sha256": "fd7d5159e8ffa3d5efada89009e960abb4aa279968482299efe1a9416677a47e",
+  "tracked_worktree_patch_sha256": "bf9f695a9f781bf706dc67b028f1243e3e2daa82b0684bd8856b058fc8017f23",
+  "promoted_files_manifest_sha256": "9cdf640db553595e6abbd2d1e0f9b3fd41bb7a76e872bec344d044589870659d",
+  "promoted_file_count": 18,
+  "b32_prompt_sha256": "6ee3f368883b8088bb29fe51ac6dd424d98ed9345c823eafa491a2aa0739dccf",
+  "b32_output_sha256": "c24e9fe709ea9dcc41a3dc7181817ff2c0e54265e750c5789162b6c8bfbdb465",
+  "note": "Report-time snapshot for the graph-generation guard, incumbent residency telemetry, README comparison, audit, and promoted raw artifacts."
+}
