@@ -6158,11 +6158,14 @@ class TokenPoolDecodeBackendState:
         invalidated_full_attention_rows = 0
         try:
             if caches_by_req_id is not None:
-                invalidate_req_ids = self.commit_full_attention_decode_to_caches(
-                    reservations=reservations,
-                    caches_by_req_id=caches_by_req_id,
-                    owner_layer_ids=owner_layer_ids,
-                )
+                import torch
+
+                with torch.inference_mode():
+                    invalidate_req_ids = self.commit_full_attention_decode_to_caches(
+                        reservations=reservations,
+                        caches_by_req_id=caches_by_req_id,
+                        owner_layer_ids=owner_layer_ids,
+                    )
                 if invalidate_req_ids:
                     invalidated_full_attention_rows += (
                         self.invalidate_full_attention_rows(invalidate_req_ids)
@@ -7969,15 +7972,14 @@ class TokenPoolDecodeBackendState:
                         token_slots_long=prepared_row.materialized_slots_long,
                         token_slot_ids=prepared_row.materialized_slot_ids,
                     )
-                if persistent_rows:
-                    for _layer_id, layer, _writer in routed_layers:
-                        release = getattr(
-                            layer,
-                            "release_dense_materialized_storage",
-                            None,
-                        )
-                        if release is not None:
-                            release(reserve_steps=append_reserve_slots)
+                for _layer_id, layer, _writer in routed_layers:
+                    release = getattr(
+                        layer,
+                        "release_dense_materialized_storage",
+                        None,
+                    )
+                    if release is not None:
+                        release(reserve_steps=append_reserve_slots)
 
             rows.append(prepared_row.row_chunks)
             req_slots.append(int(getattr(reservation, "req_slot")))

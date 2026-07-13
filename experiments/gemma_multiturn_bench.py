@@ -793,8 +793,16 @@ def run_wkvm(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[str,
                         f"{request_id} logical prompt diverged before turn {turn_index}"
                     )
             steps_before = engine.metrics.steps
+            emptied_cache_before_decode = False
             while engine.has_unfinished:
                 engine.step()
+                if (
+                    args.wkvm_empty_cache_before_decode
+                    and not emptied_cache_before_decode
+                    and all(request.output_token_ids for request in requests.values())
+                ):
+                    torch.cuda.empty_cache()
+                    emptied_cache_before_decode = True
                 if engine.metrics.steps - steps_before > args.max_steps:
                     raise RuntimeError(
                         f"WKVM turn {turn_index} did not converge within "
@@ -849,6 +857,7 @@ def run_wkvm(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[str,
                 errors=errors,
             )
             row["reuse_kind"] = "wkvm_parked_session_state"
+            row["emptied_cuda_cache_before_decode"] = emptied_cache_before_decode
             row["request_order_policy"] = args.request_order_policy
             row["request_order"] = [request_ids[index] for index in request_order]
             row["cached_tokens_source"] = (
@@ -1083,6 +1092,7 @@ def run_wkvm(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[str,
         "route_chunk": args.route_chunk,
         "verify_fresh_history_parity": args.wkvm_verify_fresh_parity,
         "fresh_history_parity_mode": args.wkvm_fresh_parity_mode,
+        "empty_cuda_cache_before_decode": args.wkvm_empty_cache_before_decode,
         "request_order_policy": args.request_order_policy,
         "request_order_seed": args.request_order_seed,
         "device": args.device,
@@ -1625,6 +1635,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--persistent-padded-decode-cuda-graph", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--persistent-padded-decode-graph-warmup-iters", type=int, default=0)
     parser.add_argument("--cuda-phase-metrics", action="store_true")
+    parser.add_argument(
+        "--wkvm-empty-cache-before-decode",
+        action="store_true",
+        help=(
+            "Release unused allocator reservations after every turn prefill and "
+            "before decode. The timed call can help near-capacity B32 runs."
+        ),
+    )
     parser.add_argument("--use-native-gemma-forward", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--native-gemma-checkpoint-loader", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--native-gemma-attention-backend", choices=["manual", "manual_gqa", "sdpa", "sdpa_single_gqa", "triton_dense_gqa"], default="sdpa_single_gqa")

@@ -3484,6 +3484,8 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         cache.update(sliding_keys, sliding_keys + 100, layer_idx=0)
         cache.update(full_keys, full_keys + 100, layer_idx=1)
         engine._caches[req.req_id] = cache
+        expected_full_keys = cache.layers[1].keys.clone()
+        expected_full_values = cache.layers[1].values.clone()
 
         engine._token_pool_commit_prefill_tokens(
             req,
@@ -3547,8 +3549,11 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
             1,
             full_metadata.kv_indices[:-1],
         )
-        self.assertTrue(torch.equal(gathered_k, full_layer.keys[0].permute(1, 0, 2)))
-        self.assertTrue(torch.equal(gathered_v, full_layer.values[0].permute(1, 0, 2)))
+        self.assertTrue(torch.equal(gathered_k, expected_full_keys[0].permute(1, 0, 2)))
+        self.assertTrue(torch.equal(gathered_v, expected_full_values[0].permute(1, 0, 2)))
+        self.assertIsNotNone(full_layer.keys)
+        self.assertIsNotNone(full_layer.values)
+        self.assertFalse(full_layer._dense_storage_released)
 
         engine._token_pool_discard_decode_reservations(reservations)
         self.assertEqual(engine._token_pool_full_attention_slots, {})
@@ -3581,6 +3586,32 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         )
         engine._token_pool_discard_decode_reservations(padded_reservations)
         self.assertEqual(engine.stats()["token_pool"]["allocated_token_slots"], 16)
+
+    def test_nonpersistent_full_attention_row_releases_dense_readout(self) -> None:
+        engine, req, cache = self._make_full_attention_token_pool_fixture(
+            req_id="nonpersistent-release"
+        )
+        full_layer = cache.layers[1]
+        self.assertIsNotNone(full_layer.keys)
+
+        reservations = engine._token_pool_prepare_decode_batch([req])
+        context = engine._token_pool_decode_context(reservations)
+
+        self.assertIsNotNone(context)
+        self.assertIn("full_attention", context.covered_layer_types)
+        self.assertIsNone(full_layer.keys)
+        self.assertIsNone(full_layer.values)
+        self.assertTrue(full_layer._dense_storage_released)
+
+        engine._token_pool_discard_decode_reservations(reservations)
+        repeated = engine._token_pool_prepare_decode_batch([req])
+        repeated_context = engine._token_pool_decode_context(repeated)
+        self.assertIsNotNone(repeated_context)
+        self.assertIn("full_attention", repeated_context.covered_layer_types)
+        self.assertIsNone(full_layer.keys)
+        self.assertIsNone(full_layer.values)
+        engine._token_pool_discard_decode_reservations(repeated)
+        engine._token_pool_release_request(req.req_id)
 
     def test_persistent_full_attention_rows_reuse_materialized_slots(self) -> None:
         import torch
@@ -4094,20 +4125,37 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
             decode_key,
             decode_value,
         )
+        original_commit_decode_token = full_layer.commit_decode_token
+
+        def commit_decode_token_in_inference_mode(key_states, value_states):
+            self.assertTrue(torch.is_inference_mode_enabled())
+            return original_commit_decode_token(key_states, value_states)
+
+        full_layer.commit_decode_token = commit_decode_token_in_inference_mode
 
         engine._token_pool_commit_decode_reservations(reservations)
 
         self.assertEqual(full_layer.cumulative_length, previous_length + 1)
+        self.assertIsNone(full_layer.keys)
+        self.assertIsNone(full_layer.values)
+        self.assertTrue(full_layer._dense_storage_released)
         self.assertTrue(
             torch.equal(
-                full_layer.keys[:, :, -1:, :],
+                full_layer._ring_k[:, :, -1:, :],
                 decode_key.permute(1, 0, 2).unsqueeze(0),
             )
         )
         self.assertTrue(
             torch.equal(
-                full_layer.values[:, :, -1:, :],
+                full_layer._ring_v[:, :, -1:, :],
                 decode_value.permute(1, 0, 2).unsqueeze(0),
+            )
+        )
+        self.assertTrue(full_layer.restore_dense_materialized_storage())
+        self.assertTrue(
+            torch.equal(
+                full_layer.keys[:, :, -1:, :],
+                decode_key.permute(1, 0, 2).unsqueeze(0),
             )
         )
         self.assertEqual(engine._token_pool_full_attention_slots, {})
