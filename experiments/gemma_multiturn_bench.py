@@ -985,7 +985,11 @@ def run_wkvm(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[str,
                         "passed": (
                             all(exact_rows)
                             if args.wkvm_fresh_parity_mode == "full-sequence"
-                            else all(first_token_exact_rows)
+                            else (
+                                all(first_token_exact_rows)
+                                if args.wkvm_fresh_parity_mode == "first-token"
+                                else None
+                            )
                         ),
                         "mismatches": mismatch_details,
                         "wall_s": round_or_none(parity_wall_s),
@@ -1001,19 +1005,32 @@ def run_wkvm(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[str,
                         ),
                     }
                 )
+            enforced = args.wkvm_fresh_parity_mode != "report-only"
             fresh_parity = {
                 "enabled": True,
                 "mode": args.wkvm_fresh_parity_mode,
-                "passed": all(row["passed"] for row in parity_turns),
+                "enforced": enforced,
+                "passed": (
+                    all(bool(row["passed"]) for row in parity_turns)
+                    if enforced
+                    else None
+                ),
                 "full_sequence_passed": all(
                     row["full_sequence_passed"] for row in parity_turns
                 ),
                 "first_token_passed": all(
                     row["first_token_passed"] for row in parity_turns
                 ),
+                "full_sequence_exact_rows": sum(
+                    row["full_sequence_exact_rows"] for row in parity_turns
+                ),
+                "first_token_exact_rows": sum(
+                    row["first_token_exact_rows"] for row in parity_turns
+                ),
+                "total_rows": sum(row["request_count"] for row in parity_turns),
                 "turns": parity_turns,
             }
-            if not fresh_parity["passed"]:
+            if fresh_parity["passed"] is False:
                 raise RuntimeError(f"WKVM fresh-history parity failed: {fresh_parity}")
     finally:
         if not closed and requests:
@@ -1582,11 +1599,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--wkvm-fresh-parity-mode",
-        choices=["full-sequence", "first-token"],
+        choices=["full-sequence", "first-token", "report-only"],
         default="full-sequence",
         help=(
             "Full-sequence requires every generated token to match; first-token "
-            "checks the continuation boundary and still reports later divergence."
+            "checks the continuation boundary; report-only records both without "
+            "turning divergence into a benchmark failure."
         ),
     )
 
