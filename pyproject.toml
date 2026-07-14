@@ -22,6 +22,11 @@ gemma-server = [
     "safetensors>=0.4.3",
     "accelerate>=1.1",
 ]
+open-webui-bench = [
+    "transformers>=5.7,<6",
+    "python-socketio[client]>=5.16,<6",
+    "websocket-client>=1.9,<2",
+]
 
 [project.scripts]
 wkvm-gemma-server = "wkvm.gemma_server:main"

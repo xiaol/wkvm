@@ -1,0 +1,221 @@
+{
+  "schema": "wkvm.open_webui_multiturn_compare.v1",
+  "created_date": "2026-07-14",
+  "source_base_commit": "ae261cab7263263bde70e71b59df11f16d212527",
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "gpu_memory_mib": 24564,
+    "driver": "595.71.05",
+    "system_memory_gib": 61
+  },
+  "open_webui": {
+    "version": "0.10.2",
+    "commit": "ecd48e2f718220a6400ecf49eafd4867a38feb10",
+    "rest_path": "/api/chat/completions",
+    "socketio_path": "/ws/socket.io",
+    "client_layout": "one_authenticated_socket_multiple_logical_conversations",
+    "persisted_conversations": 32,
+    "browser_users": 1,
+    "function_calling": "legacy",
+    "background_tasks": false,
+    "context_compaction": false,
+    "realtime_save": false,
+    "forward_user_info_headers": true
+  },
+  "workload": {
+    "sessions": 32,
+    "turns": 8,
+    "requests": 256,
+    "initial_rendered_prompt_tokens_per_session": 13824,
+    "continuation_user_content_tokens_per_request": 32,
+    "output_tokens_per_request": 128,
+    "total_generated_tokens": 32768,
+    "total_unique_application_tokens": 482304,
+    "maximum_server_context_tokens": 15232,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "ignore_eos": true,
+    "request_order": "alternating",
+    "turn_barrier": true,
+    "workload_fingerprints_identical": true,
+    "initial_content_sha256": "eba2ceaa9d22259feb26e332963ab5ee7a35befc90b6d05beda52c8bb27ac539"
+  },
+  "metric_definitions": {
+    "e2e_generated_output_tok_s": "Generated completion tokens divided by summed synchronized-turn wall time.",
+    "api_accounted_total_tok_s": "Provider usage prompt plus completion tokens divided by wall time; cumulative histories are counted again on later turns.",
+    "total_application_goodput_tok_s": "Turn-0 rendered prompts, later new user-content tokens, and generated tokens counted once, divided by wall time.",
+    "ui_path_ttft_s": "HTTP POST start to first non-empty Socket.IO chat completion content.",
+    "e2e_latency_s": "HTTP POST start to terminal Socket.IO done or error event."
+  },
+  "results": [
+    {
+      "engine": "vLLM",
+      "version": "0.24.0",
+      "raw_status": "passed",
+      "primary_accounting_passed": true,
+      "success_count": 256,
+      "error_count": 0,
+      "synchronized_wall_s": 355.921162,
+      "e2e_generated_output_tok_s": 92.065332,
+      "api_accounted_total_tok_s": 10451.440929,
+      "total_application_goodput_tok_s": 1355.086608,
+      "completed_requests_per_s": 0.71926,
+      "turn_0_output_tok_s": 99.599528,
+      "continuation_output_tok_s": 91.081072,
+      "ack_latency_s": {
+        "p50": 0.795331,
+        "p95": 1.495965,
+        "p99": 1.925272
+      },
+      "ui_path_ttft_s": {
+        "p50": 20.634006,
+        "p95": 39.58028,
+        "p99": 43.668267
+      },
+      "e2e_latency_s": {
+        "p50": 32.719583,
+        "p95": 45.858064,
+        "p99": 46.960242
+      },
+      "api_prompt_tokens": 3687121,
+      "completion_tokens": 32768,
+      "reported_cached_tokens": 85760,
+      "nonzero_cached_continuation_requests": 6,
+      "capacity": {
+        "profiled_kv_tokens": 144406,
+        "full_history_equivalents_at_15232": 9.4806985
+      },
+      "whole_gpu_memory": {
+        "baseline_used_mib": 20058,
+        "peak_used_mib": 20494,
+        "peak_delta_mib": 436
+      }
+    },
+    {
+      "engine": "SGLang",
+      "version": "0.5.14",
+      "raw_status": "passed",
+      "primary_accounting_passed": true,
+      "success_count": 256,
+      "error_count": 0,
+      "synchronized_wall_s": 605.763324,
+      "e2e_generated_output_tok_s": 54.093734,
+      "api_accounted_total_tok_s": 6136.393295,
+      "total_application_goodput_tok_s": 796.192145,
+      "completed_requests_per_s": 0.422607,
+      "turn_0_output_tok_s": 54.505888,
+      "continuation_output_tok_s": 54.035363,
+      "ack_latency_s": {
+        "p50": 0.758384,
+        "p95": 1.182918,
+        "p99": 1.317452
+      },
+      "ui_path_ttft_s": {
+        "p50": 37.920953,
+        "p95": 71.808162,
+        "p99": 74.246985
+      },
+      "e2e_latency_s": {
+        "p50": 40.558495,
+        "p95": 74.832123,
+        "p99": 76.709486
+      },
+      "api_prompt_tokens": 3684434,
+      "completion_tokens": 32768,
+      "reported_cached_tokens": 2170,
+      "capacity": {
+        "full_attention_pool_tokens": 38146,
+        "sliding_window_pool_tokens": 30516,
+        "full_history_equivalents_at_15232": 2.504333
+      },
+      "whole_gpu_memory": {
+        "baseline_used_mib": 20486,
+        "peak_used_mib": 20970,
+        "peak_delta_mib": 484
+      }
+    },
+    {
+      "engine": "WKVM",
+      "version": "0.0.1 worktree",
+      "raw_status": "failed",
+      "primary_accounting_passed": true,
+      "strict_session_reuse_passed": false,
+      "strict_failure": "engine.session_reuse_hits expected 224, got 125",
+      "success_count": 256,
+      "error_count": 0,
+      "synchronized_wall_s": 607.226151,
+      "e2e_generated_output_tok_s": 53.96342,
+      "api_accounted_total_tok_s": 6127.860261,
+      "total_application_goodput_tok_s": 794.274092,
+      "completed_requests_per_s": 0.421589,
+      "turn_0_output_tok_s": 41.755702,
+      "continuation_output_tok_s": 56.315481,
+      "ack_latency_s": {
+        "p50": 0.726683,
+        "p95": 1.107421,
+        "p99": 1.189768
+      },
+      "ui_path_ttft_s": {
+        "p50": 23.611638,
+        "p95": 53.865679,
+        "p99": 54.028541
+      },
+      "e2e_latency_s": {
+        "p50": 73.688265,
+        "p95": 97.905833,
+        "p99": 98.053056
+      },
+      "api_prompt_tokens": 3688229,
+      "completion_tokens": 32768,
+      "capacity": {
+        "state_slots": 32,
+        "maximum_resident_sessions": 32,
+        "final_parked_sessions": 32,
+        "exact_reuse_hits": 125,
+        "continuation_turns": 224,
+        "safe_session_restarts": 99,
+        "sessions_opened": 131,
+        "sessions_closed": 99,
+        "full_reprefill_turns_reported_by_engine": 0
+      },
+      "whole_gpu_memory": {
+        "baseline_used_mib": 16654,
+        "peak_used_mib": 22858,
+        "peak_delta_mib": 6204
+      }
+    }
+  ],
+  "comparisons": {
+    "vllm_vs_wkvm_output_throughput_ratio": 1.70606926,
+    "vllm_vs_wkvm_output_percent_faster": 70.606926,
+    "vllm_vs_wkvm_wall_seconds_saved": 251.304989,
+    "vllm_vs_wkvm_wall_percent_less": 41.385732,
+    "sglang_vs_wkvm_output_throughput_ratio": 1.00241486,
+    "sglang_vs_wkvm_output_percent_faster": 0.241486,
+    "sglang_vs_wkvm_wall_seconds_saved": 1.462827,
+    "wkvm_exact_reuse_percent": 55.803571,
+    "wkvm_peak_minus_vllm_mib": 2364,
+    "wkvm_peak_minus_sglang_mib": 1888
+  },
+  "raw_artifacts": [
+    {
+      "engine": "WKVM",
+      "basename": "wkvm_openwebui_b32_t8_ctx13824_out128_legacy_20260714.json",
+      "bytes": 1153164,
+      "sha256": "a0ca0bc524ac8d9de348e801c96f79f39fa47b63972b59ca46173b83383f877c"
+    },
+    {
+      "engine": "vLLM",
+      "basename": "vllm_openwebui_b32_t8_ctx13824_out128_20260714.json",
+      "bytes": 543567,
+      "sha256": "78150b4db0585167ba27fef3f33946da688f6acdd923da21d6bc9f378262cb4c"
+    },
+    {
+      "engine": "SGLang",
+      "basename": "sglang_openwebui_b32_t8_ctx13824_out128_20260714.json",
+      "bytes": 551610,
+      "sha256": "75580ba760ea39f4fe6f62d8f7395f623a7a727b9727f4ee3f424ebf70fef6d0"
+    }
+  ],
+  "raw_artifact_store_note": "Raw request-level JSON remains in the external local benchmark artifact store; this committed summary records its hashes and audited aggregates."
+}

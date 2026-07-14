@@ -23,6 +23,10 @@ from experiments.incumbent_gemma_bench import (
     vllm_request_metrics_timing,
     vllm_runtime_telemetry_sample,
 )
+from experiments.sglang_gemma_server import (
+    build_arg_parser as build_sglang_server_arg_parser,
+    server_kwargs as sglang_server_kwargs,
+)
 
 
 class TestIncumbentGemmaBench(unittest.TestCase):
@@ -500,6 +504,25 @@ class TestIncumbentGemmaBench(unittest.TestCase):
         self.assertEqual(override["num_key_value_heads"], 4)
         self.assertEqual(override["swa_num_key_value_heads"], 2)
         self.assertNotIn("vision_config", override)
+
+    def test_sglang_server_launcher_forces_text_only_mode(self) -> None:
+        args = build_sglang_server_arg_parser().parse_args(
+            ["--model-path", "/models/gemma-4-E4B-it"]
+        )
+        with mock.patch(
+            "experiments.sglang_gemma_server.sglang_language_model_override",
+            return_value={"architectures": ["Gemma4ForCausalLM"]},
+        ):
+            kwargs = sglang_server_kwargs(args)
+
+        self.assertFalse(kwargs["enable_multimodal"])
+        self.assertEqual(kwargs["context_length"], 15_232)
+        self.assertEqual(kwargs["max_running_requests"], 32)
+        self.assertEqual(kwargs["sampling_defaults"], "openai")
+        self.assertEqual(
+            json.loads(kwargs["json_model_override_args"])["architectures"],
+            ["Gemma4ForCausalLM"],
+        )
 
 
 if __name__ == "__main__":

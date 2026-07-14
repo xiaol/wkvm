@@ -8,6 +8,7 @@ import urllib.error
 import urllib.request
 import json
 import sys
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -16,6 +17,7 @@ from wkvm.gemma_server import (
     BoundedGemmaService,
     QueueFull,
     ServiceUnavailable,
+    _chat_stop_token_ids,
     apply_native_gemma_production_profile,
     engine_kwargs_from_args,
     main,
@@ -92,6 +94,203 @@ class ErrorEngine(FakeEngine):
         raise RuntimeError("synthetic engine failure")
 
 
+class FakeChatTokenizer:
+    _role_tokens = {
+        "system": 8,
+        "developer": 9,
+        "user": 10,
+        "assistant": 12,
+    }
+    _end_tokens = {
+        "system": 11,
+        "developer": 11,
+        "user": 11,
+        "assistant": 13,
+    }
+    _special_tokens = {2, 8, 9, 10, 11, 12, 13}
+    eos_token_id = 1
+    eot_token_id = 13
+
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        add_generation_prompt,
+        tokenize,
+        return_dict=False,
+    ):
+        if not add_generation_prompt or not tokenize or return_dict:
+            raise AssertionError("unexpected chat template options")
+        token_ids = [2]
+        for message in messages:
+            role = message["role"]
+            token_ids.append(self._role_tokens[role])
+            token_ids.extend(ord(character) for character in message["content"])
+            token_ids.append(self._end_tokens[role])
+        token_ids.append(self._role_tokens["assistant"])
+        return token_ids
+
+    def decode(
+        self,
+        token_ids,
+        *,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    ):
+        del clean_up_tokenization_spaces
+        return "".join(
+            chr(token_id)
+            for token_id in token_ids
+            if not skip_special_tokens or token_id not in self._special_tokens
+        )
+
+
+class FakeSessionArena:
+    def __init__(self, engine, num_slots=2):
+        self.engine = engine
+        self.num_slots = num_slots
+
+    def num_free_slots(self):
+        resident = len(self.engine.scheduler.running) + len(self.engine.scheduler.parked)
+        return max(0, self.num_slots - resident)
+
+
+class FakeSessionTrace:
+    def __init__(self, req_id, finish_reason="length", error=None):
+        self.req_id = req_id
+        self.finish_reason = finish_reason
+        self.error = error
+
+    def as_dict(self):
+        return {
+            "req_id": self.req_id,
+            "finish_reason": self.finish_reason,
+            "error": self.error,
+        }
+
+
+class FakeSessionEngine:
+    def __init__(self, num_slots=2):
+        self.scheduler = SimpleNamespace(
+            waiting=deque(),
+            running=[],
+            parked={},
+            requests={},
+            config=SimpleNamespace(max_running_requests=num_slots),
+        )
+        self.arena = FakeSessionArena(self, num_slots=num_slots)
+        self.finished_traces = {}
+        self.started = []
+        self.continuations = []
+        self.closed_sessions = []
+
+    @property
+    def has_unfinished(self):
+        return bool(self.scheduler.waiting or self.scheduler.running)
+
+    def add_session_request(self, request, *, break_mask=None):
+        self.scheduler.requests[request.req_id] = request
+        self.scheduler.waiting.append(request)
+        self.started.append((request.req_id, list(request.prompt_token_ids), break_mask))
+
+    def continue_session_requests(
+        self,
+        continuations,
+        *,
+        max_new_tokens,
+        break_masks=None,
+    ):
+        for req_id, tokens in continuations.items():
+            request = self.scheduler.parked.pop(req_id)
+            request.prompt_token_ids.extend(request.output_token_ids)
+            request.prompt_token_ids.extend(tokens)
+            request.output_token_ids.clear()
+            request.max_new_tokens = max_new_tokens
+            request.status = type(request.status).RUNNING
+            request.parked_finish_status = None
+            self.scheduler.running.append(request)
+            self.continuations.append(
+                (req_id, list(tokens), None if break_masks is None else break_masks[req_id])
+            )
+
+    def step(self):
+        from wkvm.core.request import RequestStatus
+
+        while self.scheduler.waiting and len(self.scheduler.running) < self.arena.num_slots:
+            request = self.scheduler.waiting.popleft()
+            request.status = RequestStatus.RUNNING
+            self.scheduler.running.append(request)
+        completed = []
+        for request in list(self.scheduler.running):
+            output = [65, 13][: request.max_new_tokens]
+            request.output_token_ids.extend(output)
+            request.parked_finish_status = RequestStatus.FINISHED_LENGTH
+            request.status = RequestStatus.PARKED
+            self.scheduler.running.remove(request)
+            self.scheduler.parked[request.req_id] = request
+            self.finished_traces[request.req_id] = FakeSessionTrace(request.req_id)
+            completed.append(request)
+        return completed
+
+    def close_sessions(self, req_ids):
+        from wkvm.core.request import RequestStatus
+
+        closed = []
+        for req_id in req_ids:
+            request = self.scheduler.parked.pop(req_id)
+            request.status = RequestStatus.FINISHED_CLOSED
+            request.parked_finish_status = None
+            self.closed_sessions.append(req_id)
+            closed.append(request)
+        return closed
+
+    def abort_request(self, req_id):
+        from wkvm.core.request import RequestStatus
+
+        request = self.scheduler.requests.get(req_id)
+        if request is None:
+            return
+        try:
+            self.scheduler.waiting.remove(request)
+        except ValueError:
+            pass
+        if request in self.scheduler.running:
+            self.scheduler.running.remove(request)
+        self.scheduler.parked.pop(req_id, None)
+        request.status = RequestStatus.FINISHED_ABORTED
+
+    def fail_unfinished(self, error):
+        from wkvm.core.request import RequestStatus
+
+        for request in self.scheduler.requests.values():
+            if not request.status.is_finished:
+                request.status = RequestStatus.FINISHED_ERROR
+                self.finished_traces[request.req_id] = FakeSessionTrace(
+                    request.req_id,
+                    finish_reason="error",
+                    error=error,
+                )
+        self.scheduler.waiting.clear()
+        self.scheduler.running.clear()
+        self.scheduler.parked.clear()
+
+    def stats(self):
+        return {
+            "queue_depth": len(self.scheduler.waiting),
+            "parked_sessions": len(self.scheduler.parked),
+        }
+
+
+class NeverFinishSessionEngine(FakeSessionEngine):
+    def step(self):
+        time.sleep(0.01)
+        while self.scheduler.waiting and len(self.scheduler.running) < self.arena.num_slots:
+            request = self.scheduler.waiting.popleft()
+            request.status = type(request.status).RUNNING
+            self.scheduler.running.append(request)
+        return []
+
+
 class FatalAfterStepEngine(FakeEngine):
     def __init__(self):
         super().__init__()
@@ -155,6 +354,7 @@ class SigtermServer:
 class TestGemmaServerEngineArgs(unittest.TestCase):
     def test_native_forward_flags_are_passed_to_engine_kwargs(self) -> None:
         args = SimpleNamespace(
+            prefill_microbatch_rows=1,
             decode_microbatch_rows=8,
             decode_microbatch_bytes=370_000_000,
             decode_batch_planner="length_bucketed",
@@ -163,6 +363,7 @@ class TestGemmaServerEngineArgs(unittest.TestCase):
             disable_persistent_exact_decode=True,
             disable_persistent_padded_decode=False,
             persistent_padded_decode_steps=128,
+            persistent_padded_full_attention_rows=False,
             persistent_padded_decode_cuda_graph=True,
             persistent_padded_decode_graph_warmup_iters=5,
             persistent_padded_sliding_metadata_padding=True,
@@ -181,6 +382,7 @@ class TestGemmaServerEngineArgs(unittest.TestCase):
 
         kwargs = engine_kwargs_from_args(args)
 
+        self.assertEqual(kwargs["prefill_microbatch_rows"], 1)
         self.assertEqual(kwargs["decode_microbatch_rows"], 8)
         self.assertEqual(kwargs["decode_microbatch_bytes"], 370_000_000)
         self.assertEqual(kwargs["decode_batch_planner"], "length_bucketed")
@@ -189,6 +391,7 @@ class TestGemmaServerEngineArgs(unittest.TestCase):
         self.assertFalse(kwargs["persistent_exact_decode"])
         self.assertTrue(kwargs["persistent_padded_decode"])
         self.assertEqual(kwargs["persistent_padded_decode_steps"], 128)
+        self.assertFalse(kwargs["persistent_padded_full_attention_rows"])
         self.assertTrue(kwargs["persistent_padded_decode_cuda_graph"])
         self.assertEqual(kwargs["persistent_padded_decode_graph_warmup_iters"], 5)
         self.assertTrue(kwargs["persistent_padded_sliding_metadata_padding"])
@@ -203,6 +406,23 @@ class TestGemmaServerEngineArgs(unittest.TestCase):
         self.assertEqual(kwargs["token_pool_capacity"], 49_152)
         self.assertEqual(kwargs["token_pool_paged_block_size"], 64)
         self.assertEqual(kwargs["finished_trace_limit"], 128)
+
+    def test_chat_stop_tokens_are_opt_in_and_can_be_ignored(self) -> None:
+        full_config = SimpleNamespace(eos_token_id=[1, 2])
+        tokenizer = SimpleNamespace(eos_token_id=1, eot_token_id=106)
+
+        self.assertEqual(
+            _chat_stop_token_ids(full_config, None, ignore_eos=False),
+            frozenset(),
+        )
+        self.assertEqual(
+            _chat_stop_token_ids(full_config, tokenizer, ignore_eos=False),
+            frozenset({1, 2, 106}),
+        )
+        self.assertEqual(
+            _chat_stop_token_ids(full_config, tokenizer, ignore_eos=True),
+            frozenset(),
+        )
 
     def test_production_profile_enables_checkpoint_native_graph_profile(self) -> None:
         args = SimpleNamespace(
@@ -261,6 +481,30 @@ class TestGemmaServerEngineArgs(unittest.TestCase):
 
 
 class TestBoundedGemmaService(unittest.TestCase):
+    def test_batch_wait_is_not_shortened_by_enqueue_notifications(self) -> None:
+        engine = FakeEngine()
+        original_step = engine.step
+        step_times = []
+
+        def recorded_step():
+            step_times.append(time.perf_counter())
+            return original_step()
+
+        engine.step = recorded_step
+        service = BoundedGemmaService(engine, max_queue=4, batch_wait_s=0.05)
+        started = time.perf_counter()
+        try:
+            service.submit(prompt_ids=[1], max_tokens=1, req_id="first")
+            time.sleep(0.01)
+            service.submit(prompt_ids=[2], max_tokens=1, req_id="second")
+            deadline = time.perf_counter() + 2
+            while not step_times and time.perf_counter() < deadline:
+                time.sleep(0.005)
+            self.assertTrue(step_times)
+            self.assertGreaterEqual(step_times[0] - started, 0.04)
+        finally:
+            service.close()
+
     def test_run_server_closes_service_and_restores_sigterm_handler(self) -> None:
         service = BoundedGemmaService(FakeEngine(), max_queue=2, batch_wait_s=0.0)
         server = SigtermServer()
@@ -1120,6 +1364,393 @@ class TestBoundedGemmaService(unittest.TestCase):
             self.assertEqual(metrics["tracked_requests"], 2)
             self.assertEqual(metrics["completed_tracked_requests"], 2)
         finally:
+            service.close()
+
+
+class TestOpenAIChatCompatibility(unittest.TestCase):
+    @staticmethod
+    def _start_server(engine, **serve_kwargs):
+        service = BoundedGemmaService(engine, max_queue=8, batch_wait_s=0.0)
+        server = serve(service, port=0, **serve_kwargs)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return service, server, thread
+
+    @staticmethod
+    def _stop_server(service, server, thread):
+        service.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    @staticmethod
+    def _post(host, port, path, body, headers=None):
+        request = urllib.request.Request(
+            f"http://{host}:{port}{path}",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json", **(headers or {})},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, response.headers, response.read()
+
+    @staticmethod
+    def _sse_events(body):
+        events = []
+        for block in body.decode().strip().split("\n\n"):
+            data_line = next(
+                line for line in block.splitlines() if line.startswith("data:")
+            )
+            data = data_line.removeprefix("data:").strip()
+            events.append(data if data == "[DONE]" else json.loads(data))
+        return events
+
+    def test_models_discovery_and_blocking_chat_response(self) -> None:
+        service, server, thread = self._start_server(
+            StepwiseEngine(),
+            tokenizer=FakeChatTokenizer(),
+            model_id="gemma-test",
+            ignore_eos=True,
+        )
+        host, port = server.server_address
+        try:
+            with urllib.request.urlopen(
+                f"http://{host}:{port}/v1/models", timeout=5
+            ) as response:
+                models = json.loads(response.read())
+            self.assertEqual(models["object"], "list")
+            self.assertEqual(models["data"][0]["id"], "gemma-test")
+            self.assertEqual(models["data"][0]["owned_by"], "wkvm")
+
+            status, headers, raw = self._post(
+                host,
+                port,
+                "/v1/chat/completions",
+                {
+                    "model": "gemma-test",
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "max_tokens": 2,
+                    "temperature": 0,
+                    "ignore_eos": True,
+                    "stream": False,
+                    "request_id": "chat-block",
+                },
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(headers.get_content_type(), "application/json")
+            out = json.loads(raw)
+            self.assertEqual(out["id"], "chat-block")
+            self.assertEqual(out["object"], "chat.completion")
+            self.assertEqual(out["choices"][0]["message"], {"role": "assistant", "content": "de"})
+            self.assertEqual(out["choices"][0]["finish_reason"], "length")
+            self.assertEqual(out["usage"]["completion_tokens"], 2)
+        finally:
+            self._stop_server(service, server, thread)
+
+    def test_chat_rejects_per_request_eos_policy_mismatch(self) -> None:
+        service, server, thread = self._start_server(
+            StepwiseEngine(),
+            tokenizer=FakeChatTokenizer(),
+            model_id="gemma-test",
+            ignore_eos=False,
+        )
+        host, port = server.server_address
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                self._post(
+                    host,
+                    port,
+                    "/v1/chat/completions",
+                    {
+                        "model": "gemma-test",
+                        "messages": [{"role": "user", "content": "Hi"}],
+                        "max_tokens": 2,
+                        "temperature": 0,
+                        "ignore_eos": True,
+                    },
+                )
+            self.assertEqual(raised.exception.code, 400)
+            error = json.loads(raised.exception.read())
+            self.assertIn("server EOS policy", error["error"])
+        finally:
+            self._stop_server(service, server, thread)
+
+    def test_streaming_chat_reuses_openwebui_session_prefix(self) -> None:
+        engine = FakeSessionEngine(num_slots=2)
+        tokenizer = FakeChatTokenizer()
+        service, server, thread = self._start_server(
+            engine,
+            tokenizer=tokenizer,
+            model_id="gemma-test",
+        )
+        host, port = server.server_address
+        try:
+            first_messages = [{"role": "user", "content": "Hi"}]
+            _, _, first_raw = self._post(
+                host,
+                port,
+                "/v1/chat/completions",
+                {
+                    "model": "gemma-test",
+                    "messages": first_messages,
+                    "max_tokens": 2,
+                    "temperature": 0,
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                    "request_id": "chat-turn-1",
+                },
+                {"X-OpenWebUI-Chat-Id": "chat-123"},
+            )
+            first_events = self._sse_events(first_raw)
+            first_text = "".join(
+                event["choices"][0]["delta"].get("content", "")
+                for event in first_events
+                if isinstance(event, dict) and event.get("choices")
+            )
+            self.assertEqual(first_text, "A")
+            self.assertEqual(first_events[-1], "[DONE]")
+
+            second_messages = [
+                *first_messages,
+                {"role": "assistant", "content": "A"},
+                {"role": "user", "content": "Next"},
+            ]
+            _, _, second_raw = self._post(
+                host,
+                port,
+                "/v1/chat/completions",
+                {
+                    "model": "gemma-test",
+                    "messages": second_messages,
+                    "max_tokens": 2,
+                    "temperature": 0,
+                    "stream": True,
+                    "request_id": "chat-turn-2",
+                },
+                {"X-OpenWebUI-Chat-Id": "chat-123"},
+            )
+            second_events = self._sse_events(second_raw)
+            second_text = "".join(
+                event["choices"][0]["delta"].get("content", "")
+                for event in second_events
+                if isinstance(event, dict) and event.get("choices")
+            )
+            self.assertEqual(second_text, "A")
+            self.assertEqual(len(engine.started), 1)
+            self.assertEqual(len(engine.continuations), 1)
+            continuation = engine.continuations[0][1]
+            first_prompt = tokenizer.apply_chat_template(
+                first_messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=False,
+            )
+            second_prompt = tokenizer.apply_chat_template(
+                second_messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=False,
+            )
+            self.assertEqual(continuation, second_prompt[len(first_prompt) + 2 :])
+            self.assertFalse(engine.closed_sessions)
+        finally:
+            self._stop_server(service, server, thread)
+
+    def test_openwebui_session_identity_isolated_by_user(self) -> None:
+        engine = FakeSessionEngine(num_slots=2)
+        service, server, thread = self._start_server(
+            engine,
+            tokenizer=FakeChatTokenizer(),
+            model_id="gemma-test",
+        )
+        host, port = server.server_address
+        try:
+            first_messages = [{"role": "user", "content": "Hi"}]
+            self._post(
+                host,
+                port,
+                "/v1/chat/completions",
+                {
+                    "model": "gemma-test",
+                    "messages": first_messages,
+                    "max_tokens": 2,
+                    "temperature": 0,
+                    "request_id": "user-a-turn",
+                },
+                {
+                    "X-OpenWebUI-User-Id": "user-a",
+                    "X-OpenWebUI-Chat-Id": "shared-chat-id",
+                },
+            )
+            self._post(
+                host,
+                port,
+                "/v1/chat/completions",
+                {
+                    "model": "gemma-test",
+                    "messages": [
+                        *first_messages,
+                        {"role": "assistant", "content": "A"},
+                        {"role": "user", "content": "Next"},
+                    ],
+                    "max_tokens": 2,
+                    "temperature": 0,
+                    "request_id": "user-b-turn",
+                },
+                {
+                    "X-OpenWebUI-User-Id": "user-b",
+                    "X-OpenWebUI-Chat-Id": "shared-chat-id",
+                },
+            )
+
+            self.assertEqual(len(engine.started), 2)
+            self.assertFalse(engine.continuations)
+            self.assertFalse(engine.closed_sessions)
+            self.assertEqual(service.metrics()["server"]["chat_sessions"], 2)
+        finally:
+            self._stop_server(service, server, thread)
+
+    def test_prefix_mismatch_restarts_and_retires_old_session(self) -> None:
+        engine = FakeSessionEngine(num_slots=1)
+        service = BoundedGemmaService(
+            engine,
+            max_queue=4,
+            batch_wait_s=0.0,
+            max_chat_sessions=1,
+        )
+        try:
+            list(
+                service.stream_chat(
+                    prompt_ids=[1, 2],
+                    max_tokens=2,
+                    session_id="session",
+                    req_id="turn-1",
+                    break_mask=[False, False],
+                )
+            )
+            old_engine_id = engine.started[0][0]
+            list(
+                service.stream_chat(
+                    prompt_ids=[1, 3, 4],
+                    max_tokens=2,
+                    session_id="session",
+                    req_id="turn-2",
+                    break_mask=[False, False, False],
+                )
+            )
+            self.assertEqual(len(engine.started), 2)
+            self.assertFalse(engine.continuations)
+            self.assertEqual(engine.closed_sessions, [old_engine_id])
+            self.assertNotIn(old_engine_id, engine.scheduler.requests)
+        finally:
+            service.close()
+
+    def test_chat_cohort_empties_cuda_cache_once_per_turn(self) -> None:
+        empty_cache_calls = []
+        engine = FakeSessionEngine(num_slots=1)
+        service = BoundedGemmaService(
+            engine,
+            max_queue=4,
+            batch_wait_s=0.0,
+            cuda_empty_cache=lambda: empty_cache_calls.append(time.perf_counter()),
+        )
+        try:
+            list(
+                service.stream_chat(
+                    prompt_ids=[1],
+                    max_tokens=2,
+                    session_id="session",
+                    req_id="turn-1",
+                )
+            )
+            list(
+                service.stream_chat(
+                    prompt_ids=[1, 65, 13, 2],
+                    max_tokens=2,
+                    session_id="session",
+                    req_id="turn-2",
+                )
+            )
+            self.assertEqual(len(empty_cache_calls), 2)
+            server_metrics = service.metrics()["server"]
+            self.assertTrue(server_metrics["empty_cuda_cache_before_decode"])
+            self.assertEqual(server_metrics["cuda_empty_cache_calls"], 2)
+        finally:
+            service.close()
+
+    def test_lru_and_ttl_retire_parked_session_history(self) -> None:
+        engine = FakeSessionEngine(num_slots=1)
+        service = BoundedGemmaService(
+            engine,
+            max_queue=4,
+            batch_wait_s=0.0,
+            max_chat_sessions=1,
+            chat_session_ttl_s=0.02,
+        )
+        try:
+            list(
+                service.stream_chat(
+                    prompt_ids=[1],
+                    max_tokens=1,
+                    session_id="first",
+                    req_id="first-turn",
+                )
+            )
+            first_engine_id = engine.started[0][0]
+            deadline = time.perf_counter() + 2
+            while first_engine_id not in engine.closed_sessions and time.perf_counter() < deadline:
+                time.sleep(0.01)
+            self.assertIn(first_engine_id, engine.closed_sessions)
+            self.assertNotIn(first_engine_id, engine.scheduler.requests)
+            self.assertEqual(service.metrics()["server"]["chat_sessions"], 0)
+            service.chat_session_ttl_s = 60.0
+
+            list(
+                service.stream_chat(
+                    prompt_ids=[2],
+                    max_tokens=1,
+                    session_id="second",
+                    req_id="second-turn",
+                )
+            )
+            list(
+                service.stream_chat(
+                    prompt_ids=[3],
+                    max_tokens=1,
+                    session_id="third",
+                    req_id="third-turn",
+                )
+            )
+            second_engine_id = engine.started[1][0]
+            self.assertIn(second_engine_id, engine.closed_sessions)
+            self.assertNotIn(second_engine_id, engine.scheduler.requests)
+        finally:
+            service.close()
+
+    def test_same_session_rejects_overlapping_turn(self) -> None:
+        service = BoundedGemmaService(
+            NeverFinishSessionEngine(num_slots=1),
+            max_queue=4,
+            batch_wait_s=0.0,
+        )
+        first = service.stream_chat(
+            prompt_ids=[1],
+            max_tokens=2,
+            session_id="busy",
+            req_id="turn-1",
+        )
+        try:
+            self.assertEqual(next(first)["type"], "queued")
+            second = service.stream_chat(
+                prompt_ids=[1, 2],
+                max_tokens=2,
+                session_id="busy",
+                req_id="turn-2",
+            )
+            with self.assertRaisesRegex(RuntimeError, "active turn"):
+                next(second)
+        finally:
+            first.close()
             service.close()
 
 
