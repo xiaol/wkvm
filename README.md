@@ -33,7 +33,7 @@ Uniform B16, 128 fixed output tokens, BF16, greedy decode, and a 19 GiB cap with
 
 See the [`final evidence audit`](experiments/results/gemma_b16_evidence_audit_20260713.md) and [`verified provenance bundle`](experiments/results/gemma_b16_evidence_bundle_20260713/README.md) for ranges, configurations, fingerprints, source identity, raw artifacts, and caveats.
 
-### High-concurrency B32 comparison (2026-07-13)
+### One-shot offered-B32 comparison (2026-07-13)
 
 Direct-engine cohort with 32 uniform 16,384-token prompts and 128 fixed output tokens on the same RTX 4090. Performance cells are `min / mean / max` over two runs. WKVM's resident count is engine-proven; vLLM/SGLang values are offered B32 with much smaller profiled full-length KV capacity and queued waves.
 
@@ -46,6 +46,20 @@ Direct-engine cohort with 32 uniform 16,384-token prompts and 128 fixed output t
 **Readout:** WKVM proves the architecture's resident-capacity benefit—32 simultaneous long-context states versus roughly three full-length KV equivalents—but not an overall B32 win. vLLM is 11.9% faster on mean E2E goodput; WKVM is 3.11x faster on the same-run decode interval; WKVM/SGLang E2E ranges overlap. All B32 rows miss the memory gate, while current-source WKVM B16 remains green at 16.797 GiB. SGLang at its lower 0.78 memory fraction passes the memory gate but cannot admit one 16K prompt under the measured desktop baseline.
 
 The experiment also fixed a high-concurrency CUDA-graph bug: lazy token-pool growth could invalidate captured buffer addresses above one decode microbatch. Graph replay now checks the pool generation and safely recaptures; guarded B24/B32 runs complete with unchanged output fingerprints. See the [`high-concurrency audit and raw artifacts`](experiments/results/gemma_high_concurrency_b32_audit_20260713.md) and [`source/artifact provenance`](experiments/results/gemma_high_concurrency_b32_provenance_20260713/README.md) for telemetry, the two-pass measurement method, graph-fault evidence, and limitations. This remains a direct-engine cohort result; a sustained HTTP ladder is still pending.
+
+### Sustained multi-turn B32 session comparison (2026-07-13)
+
+Direct-engine synchronized-turn workload on the same RTX 4090: 32 logical sessions, 8 turns, 13,824 initial tokens/session, 32 new input tokens/continuation, and 128 output tokens/request. Each turn submits 32 requests (`offered B32`), so every engine completes 256 session-turn requests and emits 32,768 tokens. Alternating request order avoids deterministic forward-scan cache thrashing.
+
+| engine | completion | retained-history evidence | turn-0 output tok/s | continuation output tok/s | all-turn output tok/s | 8-turn wall | completed req/s |
+|---|---:|---|---:|---:|---:|---:|---:|
+| vLLM 0.24.0 | 256/256 | 49,114 KV-token capacity = 3.255 full-history equivalents; about 6 full-prefix hits/continuation turn | **80.120** | **85.063** | **84.412** | **388.190s** | **0.659** |
+| WKVM current (tuned m32) | 256/256 | **32/32 parked states**, 224/224 continuation reuse hits, zero full reprefills | 32.177 | 65.507 | 57.997 | 564.990s | 0.453 |
+| SGLang 0.5.14 | 256/256 | 33,736 effective KV tokens = 2.236 full-history equivalents; about 2 full-prefix hits/continuation turn | 56.932 | 56.068 | 56.175 | 583.324s | 0.439 |
+
+**Readout:** yes, vLLM finishes the complete workload faster: **176.800s sooner than WKVM**, with 45.5% higher all-turn output throughput and 29.9% higher continuation throughput. Counting each unique application input and output token once gives the same ordering: **1,242.444 tok/s vLLM**, 853.650 WKVM, and 826.820 SGLang; this is application goodput, not model-compute throughput. WKVM is 3.24% faster overall than SGLang and retains far more long histories, but residency is a memory-capacity advantage, not automatically a speed advantage. `32 parked states` means all 32 compact WKVM histories survive between turns; it does not mean 32 rows execute simultaneously (this run decodes in two-row microbatches). Likewise, `3.255 KV equivalents` is vLLM's profiled KV-token capacity divided by one provisioned full history—not 3.255 requests completed and not a hard request-concurrency limit. vLLM accepts all 32 requests and schedules them in waves.
+
+The primary throughput number is generated output tokens divided by summed synchronized-turn wall time, so it includes prefill, queueing, cache reuse/recomputation, and decode. Counting every logical input token as fresh compute would be misleading because WKVM advances retained state while vLLM/SGLang may reuse prefix KV. The successful WKVM row required `m_slots=32`, one prefill row, two decode rows, and nonpersistent full-attention rows; the default m64 B32 attempt OOMed. Only turn-0 prompts are token-identical across engines; greedy outputs diverge, so later turns are equal-shape autonomous histories rather than token-identical requests. WKVM remains approximate routed-span semantics, not full-KV quality equivalence. See the [`sustained B32 experiment report`](experiments/results/gemma_multiturn_b32_compare_20260713.md) for turn-level data, order controls, B3 low-concurrency results, parity evidence, launch flags, artifact hashes, and limitations.
 
 **Single long prompt + long output**: 13,824-token prompt + 512-token output, greedy decode, `ignore_eos=True`.
 
