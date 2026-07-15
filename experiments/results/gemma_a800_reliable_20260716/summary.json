@@ -1,0 +1,1905 @@
+{
+  "caveats": [
+    "routed_span_approximate and full_kv are different model-state semantics",
+    "whole-device memory includes every process on the selected GPU",
+    "SGLang separate max_tokens=1 prefill is excluded from cohort-input ratios",
+    "SGLang separate-run subtraction is excluded from decode ratios"
+  ],
+  "comparisons": [
+    {
+      "B": 64,
+      "cohort_input_ratio_exclusion": null,
+      "decode_ratio_exclusion": null,
+      "denominator_engine": "vllm",
+      "median_cohort_input_ratio": 0.8681387428956311,
+      "median_comparable_decode_ratio": 4.466595658721122,
+      "median_e2e_output_ratio": 0.7927412344248044,
+      "numerator_engine": "wkvm-native",
+      "ratio_definition": "numerator_over_denominator",
+      "semantics_warning": true
+    },
+    {
+      "B": 64,
+      "cohort_input_ratio_exclusion": "incomparable_methods:same_run_max_request_ttft,separate_run_batch_wall",
+      "decode_ratio_exclusion": "separate_run_subtraction",
+      "denominator_engine": "sglang",
+      "median_cohort_input_ratio": null,
+      "median_comparable_decode_ratio": null,
+      "median_e2e_output_ratio": 1.4041188169628536,
+      "numerator_engine": "wkvm-native",
+      "ratio_definition": "numerator_over_denominator",
+      "semantics_warning": true
+    }
+  ],
+  "contract": {
+    "artifacts": [
+      {
+        "batch_sizes": [
+          64
+        ],
+        "benchmark_config": {
+          "attention_backend": "triton",
+          "chunked_prefill_size": 8192,
+          "context_length": 16432,
+          "cuda_graph_backend_decode": "full",
+          "cuda_graph_backend_prefill": "breakable",
+          "disable_radix_cache": true,
+          "language_model_only": true,
+          "max_running_requests": 32,
+          "max_total_tokens": null,
+          "mem_fraction_static": 0.83,
+          "model_override_architectures": [
+            "Gemma4ForCausalLM"
+          ],
+          "model_override_model_type": "gemma4_text",
+          "residency_telemetry_capacity": {
+            "capacity_error": null,
+            "capacity_source": "engine.get_server_info",
+            "configured_max_running_requests": 32,
+            "effective_token_capacity": 1815560
+          },
+          "separate_timing_probe_order": "full_then_max_tokens_1",
+          "sglang_version": "0.5.15.post1"
+        },
+        "engine": "sglang",
+        "engine_version": "0.5.15.post1",
+        "launch_command": "/home/aiuser/X/.venv-sglang/bin/python experiments/incumbent_gemma_bench.py --engine sglang --model-path /home/aiuser/X/models/gemma-4-E4B-it --ctx 16384 --out 32 --concurrency 64 --prompt-lengths uniform --synthetic-prompts --mem-cap-gib 80 --headroom-gib 4 --max-baseline-gpu-used-gib 1 --gpu-memory-device 7 --mem-sample-interval-s 0.1 --telemetry-sample-interval-s 0.05 --sglang-mem-fraction 0.83 --sglang-context-length 16432 --sglang-chunked-prefill-size 8192 --sglang-attention-backend triton --sglang-language-model-only --sglang-max-running-requests 32 --sglang-decode-graph full --sglang-prefill-graph breakable --sglang-log-level warning --no-warmup --stop-on-failure --json experiments/results/gemma_a800_reliable_20260716/artifacts/sglang-r1.json",
+        "model_identity": {
+          "error": null,
+          "excluded_path_patterns": [
+            ".cache/**"
+          ],
+          "file_count": 9,
+          "files": [
+            {
+              "path": ".gitattributes",
+              "sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930",
+              "size_bytes": 1570
+            },
+            {
+              "path": "README.md",
+              "sha256": "50e6a2fe120b6151091f7e36416bc61380a3916abf3e31fbc345322e00977679",
+              "size_bytes": 27169
+            },
+            {
+              "path": "chat_template.jinja",
+              "sha256": "2f1b4d75d067bae3fe44e676721c7f077d243bc007156cb9c2f8b5836613d082",
+              "size_bytes": 17336
+            },
+            {
+              "path": "config.json",
+              "sha256": "33b10c02df3c2e8536cf323d29d53262aaa2f4d11dbe19bc729373fbe90295d4",
+              "size_bytes": 5145
+            },
+            {
+              "path": "generation_config.json",
+              "sha256": "d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de",
+              "size_bytes": 208
+            },
+            {
+              "path": "model.safetensors",
+              "sha256": "cfbd3d2f1cd71bd471c37fe2bf8546d5028d41e5736f64e1ca6c6b8893125503",
+              "size_bytes": 15992595884
+            },
+            {
+              "path": "processor_config.json",
+              "sha256": "32bdf45d2ad4cc29a0822ddd157a182de76644f0419a6228d151495256e9813c",
+              "size_bytes": 1689
+            },
+            {
+              "path": "tokenizer.json",
+              "sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+              "size_bytes": 32169626
+            },
+            {
+              "path": "tokenizer_config.json",
+              "sha256": "90c3a3ba5bf53818383a58e1a776cbcacd2a038d4812eaa373e1522f2d06f3df",
+              "size_bytes": 2095
+            }
+          ],
+          "manifest_sha256": "0829868c14a87b8dc1323f17b5a0808865acd81d15d320ace171c46e2ce4f946",
+          "model_root": "/home/aiuser/X/models/gemma-4-E4B-it",
+          "schema": "wkvm.model_checkpoint_identity.sha256.v1",
+          "total_bytes": 16024820722
+        },
+        "normalized_launch_command": "/home/aiuser/X/.venv-sglang/bin/python experiments/incumbent_gemma_bench.py --engine sglang --model-path /home/aiuser/X/models/gemma-4-E4B-it --ctx 16384 --out 32 --concurrency 64 --prompt-lengths uniform --synthetic-prompts --mem-cap-gib 80 --headroom-gib 4 --max-baseline-gpu-used-gib 1 --gpu-memory-device 7 --mem-sample-interval-s 0.1 --telemetry-sample-interval-s 0.05 --sglang-mem-fraction 0.83 --sglang-context-length 16432 --sglang-chunked-prefill-size 8192 --sglang-attention-backend triton --sglang-language-model-only --sglang-max-running-requests 32 --sglang-decode-graph full --sglang-prefill-graph breakable --sglang-log-level warning --no-warmup --stop-on-failure",
+        "path": "experiments/results/gemma_a800_reliable_20260716/artifacts/sglang-r1.json",
+        "provenance": {
+          "benchmark": {
+            "git_commit": "234cc04867a93f1352d2a1c220c216b698f46560",
+            "git_worktree_dirty": false,
+            "pre_run_source_identity_sha256": "28763ceb275e942aea3b51fe516b9ed362e84a3aabf29f03b752989b9ec960c4",
+            "source_identity": {
+              "error": null,
+              "excluded_path_patterns": [
+                "experiments/results/**",
+                "**/__pycache__/**",
+                ".pytest_cache/**",
+                "**/*.egg-info/**",
+                ".venv/**",
+                "build/**",
+                "dist/**"
+              ],
+              "excluded_paths": [],
+              "git_commit": "234cc04867a93f1352d2a1c220c216b698f46560",
+              "git_head_tree": "431cfcc661e139bec44749bd68ff501f83baef35",
+              "git_status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "git_tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "git_worktree_dirty": false,
+              "identity_sha256": "28763ceb275e942aea3b51fe516b9ed362e84a3aabf29f03b752989b9ec960c4",
+              "repo_root": "/home/aiuser/X/wkvm",
+              "schema": "wkvm.git_worktree_identity.sha256.v1",
+              "scope": "git tracked and all untracked worktree files excluding declared generated artifacts",
+              "tracked_file_count": 95,
+              "untracked_file_count": 0,
+              "worktree_file_count": 95,
+              "worktree_manifest_sha256": "8a8d109b6b7b27124b41479dc92e716e3e59fdfc870a30bce99ddf79d245c0a4"
+            },
+            "source_identity_unchanged_during_run": true
+          },
+          "engine": {
+            "label": "sglang",
+            "version": "0.5.15.post1",
+            "version_source": "imported_package"
+          },
+          "gpu": {
+            "driver_version": "595.58.03",
+            "index": 7,
+            "memory_total_mib": 81920,
+            "name": "NVIDIA A800-SXM4-80GB",
+            "source": "nvidia-smi",
+            "uuid": "GPU-d14ae640-d8a8-de48-c9cc-3b73f99604f0"
+          },
+          "gpu_memory_monitor": {
+            "caveat": "includes every process on the selected physical GPU; baseline and peak are not process-attributed",
+            "device_selector": "7",
+            "device_selector_source": "explicit",
+            "sample_interval_s": 0.1,
+            "scope": "whole_device",
+            "source": "nvidia-smi"
+          },
+          "runtime": {
+            "cuda_visible_devices": "7",
+            "machine": "x86_64",
+            "packages": {
+              "sglang": "0.5.15.post1",
+              "torch": "2.11.0",
+              "transformers": "5.12.1",
+              "triton": "3.6.0",
+              "vllm": null,
+              "wkvm": "0.0.1"
+            },
+            "platform": "Linux-5.14.0-611.47.1.el9_7.x86_64-x86_64-with-glibc2.34",
+            "python_executable": "/home/aiuser/X/.venv-sglang/bin/python",
+            "python_implementation": "CPython",
+            "python_version": "3.11.8"
+          },
+          "schema": "wkvm.incumbent_gemma_bench.provenance.v1"
+        },
+        "semantics": "full_kv"
+      },
+      {
+        "batch_sizes": [
+          64
+        ],
+        "benchmark_config": {
+          "attention_backend": "triton",
+          "chunked_prefill_size": 8192,
+          "context_length": 16432,
+          "cuda_graph_backend_decode": "full",
+          "cuda_graph_backend_prefill": "breakable",
+          "disable_radix_cache": true,
+          "language_model_only": true,
+          "max_running_requests": 32,
+          "max_total_tokens": null,
+          "mem_fraction_static": 0.83,
+          "model_override_architectures": [
+            "Gemma4ForCausalLM"
+          ],
+          "model_override_model_type": "gemma4_text",
+          "residency_telemetry_capacity": {
+            "capacity_error": null,
+            "capacity_source": "engine.get_server_info",
+            "configured_max_running_requests": 32,
+            "effective_token_capacity": 1815558
+          },
+          "separate_timing_probe_order": "full_then_max_tokens_1",
+          "sglang_version": "0.5.15.post1"
+        },
+        "engine": "sglang",
+        "engine_version": "0.5.15.post1",
+        "launch_command": "/home/aiuser/X/.venv-sglang/bin/python experiments/incumbent_gemma_bench.py --engine sglang --model-path /home/aiuser/X/models/gemma-4-E4B-it --ctx 16384 --out 32 --concurrency 64 --prompt-lengths uniform --synthetic-prompts --mem-cap-gib 80 --headroom-gib 4 --max-baseline-gpu-used-gib 1 --gpu-memory-device 7 --mem-sample-interval-s 0.1 --telemetry-sample-interval-s 0.05 --sglang-mem-fraction 0.83 --sglang-context-length 16432 --sglang-chunked-prefill-size 8192 --sglang-attention-backend triton --sglang-language-model-only --sglang-max-running-requests 32 --sglang-decode-graph full --sglang-prefill-graph breakable --sglang-log-level warning --no-warmup --stop-on-failure --json experiments/results/gemma_a800_reliable_20260716/artifacts/sglang-r2.json",
+        "model_identity": {
+          "error": null,
+          "excluded_path_patterns": [
+            ".cache/**"
+          ],
+          "file_count": 9,
+          "files": [
+            {
+              "path": ".gitattributes",
+              "sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930",
+              "size_bytes": 1570
+            },
+            {
+              "path": "README.md",
+              "sha256": "50e6a2fe120b6151091f7e36416bc61380a3916abf3e31fbc345322e00977679",
+              "size_bytes": 27169
+            },
+            {
+              "path": "chat_template.jinja",
+              "sha256": "2f1b4d75d067bae3fe44e676721c7f077d243bc007156cb9c2f8b5836613d082",
+              "size_bytes": 17336
+            },
+            {
+              "path": "config.json",
+              "sha256": "33b10c02df3c2e8536cf323d29d53262aaa2f4d11dbe19bc729373fbe90295d4",
+              "size_bytes": 5145
+            },
+            {
+              "path": "generation_config.json",
+              "sha256": "d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de",
+              "size_bytes": 208
+            },
+            {
+              "path": "model.safetensors",
+              "sha256": "cfbd3d2f1cd71bd471c37fe2bf8546d5028d41e5736f64e1ca6c6b8893125503",
+              "size_bytes": 15992595884
+            },
+            {
+              "path": "processor_config.json",
+              "sha256": "32bdf45d2ad4cc29a0822ddd157a182de76644f0419a6228d151495256e9813c",
+              "size_bytes": 1689
+            },
+            {
+              "path": "tokenizer.json",
+              "sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+              "size_bytes": 32169626
+            },
+            {
+              "path": "tokenizer_config.json",
+              "sha256": "90c3a3ba5bf53818383a58e1a776cbcacd2a038d4812eaa373e1522f2d06f3df",
+              "size_bytes": 2095
+            }
+          ],
+          "manifest_sha256": "0829868c14a87b8dc1323f17b5a0808865acd81d15d320ace171c46e2ce4f946",
+          "model_root": "/home/aiuser/X/models/gemma-4-E4B-it",
+          "schema": "wkvm.model_checkpoint_identity.sha256.v1",
+          "total_bytes": 16024820722
+        },
+        "normalized_launch_command": "/home/aiuser/X/.venv-sglang/bin/python experiments/incumbent_gemma_bench.py --engine sglang --model-path /home/aiuser/X/models/gemma-4-E4B-it --ctx 16384 --out 32 --concurrency 64 --prompt-lengths uniform --synthetic-prompts --mem-cap-gib 80 --headroom-gib 4 --max-baseline-gpu-used-gib 1 --gpu-memory-device 7 --mem-sample-interval-s 0.1 --telemetry-sample-interval-s 0.05 --sglang-mem-fraction 0.83 --sglang-context-length 16432 --sglang-chunked-prefill-size 8192 --sglang-attention-backend triton --sglang-language-model-only --sglang-max-running-requests 32 --sglang-decode-graph full --sglang-prefill-graph breakable --sglang-log-level warning --no-warmup --stop-on-failure",
+        "path": "experiments/results/gemma_a800_reliable_20260716/artifacts/sglang-r2.json",
+        "provenance": {
+          "benchmark": {
+            "git_commit": "234cc04867a93f1352d2a1c220c216b698f46560",
+            "git_worktree_dirty": false,
+            "pre_run_source_identity_sha256": "28763ceb275e942aea3b51fe516b9ed362e84a3aabf29f03b752989b9ec960c4",
+            "source_identity": {
+              "error": null,
+              "excluded_path_patterns": [
+                "experiments/results/**",
+                "**/__pycache__/**",
+                ".pytest_cache/**",
+                "**/*.egg-info/**",
+                ".venv/**",
+                "build/**",
+                "dist/**"
+              ],
+              "excluded_paths": [],
+              "git_commit": "234cc04867a93f1352d2a1c220c216b698f46560",
+              "git_head_tree": "431cfcc661e139bec44749bd68ff501f83baef35",
+              "git_status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "git_tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "git_worktree_dirty": false,
+              "identity_sha256": "28763ceb275e942aea3b51fe516b9ed362e84a3aabf29f03b752989b9ec960c4",
+              "repo_root": "/home/aiuser/X/wkvm",
+              "schema": "wkvm.git_worktree_identity.sha256.v1",
+              "scope": "git tracked and all untracked worktree files excluding declared generated artifacts",
+              "tracked_file_count": 95,
+              "untracked_file_count": 0,
+              "worktree_file_count": 95,
+              "worktree_manifest_sha256": "8a8d109b6b7b27124b41479dc92e716e3e59fdfc870a30bce99ddf79d245c0a4"
+            },
+            "source_identity_unchanged_during_run": true
+          },
+          "engine": {
+            "label": "sglang",
+            "version": "0.5.15.post1",
+            "version_source": "imported_package"
+          },
+          "gpu": {
+            "driver_version": "595.58.03",
+            "index": 7,
+            "memory_total_mib": 81920,
+            "name": "NVIDIA A800-SXM4-80GB",
+            "source": "nvidia-smi",
+            "uuid": "GPU-d14ae640-d8a8-de48-c9cc-3b73f99604f0"
+          },
+          "gpu_memory_monitor": {
+            "caveat": "includes every process on the selected physical GPU; baseline and peak are not process-attributed",
+            "device_selector": "7",
+            "device_selector_source": "explicit",
+            "sample_interval_s": 0.1,
+            "scope": "whole_device",
+            "source": "nvidia-smi"
+          },
+          "runtime": {
+            "cuda_visible_devices": "7",
+            "machine": "x86_64",
+            "packages": {
+              "sglang": "0.5.15.post1",
+              "torch": "2.11.0",
+              "transformers": "5.12.1",
+              "triton": "3.6.0",
+              "vllm": null,
+              "wkvm": "0.0.1"
+            },
+            "platform": "Linux-5.14.0-611.47.1.el9_7.x86_64-x86_64-with-glibc2.34",
+            "python_executable": "/home/aiuser/X/.venv-sglang/bin/python",
+            "python_implementation": "CPython",
+            "python_version": "3.11.8"
+          },
+          "schema": "wkvm.incumbent_gemma_bench.provenance.v1"
+        },
+        "semantics": "full_kv"
+      },
+      {
+        "batch_sizes": [
+          64
+        ],
+        "benchmark_config": {
+          "attention_backend": "triton",
+          "chunked_prefill_size": 8192,
+          "context_length": 16432,
+          "cuda_graph_backend_decode": "full",
+          "cuda_graph_backend_prefill": "breakable",
+          "disable_radix_cache": true,
+          "language_model_only": true,
+          "max_running_requests": 32,
+          "max_total_tokens": null,
+          "mem_fraction_static": 0.83,
+          "model_override_architectures": [
+            "Gemma4ForCausalLM"
+          ],
+          "model_override_model_type": "gemma4_text",
+          "residency_telemetry_capacity": {
+            "capacity_error": null,
+            "capacity_source": "engine.get_server_info",
+            "configured_max_running_requests": 32,
+            "effective_token_capacity": 1815558
+          },
+          "separate_timing_probe_order": "full_then_max_tokens_1",
+          "sglang_version": "0.5.15.post1"
+        },
+        "engine": "sglang",
+        "engine_version": "0.5.15.post1",
+        "launch_command": "/home/aiuser/X/.venv-sglang/bin/python experiments/incumbent_gemma_bench.py --engine sglang --model-path /home/aiuser/X/models/gemma-4-E4B-it --ctx 16384 --out 32 --concurrency 64 --prompt-lengths uniform --synthetic-prompts --mem-cap-gib 80 --headroom-gib 4 --max-baseline-gpu-used-gib 1 --gpu-memory-device 7 --mem-sample-interval-s 0.1 --telemetry-sample-interval-s 0.05 --sglang-mem-fraction 0.83 --sglang-context-length 16432 --sglang-chunked-prefill-size 8192 --sglang-attention-backend triton --sglang-language-model-only --sglang-max-running-requests 32 --sglang-decode-graph full --sglang-prefill-graph breakable --sglang-log-level warning --no-warmup --stop-on-failure --json experiments/results/gemma_a800_reliable_20260716/artifacts/sglang-r3.json",
+        "model_identity": {
+          "error": null,
+          "excluded_path_patterns": [
+            ".cache/**"
+          ],
+          "file_count": 9,
+          "files": [
+            {
+              "path": ".gitattributes",
+              "sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930",
+              "size_bytes": 1570
+            },
+            {
+              "path": "README.md",
+              "sha256": "50e6a2fe120b6151091f7e36416bc61380a3916abf3e31fbc345322e00977679",
+              "size_bytes": 27169
+            },
+            {
+              "path": "chat_template.jinja",
+              "sha256": "2f1b4d75d067bae3fe44e676721c7f077d243bc007156cb9c2f8b5836613d082",
+              "size_bytes": 17336
+            },
+            {
+              "path": "config.json",
+              "sha256": "33b10c02df3c2e8536cf323d29d53262aaa2f4d11dbe19bc729373fbe90295d4",
+              "size_bytes": 5145
+            },
+            {
+              "path": "generation_config.json",
+              "sha256": "d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de",
+              "size_bytes": 208
+            },
+            {
+              "path": "model.safetensors",
+              "sha256": "cfbd3d2f1cd71bd471c37fe2bf8546d5028d41e5736f64e1ca6c6b8893125503",
+              "size_bytes": 15992595884
+            },
+            {
+              "path": "processor_config.json",
+              "sha256": "32bdf45d2ad4cc29a0822ddd157a182de76644f0419a6228d151495256e9813c",
+              "size_bytes": 1689
+            },
+            {
+              "path": "tokenizer.json",
+              "sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+              "size_bytes": 32169626
+            },
+            {
+              "path": "tokenizer_config.json",
+              "sha256": "90c3a3ba5bf53818383a58e1a776cbcacd2a038d4812eaa373e1522f2d06f3df",
+              "size_bytes": 2095
+            }
+          ],
+          "manifest_sha256": "0829868c14a87b8dc1323f17b5a0808865acd81d15d320ace171c46e2ce4f946",
+          "model_root": "/home/aiuser/X/models/gemma-4-E4B-it",
+          "schema": "wkvm.model_checkpoint_identity.sha256.v1",
+          "total_bytes": 16024820722
+        },
+        "normalized_launch_command": "/home/aiuser/X/.venv-sglang/bin/python experiments/incumbent_gemma_bench.py --engine sglang --model-path /home/aiuser/X/models/gemma-4-E4B-it --ctx 16384 --out 32 --concurrency 64 --prompt-lengths uniform --synthetic-prompts --mem-cap-gib 80 --headroom-gib 4 --max-baseline-gpu-used-gib 1 --gpu-memory-device 7 --mem-sample-interval-s 0.1 --telemetry-sample-interval-s 0.05 --sglang-mem-fraction 0.83 --sglang-context-length 16432 --sglang-chunked-prefill-size 8192 --sglang-attention-backend triton --sglang-language-model-only --sglang-max-running-requests 32 --sglang-decode-graph full --sglang-prefill-graph breakable --sglang-log-level warning --no-warmup --stop-on-failure",
+        "path": "experiments/results/gemma_a800_reliable_20260716/artifacts/sglang-r3.json",
+        "provenance": {
+          "benchmark": {
+            "git_commit": "234cc04867a93f1352d2a1c220c216b698f46560",
+            "git_worktree_dirty": false,
+            "pre_run_source_identity_sha256": "28763ceb275e942aea3b51fe516b9ed362e84a3aabf29f03b752989b9ec960c4",
+            "source_identity": {
+              "error": null,
+              "excluded_path_patterns": [
+                "experiments/results/**",
+                "**/__pycache__/**",
+                ".pytest_cache/**",
+                "**/*.egg-info/**",
+                ".venv/**",
+                "build/**",
+                "dist/**"
+              ],
+              "excluded_paths": [],
+              "git_commit": "234cc04867a93f1352d2a1c220c216b698f46560",
+              "git_head_tree": "431cfcc661e139bec44749bd68ff501f83baef35",
+              "git_status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "git_tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "git_worktree_dirty": false,
+              "identity_sha256": "28763ceb275e942aea3b51fe516b9ed362e84a3aabf29f03b752989b9ec960c4",
+              "repo_root": "/home/aiuser/X/wkvm",
+              "schema": "wkvm.git_worktree_identity.sha256.v1",
+              "scope": "git tracked and all untracked worktree files excluding declared generated artifacts",
+              "tracked_file_count": 95,
+              "untracked_file_count": 0,
+              "worktree_file_count": 95,
+              "worktree_manifest_sha256": "8a8d109b6b7b27124b41479dc92e716e3e59fdfc870a30bce99ddf79d245c0a4"
+            },
+            "source_identity_unchanged_during_run": true
+          },
+          "engine": {
+            "label": "sglang",
+            "version": "0.5.15.post1",
+            "version_source": "imported_package"
+          },
+          "gpu": {
+            "driver_version": "595.58.03",
+            "index": 7,
+            "memory_total_mib": 81920,
+            "name": "NVIDIA A800-SXM4-80GB",
+            "source": "nvidia-smi",
+            "uuid": "GPU-d14ae640-d8a8-de48-c9cc-3b73f99604f0"
+          },
+          "gpu_memory_monitor": {
+            "caveat": "includes every process on the selected physical GPU; baseline and peak are not process-attributed",
+            "device_selector": "7",
+            "device_selector_source": "explicit",
+            "sample_interval_s": 0.1,
+            "scope": "whole_device",
+            "source": "nvidia-smi"
+          },
+          "runtime": {
+            "cuda_visible_devices": "7",
+            "machine": "x86_64",
+            "packages": {
+              "sglang": "0.5.15.post1",
+              "torch": "2.11.0",
+              "transformers": "5.12.1",
+              "triton": "3.6.0",
+              "vllm": null,
+              "wkvm": "0.0.1"
+            },
+            "platform": "Linux-5.14.0-611.47.1.el9_7.x86_64-x86_64-with-glibc2.34",
+            "python_executable": "/home/aiuser/X/.venv-sglang/bin/python",
+            "python_implementation": "CPython",
+            "python_version": "3.11.8"
+          },
+          "schema": "wkvm.incumbent_gemma_bench.provenance.v1"
+        },
+        "semantics": "full_kv"
+      },
+      {
+        "batch_sizes": [
+          64
+        ],
+        "benchmark_config": {
+          "compilation_config": null,
+          "decode_timing_fallback_comparable": false,
+          "decode_timing_preferred_method": "same_run_request_metrics",
+          "enforce_eager": false,
+          "gpu_memory_utilization": 0.92,
+          "language_model_only": true,
+          "max_model_len": 16432,
+          "max_num_batched_tokens": 16384,
+          "max_num_seqs": 64,
+          "mm_note": "limit_mm_per_prompt={image:0,audio:0}",
+          "prefix_caching": false,
+          "request_metrics_enabled": true,
+          "residency_telemetry_capacity": {
+            "capacity_estimated": false,
+            "capacity_source": "llm.llm_engine.vllm_config.cache_config",
+            "kv_max_concurrency": 64.45752359800112,
+            "kv_token_capacity": 1059166
+          },
+          "vllm_version": "0.25.1"
+        },
+        "engine": "vllm",
+        "engine_version": "0.25.1",
+        "launch_command": "/home/aiuser/X/.venv-vllm/bin/python experiments/incumbent_gemma_bench.py --engine vllm --model-path /home/aiuser/X/models/gemma-4-E4B-it --ctx 16384 --out 32 --concurrency 64 --prompt-lengths uniform --synthetic-prompts --mem-cap-gib 80 --headroom-gib 4 --max-baseline-gpu-used-gib 1 --gpu-memory-device 7 --mem-sample-interval-s 0.1 --telemetry-sample-interval-s 0.05 --max-model-len 16432 --vllm-gpu-mem-util 0.92 --vllm-max-num-batched-tokens 16384 --vllm-language-model-only --no-warmup --stop-on-failure --json experiments/results/gemma_a800_reliable_20260716/artifacts/vllm-r1.json",
+        "model_identity": {
+          "error": null,
+          "excluded_path_patterns": [
+            ".cache/**"
+          ],
+          "file_count": 9,
+          "files": [
+            {
+              "path": ".gitattributes",
+              "sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930",
+              "size_bytes": 1570
+            },
+            {
+              "path": "README.md",
+              "sha256": "50e6a2fe120b6151091f7e36416bc61380a3916abf3e31fbc345322e00977679",
+              "size_bytes": 27169
+            },
+            {
+              "path": "chat_template.jinja",
+              "sha256": "2f1b4d75d067bae3fe44e676721c7f077d243bc007156cb9c2f8b5836613d082",
+              "size_bytes": 17336
+            },
+            {
+              "path": "config.json",
+              "sha256": "33b10c02df3c2e8536cf323d29d53262aaa2f4d11dbe19bc729373fbe90295d4",
+              "size_bytes": 5145
+            },
+            {
+              "path": "generation_config.json",
+              "sha256": "d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de",
+              "size_bytes": 208
+            },
+            {
+              "path": "model.safetensors",
+              "sha256": "cfbd3d2f1cd71bd471c37fe2bf8546d5028d41e5736f64e1ca6c6b8893125503",
+              "size_bytes": 15992595884
+            },
+            {
+              "path": "processor_config.json",
+              "sha256": "32bdf45d2ad4cc29a0822ddd157a182de76644f0419a6228d151495256e9813c",
+              "size_bytes": 1689
+            },
+            {
+              "path": "tokenizer.json",
+              "sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+              "size_bytes": 32169626
+            },
+            {
+              "path": "tokenizer_config.json",
+              "sha256": "90c3a3ba5bf53818383a58e1a776cbcacd2a038d4812eaa373e1522f2d06f3df",
+              "size_bytes": 2095
+            }
+          ],
+          "manifest_sha256": "0829868c14a87b8dc1323f17b5a0808865acd81d15d320ace171c46e2ce4f946",
+          "model_root": "/home/aiuser/X/models/gemma-4-E4B-it",
+          "schema": "wkvm.model_checkpoint_identity.sha256.v1",
+          "total_bytes": 16024820722
+        },
+        "normalized_launch_command": "/home/aiuser/X/.venv-vllm/bin/python experiments/incumbent_gemma_bench.py --engine vllm --model-path /home/aiuser/X/models/gemma-4-E4B-it --ctx 16384 --out 32 --concurrency 64 --prompt-lengths uniform --synthetic-prompts --mem-cap-gib 80 --headroom-gib 4 --max-baseline-gpu-used-gib 1 --gpu-memory-device 7 --mem-sample-interval-s 0.1 --telemetry-sample-interval-s 0.05 --max-model-len 16432 --vllm-gpu-mem-util 0.92 --vllm-max-num-batched-tokens 16384 --vllm-language-model-only --no-warmup --stop-on-failure",
+        "path": "experiments/results/gemma_a800_reliable_20260716/artifacts/vllm-r1.json",
+        "provenance": {
+          "benchmark": {
+            "git_commit": "234cc04867a93f1352d2a1c220c216b698f46560",
+            "git_worktree_dirty": false,
+            "pre_run_source_identity_sha256": "28763ceb275e942aea3b51fe516b9ed362e84a3aabf29f03b752989b9ec960c4",
+            "source_identity": {
+              "error": null,
+              "excluded_path_patterns": [
+                "experiments/results/**",
+                "**/__pycache__/**",
+                ".pytest_cache/**",
+                "**/*.egg-info/**",
+                ".venv/**",
+                "build/**",
+                "dist/**"
+              ],
+              "excluded_paths": [],
+              "git_commit": "234cc04867a93f1352d2a1c220c216b698f46560",
+              "git_head_tree": "431cfcc661e139bec44749bd68ff501f83baef35",
+              "git_status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "git_tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "git_worktree_dirty": false,
+              "identity_sha256": "28763ceb275e942aea3b51fe516b9ed362e84a3aabf29f03b752989b9ec960c4",
+              "repo_root": "/home/aiuser/X/wkvm",
+              "schema": "wkvm.git_worktree_identity.sha256.v1",
+              "scope": "git tracked and all untracked worktree files excluding declared generated artifacts",
+              "tracked_file_count": 95,
+              "untracked_file_count": 0,
+              "worktree_file_count": 95,
+              "worktree_manifest_sha256": "8a8d109b6b7b27124b41479dc92e716e3e59fdfc870a30bce99ddf79d245c0a4"
+            },
+            "source_identity_unchanged_during_run": true
+          },
+          "engine": {
+            "label": "vllm",
+            "version": "0.25.1",
+            "version_source": "imported_package"
+          },
+          "gpu": {
+            "driver_version": "595.58.03",
+            "index": 7,
+            "memory_total_mib": 81920,
+            "name": "NVIDIA A800-SXM4-80GB",
+            "source": "nvidia-smi",
+            "uuid": "GPU-d14ae640-d8a8-de48-c9cc-3b73f99604f0"
+          },
+          "gpu_memory_monitor": {
+            "caveat": "includes every process on the selected physical GPU; baseline and peak are not process-attributed",
+            "device_selector": "7",
+            "device_selector_source": "explicit",
+            "sample_interval_s": 0.1,
+            "scope": "whole_device",
+            "source": "nvidia-smi"
+          },
+          "runtime": {
+            "cuda_visible_devices": "7",
+            "machine": "x86_64",
+            "packages": {
+              "sglang": null,
+              "torch": "2.11.0",
+              "transformers": "5.13.1",
+              "triton": "3.6.0",
+              "vllm": "0.25.1",
+              "wkvm": "0.0.1"
+            },
+            "platform": "Linux-5.14.0-611.47.1.el9_7.x86_64-x86_64-with-glibc2.34",
+            "python_executable": "/home/aiuser/X/.venv-vllm/bin/python",
+            "python_implementation": "CPython",
+            "python_version": "3.11.8"
+          },
+          "schema": "wkvm.incumbent_gemma_bench.provenance.v1"
+        },
+        "semantics": "full_kv"
+      },
+      {
+        "batch_sizes": [
+          64
+        ],
+        "benchmark_config": {
+          "compilation_config": null,
+          "decode_timing_fallback_comparable": false,
+          "decode_timing_preferred_method": "same_run_request_metrics",
+          "enforce_eager": false,
+          "gpu_memory_utilization": 0.92,
+          "language_model_only": true,
+          "max_model_len": 16432,
+          "max_num_batched_tokens": 16384,
+          "max_num_seqs": 64,
+          "mm_note": "limit_mm_per_prompt={image:0,audio:0}",
+          "prefix_caching": false,
+          "request_metrics_enabled": true,
+          "residency_telemetry_capacity": {
+            "capacity_estimated": false,
+            "capacity_source": "llm.llm_engine.vllm_config.cache_config",
+            "kv_max_concurrency": 64.45752359800112,
+            "kv_token_capacity": 1059166
+          },
+          "vllm_version": "0.25.1"
+        },
+        "engine": "vllm",
+        "engine_version": "0.25.1",
+        "launch_command": "/home/aiuser/X/.venv-vllm/bin/python experiments/incumbent_gemma_bench.py --engine vllm --model-path /home/aiuser/X/models/gemma-4-E4B-it --ctx 16384 --out 32 --concurrency 64 --prompt-lengths uniform --synthetic-prompts --mem-cap-gib 80 --headroom-gib 4 --max-baseline-gpu-used-gib 1 --gpu-memory-device 7 --mem-sample-interval-s 0.1 --telemetry-sample-interval-s 0.05 --max-model-len 16432 --vllm-gpu-mem-util 0.92 --vllm-max-num-batched-tokens 16384 --vllm-language-model-only --no-warmup --stop-on-failure --json experiments/results/gemma_a800_reliable_20260716/artifacts/vllm-r2.json",
+        "model_identity": {
+          "error": null,
+          "excluded_path_patterns": [
+            ".cache/**"
+          ],
+          "file_count": 9,
+          "files": [
+            {
+              "path": ".gitattributes",
+              "sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930",
+              "size_bytes": 1570
+            },
+            {
+              "path": "README.md",
+              "sha256": "50e6a2fe120b6151091f7e36416bc61380a3916abf3e31fbc345322e00977679",
+              "size_bytes": 27169
+            },
+            {
+              "path": "chat_template.jinja",
+              "sha256": "2f1b4d75d067bae3fe44e676721c7f077d243bc007156cb9c2f8b5836613d082",
+              "size_bytes": 17336
+            },
+            {
+              "path": "config.json",
+              "sha256": "33b10c02df3c2e8536cf323d29d53262aaa2f4d11dbe19bc729373fbe90295d4",
+              "size_bytes": 5145
+            },
+            {
+              "path": "generation_config.json",
+              "sha256": "d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de",
+              "size_bytes": 208
+            },
+            {
+              "path": "model.safetensors",
+              "sha256": "cfbd3d2f1cd71bd471c37fe2bf8546d5028d41e5736f64e1ca6c6b8893125503",
+              "size_bytes": 15992595884
+            },
+            {
+              "path": "processor_config.json",
+              "sha256": "32bdf45d2ad4cc29a0822ddd157a182de76644f0419a6228d151495256e9813c",
+              "size_bytes": 1689
+            },
+            {
+              "path": "tokenizer.json",
+              "sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+              "size_bytes": 32169626
+            },
+            {
+              "path": "tokenizer_config.json",
+              "sha256": "90c3a3ba5bf53818383a58e1a776cbcacd2a038d4812eaa373e1522f2d06f3df",
+              "size_bytes": 2095
+            }
+          ],
+          "manifest_sha256": "0829868c14a87b8dc1323f17b5a0808865acd81d15d320ace171c46e2ce4f946",
+          "model_root": "/home/aiuser/X/models/gemma-4-E4B-it",
+          "schema": "wkvm.model_checkpoint_identity.sha256.v1",
+          "total_bytes": 16024820722
+        },
+        "normalized_launch_command": "/home/aiuser/X/.venv-vllm/bin/python experiments/incumbent_gemma_bench.py --engine vllm --model-path /home/aiuser/X/models/gemma-4-E4B-it --ctx 16384 --out 32 --concurrency 64 --prompt-lengths uniform --synthetic-prompts --mem-cap-gib 80 --headroom-gib 4 --max-baseline-gpu-used-gib 1 --gpu-memory-device 7 --mem-sample-interval-s 0.1 --telemetry-sample-interval-s 0.05 --max-model-len 16432 --vllm-gpu-mem-util 0.92 --vllm-max-num-batched-tokens 16384 --vllm-language-model-only --no-warmup --stop-on-failure",
+        "path": "experiments/results/gemma_a800_reliable_20260716/artifacts/vllm-r2.json",
+        "provenance": {
+          "benchmark": {
+            "git_commit": "234cc04867a93f1352d2a1c220c216b698f46560",
+            "git_worktree_dirty": false,
+            "pre_run_source_identity_sha256": "28763ceb275e942aea3b51fe516b9ed362e84a3aabf29f03b752989b9ec960c4",
+            "source_identity": {
+              "error": null,
+              "excluded_path_patterns": [
+                "experiments/results/**",
+                "**/__pycache__/**",
+                ".pytest_cache/**",
+                "**/*.egg-info/**",
+                ".venv/**",
+                "build/**",
+                "dist/**"
+              ],
+              "excluded_paths": [],
+              "git_commit": "234cc04867a93f1352d2a1c220c216b698f46560",
+              "git_head_tree": "431cfcc661e139bec44749bd68ff501f83baef35",
+              "git_status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "git_tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "git_worktree_dirty": false,
+              "identity_sha256": "28763ceb275e942aea3b51fe516b9ed362e84a3aabf29f03b752989b9ec960c4",
+              "repo_root": "/home/aiuser/X/wkvm",
+              "schema": "wkvm.git_worktree_identity.sha256.v1",
+              "scope": "git tracked and all untracked worktree files excluding declared generated artifacts",
+              "tracked_file_count": 95,
+              "untracked_file_count": 0,
+              "worktree_file_count": 95,
+              "worktree_manifest_sha256": "8a8d109b6b7b27124b41479dc92e716e3e59fdfc870a30bce99ddf79d245c0a4"
+            },
+            "source_identity_unchanged_during_run": true
+          },
+          "engine": {
+            "label": "vllm",
+            "version": "0.25.1",
+            "version_source": "imported_package"
+          },
+          "gpu": {
+            "driver_version": "595.58.03",
+            "index": 7,
+            "memory_total_mib": 81920,
+            "name": "NVIDIA A800-SXM4-80GB",
+            "source": "nvidia-smi",
+            "uuid": "GPU-d14ae640-d8a8-de48-c9cc-3b73f99604f0"
+          },
+          "gpu_memory_monitor": {
+            "caveat": "includes every process on the selected physical GPU; baseline and peak are not process-attributed",
+            "device_selector": "7",
+            "device_selector_source": "explicit",
+            "sample_interval_s": 0.1,
+            "scope": "whole_device",
+            "source": "nvidia-smi"
+          },
+          "runtime": {
+            "cuda_visible_devices": "7",
+            "machine": "x86_64",
+            "packages": {
+              "sglang": null,
+              "torch": "2.11.0",
+              "transformers": "5.13.1",
+              "triton": "3.6.0",
+              "vllm": "0.25.1",
+              "wkvm": "0.0.1"
+            },
+            "platform": "Linux-5.14.0-611.47.1.el9_7.x86_64-x86_64-with-glibc2.34",
+            "python_executable": "/home/aiuser/X/.venv-vllm/bin/python",
+            "python_implementation": "CPython",
+            "python_version": "3.11.8"
+          },
+          "schema": "wkvm.incumbent_gemma_bench.provenance.v1"
+        },
+        "semantics": "full_kv"
+      },
+      {
+        "batch_sizes": [
+          64
+        ],
+        "benchmark_config": {
+          "compilation_config": null,
+          "decode_timing_fallback_comparable": false,
+          "decode_timing_preferred_method": "same_run_request_metrics",
+          "enforce_eager": false,
+          "gpu_memory_utilization": 0.92,
+          "language_model_only": true,
+          "max_model_len": 16432,
+          "max_num_batched_tokens": 16384,
+          "max_num_seqs": 64,
+          "mm_note": "limit_mm_per_prompt={image:0,audio:0}",
+          "prefix_caching": false,
+          "request_metrics_enabled": true,
+          "residency_telemetry_capacity": {
+            "capacity_estimated": false,
+            "capacity_source": "llm.llm_engine.vllm_config.cache_config",
+            "kv_max_concurrency": 64.45752359800112,
+            "kv_token_capacity": 1059166
+          },
+          "vllm_version": "0.25.1"
+        },
+        "engine": "vllm",
+        "engine_version": "0.25.1",
+        "launch_command": "/home/aiuser/X/.venv-vllm/bin/python experiments/incumbent_gemma_bench.py --engine vllm --model-path /home/aiuser/X/models/gemma-4-E4B-it --ctx 16384 --out 32 --concurrency 64 --prompt-lengths uniform --synthetic-prompts --mem-cap-gib 80 --headroom-gib 4 --max-baseline-gpu-used-gib 1 --gpu-memory-device 7 --mem-sample-interval-s 0.1 --telemetry-sample-interval-s 0.05 --max-model-len 16432 --vllm-gpu-mem-util 0.92 --vllm-max-num-batched-tokens 16384 --vllm-language-model-only --no-warmup --stop-on-failure --json experiments/results/gemma_a800_reliable_20260716/artifacts/vllm-r3.json",
+        "model_identity": {
+          "error": null,
+          "excluded_path_patterns": [
+            ".cache/**"
+          ],
+          "file_count": 9,
+          "files": [
+            {
+              "path": ".gitattributes",
+              "sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930",
+              "size_bytes": 1570
+            },
+            {
+              "path": "README.md",
+              "sha256": "50e6a2fe120b6151091f7e36416bc61380a3916abf3e31fbc345322e00977679",
+              "size_bytes": 27169
+            },
+            {
+              "path": "chat_template.jinja",
+              "sha256": "2f1b4d75d067bae3fe44e676721c7f077d243bc007156cb9c2f8b5836613d082",
+              "size_bytes": 17336
+            },
+            {
+              "path": "config.json",
+              "sha256": "33b10c02df3c2e8536cf323d29d53262aaa2f4d11dbe19bc729373fbe90295d4",
+              "size_bytes": 5145
+            },
+            {
+              "path": "generation_config.json",
+              "sha256": "d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de",
+              "size_bytes": 208
+            },
+            {
+              "path": "model.safetensors",
+              "sha256": "cfbd3d2f1cd71bd471c37fe2bf8546d5028d41e5736f64e1ca6c6b8893125503",
+              "size_bytes": 15992595884
+            },
+            {
+              "path": "processor_config.json",
+              "sha256": "32bdf45d2ad4cc29a0822ddd157a182de76644f0419a6228d151495256e9813c",
+              "size_bytes": 1689
+            },
+            {
+              "path": "tokenizer.json",
+              "sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+              "size_bytes": 32169626
+            },
+            {
+              "path": "tokenizer_config.json",
+              "sha256": "90c3a3ba5bf53818383a58e1a776cbcacd2a038d4812eaa373e1522f2d06f3df",
+              "size_bytes": 2095
+            }
+          ],
+          "manifest_sha256": "0829868c14a87b8dc1323f17b5a0808865acd81d15d320ace171c46e2ce4f946",
+          "model_root": "/home/aiuser/X/models/gemma-4-E4B-it",
+          "schema": "wkvm.model_checkpoint_identity.sha256.v1",
+          "total_bytes": 16024820722
+        },
+        "normalized_launch_command": "/home/aiuser/X/.venv-vllm/bin/python experiments/incumbent_gemma_bench.py --engine vllm --model-path /home/aiuser/X/models/gemma-4-E4B-it --ctx 16384 --out 32 --concurrency 64 --prompt-lengths uniform --synthetic-prompts --mem-cap-gib 80 --headroom-gib 4 --max-baseline-gpu-used-gib 1 --gpu-memory-device 7 --mem-sample-interval-s 0.1 --telemetry-sample-interval-s 0.05 --max-model-len 16432 --vllm-gpu-mem-util 0.92 --vllm-max-num-batched-tokens 16384 --vllm-language-model-only --no-warmup --stop-on-failure",
+        "path": "experiments/results/gemma_a800_reliable_20260716/artifacts/vllm-r3.json",
+        "provenance": {
+          "benchmark": {
+            "git_commit": "234cc04867a93f1352d2a1c220c216b698f46560",
+            "git_worktree_dirty": false,
+            "pre_run_source_identity_sha256": "28763ceb275e942aea3b51fe516b9ed362e84a3aabf29f03b752989b9ec960c4",
+            "source_identity": {
+              "error": null,
+              "excluded_path_patterns": [
+                "experiments/results/**",
+                "**/__pycache__/**",
+                ".pytest_cache/**",
+                "**/*.egg-info/**",
+                ".venv/**",
+                "build/**",
+                "dist/**"
+              ],
+              "excluded_paths": [],
+              "git_commit": "234cc04867a93f1352d2a1c220c216b698f46560",
+              "git_head_tree": "431cfcc661e139bec44749bd68ff501f83baef35",
+              "git_status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "git_tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "git_worktree_dirty": false,
+              "identity_sha256": "28763ceb275e942aea3b51fe516b9ed362e84a3aabf29f03b752989b9ec960c4",
+              "repo_root": "/home/aiuser/X/wkvm",
+              "schema": "wkvm.git_worktree_identity.sha256.v1",
+              "scope": "git tracked and all untracked worktree files excluding declared generated artifacts",
+              "tracked_file_count": 95,
+              "untracked_file_count": 0,
+              "worktree_file_count": 95,
+              "worktree_manifest_sha256": "8a8d109b6b7b27124b41479dc92e716e3e59fdfc870a30bce99ddf79d245c0a4"
+            },
+            "source_identity_unchanged_during_run": true
+          },
+          "engine": {
+            "label": "vllm",
+            "version": "0.25.1",
+            "version_source": "imported_package"
+          },
+          "gpu": {
+            "driver_version": "595.58.03",
+            "index": 7,
+            "memory_total_mib": 81920,
+            "name": "NVIDIA A800-SXM4-80GB",
+            "source": "nvidia-smi",
+            "uuid": "GPU-d14ae640-d8a8-de48-c9cc-3b73f99604f0"
+          },
+          "gpu_memory_monitor": {
+            "caveat": "includes every process on the selected physical GPU; baseline and peak are not process-attributed",
+            "device_selector": "7",
+            "device_selector_source": "explicit",
+            "sample_interval_s": 0.1,
+            "scope": "whole_device",
+            "source": "nvidia-smi"
+          },
+          "runtime": {
+            "cuda_visible_devices": "7",
+            "machine": "x86_64",
+            "packages": {
+              "sglang": null,
+              "torch": "2.11.0",
+              "transformers": "5.13.1",
+              "triton": "3.6.0",
+              "vllm": "0.25.1",
+              "wkvm": "0.0.1"
+            },
+            "platform": "Linux-5.14.0-611.47.1.el9_7.x86_64-x86_64-with-glibc2.34",
+            "python_executable": "/home/aiuser/X/.venv-vllm/bin/python",
+            "python_implementation": "CPython",
+            "python_version": "3.11.8"
+          },
+          "schema": "wkvm.incumbent_gemma_bench.provenance.v1"
+        },
+        "semantics": "full_kv"
+      },
+      {
+        "batch_sizes": [
+          64
+        ],
+        "benchmark_config": {
+          "chunk": 2048,
+          "cuda_phase_metrics": false,
+          "decode_batch_planner": "scheduler",
+          "decode_microbatch_bytes": null,
+          "decode_microbatch_rows": 32,
+          "decode_workspace_bytes": null,
+          "decode_workspace_width_bucket": 16,
+          "enable_token_pool_attention": true,
+          "enable_token_pool_metadata": null,
+          "enable_token_pool_paged_split_triton": true,
+          "enable_token_pool_paged_triton": true,
+          "enable_token_pool_triton": true,
+          "m_slots": 32,
+          "native_gemma_attention_backend": "sdpa_single_gqa",
+          "native_gemma_config_loader": true,
+          "native_gemma_projection_backend": "separate",
+          "native_gemma_release_hf_decoder_layers": false,
+          "native_gemma_weight_backend": "hf_live",
+          "persistent_exact_decode": true,
+          "persistent_padded_decode": true,
+          "persistent_padded_decode_cuda_graph": true,
+          "persistent_padded_decode_graph_warmup_iters": 0,
+          "persistent_padded_decode_steps": 32,
+          "persistent_padded_full_attention_rows": null,
+          "persistent_padded_sliding_metadata_padding": true,
+          "prefill_microbatch_rows": 8,
+          "route_chunk": 512,
+          "sink": 16,
+          "slots": 64,
+          "synthetic_prompts": true,
+          "synthetic_vocab_size": 262144,
+          "token_budget": null,
+          "token_pool_capacity": 262144,
+          "token_pool_max_context_len": 16640,
+          "token_pool_paged_block_size": 16,
+          "token_pool_sliding_paged_metadata_only": true,
+          "token_pool_triton_env": {
+            "WKVM_ENABLE_TOKEN_POOL_PAGED_SPLIT_TRITON": "1",
+            "WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON": "1",
+            "WKVM_ENABLE_TOKEN_POOL_TRITON": "1",
+            "WKVM_TOKEN_POOL_SLIDING_PAGED_METADATA_ONLY": "1",
+            "WKVM_TOKEN_POOL_TRITON_STRICT": "1"
+          },
+          "token_pool_triton_strict": true,
+          "use_native_gemma_forward": true,
+          "uses_hf_config": false,
+          "window": 1024
+        },
+        "engine": "wkvm-native",
+        "engine_version": "0.0.1",
+        "launch_command": "/home/aiuser/X/.venv-wkvm/bin/python experiments/native_gemma_bench.py --model-path /home/aiuser/X/models/gemma-4-E4B-it --ctx 16384 --out 32 --concurrency 64 --slots 64 --prompt-lengths uniform --synthetic-prompts --native-gemma-checkpoint-loader --native-gemma-attention-backend sdpa_single_gqa --native-gemma-projection-backend separate --enable-token-pool-attention --token-pool-max-context-len 16640 --token-pool-capacity 262144 --token-pool-paged-block-size 16 --enable-token-pool-triton --enable-token-pool-paged-triton --enable-token-pool-paged-split-triton --token-pool-triton-strict --token-pool-sliding-paged-metadata-only --persistent-padded-sliding-metadata-padding --persistent-padded-decode-steps 32 --persistent-padded-decode-cuda-graph --persistent-padded-decode-graph-warmup-iters 0 --sink 16 --window 1024 --m-slots 32 --route-chunk 512 --chunk 2048 --prefill-microbatch-rows 8 --decode-microbatch-rows 32 --mem-cap-gib 80 --headroom-gib 4 --max-baseline-gpu-used-gib 1 --gpu-memory-device 7 --gpu-memory-sample-interval-s 0.1 --require-native-no-hf --stop-on-failure --json experiments/results/gemma_a800_reliable_20260716/artifacts/wkvm-r1.json",
+        "model_identity": {
+          "error": null,
+          "excluded_path_patterns": [
+            ".cache/**"
+          ],
+          "file_count": 9,
+          "files": [
+            {
+              "path": ".gitattributes",
+              "sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930",
+              "size_bytes": 1570
+            },
+            {
+              "path": "README.md",
+              "sha256": "50e6a2fe120b6151091f7e36416bc61380a3916abf3e31fbc345322e00977679",
+              "size_bytes": 27169
+            },
+            {
+              "path": "chat_template.jinja",
+              "sha256": "2f1b4d75d067bae3fe44e676721c7f077d243bc007156cb9c2f8b5836613d082",
+              "size_bytes": 17336
+            },
+            {
+              "path": "config.json",
+              "sha256": "33b10c02df3c2e8536cf323d29d53262aaa2f4d11dbe19bc729373fbe90295d4",
+              "size_bytes": 5145
+            },
+            {
+              "path": "generation_config.json",
+              "sha256": "d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de",
+              "size_bytes": 208
+            },
+            {
+              "path": "model.safetensors",
+              "sha256": "cfbd3d2f1cd71bd471c37fe2bf8546d5028d41e5736f64e1ca6c6b8893125503",
+              "size_bytes": 15992595884
+            },
+            {
+              "path": "processor_config.json",
+              "sha256": "32bdf45d2ad4cc29a0822ddd157a182de76644f0419a6228d151495256e9813c",
+              "size_bytes": 1689
+            },
+            {
+              "path": "tokenizer.json",
+              "sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+              "size_bytes": 32169626
+            },
+            {
+              "path": "tokenizer_config.json",
+              "sha256": "90c3a3ba5bf53818383a58e1a776cbcacd2a038d4812eaa373e1522f2d06f3df",
+              "size_bytes": 2095
+            }
+          ],
+          "manifest_sha256": "0829868c14a87b8dc1323f17b5a0808865acd81d15d320ace171c46e2ce4f946",
+          "model_root": "/home/aiuser/X/models/gemma-4-E4B-it",
+          "schema": "wkvm.model_checkpoint_identity.sha256.v1",
+          "total_bytes": 16024820722
+        },
+        "normalized_launch_command": "/home/aiuser/X/.venv-wkvm/bin/python experiments/native_gemma_bench.py --model-path /home/aiuser/X/models/gemma-4-E4B-it --ctx 16384 --out 32 --concurrency 64 --slots 64 --prompt-lengths uniform --synthetic-prompts --native-gemma-checkpoint-loader --native-gemma-attention-backend sdpa_single_gqa --native-gemma-projection-backend separate --enable-token-pool-attention --token-pool-max-context-len 16640 --token-pool-capacity 262144 --token-pool-paged-block-size 16 --enable-token-pool-triton --enable-token-pool-paged-triton --enable-token-pool-paged-split-triton --token-pool-triton-strict --token-pool-sliding-paged-metadata-only --persistent-padded-sliding-metadata-padding --persistent-padded-decode-steps 32 --persistent-padded-decode-cuda-graph --persistent-padded-decode-graph-warmup-iters 0 --sink 16 --window 1024 --m-slots 32 --route-chunk 512 --chunk 2048 --prefill-microbatch-rows 8 --decode-microbatch-rows 32 --mem-cap-gib 80 --headroom-gib 4 --max-baseline-gpu-used-gib 1 --gpu-memory-device 7 --gpu-memory-sample-interval-s 0.1 --require-native-no-hf --stop-on-failure",
+        "path": "experiments/results/gemma_a800_reliable_20260716/artifacts/wkvm-r1.json",
+        "provenance": {
+          "benchmark": {
+            "git_commit": "234cc04867a93f1352d2a1c220c216b698f46560",
+            "git_worktree_dirty": false,
+            "pre_run_source_identity_sha256": "28763ceb275e942aea3b51fe516b9ed362e84a3aabf29f03b752989b9ec960c4",
+            "source_identity": {
+              "error": null,
+              "excluded_path_patterns": [
+                "experiments/results/**",
+                "**/__pycache__/**",
+                ".pytest_cache/**",
+                "**/*.egg-info/**",
+                ".venv/**",
+                "build/**",
+                "dist/**"
+              ],
+              "excluded_paths": [],
+              "git_commit": "234cc04867a93f1352d2a1c220c216b698f46560",
+              "git_head_tree": "431cfcc661e139bec44749bd68ff501f83baef35",
+              "git_status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "git_tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "git_worktree_dirty": false,
+              "identity_sha256": "28763ceb275e942aea3b51fe516b9ed362e84a3aabf29f03b752989b9ec960c4",
+              "repo_root": "/home/aiuser/X/wkvm",
+              "schema": "wkvm.git_worktree_identity.sha256.v1",
+              "scope": "git tracked and all untracked worktree files excluding declared generated artifacts",
+              "tracked_file_count": 95,
+              "untracked_file_count": 0,
+              "worktree_file_count": 95,
+              "worktree_manifest_sha256": "8a8d109b6b7b27124b41479dc92e716e3e59fdfc870a30bce99ddf79d245c0a4"
+            },
+            "source_identity_unchanged_during_run": true,
+            "wkvm_package_version": "0.0.1"
+          },
+          "environment": {
+            "cuda_visible_devices": "7",
+            "machine": "x86_64",
+            "packages": {
+              "sglang": null,
+              "torch": "2.11.0",
+              "transformers": "5.13.1",
+              "vllm": null,
+              "wkvm": "0.0.1"
+            },
+            "platform": "Linux-5.14.0-611.47.1.el9_7.x86_64-x86_64-with-glibc2.34",
+            "python_implementation": "CPython",
+            "python_version": "3.11.8"
+          },
+          "gpu": {
+            "device_index": 7,
+            "device_selector": "7",
+            "device_uuid": "GPU-d14ae640-d8a8-de48-c9cc-3b73f99604f0",
+            "driver_version": "595.58.03",
+            "gpu_name": "NVIDIA A800-SXM4-80GB",
+            "memory_total_mib": 81920
+          },
+          "gpu_memory_device": "7",
+          "schema": "wkvm.native_gemma_bench.provenance.v1"
+        },
+        "semantics": "routed_span_approximate"
+      },
+      {
+        "batch_sizes": [
+          64
+        ],
+        "benchmark_config": {
+          "chunk": 2048,
+          "cuda_phase_metrics": false,
+          "decode_batch_planner": "scheduler",
+          "decode_microbatch_bytes": null,
+          "decode_microbatch_rows": 32,
+          "decode_workspace_bytes": null,
+          "decode_workspace_width_bucket": 16,
+          "enable_token_pool_attention": true,
+          "enable_token_pool_metadata": null,
+          "enable_token_pool_paged_split_triton": true,
+          "enable_token_pool_paged_triton": true,
+          "enable_token_pool_triton": true,
+          "m_slots": 32,
+          "native_gemma_attention_backend": "sdpa_single_gqa",
+          "native_gemma_config_loader": true,
+          "native_gemma_projection_backend": "separate",
+          "native_gemma_release_hf_decoder_layers": false,
+          "native_gemma_weight_backend": "hf_live",
+          "persistent_exact_decode": true,
+          "persistent_padded_decode": true,
+          "persistent_padded_decode_cuda_graph": true,
+          "persistent_padded_decode_graph_warmup_iters": 0,
+          "persistent_padded_decode_steps": 32,
+          "persistent_padded_full_attention_rows": null,
+          "persistent_padded_sliding_metadata_padding": true,
+          "prefill_microbatch_rows": 8,
+          "route_chunk": 512,
+          "sink": 16,
+          "slots": 64,
+          "synthetic_prompts": true,
+          "synthetic_vocab_size": 262144,
+          "token_budget": null,
+          "token_pool_capacity": 262144,
+          "token_pool_max_context_len": 16640,
+          "token_pool_paged_block_size": 16,
+          "token_pool_sliding_paged_metadata_only": true,
+          "token_pool_triton_env": {
+            "WKVM_ENABLE_TOKEN_POOL_PAGED_SPLIT_TRITON": "1",
+            "WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON": "1",
+            "WKVM_ENABLE_TOKEN_POOL_TRITON": "1",
+            "WKVM_TOKEN_POOL_SLIDING_PAGED_METADATA_ONLY": "1",
+            "WKVM_TOKEN_POOL_TRITON_STRICT": "1"
+          },
+          "token_pool_triton_strict": true,
+          "use_native_gemma_forward": true,
+          "uses_hf_config": false,
+          "window": 1024
+        },
+        "engine": "wkvm-native",
+        "engine_version": "0.0.1",
+        "launch_command": "/home/aiuser/X/.venv-wkvm/bin/python experiments/native_gemma_bench.py --model-path /home/aiuser/X/models/gemma-4-E4B-it --ctx 16384 --out 32 --concurrency 64 --slots 64 --prompt-lengths uniform --synthetic-prompts --native-gemma-checkpoint-loader --native-gemma-attention-backend sdpa_single_gqa --native-gemma-projection-backend separate --enable-token-pool-attention --token-pool-max-context-len 16640 --token-pool-capacity 262144 --token-pool-paged-block-size 16 --enable-token-pool-triton --enable-token-pool-paged-triton --enable-token-pool-paged-split-triton --token-pool-triton-strict --token-pool-sliding-paged-metadata-only --persistent-padded-sliding-metadata-padding --persistent-padded-decode-steps 32 --persistent-padded-decode-cuda-graph --persistent-padded-decode-graph-warmup-iters 0 --sink 16 --window 1024 --m-slots 32 --route-chunk 512 --chunk 2048 --prefill-microbatch-rows 8 --decode-microbatch-rows 32 --mem-cap-gib 80 --headroom-gib 4 --max-baseline-gpu-used-gib 1 --gpu-memory-device 7 --gpu-memory-sample-interval-s 0.1 --require-native-no-hf --stop-on-failure --json experiments/results/gemma_a800_reliable_20260716/artifacts/wkvm-r2.json",
+        "model_identity": {
+          "error": null,
+          "excluded_path_patterns": [
+            ".cache/**"
+          ],
+          "file_count": 9,
+          "files": [
+            {
+              "path": ".gitattributes",
+              "sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930",
+              "size_bytes": 1570
+            },
+            {
+              "path": "README.md",
+              "sha256": "50e6a2fe120b6151091f7e36416bc61380a3916abf3e31fbc345322e00977679",
+              "size_bytes": 27169
+            },
+            {
+              "path": "chat_template.jinja",
+              "sha256": "2f1b4d75d067bae3fe44e676721c7f077d243bc007156cb9c2f8b5836613d082",
+              "size_bytes": 17336
+            },
+            {
+              "path": "config.json",
+              "sha256": "33b10c02df3c2e8536cf323d29d53262aaa2f4d11dbe19bc729373fbe90295d4",
+              "size_bytes": 5145
+            },
+            {
+              "path": "generation_config.json",
+              "sha256": "d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de",
+              "size_bytes": 208
+            },
+            {
+              "path": "model.safetensors",
+              "sha256": "cfbd3d2f1cd71bd471c37fe2bf8546d5028d41e5736f64e1ca6c6b8893125503",
+              "size_bytes": 15992595884
+            },
+            {
+              "path": "processor_config.json",
+              "sha256": "32bdf45d2ad4cc29a0822ddd157a182de76644f0419a6228d151495256e9813c",
+              "size_bytes": 1689
+            },
+            {
+              "path": "tokenizer.json",
+              "sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+              "size_bytes": 32169626
+            },
+            {
+              "path": "tokenizer_config.json",
+              "sha256": "90c3a3ba5bf53818383a58e1a776cbcacd2a038d4812eaa373e1522f2d06f3df",
+              "size_bytes": 2095
+            }
+          ],
+          "manifest_sha256": "0829868c14a87b8dc1323f17b5a0808865acd81d15d320ace171c46e2ce4f946",
+          "model_root": "/home/aiuser/X/models/gemma-4-E4B-it",
+          "schema": "wkvm.model_checkpoint_identity.sha256.v1",
+          "total_bytes": 16024820722
+        },
+        "normalized_launch_command": "/home/aiuser/X/.venv-wkvm/bin/python experiments/native_gemma_bench.py --model-path /home/aiuser/X/models/gemma-4-E4B-it --ctx 16384 --out 32 --concurrency 64 --slots 64 --prompt-lengths uniform --synthetic-prompts --native-gemma-checkpoint-loader --native-gemma-attention-backend sdpa_single_gqa --native-gemma-projection-backend separate --enable-token-pool-attention --token-pool-max-context-len 16640 --token-pool-capacity 262144 --token-pool-paged-block-size 16 --enable-token-pool-triton --enable-token-pool-paged-triton --enable-token-pool-paged-split-triton --token-pool-triton-strict --token-pool-sliding-paged-metadata-only --persistent-padded-sliding-metadata-padding --persistent-padded-decode-steps 32 --persistent-padded-decode-cuda-graph --persistent-padded-decode-graph-warmup-iters 0 --sink 16 --window 1024 --m-slots 32 --route-chunk 512 --chunk 2048 --prefill-microbatch-rows 8 --decode-microbatch-rows 32 --mem-cap-gib 80 --headroom-gib 4 --max-baseline-gpu-used-gib 1 --gpu-memory-device 7 --gpu-memory-sample-interval-s 0.1 --require-native-no-hf --stop-on-failure",
+        "path": "experiments/results/gemma_a800_reliable_20260716/artifacts/wkvm-r2.json",
+        "provenance": {
+          "benchmark": {
+            "git_commit": "234cc04867a93f1352d2a1c220c216b698f46560",
+            "git_worktree_dirty": false,
+            "pre_run_source_identity_sha256": "28763ceb275e942aea3b51fe516b9ed362e84a3aabf29f03b752989b9ec960c4",
+            "source_identity": {
+              "error": null,
+              "excluded_path_patterns": [
+                "experiments/results/**",
+                "**/__pycache__/**",
+                ".pytest_cache/**",
+                "**/*.egg-info/**",
+                ".venv/**",
+                "build/**",
+                "dist/**"
+              ],
+              "excluded_paths": [],
+              "git_commit": "234cc04867a93f1352d2a1c220c216b698f46560",
+              "git_head_tree": "431cfcc661e139bec44749bd68ff501f83baef35",
+              "git_status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "git_tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "git_worktree_dirty": false,
+              "identity_sha256": "28763ceb275e942aea3b51fe516b9ed362e84a3aabf29f03b752989b9ec960c4",
+              "repo_root": "/home/aiuser/X/wkvm",
+              "schema": "wkvm.git_worktree_identity.sha256.v1",
+              "scope": "git tracked and all untracked worktree files excluding declared generated artifacts",
+              "tracked_file_count": 95,
+              "untracked_file_count": 0,
+              "worktree_file_count": 95,
+              "worktree_manifest_sha256": "8a8d109b6b7b27124b41479dc92e716e3e59fdfc870a30bce99ddf79d245c0a4"
+            },
+            "source_identity_unchanged_during_run": true,
+            "wkvm_package_version": "0.0.1"
+          },
+          "environment": {
+            "cuda_visible_devices": "7",
+            "machine": "x86_64",
+            "packages": {
+              "sglang": null,
+              "torch": "2.11.0",
+              "transformers": "5.13.1",
+              "vllm": null,
+              "wkvm": "0.0.1"
+            },
+            "platform": "Linux-5.14.0-611.47.1.el9_7.x86_64-x86_64-with-glibc2.34",
+            "python_implementation": "CPython",
+            "python_version": "3.11.8"
+          },
+          "gpu": {
+            "device_index": 7,
+            "device_selector": "7",
+            "device_uuid": "GPU-d14ae640-d8a8-de48-c9cc-3b73f99604f0",
+            "driver_version": "595.58.03",
+            "gpu_name": "NVIDIA A800-SXM4-80GB",
+            "memory_total_mib": 81920
+          },
+          "gpu_memory_device": "7",
+          "schema": "wkvm.native_gemma_bench.provenance.v1"
+        },
+        "semantics": "routed_span_approximate"
+      },
+      {
+        "batch_sizes": [
+          64
+        ],
+        "benchmark_config": {
+          "chunk": 2048,
+          "cuda_phase_metrics": false,
+          "decode_batch_planner": "scheduler",
+          "decode_microbatch_bytes": null,
+          "decode_microbatch_rows": 32,
+          "decode_workspace_bytes": null,
+          "decode_workspace_width_bucket": 16,
+          "enable_token_pool_attention": true,
+          "enable_token_pool_metadata": null,
+          "enable_token_pool_paged_split_triton": true,
+          "enable_token_pool_paged_triton": true,
+          "enable_token_pool_triton": true,
+          "m_slots": 32,
+          "native_gemma_attention_backend": "sdpa_single_gqa",
+          "native_gemma_config_loader": true,
+          "native_gemma_projection_backend": "separate",
+          "native_gemma_release_hf_decoder_layers": false,
+          "native_gemma_weight_backend": "hf_live",
+          "persistent_exact_decode": true,
+          "persistent_padded_decode": true,
+          "persistent_padded_decode_cuda_graph": true,
+          "persistent_padded_decode_graph_warmup_iters": 0,
+          "persistent_padded_decode_steps": 32,
+          "persistent_padded_full_attention_rows": null,
+          "persistent_padded_sliding_metadata_padding": true,
+          "prefill_microbatch_rows": 8,
+          "route_chunk": 512,
+          "sink": 16,
+          "slots": 64,
+          "synthetic_prompts": true,
+          "synthetic_vocab_size": 262144,
+          "token_budget": null,
+          "token_pool_capacity": 262144,
+          "token_pool_max_context_len": 16640,
+          "token_pool_paged_block_size": 16,
+          "token_pool_sliding_paged_metadata_only": true,
+          "token_pool_triton_env": {
+            "WKVM_ENABLE_TOKEN_POOL_PAGED_SPLIT_TRITON": "1",
+            "WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON": "1",
+            "WKVM_ENABLE_TOKEN_POOL_TRITON": "1",
+            "WKVM_TOKEN_POOL_SLIDING_PAGED_METADATA_ONLY": "1",
+            "WKVM_TOKEN_POOL_TRITON_STRICT": "1"
+          },
+          "token_pool_triton_strict": true,
+          "use_native_gemma_forward": true,
+          "uses_hf_config": false,
+          "window": 1024
+        },
+        "engine": "wkvm-native",
+        "engine_version": "0.0.1",
+        "launch_command": "/home/aiuser/X/.venv-wkvm/bin/python experiments/native_gemma_bench.py --model-path /home/aiuser/X/models/gemma-4-E4B-it --ctx 16384 --out 32 --concurrency 64 --slots 64 --prompt-lengths uniform --synthetic-prompts --native-gemma-checkpoint-loader --native-gemma-attention-backend sdpa_single_gqa --native-gemma-projection-backend separate --enable-token-pool-attention --token-pool-max-context-len 16640 --token-pool-capacity 262144 --token-pool-paged-block-size 16 --enable-token-pool-triton --enable-token-pool-paged-triton --enable-token-pool-paged-split-triton --token-pool-triton-strict --token-pool-sliding-paged-metadata-only --persistent-padded-sliding-metadata-padding --persistent-padded-decode-steps 32 --persistent-padded-decode-cuda-graph --persistent-padded-decode-graph-warmup-iters 0 --sink 16 --window 1024 --m-slots 32 --route-chunk 512 --chunk 2048 --prefill-microbatch-rows 8 --decode-microbatch-rows 32 --mem-cap-gib 80 --headroom-gib 4 --max-baseline-gpu-used-gib 1 --gpu-memory-device 7 --gpu-memory-sample-interval-s 0.1 --require-native-no-hf --stop-on-failure --json experiments/results/gemma_a800_reliable_20260716/artifacts/wkvm-r3.json",
+        "model_identity": {
+          "error": null,
+          "excluded_path_patterns": [
+            ".cache/**"
+          ],
+          "file_count": 9,
+          "files": [
+            {
+              "path": ".gitattributes",
+              "sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930",
+              "size_bytes": 1570
+            },
+            {
+              "path": "README.md",
+              "sha256": "50e6a2fe120b6151091f7e36416bc61380a3916abf3e31fbc345322e00977679",
+              "size_bytes": 27169
+            },
+            {
+              "path": "chat_template.jinja",
+              "sha256": "2f1b4d75d067bae3fe44e676721c7f077d243bc007156cb9c2f8b5836613d082",
+              "size_bytes": 17336
+            },
+            {
+              "path": "config.json",
+              "sha256": "33b10c02df3c2e8536cf323d29d53262aaa2f4d11dbe19bc729373fbe90295d4",
+              "size_bytes": 5145
+            },
+            {
+              "path": "generation_config.json",
+              "sha256": "d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de",
+              "size_bytes": 208
+            },
+            {
+              "path": "model.safetensors",
+              "sha256": "cfbd3d2f1cd71bd471c37fe2bf8546d5028d41e5736f64e1ca6c6b8893125503",
+              "size_bytes": 15992595884
+            },
+            {
+              "path": "processor_config.json",
+              "sha256": "32bdf45d2ad4cc29a0822ddd157a182de76644f0419a6228d151495256e9813c",
+              "size_bytes": 1689
+            },
+            {
+              "path": "tokenizer.json",
+              "sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+              "size_bytes": 32169626
+            },
+            {
+              "path": "tokenizer_config.json",
+              "sha256": "90c3a3ba5bf53818383a58e1a776cbcacd2a038d4812eaa373e1522f2d06f3df",
+              "size_bytes": 2095
+            }
+          ],
+          "manifest_sha256": "0829868c14a87b8dc1323f17b5a0808865acd81d15d320ace171c46e2ce4f946",
+          "model_root": "/home/aiuser/X/models/gemma-4-E4B-it",
+          "schema": "wkvm.model_checkpoint_identity.sha256.v1",
+          "total_bytes": 16024820722
+        },
+        "normalized_launch_command": "/home/aiuser/X/.venv-wkvm/bin/python experiments/native_gemma_bench.py --model-path /home/aiuser/X/models/gemma-4-E4B-it --ctx 16384 --out 32 --concurrency 64 --slots 64 --prompt-lengths uniform --synthetic-prompts --native-gemma-checkpoint-loader --native-gemma-attention-backend sdpa_single_gqa --native-gemma-projection-backend separate --enable-token-pool-attention --token-pool-max-context-len 16640 --token-pool-capacity 262144 --token-pool-paged-block-size 16 --enable-token-pool-triton --enable-token-pool-paged-triton --enable-token-pool-paged-split-triton --token-pool-triton-strict --token-pool-sliding-paged-metadata-only --persistent-padded-sliding-metadata-padding --persistent-padded-decode-steps 32 --persistent-padded-decode-cuda-graph --persistent-padded-decode-graph-warmup-iters 0 --sink 16 --window 1024 --m-slots 32 --route-chunk 512 --chunk 2048 --prefill-microbatch-rows 8 --decode-microbatch-rows 32 --mem-cap-gib 80 --headroom-gib 4 --max-baseline-gpu-used-gib 1 --gpu-memory-device 7 --gpu-memory-sample-interval-s 0.1 --require-native-no-hf --stop-on-failure",
+        "path": "experiments/results/gemma_a800_reliable_20260716/artifacts/wkvm-r3.json",
+        "provenance": {
+          "benchmark": {
+            "git_commit": "234cc04867a93f1352d2a1c220c216b698f46560",
+            "git_worktree_dirty": false,
+            "pre_run_source_identity_sha256": "28763ceb275e942aea3b51fe516b9ed362e84a3aabf29f03b752989b9ec960c4",
+            "source_identity": {
+              "error": null,
+              "excluded_path_patterns": [
+                "experiments/results/**",
+                "**/__pycache__/**",
+                ".pytest_cache/**",
+                "**/*.egg-info/**",
+                ".venv/**",
+                "build/**",
+                "dist/**"
+              ],
+              "excluded_paths": [],
+              "git_commit": "234cc04867a93f1352d2a1c220c216b698f46560",
+              "git_head_tree": "431cfcc661e139bec44749bd68ff501f83baef35",
+              "git_status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "git_tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "git_worktree_dirty": false,
+              "identity_sha256": "28763ceb275e942aea3b51fe516b9ed362e84a3aabf29f03b752989b9ec960c4",
+              "repo_root": "/home/aiuser/X/wkvm",
+              "schema": "wkvm.git_worktree_identity.sha256.v1",
+              "scope": "git tracked and all untracked worktree files excluding declared generated artifacts",
+              "tracked_file_count": 95,
+              "untracked_file_count": 0,
+              "worktree_file_count": 95,
+              "worktree_manifest_sha256": "8a8d109b6b7b27124b41479dc92e716e3e59fdfc870a30bce99ddf79d245c0a4"
+            },
+            "source_identity_unchanged_during_run": true,
+            "wkvm_package_version": "0.0.1"
+          },
+          "environment": {
+            "cuda_visible_devices": "7",
+            "machine": "x86_64",
+            "packages": {
+              "sglang": null,
+              "torch": "2.11.0",
+              "transformers": "5.13.1",
+              "vllm": null,
+              "wkvm": "0.0.1"
+            },
+            "platform": "Linux-5.14.0-611.47.1.el9_7.x86_64-x86_64-with-glibc2.34",
+            "python_implementation": "CPython",
+            "python_version": "3.11.8"
+          },
+          "gpu": {
+            "device_index": 7,
+            "device_selector": "7",
+            "device_uuid": "GPU-d14ae640-d8a8-de48-c9cc-3b73f99604f0",
+            "driver_version": "595.58.03",
+            "gpu_name": "NVIDIA A800-SXM4-80GB",
+            "memory_total_mib": 81920
+          },
+          "gpu_memory_device": "7",
+          "schema": "wkvm.native_gemma_bench.provenance.v1"
+        },
+        "semantics": "routed_span_approximate"
+      }
+    ],
+    "git_commit": "234cc04867a93f1352d2a1c220c216b698f46560",
+    "gpu": {
+      "driver_version": "595.58.03",
+      "model": "NVIDIA A800-SXM4-80GB",
+      "uuid": "GPU-d14ae640-d8a8-de48-c9cc-3b73f99604f0"
+    },
+    "model_identity": {
+      "error": null,
+      "excluded_path_patterns": [
+        ".cache/**"
+      ],
+      "file_count": 9,
+      "files": [
+        {
+          "path": ".gitattributes",
+          "sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930",
+          "size_bytes": 1570
+        },
+        {
+          "path": "README.md",
+          "sha256": "50e6a2fe120b6151091f7e36416bc61380a3916abf3e31fbc345322e00977679",
+          "size_bytes": 27169
+        },
+        {
+          "path": "chat_template.jinja",
+          "sha256": "2f1b4d75d067bae3fe44e676721c7f077d243bc007156cb9c2f8b5836613d082",
+          "size_bytes": 17336
+        },
+        {
+          "path": "config.json",
+          "sha256": "33b10c02df3c2e8536cf323d29d53262aaa2f4d11dbe19bc729373fbe90295d4",
+          "size_bytes": 5145
+        },
+        {
+          "path": "generation_config.json",
+          "sha256": "d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de",
+          "size_bytes": 208
+        },
+        {
+          "path": "model.safetensors",
+          "sha256": "cfbd3d2f1cd71bd471c37fe2bf8546d5028d41e5736f64e1ca6c6b8893125503",
+          "size_bytes": 15992595884
+        },
+        {
+          "path": "processor_config.json",
+          "sha256": "32bdf45d2ad4cc29a0822ddd157a182de76644f0419a6228d151495256e9813c",
+          "size_bytes": 1689
+        },
+        {
+          "path": "tokenizer.json",
+          "sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+          "size_bytes": 32169626
+        },
+        {
+          "path": "tokenizer_config.json",
+          "sha256": "90c3a3ba5bf53818383a58e1a776cbcacd2a038d4812eaa373e1522f2d06f3df",
+          "size_bytes": 2095
+        }
+      ],
+      "manifest_sha256": "0829868c14a87b8dc1323f17b5a0808865acd81d15d320ace171c46e2ce4f946",
+      "model_root": "/home/aiuser/X/models/gemma-4-E4B-it",
+      "schema": "wkvm.model_checkpoint_identity.sha256.v1",
+      "total_bytes": 16024820722
+    },
+    "model_identity_excluded_path_patterns": [
+      ".cache/**"
+    ],
+    "model_identity_sha256": "0829868c14a87b8dc1323f17b5a0808865acd81d15d320ace171c46e2ce4f946",
+    "model_path": "/home/aiuser/X/models/gemma-4-E4B-it",
+    "output_fingerprints_by_batch": {
+      "64": "bfabb16acea48e733714142e1120307f6f54a3264ff7f9298bc5dfe8bf53f6c0"
+    },
+    "policy": {
+      "gpu_memory_sample_interval_s": 0.1,
+      "headroom_gib": 4.0,
+      "max_baseline_gpu_used_gib": 1.0,
+      "mem_cap_gib": 80.0,
+      "prompt_token_source": "synthetic",
+      "uses_hf_tokenizer": false,
+      "warmup": false
+    },
+    "prompt_fingerprints_by_batch": {
+      "64": "992c688200123ad3b570348e47cec8e5f42058a2c243b0097bca2d8965e156ee"
+    },
+    "shape": {
+      "context_tokens_per_session": 16384,
+      "decode_tokens_per_session": 32,
+      "dtype": "bfloat16",
+      "prompt_lengths_mode": "uniform"
+    },
+    "source_identity_excluded_path_patterns": [
+      "experiments/results/**",
+      "**/__pycache__/**",
+      ".pytest_cache/**",
+      "**/*.egg-info/**",
+      ".venv/**",
+      "build/**",
+      "dist/**"
+    ],
+    "source_identity_sha256": "28763ceb275e942aea3b51fe516b9ed362e84a3aabf29f03b752989b9ec960c4"
+  },
+  "groups": [
+    {
+      "B": 64,
+      "artifact_paths": [
+        "experiments/results/gemma_a800_reliable_20260716/artifacts/wkvm-r1.json",
+        "experiments/results/gemma_a800_reliable_20260716/artifacts/wkvm-r2.json",
+        "experiments/results/gemma_a800_reliable_20260716/artifacts/wkvm-r3.json"
+      ],
+      "cohort_prefill": {
+        "comparable_sample_count": 3,
+        "method": "same_run_max_request_ttft",
+        "ratio_eligible": true
+      },
+      "decode": {
+        "comparable_sample_count": 3,
+        "excluded_sample_count": 0,
+        "exclusion_reasons": [],
+        "ratio_eligible": true
+      },
+      "engine": "wkvm-native",
+      "engine_version": "0.0.1",
+      "metrics": {
+        "batch_wall_s": {
+          "count": 3,
+          "max": 93.851725,
+          "median": 93.573895,
+          "min": 93.080253
+        },
+        "cohort_input_tok_s": {
+          "count": 3,
+          "max": 12413.08,
+          "median": 12368.41,
+          "min": 12331.504
+        },
+        "cohort_prefill_wall_s": {
+          "count": 3,
+          "max": 85.032286,
+          "median": 84.77856,
+          "min": 84.473473
+        },
+        "comparable_decode_interval_s": {
+          "count": 3,
+          "max": 16.362848,
+          "median": 16.314235,
+          "min": 16.198407
+        },
+        "comparable_decode_tok_s": {
+          "count": 3,
+          "max": 122.481,
+          "median": 121.612,
+          "min": 121.25
+        },
+        "e2e_output_tok_s": {
+          "count": 3,
+          "max": 22.003,
+          "median": 21.886,
+          "min": 21.822
+        },
+        "max_ttft_s": {
+          "count": 3,
+          "max": 85.032286,
+          "median": 84.77856,
+          "min": 84.473473
+        },
+        "p50_ttft_s": {
+          "count": 3,
+          "max": 81.179702,
+          "median": 80.811647,
+          "min": 80.482162
+        },
+        "p95_ttft_s": {
+          "count": 3,
+          "max": 84.891823,
+          "median": 84.638966,
+          "min": 84.334578
+        },
+        "peak_gpu_delta_gib": {
+          "count": 3,
+          "max": 28.6181640625,
+          "median": 28.4384765625,
+          "min": 28.4326171875
+        },
+        "peak_gpu_used_gib": {
+          "count": 3,
+          "max": 28.6181640625,
+          "median": 28.4384765625,
+          "min": 28.4326171875
+        }
+      },
+      "sample_count": 3,
+      "semantics": "routed_span_approximate"
+    },
+    {
+      "B": 64,
+      "artifact_paths": [
+        "experiments/results/gemma_a800_reliable_20260716/artifacts/vllm-r1.json",
+        "experiments/results/gemma_a800_reliable_20260716/artifacts/vllm-r2.json",
+        "experiments/results/gemma_a800_reliable_20260716/artifacts/vllm-r3.json"
+      ],
+      "cohort_prefill": {
+        "comparable_sample_count": 3,
+        "method": "same_run_max_request_ttft",
+        "ratio_eligible": true
+      },
+      "decode": {
+        "comparable_sample_count": 3,
+        "excluded_sample_count": 0,
+        "exclusion_reasons": [],
+        "ratio_eligible": true
+      },
+      "engine": "vllm",
+      "engine_version": "0.25.1",
+      "metrics": {
+        "batch_wall_s": {
+          "count": 3,
+          "max": 74.207,
+          "median": 74.182,
+          "min": 74.171
+        },
+        "cohort_input_tok_s": {
+          "count": 3,
+          "max": 14249.204,
+          "median": 14247.043,
+          "min": 14242.409
+        },
+        "cohort_prefill_wall_s": {
+          "count": 3,
+          "max": 73.623,
+          "median": 73.6,
+          "min": 73.588
+        },
+        "comparable_decode_interval_s": {
+          "count": 3,
+          "max": 72.889,
+          "median": 72.869,
+          "min": 72.858
+        },
+        "comparable_decode_tok_s": {
+          "count": 3,
+          "max": 27.231,
+          "median": 27.227,
+          "min": 27.22
+        },
+        "e2e_output_tok_s": {
+          "count": 3,
+          "max": 27.612,
+          "median": 27.608,
+          "min": 27.598
+        },
+        "max_ttft_s": {
+          "count": 3,
+          "max": 73.623,
+          "median": 73.6,
+          "min": 73.588
+        },
+        "p50_ttft_s": {
+          "count": 3,
+          "max": 38.424,
+          "median": 38.399,
+          "min": 38.397
+        },
+        "p95_ttft_s": {
+          "count": 3,
+          "max": 70.992,
+          "median": 70.969,
+          "min": 70.953
+        },
+        "peak_gpu_delta_gib": {
+          "count": 3,
+          "max": 74.7431640625,
+          "median": 74.7431640625,
+          "min": 74.7431640625
+        },
+        "peak_gpu_used_gib": {
+          "count": 3,
+          "max": 74.7431640625,
+          "median": 74.7431640625,
+          "min": 74.7431640625
+        }
+      },
+      "sample_count": 3,
+      "semantics": "full_kv"
+    },
+    {
+      "B": 64,
+      "artifact_paths": [
+        "experiments/results/gemma_a800_reliable_20260716/artifacts/sglang-r1.json",
+        "experiments/results/gemma_a800_reliable_20260716/artifacts/sglang-r2.json",
+        "experiments/results/gemma_a800_reliable_20260716/artifacts/sglang-r3.json"
+      ],
+      "cohort_prefill": {
+        "comparable_sample_count": 0,
+        "method": "separate_run_batch_wall",
+        "ratio_eligible": false
+      },
+      "decode": {
+        "comparable_sample_count": 0,
+        "excluded_sample_count": 3,
+        "exclusion_reasons": [
+          "separate_run_subtraction"
+        ],
+        "ratio_eligible": false
+      },
+      "engine": "sglang",
+      "engine_version": "0.5.15.post1",
+      "metrics": {
+        "batch_wall_s": {
+          "count": 3,
+          "max": 131.411,
+          "median": 131.389,
+          "min": 131.38
+        },
+        "cohort_input_tok_s": {
+          "count": 3,
+          "max": 8709.324,
+          "median": 8706.142,
+          "min": 8705.931
+        },
+        "cohort_prefill_wall_s": {
+          "count": 3,
+          "max": 120.444,
+          "median": 120.441,
+          "min": 120.397
+        },
+        "comparable_decode_interval_s": null,
+        "comparable_decode_tok_s": null,
+        "e2e_output_tok_s": {
+          "count": 3,
+          "max": 15.588,
+          "median": 15.587,
+          "min": 15.585
+        },
+        "max_ttft_s": null,
+        "p50_ttft_s": null,
+        "p95_ttft_s": null,
+        "peak_gpu_delta_gib": {
+          "count": 3,
+          "max": 69.9296875,
+          "median": 69.9296875,
+          "min": 69.92578125
+        },
+        "peak_gpu_used_gib": {
+          "count": 3,
+          "max": 69.9296875,
+          "median": 69.9296875,
+          "min": 69.9296875
+        }
+      },
+      "sample_count": 3,
+      "semantics": "full_kv"
+    }
+  ],
+  "minimum_samples_per_engine_batch": 3,
+  "schema": "wkvm.reliable_gemma_report.v1",
+  "status": "pass"
+}
