@@ -21,6 +21,7 @@ class TestPackaging(unittest.TestCase):
         self.assertEqual(
             set(self.project["optional-dependencies"]["gemma-server"]),
             {
+                "numpy>=1.26",
                 "torch>=2.6",
                 "transformers>=5.7,<6",
                 "safetensors>=0.4.3",

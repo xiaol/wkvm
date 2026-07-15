@@ -195,6 +195,14 @@ class GemmaEngineMetrics:
     token_pool_authoritative_prefill_requests: int = 0
     token_pool_authoritative_prefill_tokens: int = 0
     token_pool_authoritative_prefill_layer_writes: int = 0
+    token_pool_deferred_prefill_requests: int = 0
+    token_pool_deferred_prefill_tokens: int = 0
+    token_pool_deferred_prefill_layer_writes_avoided: int = 0
+    token_pool_deferred_prefill_kv_tokens_avoided: int = 0
+    token_pool_prefill_kv_layer_writes: int = 0
+    token_pool_prefill_kv_tokens_written: int = 0
+    token_pool_final_prefill_full_tail_backfills: int = 0
+    token_pool_final_prefill_full_tail_tokens: int = 0
     token_pool_decode_covered_layer_type_batches: dict[str, int] = field(
         default_factory=dict
     )
@@ -332,6 +340,30 @@ class GemmaEngineMetrics:
             ),
             "token_pool_authoritative_prefill_layer_writes": (
                 self.token_pool_authoritative_prefill_layer_writes
+            ),
+            "token_pool_deferred_prefill_requests": (
+                self.token_pool_deferred_prefill_requests
+            ),
+            "token_pool_deferred_prefill_tokens": (
+                self.token_pool_deferred_prefill_tokens
+            ),
+            "token_pool_deferred_prefill_layer_writes_avoided": (
+                self.token_pool_deferred_prefill_layer_writes_avoided
+            ),
+            "token_pool_deferred_prefill_kv_tokens_avoided": (
+                self.token_pool_deferred_prefill_kv_tokens_avoided
+            ),
+            "token_pool_prefill_kv_layer_writes": (
+                self.token_pool_prefill_kv_layer_writes
+            ),
+            "token_pool_prefill_kv_tokens_written": (
+                self.token_pool_prefill_kv_tokens_written
+            ),
+            "token_pool_final_prefill_full_tail_backfills": (
+                self.token_pool_final_prefill_full_tail_backfills
+            ),
+            "token_pool_final_prefill_full_tail_tokens": (
+                self.token_pool_final_prefill_full_tail_tokens
             ),
             "token_pool_decode_covered_layer_type_batches": dict(
                 self.token_pool_decode_covered_layer_type_batches
@@ -750,6 +782,7 @@ class GemmaNativeEngine:
         )
         self._token_table: ReqToTokenTable | None = None
         self._token_slot_allocator: TokenSlotAllocator | TokenKVPool | None = None
+        self._token_pool_full_attention_allocator: Any | None = None
         self._token_kv_pool: TokenKVPool | None = None
         self._token_pool_req_slots: dict[str, int] = {}
         self._token_pool_token_slots: dict[str, list[int]] = {}
@@ -783,6 +816,9 @@ class GemmaNativeEngine:
                     defer_buffer_allocation=True,
                 )
                 self._token_slot_allocator = self._token_kv_pool
+                self._token_pool_full_attention_allocator = (
+                    self._token_kv_pool.full_attention_row_allocator
+                )
                 self._token_pool_block_tables = self._new_token_pool_block_tables()
             else:
                 self._token_slot_allocator = TokenSlotAllocator(capacity=token_pool_capacity)
@@ -1154,10 +1190,10 @@ class GemmaNativeEngine:
                     "GemmaNativeEngine does not support multi-token decode steps"
                 )
 
-        if prefill_work:
-            sampled.update(self._execute_prefill_work(prefill_work))
         if decode_reqs:
             sampled.update(self._execute_decode_batch(decode_reqs))
+        if prefill_work:
+            sampled.update(self._execute_prefill_work(prefill_work))
         return sampled
 
     def _execute_prefill_work(
@@ -1267,6 +1303,7 @@ class GemmaNativeEngine:
                     cache=cache,
                     final_prefill=final_prefill,
                     authoritative_prefill=authoritative_prefill,
+                    defer_kv=not final_prefill,
                 )
         except Exception:
             for _req, _n, cache, _final_prefill, authoritative_prefill in prepared:
@@ -1358,6 +1395,7 @@ class GemmaNativeEngine:
                 cache=cache,
                 final_prefill=final_prefill,
                 authoritative_prefill=authoritative_prefill,
+                defer_kv=not final_prefill,
             )
         except Exception:
             self._token_pool_discard_authoritative_prefill(
@@ -2366,6 +2404,7 @@ class GemmaNativeEngine:
         return TokenPoolDecodeBackendState(
             table=table,
             allocator=self._token_slot_allocator,
+            full_attention_allocator=self._token_pool_full_attention_allocator,
             kv_pool=self._token_kv_pool,
             block_tables=self._token_pool_block_tables,
             block_size=self.token_pool_paged_block_size,
@@ -2381,8 +2420,16 @@ class GemmaNativeEngine:
         backend = self._token_pool_decode_backend
         if backend is None:
             return
+        if (
+            self._token_kv_pool is not None
+            and self._token_slot_allocator is self._token_kv_pool
+        ):
+            self._token_pool_full_attention_allocator = (
+                self._token_kv_pool.full_attention_row_allocator
+            )
         backend.bind_storage(
             allocator=self._token_slot_allocator,
+            full_attention_allocator=self._token_pool_full_attention_allocator,
             kv_pool=self._token_kv_pool,
             token_pool_capacity=(
                 None if self._token_kv_pool is None else self._token_kv_pool.capacity
@@ -2559,7 +2606,7 @@ class GemmaNativeEngine:
         defer_buffer_allocation: bool = False,
     ) -> TokenKVPool:
         dtype = self._infer_model_dtype()
-        specs = self._token_kv_layer_specs(dtype=dtype)
+        specs = self._token_kv_layer_specs(dtype=dtype, capacity=int(capacity))
         if not specs:
             raise ValueError("token-pool attention found no supported native Gemma KV layers")
         return TokenKVPool(
@@ -2569,7 +2616,22 @@ class GemmaNativeEngine:
             device=self.runner.device,
             defer_buffer_allocation=defer_buffer_allocation,
             validate_slot_writes=False,
+            request_slot_capacity=self._token_pool_request_slot_capacity(
+                int(capacity)
+            ),
         )
+
+    def _token_pool_request_slot_capacity(self, capacity: int) -> int:
+        capacity = int(capacity)
+        block_size = max(1, int(self.token_pool_paged_block_size or 1))
+        sliding_window = max(1, int(self.config.sliding_window))
+        sliding_blocks_per_request = (
+            sliding_window + block_size - 1 + block_size - 1
+        ) // block_size
+        request_capacity = (
+            int(self.arena.num_slots) * sliding_blocks_per_request * block_size
+        )
+        return min(capacity, request_capacity)
 
     def _infer_model_dtype(self):
         try:
@@ -2581,7 +2643,12 @@ class GemmaNativeEngine:
 
         return torch.float32
 
-    def _token_kv_layer_specs(self, *, dtype) -> list[TokenKVLayerSpec]:
+    def _token_kv_layer_specs(
+        self,
+        *,
+        dtype,
+        capacity: int,
+    ) -> list[TokenKVLayerSpec]:
         text_prefix = getattr(self.runner.model, "text_prefix", None)
         layers = list(getattr(text_prefix, "layers", ()) or ())
         if not layers:
@@ -2592,13 +2659,8 @@ class GemmaNativeEngine:
             return []
 
         supported_layer_types = {"full_attention", "sliding_attention"}
-        block_size = max(1, int(self.token_pool_paged_block_size or 1))
-        sliding_slots_per_request = (
-            int(self.config.sliding_window) + 1 + block_size - 1
-        ) // block_size * block_size
-        sliding_initial_capacity = min(
-            int(self.token_pool_capacity or 2**63 - 1),
-            int(self.arena.num_slots) * sliding_slots_per_request,
+        sliding_initial_capacity = self._token_pool_request_slot_capacity(
+            int(capacity)
         )
         owner_by_type: dict[str, int] = {}
         for layer in layers:
@@ -2766,6 +2828,7 @@ class GemmaNativeEngine:
         cache=None,
         final_prefill: bool = False,
         authoritative_prefill: TokenPoolAuthoritativePrefillReservation | None = None,
+        defer_kv: bool = False,
     ) -> None:
         table = self._token_table
         allocator = self._token_slot_allocator
@@ -2782,6 +2845,7 @@ class GemmaNativeEngine:
                     cache=cache,
                     sliding_window=self._token_pool_attention_window(),
                     final_prefill=final_prefill,
+                    defer_kv=bool(defer_kv and self._token_kv_pool is not None),
                 )
             else:
                 result = backend.commit_authoritative_prefill(
@@ -2801,6 +2865,28 @@ class GemmaNativeEngine:
                 )
                 self.metrics.token_pool_authoritative_prefill_layer_writes += len(
                     authoritative_prefill.expected_layer_ids
+                )
+            if result.deferred:
+                self.metrics.token_pool_deferred_prefill_requests += 1
+                self.metrics.token_pool_deferred_prefill_tokens += int(
+                    result.new_length - result.previous_length
+                )
+                self.metrics.token_pool_deferred_prefill_layer_writes_avoided += (
+                    result.deferred_layer_writes_avoided
+                )
+                self.metrics.token_pool_deferred_prefill_kv_tokens_avoided += (
+                    result.deferred_kv_tokens_avoided
+                )
+            self.metrics.token_pool_prefill_kv_layer_writes += int(
+                result.kv_layer_writes
+            )
+            self.metrics.token_pool_prefill_kv_tokens_written += int(
+                result.kv_tokens_written
+            )
+            if result.full_tail_backfilled:
+                self.metrics.token_pool_final_prefill_full_tail_backfills += 1
+                self.metrics.token_pool_final_prefill_full_tail_tokens += int(
+                    result.kept_tokens
                 )
             if result.prefix_clear_result.invalidated_full_attention_rows:
                 self.metrics.token_pool_full_attention_row_invalidations += (
@@ -2828,7 +2914,7 @@ class GemmaNativeEngine:
         initial: bool,
         final_prefill: bool,
     ) -> TokenPoolAuthoritativePrefillReservation | None:
-        if not initial or not final_prefill or self._token_kv_pool is None:
+        if self._token_kv_pool is None:
             return None
         self._sync_token_pool_decode_backend_storage()
         backend = self._token_pool_decode_backend
@@ -3118,6 +3204,8 @@ class GemmaNativeEngine:
             layer._dense_storage_released = False
             if hasattr(layer, "_token_pool_authoritative_prefill"):
                 layer._token_pool_authoritative_prefill = None
+            if hasattr(layer, "_token_pool_authoritative_prefill_snapshot"):
+                layer._token_pool_authoritative_prefill_snapshot = None
         self.metrics.session_sliding_tail_restores += 1
         self.metrics.session_sliding_tail_tokens_restored += tail_length
         self._record_cuda_memory_phase("session_sliding_tail_restore")

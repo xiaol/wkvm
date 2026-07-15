@@ -8,6 +8,7 @@ import gc
 import json
 import math
 import os
+import platform
 import shlex
 import statistics
 import subprocess
@@ -36,7 +37,8 @@ from bench_prompt_utils import (
     prompt_fingerprint_row_fields,
     prompt_set_fingerprint,
 )
-from wkvm_serving_bench import WholeGpuMemoryMonitor
+from benchmark_identity import model_checkpoint_identity, source_worktree_identity
+from wkvm_serving_bench import WholeGpuMemoryMonitor, installed_package_versions
 
 from wkvm.core.request import Request
 from wkvm.gemma_engine import GemmaNativeEngine
@@ -439,6 +441,128 @@ def git_commit() -> str | None:
         return None
 
 
+def request_latency_metrics(
+    request_traces: dict[str, dict[str, Any]],
+    *,
+    prompt_token_count: int,
+) -> dict[str, Any]:
+    request_ttft_s = [
+        float(trace["first_token_latency_s"])
+        for trace in request_traces.values()
+        if trace.get("first_token_latency_s") is not None
+    ]
+    request_e2e_latency_s = [
+        float(trace["total_latency_s"])
+        for trace in request_traces.values()
+        if trace.get("total_latency_s") is not None
+    ]
+    cohort_prefill_wall_s = max(request_ttft_s) if request_ttft_s else None
+    cohort_input_tok_s = (
+        float(prompt_token_count) / cohort_prefill_wall_s
+        if cohort_prefill_wall_s is not None and cohort_prefill_wall_s > 0
+        else None
+    )
+    min_ttft_s = min(request_ttft_s) if request_ttft_s else None
+    return {
+        "prefill_plus_first_s": round_or_none(min_ttft_s, 6),
+        "prefill_plus_first_scope": "min_request_ttft",
+        "prefill_plus_first_source": "wkvm request trace first_token_time-enqueue_time",
+        "min_ttft_s": round_or_none(min_ttft_s, 6),
+        "p50_ttft_s": round_or_none(percentile(request_ttft_s, 0.50), 6),
+        "p95_ttft_s": round_or_none(percentile(request_ttft_s, 0.95), 6),
+        "max_ttft_s": round_or_none(cohort_prefill_wall_s, 6),
+        "ttft_request_count": len(request_ttft_s),
+        "request_ttft_s": [round(value, 6) for value in request_ttft_s],
+        "request_e2e_latency_s": [
+            round(value, 6) for value in request_e2e_latency_s
+        ],
+        "cohort_prefill_wall_s": round_or_none(cohort_prefill_wall_s, 6),
+        "cohort_prefill_scope": "same_run_max_request_ttft",
+        "cohort_input_tok_s": round_or_none(cohort_input_tok_s, 3),
+        "cohort_input_token_count": int(prompt_token_count),
+    }
+
+
+TOKEN_POOL_PREFILL_METRIC_NAMES = (
+    "token_pool_authoritative_prefill_requests",
+    "token_pool_authoritative_prefill_tokens",
+    "token_pool_authoritative_prefill_layer_writes",
+    "token_pool_deferred_prefill_requests",
+    "token_pool_deferred_prefill_tokens",
+    "token_pool_deferred_prefill_layer_writes_avoided",
+    "token_pool_deferred_prefill_kv_tokens_avoided",
+    "token_pool_prefill_kv_layer_writes",
+    "token_pool_prefill_kv_tokens_written",
+    "token_pool_final_prefill_full_tail_backfills",
+    "token_pool_final_prefill_full_tail_tokens",
+)
+
+
+def token_pool_prefill_metric_fields(metrics: Any) -> dict[str, int]:
+    return {
+        name: int(getattr(metrics, name))
+        for name in TOKEN_POOL_PREFILL_METRIC_NAMES
+    }
+
+
+def native_runtime_provenance(
+    args,
+    *,
+    commit: str | None,
+    whole_gpu_memory: dict[str, Any] | None,
+    source_identity_before: dict[str, Any] | None = None,
+    source_identity_after: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    source_identity_after = source_identity_after or source_worktree_identity(ROOT)
+    source_identity_before = source_identity_before or source_identity_after
+    source_identity_unchanged = (
+        source_identity_before.get("error") is None
+        and source_identity_after.get("error") is None
+        and source_identity_before.get("identity_sha256")
+        == source_identity_after.get("identity_sha256")
+    )
+    gpu = None
+    if whole_gpu_memory is not None:
+        gpu = {
+            key: whole_gpu_memory.get(key)
+            for key in (
+                "device_selector",
+                "device_index",
+                "device_uuid",
+                "gpu_name",
+                "driver_version",
+                "memory_total_mib",
+            )
+        }
+    return {
+        "schema": "wkvm.native_gemma_bench.provenance.v1",
+        "benchmark": {
+            "git_commit": commit,
+            "wkvm_package_version": installed_package_versions().get("wkvm"),
+            "git_worktree_dirty": source_identity_after.get(
+                "git_worktree_dirty"
+            ),
+            "source_identity": source_identity_after,
+            "pre_run_source_identity_sha256": source_identity_before.get(
+                "identity_sha256"
+            ),
+            "source_identity_unchanged_during_run": (
+                source_identity_unchanged
+            ),
+        },
+        "environment": {
+            "python_version": platform.python_version(),
+            "python_implementation": platform.python_implementation(),
+            "platform": platform.platform(),
+            "machine": platform.machine(),
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "packages": installed_package_versions(),
+        },
+        "gpu": gpu,
+        "gpu_memory_device": getattr(args, "gpu_memory_device", None),
+    }
+
+
 def benchmark_fatal_error(exc: BaseException, *, phase: str) -> dict[str, Any]:
     return {
         "type": type(exc).__name__,
@@ -493,7 +617,10 @@ def build_benchmark_payload(
     token_pool_triton_env: dict[str, str | None],
     whole_gpu_memory: dict[str, Any] | None = None,
     fatal_error: dict[str, Any] | None = None,
+    source_identity_before: dict[str, Any] | None = None,
+    model_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    source_identity_after = source_worktree_identity(ROOT)
     hf_boundary = hf_boundary_summary(rows, args)
     output_fingerprints = generated_output_fingerprint_summary(rows)
     native_no_hf_requirement = native_no_hf_requirement_report(
@@ -501,6 +628,7 @@ def build_benchmark_payload(
         required=args.require_native_no_hf,
         setup_problems=native_no_hf_setup_problems(args),
     )
+    commit = git_commit()
     payload: dict[str, Any] = {
         "schema": "wkvm.native_gemma_bench.v1",
         "engine": "wkvm-native",
@@ -509,9 +637,15 @@ def build_benchmark_payload(
         "decode_tokens_per_session": args.out,
         "mem_cap_gib": args.mem_cap_gib,
         "headroom_gib": args.headroom_gib,
+        "max_baseline_gpu_used_gib": getattr(
+            args,
+            "max_baseline_gpu_used_gib",
+            1.0,
+        ),
         "gpu_memory": whole_gpu_memory,
         "torch_usable_gib": round_or_none(usable_gib),
         "model_path": path,
+        "model_identity": model_identity,
         "prompt_token_source": prompt_token_source(args),
         "uses_hf_tokenizer": uses_hf_tokenizer(args),
         "uses_hf_config": uses_hf_config(args),
@@ -552,9 +686,17 @@ def build_benchmark_payload(
         "token_pool_attention_enabled": args.enable_token_pool_attention,
         "token_pool_triton_env": token_pool_triton_env,
         "cuda_phase_metrics_enabled": args.cuda_phase_metrics,
-        "git_commit": git_commit(),
+        "git_commit": commit,
+        "provenance": native_runtime_provenance(
+            args,
+            commit=commit,
+            whole_gpu_memory=whole_gpu_memory,
+            source_identity_before=source_identity_before,
+            source_identity_after=source_identity_after,
+        ),
         "launch_command": shlex.join([sys.executable, *sys.argv]),
         "concurrency": args.concurrency,
+        "warmup": False,
         "config": {
             "sink": args.sink,
             "window": args.window,
@@ -823,6 +965,10 @@ def run_row(model, tok, cfg, B: int, args, usable_gib: float | None) -> dict[str
             for req in reqs
             if req.req_id in traces
         }
+        latency_metrics = request_latency_metrics(
+            request_traces,
+            prompt_token_count=sum(len(prompt) for prompt in prompts),
+        )
         row.update(
             {
                 "success_count": len(successes),
@@ -840,9 +986,14 @@ def run_row(model, tok, cfg, B: int, args, usable_gib: float | None) -> dict[str
                     and peak_reserved <= usable_gib - args.headroom_gib
                 ),
                 "elapsed_s": round(elapsed, 3),
+                "batch_wall_s": round(elapsed, 6),
+                "batch_wall_scope": "synchronous_batch_completion",
+                "decode_interval_s": round_or_none(decode_s, 6),
+                "decode_interval_scope": "batch_earliest_first_to_latest_last",
                 "prompt_lengths": [len(p) for p in prompts],
                 "request_trace_summary": trace_summary,
                 "request_traces": request_traces,
+                **latency_metrics,
                 "queue_time_p50_s": trace_summary["queue_time_s_p50"],
                 "queue_time_p95_s": trace_summary["queue_time_s_p95"],
                 "prefill_time_p50_s": trace_summary["prefill_time_s_p50"],
@@ -891,15 +1042,7 @@ def run_row(model, tok, cfg, B: int, args, usable_gib: float | None) -> dict[str
                 "token_pool_decode_metadata_rows": (
                     engine.metrics.token_pool_decode_metadata_rows
                 ),
-                "token_pool_authoritative_prefill_requests": (
-                    engine.metrics.token_pool_authoritative_prefill_requests
-                ),
-                "token_pool_authoritative_prefill_tokens": (
-                    engine.metrics.token_pool_authoritative_prefill_tokens
-                ),
-                "token_pool_authoritative_prefill_layer_writes": (
-                    engine.metrics.token_pool_authoritative_prefill_layer_writes
-                ),
+                **token_pool_prefill_metric_fields(engine.metrics),
                 "token_pool_decode_covered_layer_type_batches": dict(
                     engine.metrics.token_pool_decode_covered_layer_type_batches
                 ),
@@ -1141,6 +1284,8 @@ def run(args) -> dict[str, Any]:
 
     token_pool_triton_env = apply_token_pool_triton_bench_env(args)
     path = resolve_model_path(args.model_path)
+    source_identity_before = source_worktree_identity(ROOT)
+    model_identity = model_checkpoint_identity(path)
     rows = []
     usable_gib: float | None = None
     memory_monitor = None
@@ -1245,6 +1390,8 @@ def run(args) -> dict[str, Any]:
             token_pool_triton_env=token_pool_triton_env,
             whole_gpu_memory=whole_gpu_memory,
             fatal_error=benchmark_fatal_error(exc, phase=setup_phase),
+            source_identity_before=source_identity_before,
+            model_identity=model_identity,
         )
         emit_benchmark_payload(args, payload)
         if torch.cuda.is_available():
@@ -1259,6 +1406,8 @@ def run(args) -> dict[str, Any]:
         usable_gib=usable_gib,
         token_pool_triton_env=token_pool_triton_env,
         whole_gpu_memory=whole_gpu_memory,
+        source_identity_before=source_identity_before,
+        model_identity=model_identity,
     )
     emit_benchmark_payload(args, payload)
     if torch.cuda.is_available():
@@ -1294,6 +1443,12 @@ def main() -> None:
     )
     ap.add_argument("--mem-cap-gib", type=float, default=float(os.environ.get("WKVM_MEM_CAP_GIB", 19)))
     ap.add_argument("--headroom-gib", type=float, default=1.0)
+    ap.add_argument(
+        "--max-baseline-gpu-used-gib",
+        type=float,
+        default=1.0,
+        help="Reject report evidence when pre-load whole-GPU use exceeds this idle ceiling.",
+    )
     ap.add_argument("--gpu-memory-device", default=None)
     ap.add_argument("--gpu-memory-sample-interval-s", type=float, default=0.1)
     ap.add_argument("--json", default=None)
@@ -1358,7 +1513,13 @@ def main() -> None:
     )
     ap.add_argument(
         "--native-gemma-attention-backend",
-        choices=["manual", "manual_gqa", "sdpa", "sdpa_single_gqa", "triton_dense_gqa"],
+        choices=[
+            "manual",
+            "manual_gqa",
+            "sdpa",
+            "sdpa_single_gqa",
+            "triton_dense_gqa",
+        ],
         default="manual",
         help="Attention primitive used inside --use-native-gemma-forward.",
     )

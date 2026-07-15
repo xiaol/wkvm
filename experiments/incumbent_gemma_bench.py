@@ -24,11 +24,12 @@ from __future__ import annotations
 import argparse
 import contextlib
 import gc
+from importlib import metadata as importlib_metadata
 import json
 import math
 import os
+import platform
 import shlex
-import statistics
 import subprocess
 import sys
 import threading
@@ -57,6 +58,7 @@ from bench_prompt_utils import (
     prompt_fingerprint_row_fields,
     prompt_set_fingerprint,
 )
+from benchmark_identity import model_checkpoint_identity, source_worktree_identity
 
 
 def atomic_write_json(path: Path, obj: Any) -> None:
@@ -79,6 +81,13 @@ def parse_concurrency(raw: str) -> list[int]:
     if not vals:
         raise argparse.ArgumentTypeError("--concurrency must contain at least one value")
     return vals
+
+
+def parse_positive_int(raw: str) -> int:
+    value = int(raw)
+    if value < 1:
+        raise argparse.ArgumentTypeError("value must be >= 1")
+    return value
 
 
 def bench_prompt_lengths(ctx: int, concurrency: int, mode: str) -> list[int]:
@@ -111,6 +120,8 @@ def round_or_none(x: float | None, ndigits: int = 3) -> float | None:
 
 
 RESIDENCY_TELEMETRY_SCHEMA = "wkvm.incumbent_residency_telemetry.v1"
+PROVENANCE_SCHEMA = "wkvm.incumbent_gemma_bench.provenance.v1"
+PROVENANCE_PACKAGES = ("wkvm", "torch", "transformers", "vllm", "sglang", "triton")
 
 
 class TelemetryUnavailable(RuntimeError):
@@ -707,33 +718,154 @@ def git_commit() -> str | None:
         return None
 
 
-def gpu_mem_used_mib() -> int | None:
+def installed_package_versions() -> dict[str, str | None]:
+    versions: dict[str, str | None] = {}
+    for package in PROVENANCE_PACKAGES:
+        try:
+            versions[package] = importlib_metadata.version(package)
+        except Exception:
+            versions[package] = None
+    return versions
+
+
+def query_nvidia_gpu(device: str) -> dict[str, Any]:
+    """Return one physical GPU's identity, driver, and memory information."""
+
+    fields = (
+        "index",
+        "uuid",
+        "name",
+        "driver_version",
+        "memory.total",
+        "memory.used",
+    )
+    output = subprocess.check_output(
+        [
+            "nvidia-smi",
+            f"--id={device}",
+            f"--query-gpu={','.join(fields)}",
+            "--format=csv,noheader,nounits",
+        ],
+        text=True,
+        stderr=subprocess.DEVNULL,
+        timeout=5.0,
+    )
+    rows = [line.strip() for line in output.splitlines() if line.strip()]
+    if len(rows) != 1:
+        raise RuntimeError(
+            f"nvidia-smi returned {len(rows)} GPUs for device selector {device!r}"
+        )
+    values = [value.strip() for value in rows[0].split(",")]
+    if len(values) != len(fields):
+        raise RuntimeError(f"unexpected nvidia-smi output for device {device!r}")
+    return {
+        "index": int(values[0]),
+        "uuid": values[1],
+        "name": values[2],
+        "driver_version": values[3],
+        "memory_total_mib": int(values[4]),
+        "memory_used_mib": int(values[5]),
+    }
+
+
+def _single_visible_gpu_selector() -> str | None:
+    """Use a sole physical GPU only when nvidia-smi makes that unambiguous."""
+
+    try:
+        output = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=index",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5.0,
+        )
+    except Exception:
+        return None
+    indexes = [line.strip() for line in output.splitlines() if line.strip()]
+    return indexes[0] if len(indexes) == 1 else None
+
+
+def resolve_gpu_memory_device(
+    device: str | int | None = None,
+) -> tuple[str | None, str]:
+    """Resolve a physical nvidia-smi selector without assuming GPU 0.
+
+    An explicit CLI value wins.  A single-value ``CUDA_VISIBLE_DEVICES`` (or
+    ``WKVM_GPU_MEMORY_DEVICE``) is accepted as a physical index/UUID.  With no
+    selector, an unambiguous one-GPU host is detected; multi-GPU hosts require
+    the operator to pass ``--gpu-memory-device``.
+    """
+
+    if device is not None and str(device).strip():
+        return str(device).strip(), "explicit"
+    for env_name in ("WKVM_GPU_MEMORY_DEVICE", "WKVM_GPU_INDEX"):
+        value = os.environ.get(env_name, "").strip()
+        if value:
+            return value, env_name
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if visible and visible not in {"NoDevFiles", "none", "None"}:
+        values = [part.strip() for part in visible.split(",") if part.strip()]
+        if len(values) == 1:
+            return values[0], "CUDA_VISIBLE_DEVICES"
+    discovered = _single_visible_gpu_selector()
+    if discovered is not None:
+        return discovered, "single_gpu_discovery"
+    return None, "unresolved"
+
+
+def gpu_mem_used_mib(device: str | int | None = None) -> int | None:
+    selector, _source = resolve_gpu_memory_device(device)
+    if selector is None:
+        return None
     try:
         out = subprocess.check_output(
             [
                 "nvidia-smi",
+                f"--id={selector}",
                 "--query-gpu=memory.used",
                 "--format=csv,noheader,nounits",
             ],
             text=True,
             stderr=subprocess.DEVNULL,
+            timeout=5.0,
         )
     except Exception:
         return None
-    first = out.strip().splitlines()[0]
-    return int(first)
+    values = [line.strip() for line in out.splitlines() if line.strip()]
+    if len(values) != 1:
+        return None
+    try:
+        return int(values[0])
+    except ValueError:
+        return None
 
 
 class VramMonitor:
     """Whole-GPU memory sampler for engines that do not expose torch peaks."""
 
-    def __init__(self, interval_s: float = 0.1) -> None:
+    def __init__(
+        self,
+        interval_s: float = 0.1,
+        device: str | int | None = None,
+        *,
+        device_selector: str | int | None = None,
+    ) -> None:
+        if device is not None and device_selector is not None:
+            raise ValueError("pass only one of device or device_selector")
         self.interval_s = interval_s
+        requested_device = device if device is not None else device_selector
+        self.device, self.device_selector_source = resolve_gpu_memory_device(
+            requested_device
+        )
         self.baseline_mib: int | None = None
         self.peak_mib: int | None = None
         self.sample_count = 0
         self.query_error_count = 0
         self.first_error: str | None = None
+        self.gpu: dict[str, Any] | None = None
         self._process: subprocess.Popen[str] | None = None
 
     def _record_samples(self, output: str) -> None:
@@ -752,14 +884,26 @@ class VramMonitor:
             self.peak_mib = used if self.peak_mib is None else max(self.peak_mib, used)
 
     def __enter__(self):
-        self.baseline_mib = gpu_mem_used_mib()
+        if self.device is None:
+            self.query_error_count += 1
+            self.first_error = (
+                "no physical GPU selector; pass --gpu-memory-device (or set "
+                "CUDA_VISIBLE_DEVICES to one physical device)"
+            )
+            return self
+        try:
+            self.gpu = query_nvidia_gpu(self.device)
+        except Exception as exc:
+            self.query_error_count += 1
+            self.first_error = str(exc).splitlines()[0]
+        self.baseline_mib = gpu_mem_used_mib(self.device)
         self.peak_mib = self.baseline_mib
         interval_ms = max(1, int(round(self.interval_s * 1000)))
         try:
             self._process = subprocess.Popen(
                 [
                     "nvidia-smi",
-                    "--id=0",
+                    f"--id={self.device}",
                     "--query-gpu=memory.used",
                     "--format=csv,noheader,nounits",
                     f"--loop-ms={interval_ms}",
@@ -787,7 +931,7 @@ class VramMonitor:
                 self.query_error_count += 1
                 if self.first_error is None:
                     self.first_error = stderr.strip().splitlines()[0]
-        final = gpu_mem_used_mib()
+        final = gpu_mem_used_mib(self.device)
         if final is not None:
             self.sample_count += 1
             self.peak_mib = final if self.peak_mib is None else max(self.peak_mib, final)
@@ -806,9 +950,17 @@ class VramMonitor:
             "schema": "wkvm.whole_gpu_memory.v1",
             "scope": "whole_device",
             "source": "nvidia-smi",
-            "device_selector": "0",
-            "device_index": 0,
-            "device_uuid": None,
+            "device_selector": self.device,
+            "device_selector_source": self.device_selector_source,
+            "device_index": None if self.gpu is None else self.gpu.get("index"),
+            "device_uuid": None if self.gpu is None else self.gpu.get("uuid"),
+            "gpu_name": None if self.gpu is None else self.gpu.get("name"),
+            "driver_version": (
+                None if self.gpu is None else self.gpu.get("driver_version")
+            ),
+            "memory_total_mib": (
+                None if self.gpu is None else self.gpu.get("memory_total_mib")
+            ),
             "sample_interval_s": self.interval_s,
             "sample_count": self.sample_count,
             "baseline_used_mib": self.baseline_mib,
@@ -880,59 +1032,145 @@ def normalize_vllm_outputs(outputs: list[Any], expected: int) -> list[list[int]]
     return rows
 
 
+def _finite_nonnegative_metric(value: Any) -> float | None:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        return None
+    return float(value)
+
+
 def vllm_request_metrics_timing(
     outputs: list[Any],
     expected: int,
 ) -> dict[str, Any] | None:
-    """Return batch-wide decode timing from one vLLM generation run."""
+    """Extract request TTFTs and a same-run batch decode interval.
+
+    vLLM's ``first_token_latency`` is a per-request TTFT.  The old harness
+    exposed its minimum as ``prefill_plus_first_s`` without saying so, and
+    copied the batch wall time into request latency percentiles.  Keep the old
+    key as a compatibility alias while emitting explicit TTFT and batch scope
+    fields.  Timestamp coverage can be incomplete on some vLLM releases, so
+    TTFT extraction is independent of decode-interval extraction.
+    """
 
     if len(outputs) != expected:
         return None
     first_token_timestamps: list[float] = []
     last_token_timestamps: list[float] = []
     first_token_latencies: list[float] = []
+    request_e2e_latencies: list[float] = []
     for output in outputs:
         metrics = getattr(output, "metrics", None)
-        first_token_ts = getattr(metrics, "first_token_ts", None)
-        last_token_ts = getattr(metrics, "last_token_ts", None)
+        first_token_ts = _finite_nonnegative_metric(
+            getattr(metrics, "first_token_ts", None)
+        )
+        last_token_ts = _finite_nonnegative_metric(
+            getattr(metrics, "last_token_ts", None)
+        )
         if (
-            not isinstance(first_token_ts, (int, float))
-            or isinstance(first_token_ts, bool)
-            or not math.isfinite(first_token_ts)
-            or first_token_ts <= 0
-            or not isinstance(last_token_ts, (int, float))
-            or isinstance(last_token_ts, bool)
-            or not math.isfinite(last_token_ts)
-            or last_token_ts < first_token_ts
+            first_token_ts is not None
+            and last_token_ts is not None
+            and first_token_ts > 0
+            and last_token_ts >= first_token_ts
         ):
-            return None
-        first_token_timestamps.append(float(first_token_ts))
-        last_token_timestamps.append(float(last_token_ts))
-        first_token_latency = getattr(metrics, "first_token_latency", None)
-        if (
-            isinstance(first_token_latency, (int, float))
-            and not isinstance(first_token_latency, bool)
-            and math.isfinite(first_token_latency)
-            and first_token_latency >= 0
+            first_token_timestamps.append(first_token_ts)
+            last_token_timestamps.append(last_token_ts)
+            timestamp_pair_valid = True
+        else:
+            timestamp_pair_valid = False
+        first_token_latency = _finite_nonnegative_metric(
+            getattr(metrics, "first_token_latency", None)
+        )
+        if first_token_latency is not None and (
+            first_token_latency > 0 or timestamp_pair_valid
         ):
-            first_token_latencies.append(float(first_token_latency))
+            first_token_latencies.append(first_token_latency)
+            if timestamp_pair_valid:
+                request_e2e_latencies.append(
+                    first_token_latency + max(0.0, last_token_ts - first_token_ts)
+                )
 
+    has_timing = bool(first_token_latencies or first_token_timestamps)
+    if not has_timing:
+        return None
+    complete_interval = (
+        len(first_token_timestamps) == expected
+        and len(last_token_timestamps) == expected
+    )
+    decode_seconds = (
+        max(last_token_timestamps) - min(first_token_timestamps)
+        if complete_interval
+        else None
+    )
+    min_ttft = (
+        min(first_token_latencies) if first_token_latencies else None
+    )
+    max_ttft = (
+        max(first_token_latencies) if first_token_latencies else None
+    )
+    ttft_scope = (
+        "min_request_ttft" if min_ttft is not None else "unavailable_request_ttft"
+    )
+    cohort_scope = (
+        "max_request_ttft_synchronous_cohort"
+        if max_ttft is not None
+        else "unavailable_request_ttft"
+    )
     return {
-        "prefill_plus_first_s": (
-            min(first_token_latencies)
-            if len(first_token_latencies) == expected
-            else None
+        # Compatibility alias: this is *minimum request TTFT*, never batch wall.
+        "prefill_plus_first_s": min_ttft,
+        "prefill_plus_first_scope": ttft_scope,
+        "prefill_plus_first_source": (
+            "RequestOutput.metrics.first_token_latency"
+            if min_ttft is not None
+            else "RequestOutput.metrics.first_token_latency unavailable"
         ),
-        "decode_seconds": max(last_token_timestamps) - min(first_token_timestamps),
-        "decode_timing_method": "same_run_request_metrics",
+        "min_ttft_s": min_ttft,
+        "max_ttft_s": max_ttft,
+        "p50_ttft_s": percentile(first_token_latencies, 0.50),
+        "p95_ttft_s": percentile(first_token_latencies, 0.95),
+        "ttft_request_count": len(first_token_latencies),
+        "ttft_available_count": len(first_token_latencies),
+        "request_ttft_s": list(first_token_latencies),
+        "request_e2e_latency_s": list(request_e2e_latencies),
+        "decode_seconds": decode_seconds,
+        "decode_interval_s": decode_seconds,
+        "decode_interval_scope": (
+            "batch_earliest_first_to_latest_last"
+            if complete_interval
+            else "unavailable_incomplete_request_timestamps"
+        ),
+        "cohort_prefill_wall_s": max_ttft,
+        "cohort_prefill_scope": cohort_scope,
+        "cohort_prefill_wall_scope": cohort_scope,
+        "cohort_prefill_source": "RequestOutput.metrics.first_token_latency",
+        "cohort_prefill_wall_source": (
+            "RequestOutput.metrics.first_token_latency"
+        ),
+        "cohort_prefill_comparable": max_ttft is not None,
+        "cohort_prefill_timing_method": "same_run_max_request_ttft",
+        "cohort_prefill_note": (
+            "All requests were submitted synchronously; maximum request TTFT "
+            "is the cohort time until every request produced a first token."
+        ),
+        "batch_wall_scope": "synchronous_batch_completion",
+        "decode_timing_method": (
+            "same_run_request_metrics" if complete_interval else "request_metrics_partial"
+        ),
         "decode_timing_source": (
             "RequestOutput.metrics.first_token_ts/last_token_ts"
         ),
-        "decode_timing_comparable": True,
-        "decode_timing_request_count": expected,
+        "decode_timing_comparable": complete_interval,
+        "decode_timing_request_count": len(first_token_timestamps),
         "decode_timing_note": (
             "Batch interval is earliest first token to latest last token from "
             "the measured max_tokens=N run."
+            if complete_interval
+            else "Request timestamps were incomplete; no comparable same-run batch interval."
         ),
     }
 
@@ -955,7 +1193,8 @@ def measure_vllm_generation(
         full_wall_s = time.perf_counter() - started
 
     timing = vllm_request_metrics_timing(full, len(reqs))
-    if timing is not None:
+    if timing is not None and timing.get("decode_seconds") is not None:
+        timing["batch_wall_s"] = full_wall_s
         return full, full_wall_s, timing
 
     synchronize_cuda()
@@ -963,9 +1202,27 @@ def measure_vllm_generation(
     llm.generate(reqs, sp1, use_tqdm=False)
     synchronize_cuda()
     first_wall_s = time.perf_counter() - started
-    return full, full_wall_s, {
+    fallback_timing: dict[str, Any] = {
         "prefill_plus_first_s": first_wall_s,
+        "prefill_plus_first_scope": "separate_max_tokens_1_batch_wall",
+        "prefill_plus_first_source": "separate max_tokens=1 wall time",
+        "separate_first_token_batch_wall_s": first_wall_s,
+        "cohort_prefill_wall_s": first_wall_s,
+        "cohort_prefill_scope": "separate_run_batch_wall",
+        "cohort_prefill_wall_scope": "separate_run_batch_wall",
+        "cohort_prefill_source": "separate max_tokens=1 batch wall time",
+        "cohort_prefill_wall_source": "separate max_tokens=1 batch wall time",
+        "cohort_prefill_comparable": False,
+        "cohort_prefill_timing_method": "separate_run_batch_wall",
+        "cohort_prefill_note": (
+            "Measured in a separate max_tokens=1 run and not strictly comparable "
+            "to same-run maximum request TTFT."
+        ),
+        "batch_wall_s": full_wall_s,
+        "batch_wall_scope": "synchronous_batch_completion",
         "decode_seconds": max(full_wall_s - first_wall_s, 0.0),
+        "decode_interval_s": max(full_wall_s - first_wall_s, 0.0),
+        "decode_interval_scope": "separate_run_wall_time_subtraction",
         "decode_timing_method": "separate_run_subtraction",
         "decode_timing_source": (
             "max_tokens=N wall time minus a separate max_tokens=1 wall time"
@@ -977,6 +1234,64 @@ def measure_vllm_generation(
             "to same-run first-token-to-finish timing."
         ),
     }
+    if timing is not None:
+        for key in (
+            "min_ttft_s",
+            "max_ttft_s",
+            "p50_ttft_s",
+            "p95_ttft_s",
+            "ttft_request_count",
+            "ttft_available_count",
+            "request_ttft_s",
+            "request_e2e_latency_s",
+            "cohort_prefill_wall_s",
+            "cohort_prefill_scope",
+            "cohort_prefill_wall_scope",
+            "cohort_prefill_source",
+            "cohort_prefill_wall_source",
+        ):
+            fallback_timing[key] = timing.get(key)
+        if timing.get("min_ttft_s") is not None:
+            fallback_timing.update(
+                {
+                    "prefill_plus_first_s": timing["min_ttft_s"],
+                    "prefill_plus_first_scope": "min_request_ttft",
+                    "prefill_plus_first_source": (
+                        "RequestOutput.metrics.first_token_latency"
+                    ),
+                }
+            )
+        if timing.get("max_ttft_s") is not None:
+            fallback_timing.update(
+                {
+                    "cohort_prefill_wall_s": timing["max_ttft_s"],
+                    "cohort_prefill_scope": (
+                        "max_request_ttft_synchronous_cohort"
+                    ),
+                    "cohort_prefill_wall_scope": (
+                        "max_request_ttft_synchronous_cohort"
+                    ),
+                    "cohort_prefill_source": (
+                        "RequestOutput.metrics.first_token_latency"
+                    ),
+                    "cohort_prefill_wall_source": (
+                        "RequestOutput.metrics.first_token_latency"
+                    ),
+                    "cohort_prefill_comparable": True,
+                    "cohort_prefill_timing_method": (
+                        "same_run_max_request_ttft"
+                    ),
+                    "cohort_prefill_note": (
+                        "All requests were submitted synchronously; maximum "
+                        "request TTFT is the cohort time until every request "
+                        "produced a first token."
+                    ),
+                }
+            )
+        fallback_timing["decode_timing_request_count"] = timing.get(
+            "decode_timing_request_count", 0
+        )
+    return full, full_wall_s, fallback_timing
 
 
 def sglang_output_ids(obj: Any) -> list[int]:
@@ -1013,17 +1328,28 @@ def make_row(
     error: str | None = None,
     decode_seconds: float | None = None,
     decode_timing: dict[str, Any] | None = None,
+    request_ttft_s: list[float] | None = None,
+    request_e2e_latency_s: list[float] | None = None,
+    cohort_prefill_wall_s: float | None = None,
+    cohort_prefill_scope: str | None = None,
+    cohort_prefill_source: str | None = None,
 ) -> dict[str, Any]:
     success_count = sum(1 for ids in outputs if ids)
-    latencies = [full_wall_s] * success_count
-    output_tokens = sum(len(ids) for ids in outputs)
-    decode_tokens = sum(max(0, len(ids) - 1) for ids in outputs)
-    decode_s = (
-        max(full_wall_s - first_wall_s, 0.0)
-        if decode_seconds is None and first_wall_s is not None
-        else decode_seconds
-    )
     timing_fields = decode_timing or {
+        "prefill_plus_first_scope": "batch_max_tokens_1_wall",
+        "prefill_plus_first_source": "separate max_tokens=1 wall time",
+        "cohort_prefill_scope": "separate_run_batch_wall",
+        "cohort_prefill_wall_scope": "separate_run_batch_wall",
+        "cohort_prefill_source": "separate max_tokens=1 batch wall time",
+        "cohort_prefill_wall_source": "separate max_tokens=1 batch wall time",
+        "cohort_prefill_comparable": False,
+        "cohort_prefill_timing_method": "separate_run_batch_wall",
+        "cohort_prefill_note": (
+            "Measured in a separate max_tokens=1 run and not strictly comparable "
+            "to same-run maximum request TTFT."
+        ),
+        "batch_wall_scope": "synchronous_batch_completion",
+        "decode_interval_scope": "batch_wall_minus_first_token_wall",
         "decode_timing_method": "separate_run_subtraction",
         "decode_timing_source": (
             "max_tokens=N wall time minus a separate max_tokens=1 wall time"
@@ -1035,19 +1361,143 @@ def make_row(
             "first-token-to-finish timing."
         ),
     }
+    if request_ttft_s is None:
+        request_ttft_s = timing_fields.get("request_ttft_s")
+    if request_e2e_latency_s is None:
+        request_e2e_latency_s = timing_fields.get("request_e2e_latency_s")
+    if cohort_prefill_wall_s is None:
+        cohort_prefill_wall_s = timing_fields.get("cohort_prefill_wall_s")
+    if cohort_prefill_scope is None:
+        cohort_prefill_scope = timing_fields.get("cohort_prefill_scope")
+    if cohort_prefill_source is None:
+        cohort_prefill_source = timing_fields.get("cohort_prefill_source")
+    request_ttft_s = [
+        float(value)
+        for value in (request_ttft_s or [])
+        if _finite_nonnegative_metric(value) is not None
+    ]
+    request_e2e_latency_s = [
+        float(value)
+        for value in (request_e2e_latency_s or [])
+        if _finite_nonnegative_metric(value) is not None
+    ]
+    output_tokens = sum(len(ids) for ids in outputs)
+    decode_tokens = sum(max(0, len(ids) - 1) for ids in outputs)
+    decode_s = (
+        max(full_wall_s - first_wall_s, 0.0)
+        if decode_seconds is None and first_wall_s is not None
+        else decode_seconds
+    )
+    timing_min_ttft = timing_fields.get("min_ttft_s")
+    timing_max_ttft = timing_fields.get("max_ttft_s")
+    timing_p50_ttft = timing_fields.get("p50_ttft_s")
+    timing_p95_ttft = timing_fields.get("p95_ttft_s")
     timing_fields = {
         key: value
         for key, value in timing_fields.items()
-        if key not in {"prefill_plus_first_s", "decode_seconds"}
+        if key
+        not in {
+            "prefill_plus_first_s",
+            "decode_seconds",
+            "decode_interval_s",
+            "request_ttft_s",
+            "request_e2e_latency_s",
+            "batch_wall_s",
+            "cohort_prefill_wall_s",
+            "cohort_prefill_scope",
+            "cohort_prefill_wall_scope",
+            "cohort_prefill_source",
+            "cohort_prefill_wall_source",
+            "min_ttft_s",
+            "max_ttft_s",
+            "p50_ttft_s",
+            "p95_ttft_s",
+            "ttft_request_count",
+            "ttft_available_count",
+        }
     }
+    min_ttft = (
+        min(request_ttft_s) if request_ttft_s else timing_min_ttft
+    )
+    max_ttft = (
+        max(request_ttft_s) if request_ttft_s else timing_max_ttft
+    )
+    p50_ttft = (
+        percentile(request_ttft_s, 0.50)
+        if request_ttft_s
+        else timing_p50_ttft
+    )
+    p95_ttft = (
+        percentile(request_ttft_s, 0.95)
+        if request_ttft_s
+        else timing_p95_ttft
+    )
+    prefill_scope = timing_fields.get(
+        "prefill_plus_first_scope",
+        "batch_max_tokens_1_wall",
+    )
+    if cohort_prefill_wall_s is None and max_ttft is not None:
+        cohort_prefill_wall_s = max_ttft
+    if cohort_prefill_wall_s is None:
+        cohort_prefill_wall_s = first_wall_s
+    cohort_scope = cohort_prefill_scope or timing_fields.get(
+        "cohort_prefill_scope",
+        "max_request_ttft_synchronous_cohort"
+        if request_ttft_s
+        else "separate_run_batch_wall",
+    )
+    cohort_source = cohort_prefill_source or timing_fields.get(
+        "cohort_prefill_source",
+        "RequestOutput.metrics.first_token_latency"
+        if request_ttft_s
+        else "separate max_tokens=1 batch wall time",
+    )
+    cohort_comparable = bool(
+        timing_fields.get("cohort_prefill_comparable", bool(request_ttft_s))
+    )
+    cohort_input_tokens = sum(
+        int(length)
+        for length in prompt_lens
+        if isinstance(length, int) and not isinstance(length, bool) and length >= 0
+    )
+    cohort_input_tok_s = (
+        cohort_input_tokens / cohort_prefill_wall_s
+        if cohort_prefill_wall_s is not None and cohort_prefill_wall_s > 0
+        else None
+    )
     row: dict[str, Any] = {
         "B": B,
         "success_count": success_count,
         "error_count": B - success_count + (1 if error else 0),
-        "p50_latency_s": round_or_none(statistics.median(latencies) if latencies else None),
-        "p95_latency_s": round_or_none(percentile(latencies, 0.95)),
+        # These are request percentiles only when the engine exposes request
+        # metrics.  A synchronous batch wall is deliberately not replicated.
+        "p50_latency_s": round_or_none(percentile(request_e2e_latency_s, 0.50)),
+        "p95_latency_s": round_or_none(percentile(request_e2e_latency_s, 0.95)),
+        "latency_metric_source": (
+            "request_metrics" if request_e2e_latency_s else None
+        ),
+        "latency_metric_count": len(request_e2e_latency_s),
+        "p50_ttft_s": round_or_none(p50_ttft),
+        "p95_ttft_s": round_or_none(p95_ttft),
+        "min_ttft_s": round_or_none(min_ttft),
+        "max_ttft_s": round_or_none(max_ttft),
+        "ttft_metric_source": "request_metrics" if request_ttft_s else None,
+        "ttft_metric_count": len(request_ttft_s),
         "prefill_plus_first_s": round_or_none(first_wall_s),
+        "prefill_plus_first_scope": prefill_scope,
+        "cohort_prefill_wall_s": round_or_none(cohort_prefill_wall_s),
+        "cohort_prefill_scope": cohort_scope,
+        "cohort_prefill_wall_scope": cohort_scope,
+        "cohort_prefill_source": cohort_source,
+        "cohort_prefill_wall_source": cohort_source,
+        "cohort_prefill_comparable": cohort_comparable,
+        "cohort_input_tokens": cohort_input_tokens,
+        "cohort_input_tok_s": round_or_none(cohort_input_tok_s),
+        "cohort_input_tok_s_comparable": cohort_comparable,
+        "cohort_input_tok_scope": "prompt_lengths_over_cohort_prefill_wall",
+        "cohort_input_tok_source": "prompt_lengths",
         "decode_seconds": round_or_none(decode_s),
+        "decode_interval_s": round_or_none(decode_s),
         "agg_decode_tok_s": round_or_none(
             decode_tokens / decode_s
             if decode_s is not None and decode_s > 0
@@ -1056,6 +1506,10 @@ def make_row(
         "e2e_output_tok_s": round_or_none(
             output_tokens / full_wall_s if full_wall_s > 0 else None
         ),
+        "batch_wall_s": round_or_none(full_wall_s),
+        "batch_wall_scope": timing_fields.get(
+            "batch_wall_scope", "synchronous_batch_completion"
+        ),
         "elapsed_s": round_or_none(full_wall_s),
         "prompt_lengths": prompt_lens,
         "output_token_counts": [len(ids) for ids in outputs],
@@ -1063,6 +1517,12 @@ def make_row(
         **timing_fields,
         **mem,
     }
+    if request_ttft_s:
+        row["request_ttft_s"] = [round_or_none(value, 6) for value in request_ttft_s]
+    if request_e2e_latency_s:
+        row["request_e2e_latency_s"] = [
+            round_or_none(value, 6) for value in request_e2e_latency_s
+        ]
     if success_count == B:
         row.update(
             generated_output_fingerprint_row_fields(
@@ -1116,6 +1576,9 @@ def run_vllm(
         "disable_log_stats": False,
         "dtype": "bfloat16",
     }
+    max_num_batched_tokens = getattr(args, "vllm_max_num_batched_tokens", None)
+    if max_num_batched_tokens is not None:
+        kwargs["max_num_batched_tokens"] = max_num_batched_tokens
     if args.vllm_language_model_only:
         kwargs["language_model_only"] = True
     compilation_config = None
@@ -1231,6 +1694,7 @@ def run_vllm(
         "enforce_eager": args.enforce_eager,
         "max_model_len": max_model_len,
         "max_num_seqs": max(prompts_by_b),
+        "max_num_batched_tokens": max_num_batched_tokens,
         "prefix_caching": False,
         "request_metrics_enabled": True,
         "decode_timing_preferred_method": "same_run_request_metrics",
@@ -1244,6 +1708,35 @@ def run_vllm(
         del llm
     cleanup_cuda()
     return rows, engine_info
+
+
+def measure_sglang_generation(
+    engine: Any,
+    *,
+    prompts: list[list[int]],
+    full_sampling_params: dict[str, Any],
+    one_token_sampling_params: dict[str, Any],
+    telemetry: Any,
+) -> tuple[Any, float, Any, float]:
+    with telemetry:
+        synchronize_cuda()
+        started = time.perf_counter()
+        full = engine.generate(
+            input_ids=prompts,
+            sampling_params=full_sampling_params,
+        )
+        synchronize_cuda()
+        full_wall_s = time.perf_counter() - started
+
+    synchronize_cuda()
+    started = time.perf_counter()
+    first = engine.generate(
+        input_ids=prompts,
+        sampling_params=one_token_sampling_params,
+    )
+    synchronize_cuda()
+    first_wall_s = time.perf_counter() - started
+    return full, full_wall_s, first, first_wall_s
 
 
 def run_sglang(
@@ -1268,6 +1761,9 @@ def run_sglang(
     }
     if args.sglang_attention_backend:
         kwargs["attention_backend"] = args.sglang_attention_backend
+    chunked_prefill_size = getattr(args, "sglang_chunked_prefill_size", None)
+    if chunked_prefill_size is not None:
+        kwargs["chunked_prefill_size"] = chunked_prefill_size
     model_override = None
     if args.sglang_language_model_only:
         model_override = sglang_language_model_override(args.model_path)
@@ -1311,19 +1807,14 @@ def run_sglang(
             interval_s=getattr(args, "telemetry_sample_interval_s", 0.05),
         )
         try:
-            synchronize_cuda()
-            t0 = time.perf_counter()
-            first = engine.generate(input_ids=prompts, sampling_params=sp1)
-            synchronize_cuda()
-            t_first = time.perf_counter() - t0
+            full, t_full, first, t_first = measure_sglang_generation(
+                engine,
+                prompts=prompts,
+                full_sampling_params=spn,
+                one_token_sampling_params=sp1,
+                telemetry=row_telemetry,
+            )
             normalize_sglang_outputs(first, B)
-
-            with row_telemetry:
-                synchronize_cuda()
-                t0 = time.perf_counter()
-                full = engine.generate(input_ids=prompts, sampling_params=spn)
-                synchronize_cuda()
-                t_full = time.perf_counter() - t0
             outputs = normalize_sglang_outputs(full, B)
             output_retractions, captured_requests = sglang_output_retractions(
                 full,
@@ -1341,6 +1832,7 @@ def run_sglang(
                 outputs=outputs,
                 mem=monitor_memory_row(monitor),
             )
+            row["separate_timing_probe_order"] = "full_then_max_tokens_1"
         except Exception as exc:
             row = {
                 "B": B,
@@ -1367,6 +1859,8 @@ def run_sglang(
         "mem_fraction_static": args.sglang_mem_fraction,
         "context_length": args.sglang_context_length,
         "max_total_tokens": args.sglang_max_total_tokens,
+        "chunked_prefill_size": chunked_prefill_size,
+        "separate_timing_probe_order": "full_then_max_tokens_1",
         "attention_backend": args.sglang_attention_backend or "default",
         "language_model_only": args.sglang_language_model_only,
         "model_override_architectures": (
@@ -1427,7 +1921,96 @@ def generated_output_fingerprint_summary(
     }
 
 
-def build_payload(args, rows: list[dict[str, Any]], engine_info: dict[str, Any], monitor: VramMonitor) -> dict[str, Any]:
+def git_worktree_dirty() -> bool | None:
+    try:
+        output = subprocess.check_output(
+            ["git", "status", "--porcelain"],
+            cwd=ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return None
+    return bool(output.strip())
+
+
+def build_provenance(
+    args,
+    engine_info: dict[str, Any],
+    monitor: VramMonitor,
+    *,
+    source_identity_before: dict[str, Any] | None = None,
+    source_identity_after: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    packages = installed_package_versions()
+    engine_version = engine_info.get(f"{args.engine}_version")
+    source_identity_after = source_identity_after or source_worktree_identity(ROOT)
+    source_identity_before = source_identity_before or source_identity_after
+    source_identity_unchanged = (
+        source_identity_before.get("error") is None
+        and source_identity_after.get("error") is None
+        and source_identity_before.get("identity_sha256")
+        == source_identity_after.get("identity_sha256")
+    )
+    gpu = None if monitor.gpu is None else dict(monitor.gpu)
+    if gpu is not None:
+        gpu.pop("memory_used_mib", None)
+        gpu["source"] = "nvidia-smi"
+    return {
+        "schema": PROVENANCE_SCHEMA,
+        "benchmark": {
+            "git_commit": git_commit(),
+            "git_worktree_dirty": source_identity_after.get(
+                "git_worktree_dirty",
+                git_worktree_dirty(),
+            ),
+            "source_identity": source_identity_after,
+            "pre_run_source_identity_sha256": source_identity_before.get(
+                "identity_sha256"
+            ),
+            "source_identity_unchanged_during_run": (
+                source_identity_unchanged
+            ),
+        },
+        "runtime": {
+            "python_version": platform.python_version(),
+            "python_implementation": platform.python_implementation(),
+            "python_executable": sys.executable,
+            "platform": platform.platform(),
+            "machine": platform.machine(),
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "packages": packages,
+        },
+        "engine": {
+            "label": args.engine,
+            "version": engine_version,
+            "version_source": "imported_package",
+        },
+        "gpu": gpu,
+        "gpu_memory_monitor": {
+            "scope": "whole_device",
+            "source": "nvidia-smi",
+            "device_selector": monitor.device,
+            "device_selector_source": monitor.device_selector_source,
+            "sample_interval_s": monitor.interval_s,
+            "caveat": (
+                "includes every process on the selected physical GPU; baseline "
+                "and peak are not process-attributed"
+            ),
+        },
+    }
+
+
+def build_payload(
+    args,
+    rows: list[dict[str, Any]],
+    engine_info: dict[str, Any],
+    monitor: VramMonitor,
+    *,
+    source_identity_before: dict[str, Any] | None = None,
+    model_identity: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    source_identity_after = source_worktree_identity(ROOT)
     gpu_memory = monitor.result()
     for row in rows:
         row["peak_engine_delta_gib"] = round_or_none(monitor.engine_peak_delta_gib)
@@ -1444,12 +2027,25 @@ def build_payload(args, rows: list[dict[str, Any]], engine_info: dict[str, Any],
         "decode_tokens_per_session": args.out,
         "mem_cap_gib": args.mem_cap_gib,
         "headroom_gib": args.headroom_gib,
+        "max_baseline_gpu_used_gib": getattr(
+            args,
+            "max_baseline_gpu_used_gib",
+            1.0,
+        ),
         "model_path": args.model_path,
+        "model_identity": model_identity,
         "prompt_token_source": prompt_token_source(args),
         "uses_hf_tokenizer": uses_hf_tokenizer(args),
         "dtype": "bfloat16",
         "git_commit": git_commit(),
         "launch_command": shlex.join([sys.executable, *sys.argv]),
+        "provenance": build_provenance(
+            args,
+            engine_info,
+            monitor,
+            source_identity_before=source_identity_before,
+            source_identity_after=source_identity_after,
+        ),
         "concurrency": args.concurrency,
         "warmup": args.warmup,
         "generated_output_fingerprint_schema": (
@@ -1494,6 +2090,8 @@ def build_payload(args, rows: list[dict[str, Any]], engine_info: dict[str, Any],
 
 def run(args) -> dict[str, Any]:
     args.model_path = resolve_model_path(args.model_path)
+    source_identity_before = source_worktree_identity(ROOT)
+    model_identity = model_checkpoint_identity(args.model_path)
     if getattr(args, "synthetic_prompts", False):
         tok = SyntheticBenchTokenizer(vocab_size=args.synthetic_vocab_size)
     else:
@@ -1512,7 +2110,10 @@ def run(args) -> dict[str, Any]:
         "vllm": run_vllm,
         "sglang": run_sglang,
     }
-    with VramMonitor(interval_s=args.mem_sample_interval_s) as monitor:
+    with VramMonitor(
+        interval_s=args.mem_sample_interval_s,
+        device=getattr(args, "gpu_memory_device", None),
+    ) as monitor:
         try:
             rows, engine_info = runners[args.engine](args, tok, prompts_by_b, monitor)
         except Exception as exc:
@@ -1536,7 +2137,14 @@ def run(args) -> dict[str, Any]:
                     }
                 )
             engine_info = {"setup_error": setup_error}
-    payload = build_payload(args, rows, engine_info, monitor)
+    payload = build_payload(
+        args,
+        rows,
+        engine_info,
+        monitor,
+        source_identity_before=source_identity_before,
+        model_identity=model_identity,
+    )
     if args.json:
         atomic_write_json(Path(args.json), payload)
         print(f"WROTE {args.json}")
@@ -1545,7 +2153,7 @@ def run(args) -> dict[str, Any]:
     return payload
 
 
-def main() -> None:
+def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--engine", choices=["vllm", "sglang"], required=True)
     ap.add_argument("--ctx", type=int, default=13_824)
@@ -1569,7 +2177,24 @@ def main() -> None:
     )
     ap.add_argument("--mem-cap-gib", type=float, default=float(os.environ.get("WKVM_MEM_CAP_GIB", 19)))
     ap.add_argument("--headroom-gib", type=float, default=1.0)
+    ap.add_argument(
+        "--max-baseline-gpu-used-gib",
+        type=float,
+        default=1.0,
+        help="Reject report evidence when pre-load whole-GPU use exceeds this idle ceiling.",
+    )
     ap.add_argument("--mem-sample-interval-s", type=float, default=0.1)
+    ap.add_argument(
+        "--gpu-memory-device",
+        "--monitor-gpu",
+        "--gpu-index",
+        default=None,
+        help=(
+            "Physical GPU index or UUID used by nvidia-smi memory sampling. "
+            "Required on ambiguous multi-GPU hosts; a single CUDA_VISIBLE_DEVICES "
+            "value is used when present."
+        ),
+    )
     ap.add_argument("--telemetry-sample-interval-s", type=float, default=0.05)
     ap.add_argument("--json", default=None)
     ap.add_argument("--model-path", default=None)
@@ -1578,6 +2203,15 @@ def main() -> None:
 
     ap.add_argument("--vllm-gpu-mem-util", type=float, default=0.82)
     ap.add_argument("--max-model-len", type=int, default=None)
+    ap.add_argument(
+        "--vllm-max-num-batched-tokens",
+        type=parse_positive_int,
+        default=None,
+        help=(
+            "Explicit vLLM scheduler token budget. Set this high enough for the "
+            "intended long-prefill cohort; the exact value is recorded."
+        ),
+    )
     ap.add_argument("--enforce-eager", action="store_true")
     ap.add_argument("--vllm-language-model-only", action="store_true")
     ap.add_argument(
@@ -1589,13 +2223,25 @@ def main() -> None:
     ap.add_argument("--sglang-mem-fraction", type=float, default=0.88)
     ap.add_argument("--sglang-context-length", type=int, default=None)
     ap.add_argument("--sglang-max-total-tokens", type=int, default=None)
+    ap.add_argument(
+        "--sglang-chunked-prefill-size",
+        type=parse_positive_int,
+        default=None,
+        help=(
+            "Explicit SGLang chunked_prefill_size passed to Engine and recorded."
+        ),
+    )
     ap.add_argument("--sglang-attention-backend", default="triton")
     ap.add_argument("--sglang-language-model-only", action="store_true")
     ap.add_argument("--sglang-max-running-requests", type=int, default=64)
     ap.add_argument("--sglang-decode-graph", default="full")
     ap.add_argument("--sglang-prefill-graph", default="disabled")
     ap.add_argument("--sglang-log-level", default="warning")
-    run(ap.parse_args())
+    return ap
+
+
+def main() -> None:
+    run(build_arg_parser().parse_args())
 
 
 if __name__ == "__main__":

@@ -2320,7 +2320,13 @@ def main() -> None:
     )
     ap.add_argument(
         "--native-gemma-attention-backend",
-        choices=["manual", "manual_gqa", "sdpa", "sdpa_single_gqa", "triton_dense_gqa"],
+        choices=[
+            "manual",
+            "manual_gqa",
+            "sdpa",
+            "sdpa_single_gqa",
+            "triton_dense_gqa",
+        ],
         default="manual",
         help="Attention primitive used inside --use-native-gemma-forward.",
     )

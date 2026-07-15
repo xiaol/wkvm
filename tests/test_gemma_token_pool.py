@@ -1058,6 +1058,7 @@ class TestGemmaTokenPool(unittest.TestCase):
         )
         pool = TokenKVPool(
             capacity=3_000,
+            request_slot_capacity=528,
             layer_specs=[
                 TokenKVLayerSpec(
                     layer_id=1,
@@ -1072,6 +1073,7 @@ class TestGemmaTokenPool(unittest.TestCase):
         backend = TokenPoolDecodeBackendState(
             table=table,
             allocator=pool,
+            full_attention_allocator=pool.full_attention_row_allocator,
             kv_pool=pool,
             block_size=16,
             token_pool_capacity=pool.capacity,
@@ -1153,6 +1155,12 @@ class TestGemmaTokenPool(unittest.TestCase):
         row = backend.full_attention_row_records[req_id]
         self.assertEqual(len(row.owned_slots), materialized_width - stable_borrowed)
         self.assertEqual(len(row.borrowed_slots), stable_borrowed + 1)
+        self.assertTrue(
+            all(slot >= pool.request_slot_capacity for slot in row.owned_slots)
+        )
+        self.assertTrue(
+            all(slot < pool.request_slot_capacity for slot in row.borrowed_slots)
+        )
         self.assertEqual(row.borrowed_slots[-1], request_slot_ids[-1])
         self.assertEqual(row.borrowed_append_slots_remaining, reserve_steps - 1)
         self.assertEqual(reservation.full_attention_token_slot, request_slot_ids[-1])
@@ -1164,7 +1172,26 @@ class TestGemmaTokenPool(unittest.TestCase):
         old_high_watermark = request_allocated + materialized_width + reserve_steps
         self.assertEqual(old_high_watermark - pool.high_watermark, 512)
 
-        backend.clear_full_attention_rows(req_id)
+        class FailsIfScanned:
+            def __iter__(self):
+                raise AssertionError("low request slots must use the borrowed-slot index")
+
+        owned_slots = row.owned_slots
+        row.owned_slots = FailsIfScanned()
+        self.assertEqual(
+            backend.invalidate_full_attention_rows_containing(
+                [request_slot_ids[0]]
+            ),
+            0,
+        )
+        row.owned_slots = owned_slots
+        self.assertIn(req_id, backend.full_attention_row_records)
+        self.assertEqual(
+            backend.invalidate_full_attention_rows_containing(
+                [row.borrowed_slots[0]]
+            ),
+            1,
+        )
         self.assertEqual(pool.allocated_count, request_allocated)
         backend.release_request(req_id)
         self.assertEqual(pool.allocated_count, 0)
@@ -1368,6 +1395,171 @@ class TestGemmaTokenPool(unittest.TestCase):
                 "kv_pool_layers": 0,
             },
         )
+
+    def test_token_pool_decode_backend_splits_full_attention_allocator(self) -> None:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenKVLayerSpec,
+            TokenKVPool,
+            TokenPoolDecodeBackendState,
+        )
+
+        pool = TokenKVPool(
+            capacity=16,
+            request_slot_capacity=8,
+            layer_specs=[
+                TokenKVLayerSpec(layer_id=0, num_kv_heads=1, head_dim=1)
+            ],
+            defer_buffer_allocation=True,
+        )
+        full_attention_allocator = pool.full_attention_row_allocator
+        backend = TokenPoolDecodeBackendState(
+            table=ReqToTokenTable(max_requests=1, max_context_len=8),
+            kv_pool=pool,
+            block_size=4,
+        )
+        self.assertIs(backend.full_attention_allocator, full_attention_allocator)
+
+        sliding_slots, sliding_slot_ids = pool.alloc_slots_with_ids(4)
+        full_slots, full_slot_ids, full_owned_slot_ids = (
+            backend.allocate_page_aligned_full_attention_row_slots(0, 4)
+        )
+
+        self.assertEqual(sliding_slots.tolist(), [0, 1, 2, 3])
+        self.assertEqual(sliding_slot_ids, [0, 1, 2, 3])
+        self.assertEqual(full_slots.tolist(), [8, 9, 10, 11])
+        self.assertEqual(full_slot_ids, [8, 9, 10, 11])
+        self.assertEqual(full_owned_slot_ids, [8, 9, 10, 11])
+        self.assertEqual(pool.request_allocated_count, 4)
+        self.assertEqual(pool.allocated_count, 8)
+        self.assertEqual(full_attention_allocator.allocated_count, 4)
+
+        stats = backend.stats()
+        self.assertEqual(stats["allocated_token_slots"], 8)
+        self.assertEqual(stats["request_allocated_token_slots"], 4)
+        self.assertEqual(stats["full_attention_allocated_token_slots"], 4)
+        self.assertEqual(stats["token_slot_high_watermark"], 8)
+        self.assertEqual(stats["request_token_slot_high_watermark"], 4)
+        self.assertEqual(stats["full_attention_token_slot_high_watermark"], 4)
+        self.assertEqual(stats["request_token_slot_capacity"], 8)
+        self.assertEqual(stats["full_attention_token_slot_capacity"], 8)
+        self.assertEqual(stats["full_attention_token_slot_start"], 8)
+
+        pool.free_slots(sliding_slot_ids)
+        full_attention_allocator.free_slots(full_owned_slot_ids)
+        self.assertEqual(pool.allocated_count, 0)
+
+        request_block, request_block_slots = pool.alloc_page_block_with_ids(4)
+        full_block, full_block_slots = (
+            full_attention_allocator.alloc_page_block_with_ids(4)
+        )
+        self.assertEqual(request_block, 0)
+        self.assertEqual(request_block_slots, [0, 1, 2, 3])
+        self.assertEqual(full_block, 2)
+        self.assertEqual(full_block_slots, [8, 9, 10, 11])
+        pool.free_slots(request_block_slots)
+        full_attention_allocator.free_slots(full_block_slots)
+
+    def test_borrowed_full_attention_row_rolls_back_owned_slots_on_build_failure(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from unittest.mock import patch
+
+        from wkvm.runner.gemma_token_pool import (
+            TokenKVLayerSpec,
+            TokenKVPool,
+            TokenPoolFullAttentionRowManager,
+        )
+
+        pool = TokenKVPool(
+            capacity=16,
+            request_slot_capacity=8,
+            layer_specs=[TokenKVLayerSpec(layer_id=0, num_kv_heads=1, head_dim=1)],
+            defer_buffer_allocation=True,
+        )
+        full_allocator = pool.full_attention_row_allocator
+        borrowed_slots, borrowed_slot_ids = pool.alloc_slots_with_ids(3)
+        manager = TokenPoolFullAttentionRowManager(
+            allocator=full_allocator,
+            block_size=4,
+        )
+
+        with patch("torch.cat", side_effect=RuntimeError("injected build failure")):
+            with self.assertRaisesRegex(RuntimeError, "injected build failure"):
+                manager.prepare_decode_row(
+                    "borrowed",
+                    materialized_width=3,
+                    decode_token_slot=borrowed_slot_ids[-1],
+                    decode_token_slot_tensor=borrowed_slots[-1:],
+                    persistent_rows=True,
+                    build_paged_rows=False,
+                    append_reserve_slots=1,
+                    device="cpu",
+                    borrowed_materialized_slots=borrowed_slots[:2],
+                    borrowed_materialized_slot_ids=borrowed_slot_ids[:2],
+                )
+
+        self.assertEqual(full_allocator.allocated_count, 0)
+        self.assertEqual(pool.allocated_count, 3)
+        self.assertEqual(manager.rows, {})
+        pool.free_slots(borrowed_slot_ids)
+
+    def test_partitioned_full_attention_allocation_rolls_back_on_exhaustion(self) -> None:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenKVLayerSpec,
+            TokenKVPool,
+            TokenPoolDecodeBackendState,
+        )
+
+        pool = TokenKVPool(
+            capacity=12,
+            request_slot_capacity=4,
+            layer_specs=[
+                TokenKVLayerSpec(layer_id=0, num_kv_heads=1, head_dim=1)
+            ],
+            defer_buffer_allocation=True,
+        )
+        full_attention_allocator = pool.full_attention_row_allocator
+        backend = TokenPoolDecodeBackendState(
+            table=ReqToTokenTable(max_requests=1, max_context_len=4),
+            allocator=pool,
+            full_attention_allocator=full_attention_allocator,
+            kv_pool=pool,
+            block_size=4,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "full-attention page capacity"):
+            backend.allocate_page_aligned_full_attention_row_slots(0, 12)
+
+        self.assertEqual(pool.allocated_count, 0)
+        self.assertEqual(full_attention_allocator.allocated_count, 0)
+        self.assertEqual(full_attention_allocator.free_count, 8)
+
+        _, materialized_slot_ids = full_attention_allocator.alloc_slots_with_ids(8)
+        with self.assertRaisesRegex(RuntimeError, "full-attention capacity"):
+            backend.full_attention_rows.start_persistent_row(
+                "req",
+                materialized_slots=materialized_slot_ids,
+                append_reserve_slots=1,
+                page_aligned=False,
+            )
+
+        self.assertEqual(pool.allocated_count, 0)
+        self.assertEqual(full_attention_allocator.allocated_count, 0)
 
     def test_token_pool_decode_backend_builds_layer_type_metadata(self) -> None:
         try:
@@ -1931,6 +2123,467 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(cache._shared_kv_by_layer, {})
         self.assertEqual(cache._shared_kv_by_type, {})
         self.assertEqual(cache.state_bytes(), 0)
+
+    def test_deferred_prefill_writes_only_the_final_authoritative_tail(self) -> None:
+        from types import SimpleNamespace
+
+        import torch
+
+        from wkvm.models.gemma import GemmaRoutedSpanConfig
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenKVLayerSpec,
+            TokenKVPool,
+            TokenPoolBlockTables,
+            TokenPoolDecodeBackendState,
+        )
+
+        hf_config = SimpleNamespace(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("sliding_attention",),
+            sliding_window=4,
+        )
+        native_config = GemmaRoutedSpanConfig(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("sliding_attention",),
+            num_kv_heads=1,
+            head_dim=2,
+            sliding_window=4,
+        )
+        serial_cache = NativeGemmaRoutedCache(hf_config, native_config)
+        cache = NativeGemmaRoutedCache(hf_config, native_config)
+        table = ReqToTokenTable(max_requests=1, max_context_len=16)
+        block_tables = TokenPoolBlockTables(
+            max_requests=1,
+            max_context_len=16,
+            block_size=4,
+        )
+        pool = TokenKVPool(
+            capacity=16,
+            layer_specs=[
+                TokenKVLayerSpec(
+                    layer_id=0,
+                    num_kv_heads=1,
+                    head_dim=2,
+                    dtype=torch.float32,
+                )
+            ],
+            defer_buffer_allocation=True,
+        )
+        backend = TokenPoolDecodeBackendState(
+            table=table,
+            allocator=pool,
+            kv_pool=pool,
+            block_tables=block_tables,
+            block_size=4,
+        )
+
+        def fail_backfill(*args, **kwargs):
+            raise AssertionError("authoritative chunks must not backfill")
+
+        backend.backfill_prefill_tokens = fail_backfill  # type: ignore[method-assign]
+        request = SimpleNamespace(req_id="chunked")
+        position = 0
+        for width in (3, 2, 4):
+            final_prefill = position + width == 9
+            keys = torch.arange(
+                position * 2,
+                (position + width) * 2,
+                dtype=torch.float32,
+            ).reshape(1, 1, width, 2)
+            values = keys + 100
+            serial_keys, serial_values = serial_cache.layers[0].update(keys, values)
+            reservation = backend.prepare_authoritative_prefill(
+                request,
+                width,
+                expected_length=position,
+                cache=cache,
+                sliding_window=4,
+                final_prefill=final_prefill,
+            )
+            if final_prefill:
+                self.assertIsNotNone(reservation)
+            else:
+                self.assertIsNone(reservation)
+
+            returned_keys, returned_values = cache.layers[0].update(keys, values)
+            cache.store_shared_kv(
+                layer_idx=0,
+                layer_type="sliding_attention",
+                key_states=returned_keys,
+                value_states=returned_values,
+            )
+
+            self.assertTrue(torch.equal(returned_keys, serial_keys))
+            self.assertTrue(torch.equal(returned_values, serial_values))
+            self.assertTrue(
+                torch.equal(cache.layers[0].keys, serial_cache.layers[0].keys)
+            )
+            self.assertTrue(
+                torch.equal(cache.layers[0].values, serial_cache.layers[0].values)
+            )
+            if reservation is None:
+                result = backend.commit_prefill_tokens(
+                    request,
+                    width,
+                    expected_length=position,
+                    cache=cache,
+                    sliding_window=4,
+                    final_prefill=False,
+                    defer_kv=True,
+                )
+            else:
+                result = backend.commit_authoritative_prefill(
+                    reservation,
+                    cache=cache,
+                )
+            position += width
+
+            self.assertEqual(result.authoritative, final_prefill)
+            self.assertEqual(result.deferred, not final_prefill)
+            self.assertFalse(result.backfilled)
+            self.assertEqual(result.previous_length, position - width)
+            self.assertEqual(result.new_length, position)
+            slots = table.slots_for("chunked")
+            if not final_prefill:
+                self.assertTrue(slots.eq(table.padding_token).all().item())
+                self.assertEqual(pool.allocated_count, 0)
+                self.assertEqual(pool.kv_set_calls, 0)
+            else:
+                self.assertEqual(result.kept_tokens, 3)
+                self.assertEqual(result.padded_tokens, width - 3)
+                retained_slots = slots[-3:]
+                self.assertTrue(slots[:-3].eq(table.padding_token).all().item())
+                self.assertFalse(
+                    retained_slots.eq(table.padding_token).any().item()
+                )
+                pooled_k, pooled_v = pool.gather_kv(0, retained_slots)
+                self.assertTrue(
+                    torch.equal(
+                        pooled_k,
+                        serial_cache.layers[0].keys[0].permute(1, 0, 2),
+                    )
+                )
+                self.assertTrue(
+                    torch.equal(
+                        pooled_v,
+                        serial_cache.layers[0].values[0].permute(1, 0, 2),
+                    )
+                )
+                self.assertTrue(
+                    set(int(slot) for slot in retained_slots.tolist()).issubset(
+                        backend.page_owned_slots_for_request("chunked")
+                    )
+                )
+
+        self.assertEqual(table.length("chunked"), 9)
+        self.assertEqual(set(backend.page_table_for_request("chunked")), {1, 2})
+        self.assertEqual(
+            len(set(backend.page_table_for_request("chunked").values())),
+            2,
+        )
+        self.assertEqual(pool.allocated_count, 8)
+        self.assertEqual(pool.kv_set_calls, 1)
+        self.assertEqual(pool.kv_set_tokens, 3)
+        backend.release_prefill_sliding_storage(cache)
+        self.assertIsNone(cache.layers[0].keys)
+        self.assertIsNone(cache.layers[0].values)
+
+    def test_authoritative_prefill_recycles_pages_and_restores_kv_on_failure(
+        self,
+    ) -> None:
+        from types import SimpleNamespace
+
+        import torch
+
+        from wkvm.models.gemma import GemmaRoutedSpanConfig
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenKVLayerSpec,
+            TokenKVPool,
+            TokenPoolBlockTables,
+            TokenPoolDecodeBackendState,
+        )
+
+        hf_config = SimpleNamespace(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("sliding_attention",),
+            sliding_window=4,
+        )
+        native_config = GemmaRoutedSpanConfig(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("sliding_attention",),
+            num_kv_heads=1,
+            head_dim=2,
+            sliding_window=4,
+        )
+        serial_cache = NativeGemmaRoutedCache(hf_config, native_config)
+        cache = NativeGemmaRoutedCache(hf_config, native_config)
+        table = ReqToTokenTable(max_requests=1, max_context_len=16)
+        block_tables = TokenPoolBlockTables(
+            max_requests=1,
+            max_context_len=16,
+            block_size=4,
+        )
+        pool = TokenKVPool(
+            capacity=16,
+            request_slot_capacity=8,
+            layer_specs=[
+                TokenKVLayerSpec(
+                    layer_id=0,
+                    num_kv_heads=1,
+                    head_dim=2,
+                    dtype=torch.float32,
+                )
+            ],
+            defer_buffer_allocation=True,
+        )
+        backend = TokenPoolDecodeBackendState(
+            table=table,
+            allocator=pool,
+            full_attention_allocator=pool.full_attention_row_allocator,
+            kv_pool=pool,
+            block_tables=block_tables,
+            block_size=4,
+        )
+        request = SimpleNamespace(req_id="recycle")
+
+        first_keys = torch.arange(6, dtype=torch.float32).reshape(1, 1, 3, 2)
+        first_values = first_keys + 100
+        serial_cache.layers[0].update(first_keys, first_values)
+        first = backend.prepare_authoritative_prefill(
+            request,
+            3,
+            expected_length=0,
+            cache=cache,
+            sliding_window=4,
+            final_prefill=True,
+        )
+        returned = cache.layers[0].update(first_keys, first_values)
+        cache.store_shared_kv(
+            layer_idx=0,
+            layer_type="sliding_attention",
+            key_states=returned[0],
+            value_states=returned[1],
+        )
+        backend.commit_authoritative_prefill(first, cache=cache)
+
+        prior_keys = cache.layers[0].keys.clone()
+        prior_values = cache.layers[0].values.clone()
+        prior_shared = cache.get_shared_kv(layer_idx=0)
+        prior_table = table.slots_for("recycle").clone()
+        prior_pages = dict(backend.page_table_for_request("recycle"))
+        prior_owned = set(backend.page_owned_slots_for_request("recycle"))
+        prior_pool_k, prior_pool_v = pool.gather_kv(0, prior_table)
+
+        second_keys = torch.arange(6, 16, dtype=torch.float32).reshape(1, 1, 5, 2)
+        second_values = second_keys + 100
+        failed = backend.prepare_authoritative_prefill(
+            request,
+            5,
+            expected_length=3,
+            cache=cache,
+            sliding_window=4,
+            final_prefill=True,
+        )
+        self.assertEqual(failed.recycled_token_slot_ids, (1, 2, 3))
+        returned = cache.layers[0].update(second_keys, second_values)
+        cache.store_shared_kv(
+            layer_idx=0,
+            layer_type="sliding_attention",
+            key_states=returned[0],
+            value_states=returned[1],
+        )
+        original_append_table_slots = backend.append_table_slots
+
+        def fail_append(*args, **kwargs):
+            raise RuntimeError("injected authoritative append failure")
+
+        backend.append_table_slots = fail_append  # type: ignore[method-assign]
+        try:
+            with self.assertRaisesRegex(RuntimeError, "injected authoritative"):
+                backend.commit_authoritative_prefill(failed, cache=cache)
+        finally:
+            backend.append_table_slots = original_append_table_slots  # type: ignore[method-assign]
+
+        restored_pool_k, restored_pool_v = pool.gather_kv(0, prior_table)
+        self.assertTrue(torch.equal(restored_pool_k, prior_pool_k))
+        self.assertTrue(torch.equal(restored_pool_v, prior_pool_v))
+        self.assertTrue(torch.equal(cache.layers[0].keys, prior_keys))
+        self.assertTrue(torch.equal(cache.layers[0].values, prior_values))
+        restored_shared = cache.get_shared_kv(layer_idx=0)
+        self.assertIs(restored_shared[0], prior_shared[0])
+        self.assertIs(restored_shared[1], prior_shared[1])
+        self.assertTrue(torch.equal(table.slots_for("recycle"), prior_table))
+        self.assertEqual(backend.page_table_for_request("recycle"), prior_pages)
+        self.assertEqual(backend.page_owned_slots_for_request("recycle"), prior_owned)
+        self.assertEqual(pool.request_allocated_count, 4)
+
+        position = 3
+        for width, keys, values, final_prefill in (
+            (5, second_keys, second_values, True),
+            (
+                5,
+                torch.arange(16, 26, dtype=torch.float32).reshape(1, 1, 5, 2),
+                torch.arange(116, 126, dtype=torch.float32).reshape(1, 1, 5, 2),
+                True,
+            ),
+        ):
+            serial_readout = serial_cache.layers[0].update(keys, values)
+            reservation = backend.prepare_authoritative_prefill(
+                request,
+                width,
+                expected_length=position,
+                cache=cache,
+                sliding_window=4,
+                final_prefill=final_prefill,
+            )
+            returned = cache.layers[0].update(keys, values)
+            self.assertTrue(torch.equal(returned[0], serial_readout[0]))
+            self.assertTrue(torch.equal(returned[1], serial_readout[1]))
+            backend.commit_authoritative_prefill(reservation, cache=cache)
+            position += width
+            self.assertLessEqual(
+                pool.request_allocated_count,
+                pool.request_slot_capacity,
+            )
+
+        retained_slots = table.slots_for("recycle")[-3:]
+        pooled_k, pooled_v = pool.gather_kv(0, retained_slots)
+        self.assertTrue(
+            torch.equal(
+                pooled_k,
+                serial_cache.layers[0].keys[0].permute(1, 0, 2),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                pooled_v,
+                serial_cache.layers[0].values[0].permute(1, 0, 2),
+            )
+        )
+        self.assertEqual(pool.request_allocated_count, 8)
+        self.assertEqual(pool.full_attention_row_allocator.allocated_count, 0)
+        self.assertEqual(set(backend.page_table_for_request("recycle")), {2, 3})
+
+    def test_authoritative_prefill_nonzero_discard_restores_cache_and_pages(self) -> None:
+        from types import SimpleNamespace
+
+        import torch
+
+        from wkvm.models.gemma import GemmaRoutedSpanConfig
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenKVLayerSpec,
+            TokenKVPool,
+            TokenPoolBlockTables,
+            TokenPoolDecodeBackendState,
+        )
+
+        hf_config = SimpleNamespace(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("sliding_attention",),
+            sliding_window=4,
+        )
+        native_config = GemmaRoutedSpanConfig(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("sliding_attention",),
+            num_kv_heads=1,
+            head_dim=2,
+            sliding_window=4,
+        )
+        cache = NativeGemmaRoutedCache(hf_config, native_config)
+        table = ReqToTokenTable(max_requests=1, max_context_len=12)
+        block_tables = TokenPoolBlockTables(
+            max_requests=1,
+            max_context_len=12,
+            block_size=4,
+        )
+        pool = TokenKVPool(
+            capacity=12,
+            layer_specs=[
+                TokenKVLayerSpec(
+                    layer_id=0,
+                    num_kv_heads=1,
+                    head_dim=2,
+                    dtype=torch.float32,
+                )
+            ],
+            defer_buffer_allocation=True,
+        )
+        backend = TokenPoolDecodeBackendState(
+            table=table,
+            allocator=pool,
+            kv_pool=pool,
+            block_tables=block_tables,
+            block_size=4,
+        )
+        request = SimpleNamespace(req_id="rollback")
+        first = backend.prepare_authoritative_prefill(
+            request,
+            3,
+            expected_length=0,
+            cache=cache,
+            sliding_window=4,
+            final_prefill=True,
+        )
+        keys = torch.arange(6, dtype=torch.float32).reshape(1, 1, 3, 2)
+        returned = cache.layers[0].update(keys, keys + 100)
+        cache.store_shared_kv(
+            layer_idx=0,
+            layer_type="sliding_attention",
+            key_states=returned[0],
+            value_states=returned[1],
+        )
+        backend.commit_authoritative_prefill(first, cache=cache)
+        prior_keys = cache.layers[0].keys
+        prior_values = cache.layers[0].values
+        prior_shared = cache.get_shared_kv(layer_idx=0)
+        prior_slots = table.slots_for("rollback").clone()
+        prior_pages = dict(backend.page_table_for_request("rollback"))
+        prior_owned = set(backend.page_owned_slots_for_request("rollback"))
+        prior_allocated = pool.allocated_count
+
+        second = backend.prepare_authoritative_prefill(
+            request,
+            5,
+            expected_length=3,
+            cache=cache,
+            sliding_window=4,
+            final_prefill=True,
+        )
+        new_keys = torch.arange(10, 20, dtype=torch.float32).reshape(1, 1, 5, 2)
+        returned = cache.layers[0].update(new_keys, new_keys + 100)
+        cache.store_shared_kv(
+            layer_idx=0,
+            layer_type="sliding_attention",
+            key_states=returned[0],
+            value_states=returned[1],
+        )
+
+        backend.discard_authoritative_prefill(second, cache=cache)
+
+        self.assertTrue(torch.equal(cache.layers[0].keys, prior_keys))
+        self.assertTrue(torch.equal(cache.layers[0].values, prior_values))
+        self.assertEqual(cache.layers[0].cumulative_length, 3)
+        restored_shared = cache.get_shared_kv(layer_idx=0)
+        self.assertIs(restored_shared[0], prior_shared[0])
+        self.assertIs(restored_shared[1], prior_shared[1])
+        self.assertTrue(torch.equal(table.slots_for("rollback"), prior_slots))
+        self.assertEqual(backend.page_table_for_request("rollback"), prior_pages)
+        self.assertEqual(backend.page_owned_slots_for_request("rollback"), prior_owned)
+        self.assertEqual(pool.allocated_count, prior_allocated)
+        self.assertIsNone(cache.layers[0]._token_pool_authoritative_prefill)
+        self.assertIsNone(cache.layers[0]._token_pool_authoritative_prefill_snapshot)
 
     def test_authoritative_prefill_discard_restores_slots_and_cache(self) -> None:
         from types import SimpleNamespace
@@ -7727,6 +8380,62 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertTrue(torch.equal(gathered_v[:2], low_key + 100))
         self.assertTrue(torch.equal(gathered_k[2:], high_key))
         self.assertTrue(torch.equal(gathered_v[2:], high_key + 100))
+
+    def test_partitioned_full_rows_do_not_grow_sliding_layer_buffers(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_token_pool import TokenKVLayerSpec, TokenKVPool
+
+        pool = TokenKVPool(
+            capacity=64,
+            request_slot_capacity=16,
+            layer_specs=[
+                TokenKVLayerSpec(
+                    layer_id=0,
+                    num_kv_heads=1,
+                    head_dim=2,
+                    dtype=torch.float32,
+                    initial_capacity=16,
+                ),
+                TokenKVLayerSpec(
+                    layer_id=1,
+                    num_kv_heads=1,
+                    head_dim=2,
+                    dtype=torch.float32,
+                ),
+            ],
+            dtype=torch.float32,
+            defer_buffer_allocation=True,
+        )
+        request_slots = pool.alloc_slots(16)
+        sliding_kv = torch.ones((16, 1, 2), dtype=torch.float32)
+        pool.set_kv(0, request_slots, sliding_kv, sliding_kv + 1)
+        self.assertEqual(pool.layer_buffer_capacities, {0: 16})
+
+        full_allocator = pool.full_attention_row_allocator
+        full_slots = full_allocator.alloc_slots(32)
+        full_kv = torch.ones((32, 1, 2), dtype=torch.float32)
+        pool.set_kv(1, full_slots, full_kv, full_kv + 1)
+        generation_after_full_allocation = pool.buffer_generation
+
+        self.assertEqual(pool.layer_buffer_capacities, {0: 16, 1: 64})
+        self.assertEqual(pool.request_high_watermark, 16)
+        self.assertEqual(full_allocator.high_watermark, 32)
+        self.assertEqual(pool.high_watermark, 48)
+
+        extra_full_slots = full_allocator.alloc_slots(8)
+        extra_full_kv = torch.ones((8, 1, 2), dtype=torch.float32)
+        pool.set_kv(1, extra_full_slots, extra_full_kv, extra_full_kv + 1)
+        self.assertEqual(pool.layer_buffer_capacities, {0: 16, 1: 64})
+        self.assertEqual(pool.buffer_generation, generation_after_full_allocation)
+
+        pool.free_slots(request_slots)
+        full_allocator.free_slots(full_slots)
+        full_allocator.free_slots(extra_full_slots)
+        self.assertEqual(pool.allocated_count, 0)
 
     def test_token_kv_pool_reuses_whole_free_page_blocks(self) -> None:
         try:

@@ -15,8 +15,9 @@ keywords = ["rwkv", "inference", "llm", "linear-attention", "serving"]
 [project.optional-dependencies]
 # M0 core is dependency-free on purpose: the scheduler and arena are pure
 # bookkeeping and must stay unit-testable without a GPU or torch.
-gpu = ["torch>=2.6"]
+gpu = ["numpy>=1.26", "torch>=2.6"]
 gemma-server = [
+    "numpy>=1.26",
     "torch>=2.6",
     "transformers>=5.7,<6",
     "safetensors>=0.4.3",

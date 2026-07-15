@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,9 +12,12 @@ from experiments.incumbent_gemma_bench import (
     ResidencyTelemetryMonitor,
     TelemetryUnavailable,
     VramMonitor,
+    build_arg_parser,
+    gpu_mem_used_mib,
     make_row,
     measure_vllm_generation,
     residency_telemetry_row_fields,
+    resolve_gpu_memory_device,
     row_green,
     sglang_capacity_telemetry,
     sglang_language_model_override,
@@ -39,7 +43,11 @@ class TestIncumbentGemmaBench(unittest.TestCase):
         first_token_latency: float | None = None,
     ) -> SimpleNamespace:
         metrics = None
-        if first_token_ts is not None or last_token_ts is not None:
+        if (
+            first_token_ts is not None
+            or last_token_ts is not None
+            or first_token_latency is not None
+        ):
             metrics = SimpleNamespace(
                 first_token_ts=first_token_ts,
                 last_token_ts=last_token_ts,
@@ -49,6 +57,29 @@ class TestIncumbentGemmaBench(unittest.TestCase):
             outputs=[SimpleNamespace(token_ids=token_ids)],
             metrics=metrics,
         )
+
+    def test_parser_help_exposes_physical_gpu_selector(self) -> None:
+        help_text = build_arg_parser().format_help()
+
+        self.assertIn("--gpu-memory-device", help_text)
+        self.assertIn("Physical GPU index or UUID", help_text)
+        self.assertIn("--vllm-max-num-batched-tokens", help_text)
+        self.assertIn("--sglang-chunked-prefill-size", help_text)
+
+    def test_parser_accepts_explicit_prefill_scheduler_budgets(self) -> None:
+        args = build_arg_parser().parse_args(
+            [
+                "--engine",
+                "vllm",
+                "--vllm-max-num-batched-tokens",
+                "131072",
+                "--sglang-chunked-prefill-size",
+                "16384",
+            ]
+        )
+
+        self.assertEqual(args.vllm_max_num_batched_tokens, 131072)
+        self.assertEqual(args.sglang_chunked_prefill_size, 16384)
 
     def test_vllm_request_metrics_timing_uses_batch_wide_same_run_interval(
         self,
@@ -74,9 +105,51 @@ class TestIncumbentGemmaBench(unittest.TestCase):
         assert timing is not None
         self.assertEqual(timing["decode_seconds"], 6.0)
         self.assertEqual(timing["prefill_plus_first_s"], 1.5)
+        self.assertEqual(timing["prefill_plus_first_scope"], "min_request_ttft")
+        self.assertEqual(timing["min_ttft_s"], 1.5)
+        self.assertEqual(timing["max_ttft_s"], 2.0)
+        self.assertEqual(timing["p50_ttft_s"], 1.75)
+        self.assertEqual(timing["p95_ttft_s"], 1.975)
+        self.assertEqual(timing["ttft_request_count"], 2)
+        self.assertEqual(timing["decode_interval_s"], 6.0)
+        self.assertEqual(timing["decode_interval_scope"], "batch_earliest_first_to_latest_last")
+        self.assertEqual(timing["cohort_prefill_wall_s"], 2.0)
+        self.assertEqual(
+            timing["cohort_prefill_scope"],
+            "max_request_ttft_synchronous_cohort",
+        )
+        self.assertTrue(timing["cohort_prefill_comparable"])
+        self.assertEqual(timing["request_e2e_latency_s"], [6.0, 6.5])
         self.assertEqual(timing["decode_timing_method"], "same_run_request_metrics")
         self.assertTrue(timing["decode_timing_comparable"])
         self.assertEqual(timing["decode_timing_request_count"], 2)
+
+    def test_vllm_request_metrics_timing_keeps_ttft_when_timestamps_missing(self) -> None:
+        outputs = [
+            self._vllm_output(
+                [1, 2],
+                first_token_ts=None,
+                last_token_ts=None,
+                first_token_latency=0.25,
+            ),
+            self._vllm_output(
+                [3, 4],
+                first_token_ts=None,
+                last_token_ts=None,
+                first_token_latency=0.75,
+            ),
+        ]
+
+        timing = vllm_request_metrics_timing(outputs, expected=2)
+
+        self.assertIsNotNone(timing)
+        assert timing is not None
+        self.assertEqual(timing["min_ttft_s"], 0.25)
+        self.assertEqual(timing["max_ttft_s"], 0.75)
+        self.assertEqual(timing["p50_ttft_s"], 0.5)
+        self.assertAlmostEqual(timing["p95_ttft_s"], 0.725)
+        self.assertIsNone(timing["decode_seconds"])
+        self.assertFalse(timing["decode_timing_comparable"])
 
     def test_measure_vllm_generation_skips_one_token_run_with_exact_metrics(
         self,
@@ -149,6 +222,9 @@ class TestIncumbentGemmaBench(unittest.TestCase):
 
         self.assertEqual(wall_s, 10.0)
         self.assertEqual(timing["decode_seconds"], 7.0)
+        self.assertEqual(timing["cohort_prefill_wall_s"], 3.0)
+        self.assertEqual(timing["cohort_prefill_scope"], "separate_run_batch_wall")
+        self.assertFalse(timing["cohort_prefill_comparable"])
         self.assertEqual(timing["decode_timing_method"], "separate_run_subtraction")
         self.assertFalse(timing["decode_timing_comparable"])
         self.assertIn("not directly comparable", timing["decode_timing_note"])
@@ -187,6 +263,68 @@ class TestIncumbentGemmaBench(unittest.TestCase):
         self.assertEqual(result["query_error_count"], 1)
         self.assertIn("unexpected nvidia-smi sample", result["error"])
 
+    def test_vram_monitor_uses_explicit_physical_gpu_selector(self) -> None:
+        process = mock.Mock()
+        process.communicate.return_value = ("2048\n", "")
+        process.returncode = -15
+        with (
+            mock.patch(
+                "experiments.incumbent_gemma_bench.query_nvidia_gpu",
+                return_value={
+                    "index": 3,
+                    "uuid": "GPU-test",
+                    "name": "Test GPU",
+                    "driver_version": "555.1",
+                    "memory_total_mib": 80_000,
+                    "memory_used_mib": 1024,
+                },
+            ),
+            mock.patch(
+                "experiments.incumbent_gemma_bench.gpu_mem_used_mib",
+                side_effect=[1024, 4096],
+            ),
+            mock.patch(
+                "experiments.incumbent_gemma_bench.subprocess.Popen",
+                return_value=process,
+            ) as popen,
+        ):
+            with VramMonitor(interval_s=0.1, device="3") as monitor:
+                pass
+
+        command = popen.call_args.args[0]
+        self.assertIn("--id=3", command)
+        result = monitor.result()
+        self.assertEqual(result["device_selector"], "3")
+        self.assertEqual(result["device_index"], 3)
+        self.assertEqual(result["device_uuid"], "GPU-test")
+        self.assertEqual(result["driver_version"], "555.1")
+
+    def test_gpu_selector_uses_single_cuda_visible_device(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CUDA_VISIBLE_DEVICES": "5",
+                "WKVM_GPU_MEMORY_DEVICE": "",
+                "WKVM_GPU_INDEX": "",
+            },
+            clear=True,
+        ):
+            selector, source = resolve_gpu_memory_device()
+
+        self.assertEqual(selector, "5")
+        self.assertEqual(source, "CUDA_VISIBLE_DEVICES")
+
+    def test_gpu_memory_query_passes_physical_selector(self) -> None:
+        with mock.patch(
+            "experiments.incumbent_gemma_bench.subprocess.check_output",
+            return_value="1234\n",
+        ) as check_output:
+            used = gpu_mem_used_mib("GPU-test")
+
+        self.assertEqual(used, 1234)
+        command = check_output.call_args.args[0]
+        self.assertIn("--id=GPU-test", command)
+
     def test_make_row_fingerprints_generated_token_ids(self) -> None:
         row = make_row(
             B=2,
@@ -204,6 +342,109 @@ class TestIncumbentGemmaBench(unittest.TestCase):
         self.assertEqual(row["generated_output_request_ids"], ["bench-2-0", "bench-2-1"])
         self.assertEqual(row["generated_output_token_counts"], [2, 2])
         self.assertEqual(len(row["request_output_token_ids_sha256"]), 64)
+
+    def test_sglang_cold_full_run_precedes_one_token_probe(self) -> None:
+        from experiments.incumbent_gemma_bench import measure_sglang_generation
+
+        class FakeEngine:
+            def __init__(self) -> None:
+                self.max_new_tokens = []
+
+            def generate(self, *, input_ids, sampling_params):
+                self.max_new_tokens.append(sampling_params["max_new_tokens"])
+                return [[sampling_params["max_new_tokens"]] for _ in input_ids]
+
+        class FakeTelemetry:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+        engine = FakeEngine()
+        with mock.patch(
+            "experiments.incumbent_gemma_bench.synchronize_cuda"
+        ), mock.patch(
+            "experiments.incumbent_gemma_bench.time.perf_counter",
+            side_effect=[1.0, 4.0, 5.0, 7.0],
+        ):
+            full, full_wall_s, first, first_wall_s = measure_sglang_generation(
+                engine,
+                prompts=[[1, 2], [3, 4]],
+                full_sampling_params={"max_new_tokens": 32},
+                one_token_sampling_params={"max_new_tokens": 1},
+                telemetry=FakeTelemetry(),
+            )
+
+        self.assertEqual(engine.max_new_tokens, [32, 1])
+        self.assertEqual(full, [[32], [32]])
+        self.assertEqual(first, [[1], [1]])
+        self.assertEqual(full_wall_s, 3.0)
+        self.assertEqual(first_wall_s, 2.0)
+
+    def test_make_row_does_not_fabricate_request_latency_percentiles(self) -> None:
+        row = make_row(
+            B=2,
+            prompt_lens=[4, 4],
+            first_wall_s=1.0,
+            full_wall_s=8.0,
+            outputs=[[11, 12], [21, 22]],
+            mem={},
+        )
+
+        self.assertIsNone(row["p50_latency_s"])
+        self.assertIsNone(row["p95_latency_s"])
+        self.assertIsNone(row["latency_metric_source"])
+        self.assertEqual(row["batch_wall_s"], 8.0)
+        self.assertEqual(row["batch_wall_scope"], "synchronous_batch_completion")
+        self.assertEqual(row["decode_interval_s"], 7.0)
+        self.assertEqual(row["prefill_plus_first_scope"], "batch_max_tokens_1_wall")
+        self.assertEqual(row["cohort_prefill_wall_s"], 1.0)
+        self.assertEqual(row["cohort_prefill_scope"], "separate_run_batch_wall")
+        self.assertEqual(row["cohort_prefill_source"], "separate max_tokens=1 batch wall time")
+        self.assertFalse(row["cohort_prefill_comparable"])
+        self.assertFalse(row["cohort_input_tok_s_comparable"])
+        self.assertEqual(row["cohort_input_tokens"], 8)
+        self.assertEqual(row["cohort_input_tok_s"], 8.0)
+
+    def test_make_row_reports_request_ttft_and_e2e_percentiles(self) -> None:
+        row = make_row(
+            B=2,
+            prompt_lens=[4, 4],
+            first_wall_s=0.25,
+            full_wall_s=8.0,
+            outputs=[[11, 12], [21, 22]],
+            mem={},
+            decode_seconds=6.0,
+            decode_timing={
+                "prefill_plus_first_s": 0.25,
+                "prefill_plus_first_scope": "min_request_ttft",
+                "batch_wall_scope": "synchronous_batch_completion",
+                "request_ttft_s": [0.25, 0.75],
+                "request_e2e_latency_s": [6.0, 6.5],
+                "decode_timing_method": "same_run_request_metrics",
+                "decode_timing_comparable": True,
+            },
+        )
+
+        self.assertEqual(row["p50_latency_s"], 6.25)
+        self.assertEqual(row["p95_latency_s"], 6.475)
+        self.assertEqual(row["p50_ttft_s"], 0.5)
+        self.assertEqual(row["p95_ttft_s"], 0.725)
+        self.assertEqual(row["min_ttft_s"], 0.25)
+        self.assertEqual(row["max_ttft_s"], 0.75)
+        self.assertEqual(row["cohort_prefill_wall_s"], 0.75)
+        self.assertEqual(
+            row["cohort_prefill_scope"],
+            "max_request_ttft_synchronous_cohort",
+        )
+        self.assertTrue(row["cohort_prefill_comparable"])
+        self.assertTrue(row["cohort_input_tok_s_comparable"])
+        self.assertEqual(row["cohort_input_tok_s"], 10.667)
+        self.assertEqual(row["latency_metric_count"], 2)
+        self.assertEqual(row["ttft_metric_count"], 2)
+        self.assertEqual(row["batch_wall_s"], 8.0)
+        self.assertEqual(row["decode_interval_s"], 6.0)
 
     def test_vllm_capacity_uses_group_aware_cache_fields(self) -> None:
         cache_config = SimpleNamespace(

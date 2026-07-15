@@ -1,5 +1,5 @@
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 from wkvm.core.arena import StateArena
 from wkvm.models.gemma import gemma4_e4b_routed_span_config
@@ -302,6 +302,250 @@ class TestGemmaRoutedCache(unittest.TestCase):
                 cache.update(keys, keys + 100, layer_idx=layer_idx)
             self.assertEqual(coordinator.pending_operations, 0)
 
+        leader = cache.layers[0]
+        self.assertTrue(any(leader._slot_route_feats))
+        self.assertEqual(
+            [len(feats) for feats in leader._slot_route_feats],
+            [len(spans) for spans in leader._slot_spans],
+        )
+        for follower in cache.layers[1:]:
+            self.assertTrue(all(not feats for feats in follower._slot_route_feats))
+            self.assertIsNone(follower._cent)
+
+    def test_cpu_route_planner_matches_scalar_reference_across_folds(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from torch.nn import functional as F
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+
+        cfg = gemma4_e4b_routed_span_config(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention",),
+            num_kv_heads=1,
+            head_dim=4,
+            sink_tokens=1,
+            ring_tokens=2,
+            pending_tokens=8,
+            routed_slots=4,
+            reps_per_slot=1,
+            span_budget_tokens=7,
+            max_span_tokens=3,
+            sliding_window=2,
+        )
+        hf_cfg = SimpleNamespace(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention",),
+            sliding_window=2,
+        )
+        cpu_cache = NativeGemmaRoutedCache(hf_cfg, cfg)
+        reference_cache = NativeGemmaRoutedCache(hf_cfg, cfg)
+        reference_layer = reference_cache.layers[0]
+        reference_layer._route_decisions_span = MethodType(
+            lambda self, values: self._route_decisions_span_scalar_reference(
+                values
+            ),
+            reference_layer,
+        )
+        break_mask = [False] * 128
+        for position in range(2, len(break_mask), 5):
+            break_mask[position] = True
+        cpu_cache.set_span_break_mask(break_mask)
+        reference_cache.set_span_break_mask(break_mask)
+
+        for offset in range(0, 64, 7):
+            keys = torch.arange(28, dtype=torch.float32).reshape(1, 1, 7, 4)
+            keys = keys + offset * 100
+            values = torch.sin(keys * 0.137) + offset
+            cpu_cache.update(keys, values, layer_idx=0)
+            reference_cache.update(keys, values, layer_idx=0)
+
+            layer = cpu_cache.layers[0]
+            reference = reference_cache.layers[0]
+            self.assertEqual(layer._slot_cnt, reference._slot_cnt)
+            self.assertEqual(
+                layer._slot_span_tokens,
+                reference._slot_span_tokens,
+            )
+            self.assertEqual(layer._bank_span_tokens, reference._bank_span_tokens)
+            self.assertTrue(torch.equal(layer.keys, reference.keys))
+            self.assertTrue(torch.equal(layer.values, reference.values))
+            if layer._cent is not None:
+                self.assertTrue(
+                    torch.equal(
+                        torch.as_tensor(layer._cent),
+                        reference._cent.cpu(),
+                    )
+                )
+                self.assertTrue(torch.equal(layer._gmean, reference._gmean))
+            self.assertEqual(
+                [[span["pos"] for span in slot] for slot in layer._slot_spans],
+                [
+                    [span["pos"] for span in slot]
+                    for slot in reference._slot_spans
+                ],
+            )
+            self.assertEqual(
+                [len(feats) for feats in layer._slot_route_feats],
+                [len(spans) for spans in layer._slot_spans],
+            )
+            for spans, route_feats in zip(
+                layer._slot_spans,
+                layer._slot_route_feats,
+            ):
+                for span, route_feat in zip(spans, route_feats):
+                    expected = F.normalize(
+                        span["v"][0]
+                        .permute(1, 0, 2)
+                        .reshape(span["v"].shape[2], -1)
+                        .float()
+                        .mean(0),
+                        dim=-1,
+                    )
+                    self.assertTrue(
+                        torch.equal(torch.as_tensor(route_feat), expected)
+                    )
+
+        stats = cpu_cache.layers[0].routing_sync_stats()
+        self.assertGreater(stats["cpu_plans"], 0)
+        self.assertEqual(
+            stats["cpu_authoritative_plans"],
+            stats["cpu_plans"],
+        )
+        self.assertEqual(stats["bulk_transfers"], 0)
+
+    def test_cpu_route_planner_marks_tied_assignment_ambiguous(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_runner import NativeRoutedSpanLayer
+
+        layer = NativeRoutedSpanLayer(0, self._config())
+        layer._cent = torch.tensor(
+            [
+                [1.0, 0.0],
+                [1.0, 0.0],
+                [0.0, 0.0],
+                [0.0, 0.0],
+            ]
+        )
+        layer._n_active = 2
+
+        assign, ambiguous = layer._assign_spans_cpu(
+            torch.tensor([[1.0, 0.0]])
+        )
+
+        self.assertEqual(assign, [0])
+        self.assertTrue(ambiguous)
+
+    def test_ambiguous_cpu_route_plan_remains_authoritative(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_runner import NativeRoutedSpanLayer
+
+        layer = NativeRoutedSpanLayer(0, self._config())
+        values = torch.tensor(
+            [[[[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]]]]
+        )
+        layer.lazy_initialization(values, values)
+        layer._cent = torch.tensor(
+            [
+                [1.0, 0.0],
+                [1.0, 0.0],
+                [0.0, 0.0],
+                [0.0, 0.0],
+            ]
+        )
+        layer._n_active = 2
+
+        def fail_scalar_reference(self, cut_values):
+            raise AssertionError("canonical CPU routing must not replay on GPU")
+
+        layer._route_decisions_span_scalar_reference = MethodType(
+            fail_scalar_reference,
+            layer,
+        )
+
+        routed = layer._route_fold(values, values)
+
+        self.assertEqual(routed, 4)
+        stats = layer.routing_sync_stats()
+        self.assertEqual(stats["cpu_authoritative_plans"], 1)
+        self.assertEqual(stats["ambiguous_cpu_plans"], 1)
+
+    def test_exact_decode_merge_preserves_request_local_route_features(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+
+        cfg = gemma4_e4b_routed_span_config(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention",),
+            num_kv_heads=1,
+            head_dim=2,
+            sink_tokens=1,
+            ring_tokens=2,
+            pending_tokens=8,
+            routed_slots=2,
+            reps_per_slot=1,
+            span_budget_tokens=6,
+            max_span_tokens=3,
+            sliding_window=2,
+        )
+        hf_cfg = SimpleNamespace(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention",),
+            sliding_window=2,
+        )
+        caches = [NativeGemmaRoutedCache(hf_cfg, cfg) for _ in range(2)]
+        keys = torch.arange(22, dtype=torch.float32).reshape(1, 1, 11, 2)
+        for cache in caches:
+            cache.update(keys, keys + 100, layer_idx=0)
+
+        second_layer = caches[1].layers[0]
+        second_layer._slot_route_feats = [
+            [feat + 0.25 for feat in slot]
+            for slot in second_layer._slot_route_feats
+        ]
+        expected = [
+            [[feat.copy() for feat in slot] for slot in cache.layers[0]._slot_route_feats]
+            for cache in caches
+        ]
+
+        merged, info = NativeGemmaRoutedCache.merge_exact_decode(
+            caches,
+            decode_steps=1,
+        )
+        self.assertEqual(info["merge"], "exact_structural_concat")
+        merged.split_exact_decode_into(caches)
+
+        for cache, expected_slots in zip(caches, expected):
+            actual_slots = cache.layers[0]._slot_route_feats
+            self.assertEqual(len(actual_slots), len(expected_slots))
+            for actual, expected_slot in zip(actual_slots, expected_slots):
+                self.assertEqual(len(actual), len(expected_slot))
+                for actual_feat, expected_feat in zip(actual, expected_slot):
+                    self.assertTrue(
+                        torch.equal(
+                            torch.as_tensor(actual_feat),
+                            torch.as_tensor(expected_feat),
+                        )
+                    )
+
     def test_state_bytes_includes_authoritative_routed_storage(self) -> None:
         try:
             import torch
@@ -345,6 +589,53 @@ class TestGemmaRoutedCache(unittest.TestCase):
         self.assertTrue(layer.release_dense_materialized_storage())
         self.assertLess(cache.state_bytes(), before_release)
         self.assertGreater(cache.state_bytes(), 0)
+
+    def test_state_bytes_includes_cpu_route_feature_bank(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+
+        cfg = gemma4_e4b_routed_span_config(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention",),
+            num_kv_heads=1,
+            head_dim=2,
+            sink_tokens=1,
+            ring_tokens=1,
+            pending_tokens=2,
+            routed_slots=2,
+            reps_per_slot=1,
+            span_budget_tokens=2,
+            max_span_tokens=2,
+            sliding_window=1,
+        )
+        hf_cfg = SimpleNamespace(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention",),
+            sliding_window=1,
+        )
+        cache = NativeGemmaRoutedCache(hf_cfg, cfg)
+        keys = torch.arange(8, dtype=torch.float32).reshape(1, 1, 4, 2)
+        cache.update(keys, keys + 100, layer_idx=0)
+        layer = cache.layers[0]
+        route_feature_bytes = sum(
+            feature.nbytes
+            for slot in layer._slot_route_feats
+            for feature in slot
+        )
+        self.assertGreater(route_feature_bytes, 0)
+        with_features = cache.state_bytes()
+        route_features = layer._slot_route_feats
+        layer._slot_route_feats = [[] for _ in route_features]
+        without_features = cache.state_bytes()
+        layer._slot_route_feats = route_features
+
+        self.assertEqual(with_features - without_features, route_feature_bytes)
 
     def test_ring_capacity_is_constant_after_long_prefill(self) -> None:
         cfg = self._config()

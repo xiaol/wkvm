@@ -161,6 +161,54 @@ class TestGemmaSchedulerAssumptions(unittest.TestCase):
         self.assertFalse(summary["uses_hf_model_construction"])
         self.assertTrue(summary["native_gemma_checkpoint_loader"])
 
+    def test_native_bench_request_latency_metrics_use_cohort_max_ttft(self) -> None:
+        from experiments.native_gemma_bench import request_latency_metrics
+
+        metrics = request_latency_metrics(
+            {
+                "request-0": {
+                    "first_token_latency_s": 1.0,
+                    "total_latency_s": 2.0,
+                },
+                "request-1": {
+                    "first_token_latency_s": 3.0,
+                    "total_latency_s": 4.0,
+                },
+            },
+            prompt_token_count=400,
+        )
+
+        self.assertEqual(metrics["min_ttft_s"], 1.0)
+        self.assertEqual(metrics["p50_ttft_s"], 2.0)
+        self.assertEqual(metrics["p95_ttft_s"], 2.9)
+        self.assertEqual(metrics["max_ttft_s"], 3.0)
+        self.assertEqual(metrics["cohort_prefill_wall_s"], 3.0)
+        self.assertEqual(metrics["cohort_input_tok_s"], 133.333)
+        self.assertEqual(metrics["ttft_request_count"], 2)
+        self.assertEqual(metrics["request_e2e_latency_s"], [2.0, 4.0])
+
+    def test_native_bench_exports_all_token_pool_prefill_metrics(self) -> None:
+        from experiments.native_gemma_bench import token_pool_prefill_metric_fields
+
+        metrics = GemmaEngineMetrics()
+        expected = {
+            "token_pool_authoritative_prefill_requests": 1,
+            "token_pool_authoritative_prefill_tokens": 2,
+            "token_pool_authoritative_prefill_layer_writes": 3,
+            "token_pool_deferred_prefill_requests": 4,
+            "token_pool_deferred_prefill_tokens": 5,
+            "token_pool_deferred_prefill_layer_writes_avoided": 6,
+            "token_pool_deferred_prefill_kv_tokens_avoided": 7,
+            "token_pool_prefill_kv_layer_writes": 8,
+            "token_pool_prefill_kv_tokens_written": 9,
+            "token_pool_final_prefill_full_tail_backfills": 10,
+            "token_pool_final_prefill_full_tail_tokens": 11,
+        }
+        for name, value in expected.items():
+            setattr(metrics, name, value)
+
+        self.assertEqual(token_pool_prefill_metric_fields(metrics), expected)
+
     def test_native_bench_whole_gpu_memory_sets_comparable_green(self) -> None:
         from experiments.native_gemma_bench import finalize_whole_gpu_memory
 
@@ -1418,6 +1466,42 @@ class FakeGraphMismatchPersistentPaddedBatchRunner(FakePersistentPaddedBatchRunn
 
 
 class TestGemmaRoutedSpanRunner(unittest.TestCase):
+    def test_release_completed_padded_cache_keeps_allocator_warm(self) -> None:
+        from unittest.mock import patch
+
+        from wkvm.runner.gemma_runner import (
+            GemmaRoutedSpanRunner,
+            _PersistentPaddedDecodeLayer,
+        )
+
+        graph = object()
+
+        class Cache:
+            def __init__(self) -> None:
+                self.layers = [object.__new__(_PersistentPaddedDecodeLayer)]
+                self._padded_decode_graph = graph
+                self.release_calls = 0
+
+            def release_tensor_storage(self) -> None:
+                self.release_calls += 1
+
+        runner = GemmaRoutedSpanRunner(
+            SimpleNamespace(device="cpu", config=SimpleNamespace()),
+            FakeRunnerBank(),
+        )
+        runner._cache_token_pool_decode_graph(("shape",), graph)
+        cache = Cache()
+
+        with patch("gc.collect") as collect, patch("torch.cuda.empty_cache") as empty_cache:
+            released = runner.release_completed_padded_cache(cache)
+
+        self.assertTrue(released)
+        self.assertEqual(cache.release_calls, 1)
+        self.assertFalse(hasattr(cache, "_padded_decode_graph"))
+        self.assertFalse(runner._token_pool_decode_graph_cache)
+        collect.assert_not_called()
+        empty_cache.assert_not_called()
+
     @staticmethod
     def _graph_cache_context(*, kv_pool, attention_workspace, kv_indices: int = 6):
         from wkvm.runner.gemma_token_pool import (
@@ -2006,11 +2090,62 @@ class FakeSizedCache:
 
 
 class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
+    def test_execute_prioritizes_decode_before_prefill(self) -> None:
+        from wkvm.core.scheduler import SchedulerOutput
+        from wkvm.gemma_engine import GemmaNativeEngine
+        from wkvm.models.gemma import gemma4_e4b_routed_span_config
+
+        cfg = gemma4_e4b_routed_span_config(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("sliding_attention",),
+        )
+        engine = GemmaNativeEngine(
+            model=FakeModel(),
+            config=cfg,
+            num_slots=2,
+        )
+        prefill = Request(prompt_token_ids=[1, 2], max_new_tokens=1, req_id="prefill")
+        decode = Request(prompt_token_ids=[3], max_new_tokens=2, req_id="decode")
+        decode.num_computed_tokens = decode.num_prompt_tokens
+        engine.scheduler.requests = {
+            prefill.req_id: prefill,
+            decode.req_id: decode,
+        }
+        engine._caches[decode.req_id] = object()  # type: ignore[assignment]
+        order: list[str] = []
+
+        def execute_decode(reqs):
+            order.append("decode")
+            self.assertEqual(reqs, [decode])
+            return {decode.req_id: [7]}
+
+        def execute_prefill(work):
+            order.append("prefill")
+            self.assertEqual(work, [(prefill, 2, True)])
+            return {prefill.req_id: [8]}
+
+        engine._execute_decode_batch = execute_decode  # type: ignore[method-assign]
+        engine._execute_prefill_work = execute_prefill  # type: ignore[method-assign]
+
+        sampled = engine._execute(
+            SchedulerOutput(
+                num_scheduled_tokens={
+                    prefill.req_id: 2,
+                    decode.req_id: 1,
+                }
+            )
+        )
+
+        self.assertEqual(order, ["decode", "prefill"])
+        self.assertEqual(sampled, {decode.req_id: [7], prefill.req_id: [8]})
+
     def _make_sliding_session_token_pool_engine(
         self,
         *,
         num_slots: int,
         prefill_microbatch_rows: int,
+        prefill_chunk: int = 2048,
     ):
         import torch
         from wkvm.gemma_engine import GemmaNativeEngine
@@ -2051,9 +2186,10 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
             scheduler_config=SchedulerConfig(
                 max_tokens_per_step=64,
                 max_running_requests=num_slots,
-                max_tokens_per_request_per_step=64,
+                max_tokens_per_request_per_step=prefill_chunk,
             ),
             prefill_microbatch_rows=prefill_microbatch_rows,
+            prefill_chunk=prefill_chunk,
             persistent_exact_decode=False,
             persistent_padded_decode=False,
             enable_token_pool_attention=True,
@@ -2957,7 +3093,7 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         self.assertEqual(cache._shared_kv_by_type, {})
         self.assertEqual(cache.state_bytes(), 0)
 
-    def test_chunked_prefill_keeps_authoritative_metric_zero(self) -> None:
+    def test_chunked_prefill_defers_then_backfills_a_short_final_tail(self) -> None:
         import torch
         from wkvm.gemma_engine import GemmaNativeEngine
         from wkvm.models.gemma import gemma4_e4b_routed_span_config
@@ -3009,15 +3145,6 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         engine.runner = runner
         backend = engine._token_pool_decode_backend
         self.assertIsNotNone(backend)
-        original_backfill = backend.backfill_prefill_tokens
-        backfill_calls = 0
-
-        def count_backfill(*args, **kwargs):
-            nonlocal backfill_calls
-            backfill_calls += 1
-            return original_backfill(*args, **kwargs)
-
-        backend.backfill_prefill_tokens = count_backfill  # type: ignore[method-assign,union-attr]
         req = Request(
             prompt_token_ids=[1, 2, 3, 4, 5],
             max_new_tokens=2,
@@ -3026,14 +3153,179 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         engine.add_request(req)
 
         engine.step()
+        cache = runner.last_cache
         self.assertEqual(engine.metrics.token_pool_authoritative_prefill_requests, 0)
-        self.assertIsNotNone(runner.last_cache.layers[0].keys)
+        self.assertEqual(engine.metrics.token_pool_deferred_prefill_requests, 1)
+        self.assertEqual(engine.metrics.token_pool_deferred_prefill_tokens, 3)
+        self.assertEqual(
+            engine.metrics.token_pool_deferred_prefill_layer_writes_avoided,
+            1,
+        )
+        self.assertEqual(engine.metrics.token_pool_prefill_kv_layer_writes, 0)
+        self.assertEqual(engine.metrics.token_pool_prefill_kv_tokens_written, 0)
+        self.assertEqual(engine._token_kv_pool.allocated_count, 0)
+        self.assertEqual(engine._token_kv_pool.kv_set_calls, 0)
+        self.assertEqual(
+            engine._token_table.slots_for("chunked").tolist(),
+            [-1, -1, -1],
+        )
+        self.assertTrue(
+            torch.equal(
+                cache.layers[0].keys,
+                torch.arange(12, dtype=torch.float32).reshape(1, 1, 3, 4),
+            )
+        )
         engine.step()
 
         self.assertEqual(engine.metrics.token_pool_authoritative_prefill_requests, 0)
-        self.assertEqual(engine.metrics.token_pool_authoritative_prefill_tokens, 0)
-        self.assertEqual(engine.metrics.token_pool_authoritative_prefill_layer_writes, 0)
-        self.assertEqual(backfill_calls, 2)
+        self.assertEqual(engine.metrics.token_pool_deferred_prefill_requests, 1)
+        self.assertEqual(
+            engine.metrics.token_pool_final_prefill_full_tail_backfills,
+            1,
+        )
+        self.assertEqual(engine.metrics.token_pool_final_prefill_full_tail_tokens, 3)
+        self.assertEqual(engine.metrics.token_pool_prefill_kv_layer_writes, 1)
+        self.assertEqual(engine.metrics.token_pool_prefill_kv_tokens_written, 3)
+        self.assertEqual(
+            engine._token_table.slots_for("chunked").tolist(),
+            [-1, -1, 2, 3, 4],
+        )
+        pooled_k, pooled_v = engine._token_kv_pool.gather_kv(0, [2, 3, 4])
+        expected = torch.arange(8, 20, dtype=torch.float32).reshape(3, 1, 4)
+        self.assertTrue(torch.equal(pooled_k, expected))
+        self.assertTrue(torch.equal(pooled_v, expected + 1000))
+        self.assertIsNone(cache.layers[0].keys)
+        self.assertIsNone(cache.layers[0].values)
+        self.assertTrue(cache.layers[0]._dense_storage_released)
+        self.assertEqual(cache._shared_kv_by_layer, {})
+        self.assertEqual(cache._shared_kv_by_type, {})
+
+    def test_batched_ragged_chunks_defer_pool_rows_until_final_tail(self) -> None:
+        engine, runner = self._make_sliding_session_token_pool_engine(
+            num_slots=2,
+            prefill_microbatch_rows=2,
+            prefill_chunk=3,
+        )
+        reqs = [
+            Request(
+                prompt_token_ids=list(range(width)),
+                max_new_tokens=2,
+                req_id=f"chunked-{width}",
+            )
+            for width in (5, 4)
+        ]
+        for req in reqs:
+            engine.add_request(req)
+
+        engine.step()
+
+        self.assertEqual(engine.metrics.batched_prefill_model_calls, 1)
+        self.assertEqual(engine.metrics.batched_prefill_rows, 2)
+        self.assertEqual(engine.metrics.token_pool_authoritative_prefill_requests, 0)
+        self.assertEqual(engine.metrics.token_pool_deferred_prefill_requests, 2)
+        self.assertEqual(engine.metrics.token_pool_deferred_prefill_tokens, 6)
+        self.assertEqual(engine.metrics.token_pool_prefill_kv_layer_writes, 0)
+        self.assertEqual(engine.metrics.token_pool_prefill_kv_tokens_written, 0)
+        self.assertEqual(engine._token_kv_pool.allocated_count, 0)
+        self.assertEqual(engine._token_kv_pool.kv_set_calls, 0)
+        for req in reqs:
+            cache = engine._caches[req.req_id]
+            self.assertEqual(cache.layers[0].cumulative_length, 3)
+            self.assertEqual(tuple(cache.layers[0].keys.shape), (1, 1, 3, 4))
+            self.assertTrue(
+                engine._token_table.slots_for(req.req_id).eq(-1).all().item()
+            )
+
+        engine.step()
+
+        self.assertEqual(engine.metrics.token_pool_authoritative_prefill_requests, 0)
+        self.assertEqual(engine.metrics.token_pool_deferred_prefill_requests, 2)
+        self.assertEqual(
+            engine.metrics.token_pool_final_prefill_full_tail_backfills,
+            2,
+        )
+        self.assertEqual(engine.metrics.token_pool_final_prefill_full_tail_tokens, 6)
+        self.assertEqual(engine.metrics.token_pool_prefill_kv_layer_writes, 2)
+        self.assertEqual(engine.metrics.token_pool_prefill_kv_tokens_written, 6)
+        self.assertEqual(
+            runner.prefill_chunk_calls,
+            [
+                ([0, 1, 2], 0),
+                ([0, 1, 2], 0),
+                ([3, 4], 3),
+                ([3], 3),
+            ],
+        )
+        for req in reqs:
+            slots = engine._token_table.slots_for(req.req_id)
+            self.assertEqual(int(slots.numel()), req.num_prompt_tokens)
+            self.assertTrue(slots[:-3].eq(-1).all().item())
+            self.assertFalse(slots[-3:].eq(-1).any().item())
+            cache = engine._caches[req.req_id]
+            self.assertIsNone(cache.layers[0].keys)
+            self.assertTrue(cache.layers[0]._dense_storage_released)
+
+    def test_b8_eight_chunk_prefill_writes_the_pool_only_on_final_chunks(
+        self,
+    ) -> None:
+        engine, _runner = self._make_sliding_session_token_pool_engine(
+            num_slots=8,
+            prefill_microbatch_rows=8,
+            prefill_chunk=4,
+        )
+        backend = engine._token_pool_decode_backend
+
+        def fail_backfill(*args, **kwargs):
+            raise AssertionError("full final chunks must use direct pool writes")
+
+        backend.backfill_prefill_tokens = fail_backfill  # type: ignore[method-assign,union-attr]
+        reqs = [
+            Request(
+                prompt_token_ids=list(range(32)),
+                max_new_tokens=2,
+                req_id=f"b8-{row}",
+            )
+            for row in range(8)
+        ]
+        for req in reqs:
+            engine.add_request(req)
+
+        for _chunk in range(7):
+            engine.step()
+            self.assertEqual(engine._token_kv_pool.kv_set_calls, 0)
+            self.assertEqual(engine._token_kv_pool.allocated_count, 0)
+
+        self.assertEqual(engine.metrics.token_pool_deferred_prefill_requests, 56)
+        self.assertEqual(engine.metrics.token_pool_deferred_prefill_tokens, 224)
+        self.assertEqual(
+            engine.metrics.token_pool_deferred_prefill_layer_writes_avoided,
+            56,
+        )
+        self.assertEqual(
+            engine.metrics.token_pool_deferred_prefill_kv_tokens_avoided,
+            168,
+        )
+        engine.step()
+
+        self.assertEqual(engine.metrics.token_pool_authoritative_prefill_requests, 8)
+        self.assertEqual(engine.metrics.token_pool_authoritative_prefill_tokens, 32)
+        self.assertEqual(
+            engine.metrics.token_pool_authoritative_prefill_layer_writes,
+            8,
+        )
+        self.assertEqual(engine.metrics.token_pool_prefill_kv_layer_writes, 8)
+        self.assertEqual(engine.metrics.token_pool_prefill_kv_tokens_written, 24)
+        self.assertEqual(
+            engine.metrics.token_pool_final_prefill_full_tail_backfills,
+            0,
+        )
+        self.assertEqual(engine._token_kv_pool.kv_set_calls, 8)
+        self.assertEqual(engine._token_kv_pool.kv_set_tokens, 24)
+        for req in reqs:
+            slots = engine._token_table.slots_for(req.req_id)
+            self.assertEqual(int(slots.numel()), 32)
+            self.assertTrue(slots[:-3].eq(-1).all().item())
+            self.assertFalse(slots[-3:].eq(-1).any().item())
 
     def test_token_pool_attention_pages_mid_block_sliding_tail(self) -> None:
         import torch
@@ -3453,14 +3745,19 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
                 "full_attention",
             ),
             sliding_window=4,
+            sink_tokens=1,
+            ring_tokens=2,
+            routed_slots=2,
+            pending_tokens=2,
         )
         engine = GemmaNativeEngine(
             model=FakeNativeTokenPoolModel(),
             config=cfg,
             num_slots=1,
+            persistent_padded_decode_steps=24,
             enable_token_pool_attention=True,
             token_pool_max_context_len=4,
-            token_pool_capacity=4,
+            token_pool_capacity=64,
         )
 
         pool = engine._token_kv_pool
@@ -3476,6 +3773,14 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         self.assertEqual(specs[0].num_kv_heads, 2)
         self.assertEqual(specs[1].num_kv_heads, 4)
         self.assertEqual(specs[1].head_dim, 8)
+        self.assertEqual(specs[0].initial_capacity, 32)
+        self.assertIsNone(specs[1].initial_capacity)
+        self.assertEqual(specs[2].initial_capacity, 32)
+        self.assertIsNone(specs[3].initial_capacity)
+        self.assertIs(engine._token_slot_allocator, pool)
+        self.assertIsNot(engine._token_pool_full_attention_allocator, pool)
+        self.assertEqual(engine._token_pool_full_attention_allocator.capacity, 32)
+        self.assertEqual(engine._token_pool_full_attention_allocator.start_slot, 32)
         self.assertEqual(pool.allocated_layer_count, 0)
         self.assertEqual(pool.state_bytes(), 0)
         self.assertEqual(engine.stats()["token_pool"]["kv_pool_layers"], 4)

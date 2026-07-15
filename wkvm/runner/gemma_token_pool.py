@@ -145,6 +145,12 @@ class TokenPoolPrefillCommitResult:
     allocated_token_slots: tuple[int, ...] = ()
     backfilled: bool = False
     authoritative: bool = False
+    deferred: bool = False
+    full_tail_backfilled: bool = False
+    kv_layer_writes: int = 0
+    kv_tokens_written: int = 0
+    deferred_layer_writes_avoided: int = 0
+    deferred_kv_tokens_avoided: int = 0
     prefix_clear_result: TokenPoolRequestPrefixClearResult = field(
         default_factory=TokenPoolRequestPrefixClearResult
     )
@@ -158,6 +164,7 @@ class TokenPoolAuthoritativePrefillReservation:
     new_length: int
     kept_tokens: int
     padded_tokens: int
+    clear_before: int
     token_slots: Any
     token_slot_ids: tuple[int, ...]
     expected_layer_ids: tuple[int, ...]
@@ -168,6 +175,11 @@ class TokenPoolAuthoritativePrefillReservation:
     )
     written_layer_ids: set[int] = field(default_factory=set, repr=False)
     pending_layer_kv: dict[int, tuple[Any, Any]] = field(
+        default_factory=dict,
+        repr=False,
+    )
+    recycled_token_slot_ids: tuple[int, ...] = field(default=(), repr=False)
+    recycled_layer_kv: dict[int, tuple[Any, Any]] = field(
         default_factory=dict,
         repr=False,
     )
@@ -200,6 +212,12 @@ class TokenPoolAuthoritativePrefillReservation:
     def flush_staged_kv(self) -> None:
         if not self.active:
             raise RuntimeError("authoritative prefill reservation is no longer active")
+        if self.recycled_token_slot_ids and not self.recycled_layer_kv:
+            for layer_id in self.expected_layer_ids:
+                self.recycled_layer_kv[int(layer_id)] = self.kv_pool.gather_kv(
+                    int(layer_id),
+                    self.recycled_token_slot_ids,
+                )
         for layer_id in self.expected_layer_ids:
             staged = self.pending_layer_kv.get(int(layer_id))
             if staged is None:
@@ -218,6 +236,19 @@ class TokenPoolAuthoritativePrefillReservation:
                 value_rows,
             )
         self.pending_layer_kv.clear()
+
+    def restore_recycled_kv(self) -> None:
+        for layer_id, (key_states, value_states) in self.recycled_layer_kv.items():
+            self.kv_pool.set_kv(
+                int(layer_id),
+                self.recycled_token_slot_ids,
+                key_states,
+                value_states,
+            )
+        self.recycled_layer_kv.clear()
+
+    def clear_recycled_kv(self) -> None:
+        self.recycled_layer_kv.clear()
 
     def clear_staged_kv(self) -> None:
         self.pending_layer_kv.clear()
@@ -559,6 +590,30 @@ class TokenPoolFullAttentionRowManager:
         self.block_size = block_size
         self.transient_slots: dict[str, list[int]] = {}
         self.rows: dict[str, TokenPoolFullAttentionRow] = {}
+        self.borrowed_slot_rows: dict[int, set[str]] = {}
+
+    def _register_borrowed_slots(
+        self,
+        req_id: str,
+        slots: Iterable[int],
+    ) -> None:
+        req_key = str(req_id)
+        for slot in slots:
+            self.borrowed_slot_rows.setdefault(int(slot), set()).add(req_key)
+
+    def _unregister_borrowed_slots(
+        self,
+        req_id: str,
+        slots: Iterable[int],
+    ) -> None:
+        req_key = str(req_id)
+        for slot in slots:
+            owners = self.borrowed_slot_rows.get(int(slot))
+            if owners is None:
+                continue
+            owners.discard(req_key)
+            if not owners:
+                self.borrowed_slot_rows.pop(int(slot), None)
 
     def allocate_page_aligned_row_slots(
         self,
@@ -589,13 +644,18 @@ class TokenPoolFullAttentionRowManager:
         owned_slots: list[int] = []
         first_block = start_position // block_size
         last_block = (rounded_end - 1) // block_size
-        for logical_block in range(first_block, last_block + 1):
-            _physical_block, block_slots = alloc_page(block_size)
-            owned_slots.extend(int(slot) for slot in block_slots)
-            block_start = max(start_position, logical_block * block_size)
-            block_end = min(rounded_end, (logical_block + 1) * block_size)
-            for logical_pos in range(block_start, block_end):
-                slots.append(int(block_slots[logical_pos % block_size]))
+        try:
+            for logical_block in range(first_block, last_block + 1):
+                _physical_block, block_slots = alloc_page(block_size)
+                owned_slots.extend(int(slot) for slot in block_slots)
+                block_start = max(start_position, logical_block * block_size)
+                block_end = min(rounded_end, (logical_block + 1) * block_size)
+                for logical_pos in range(block_start, block_end):
+                    slots.append(int(block_slots[logical_pos % block_size]))
+        except Exception:
+            if owned_slots:
+                allocator.free_slots(owned_slots)
+            raise
         return (
             torch.as_tensor(slots, dtype=torch.int32, device=allocator.device),
             slots,
@@ -610,6 +670,10 @@ class TokenPoolFullAttentionRowManager:
             slots.extend(self.transient_slots.pop(req_key, []))
             persistent_row = self.rows.pop(req_key, None)
             if persistent_row is not None:
+                self._unregister_borrowed_slots(
+                    req_key,
+                    persistent_row.borrowed_slots,
+                )
                 slots.extend(persistent_row.owned_slots)
         if slots:
             self.allocator.free_slots(slots)
@@ -626,14 +690,19 @@ class TokenPoolFullAttentionRowManager:
         slot_set = {int(slot) for slot in _slot_values_to_list(slots)}
         if not slot_set:
             return 0
-        req_ids = [
-            req_id
-            for req_id, row in self.rows.items()
-            if any(int(slot) in slot_set for slot in row.row_slots)
-        ]
+        req_ids: set[str] = set()
+        for slot in slot_set:
+            req_ids.update(self.borrowed_slot_rows.get(slot, ()))
+        domain_start = getattr(self.allocator, "start_slot", None)
+        if domain_start is None or any(slot >= int(domain_start) for slot in slot_set):
+            req_ids.update(
+                req_id
+                for req_id, row in self.rows.items()
+                if any(int(slot) in slot_set for slot in row.owned_slots)
+            )
         if not req_ids:
             return 0
-        return self.invalidate(req_ids)
+        return self.invalidate(sorted(req_ids))
 
     def append_existing_row(
         self,
@@ -642,7 +711,8 @@ class TokenPoolFullAttentionRowManager:
         append_reserve_slots: int,
         borrowed_slot: int | None = None,
     ) -> TokenPoolFullAttentionRowAppend | None:
-        row = self.rows.get(str(req_id))
+        req_key = str(req_id)
+        row = self.rows.get(req_key)
         if row is None:
             return None
         if borrowed_slot is not None:
@@ -653,6 +723,7 @@ class TokenPoolFullAttentionRowManager:
             row.row_slots.append(full_token_slot)
             row.borrowed_slots.append(full_token_slot)
             row.borrowed_append_slots_remaining = remaining - 1
+            self._register_borrowed_slots(req_key, [full_token_slot])
             return TokenPoolFullAttentionRowAppend(
                 row=row,
                 full_token_slot=full_token_slot,
@@ -701,19 +772,24 @@ class TokenPoolFullAttentionRowManager:
             owned_slots=list(materialized_slot_list),
             page_aligned=bool(page_aligned),
         )
-        if row.page_aligned:
-            _, append_slot_list, append_owned_slots = (
-                self.allocate_page_aligned_row_slots(
-                    len(row.row_slots),
-                    append_reserve_slots,
+        try:
+            if row.page_aligned:
+                _, append_slot_list, append_owned_slots = (
+                    self.allocate_page_aligned_row_slots(
+                        len(row.row_slots),
+                        append_reserve_slots,
+                    )
                 )
-            )
-            row.owned_slots.extend(append_owned_slots)
-        else:
-            _, append_slot_list = self.allocator.alloc_slots_with_ids(
-                append_reserve_slots
-            )
-            row.owned_slots.extend(append_slot_list)
+                row.owned_slots.extend(append_owned_slots)
+            else:
+                _, append_slot_list = self.allocator.alloc_slots_with_ids(
+                    append_reserve_slots
+                )
+                row.owned_slots.extend(append_slot_list)
+        except Exception:
+            if materialized_slot_list:
+                self.allocator.free_slots(materialized_slot_list)
+            raise
         full_token_slot = int(append_slot_list[0])
         row.row_slots.append(full_token_slot)
         row.append_slots.extend(append_slot_list[1:])
@@ -856,35 +932,41 @@ class TokenPoolFullAttentionRowManager:
                     "borrowed full-attention slot tensor does not match borrowed IDs"
                 )
             owned_width = materialized_width - len(borrowed_materialized_slot_ids)
-            if owned_width:
-                owned_materialized_slots, owned_materialized_slot_ids = (
-                    self.allocator.alloc_slots_with_ids(owned_width)
+            owned_materialized_slot_ids: list[int] = []
+            try:
+                if owned_width:
+                    owned_materialized_slots, owned_materialized_slot_ids = (
+                        self.allocator.alloc_slots_with_ids(owned_width)
+                    )
+                    materialized_slots = torch.cat(
+                        (owned_materialized_slots, borrowed_materialized_slots)
+                    )
+                else:
+                    materialized_slots = borrowed_materialized_slots
+                materialized_slot_ids = [
+                    *owned_materialized_slot_ids,
+                    *borrowed_materialized_slot_ids,
+                ]
+                full_token_slot = int(decode_token_slot)
+                borrowed_slots = [*borrowed_materialized_slot_ids, full_token_slot]
+                persistent_row = TokenPoolFullAttentionRow(
+                    row_slots=[*materialized_slot_ids, full_token_slot],
+                    owned_slots=list(owned_materialized_slot_ids),
+                    borrowed_slots=list(borrowed_slots),
+                    borrowed_append_slots_remaining=max(0, append_reserve_slots - 1),
+                    page_aligned=False,
                 )
-                materialized_slots = torch.cat(
-                    (owned_materialized_slots, borrowed_materialized_slots)
+                decode_slot = self._normalized_decode_slot_tensor(
+                    decode_token_slot_tensor,
+                    full_token_slot=full_token_slot,
+                    device=device,
                 )
-            else:
-                owned_materialized_slot_ids = []
-                materialized_slots = borrowed_materialized_slots
-            materialized_slot_ids = [
-                *owned_materialized_slot_ids,
-                *borrowed_materialized_slot_ids,
-            ]
-            full_token_slot = int(decode_token_slot)
-            borrowed_slots = [*borrowed_materialized_slot_ids, full_token_slot]
-            persistent_row = TokenPoolFullAttentionRow(
-                row_slots=[*materialized_slot_ids, full_token_slot],
-                owned_slots=list(owned_materialized_slot_ids),
-                borrowed_slots=list(borrowed_slots),
-                borrowed_append_slots_remaining=max(0, append_reserve_slots - 1),
-                page_aligned=False,
-            )
+            except Exception:
+                if owned_materialized_slot_ids:
+                    self.allocator.free_slots(owned_materialized_slot_ids)
+                raise
             self.rows[req_key] = persistent_row
-            decode_slot = self._normalized_decode_slot_tensor(
-                decode_token_slot_tensor,
-                full_token_slot=full_token_slot,
-                device=device,
-            )
+            self._register_borrowed_slots(req_key, borrowed_slots)
         elif persistent_rows and build_paged_rows:
             materialized_slots, materialized_slot_ids, append = (
                 self.start_page_aligned_persistent_row(
@@ -5829,6 +5911,7 @@ class TokenPoolDecodeBackendState:
         *,
         table: ReqToTokenTable,
         allocator: Any | None = None,
+        full_attention_allocator: Any | None = None,
         kv_pool: Any | None = None,
         block_tables: TokenPoolBlockTables | None = None,
         block_size: int = 16,
@@ -5844,6 +5927,17 @@ class TokenPoolDecodeBackendState:
         self.table = table
         self.kv_pool = kv_pool
         self.allocator = allocator if allocator is not None else kv_pool
+        if full_attention_allocator is None:
+            full_attention_allocator = getattr(
+                self.allocator,
+                "full_attention_row_allocator",
+                None,
+            )
+        self.full_attention_allocator = (
+            self.allocator
+            if full_attention_allocator is None
+            else full_attention_allocator
+        )
         self.block_tables = block_tables
         self.block_size = block_size
         self.page_table_metadata_max_rows = max(0, int(page_table_metadata_max_rows))
@@ -5864,9 +5958,9 @@ class TokenPoolDecodeBackendState:
         )
         self.full_attention_rows = (
             None
-            if self.allocator is None
+            if self.full_attention_allocator is None
             else TokenPoolFullAttentionRowManager(
-                allocator=self.allocator,
+                allocator=self.full_attention_allocator,
                 block_size=block_size,
             )
         )
@@ -5874,6 +5968,7 @@ class TokenPoolDecodeBackendState:
         self.request_token_slots: dict[str, list[int]] = {}
         self.request_page_tables: dict[str, dict[int, int]] = {}
         self.request_page_owned_slots: dict[str, set[int]] = {}
+        self.deferred_prefill_requests: set[str] = set()
         self.current_decode_batch_state: TokenPoolDecodeBatchState | None = None
         self._layer_plan_cache_key: tuple[Any, ...] | None = None
         self._layer_plan_cache: TokenPoolLayerPlan | None = None
@@ -5882,6 +5977,7 @@ class TokenPoolDecodeBackendState:
         self,
         *,
         allocator: Any | None = None,
+        full_attention_allocator: Any | None = None,
         kv_pool: Any | None = None,
         token_pool_capacity: int | None = None,
     ) -> None:
@@ -5891,15 +5987,37 @@ class TokenPoolDecodeBackendState:
                 token_pool_capacity = getattr(kv_pool, "capacity", None)
             self._layer_plan_cache_key = None
             self._layer_plan_cache = None
-        if allocator is not None and allocator is not self.allocator:
+        previous_allocator = self.allocator
+        allocator_changed = allocator is not None and allocator is not previous_allocator
+        if allocator_changed:
             self.allocator = allocator
+        if full_attention_allocator is None:
+            if self.full_attention_allocator is previous_allocator:
+                full_attention_allocator = getattr(
+                    self.allocator,
+                    "full_attention_row_allocator",
+                    None,
+                )
+                if full_attention_allocator is None:
+                    full_attention_allocator = self.allocator
+            elif allocator_changed:
+                full_attention_allocator = getattr(
+                    self.allocator,
+                    "full_attention_row_allocator",
+                    None,
+                )
+        if (
+            full_attention_allocator is not None
+            and full_attention_allocator is not self.full_attention_allocator
+        ):
+            self.full_attention_allocator = full_attention_allocator
             if self.full_attention_rows is None:
                 self.full_attention_rows = TokenPoolFullAttentionRowManager(
-                    allocator=allocator,
+                    allocator=full_attention_allocator,
                     block_size=self.block_size,
                 )
             else:
-                self.full_attention_rows.allocator = allocator
+                self.full_attention_rows.allocator = full_attention_allocator
         if token_pool_capacity is not None:
             self.token_pool_capacity = int(token_pool_capacity)
 
@@ -6529,6 +6647,7 @@ class TokenPoolDecodeBackendState:
             self.table.req_to_token.numel() * self.table.req_to_token.element_size()
         )
         allocator = self.allocator
+        full_attention_allocator = self.full_attention_allocator
         kv_pool = self.kv_pool
         stats = {
             "enabled": True,
@@ -6584,6 +6703,48 @@ class TokenPoolDecodeBackendState:
                     ),
                     "kv_set_triton_copy_wall_s": float(
                         getattr(kv_pool, "kv_set_triton_copy_wall_s", 0.0)
+                    ),
+                }
+            )
+        if (
+            full_attention_allocator is not None
+            and full_attention_allocator is not allocator
+        ):
+            stats.update(
+                {
+                    "request_allocated_token_slots": int(
+                        getattr(allocator, "request_allocated_count", 0) or 0
+                    ),
+                    "request_free_token_slots": int(
+                        getattr(allocator, "request_free_count", 0) or 0
+                    ),
+                    "request_token_slot_high_watermark": int(
+                        getattr(allocator, "request_high_watermark", 0) or 0
+                    ),
+                    "request_token_slot_capacity": int(
+                        getattr(allocator, "request_slot_capacity", 0) or 0
+                    ),
+                    "full_attention_allocated_token_slots": int(
+                        getattr(full_attention_allocator, "allocated_count", 0) or 0
+                    ),
+                    "full_attention_free_token_slots": int(
+                        getattr(full_attention_allocator, "free_count", 0) or 0
+                    ),
+                    "full_attention_next_token_slot": int(
+                        getattr(full_attention_allocator, "next_slot", 0) or 0
+                    ),
+                    "full_attention_token_slot_high_watermark": int(
+                        getattr(full_attention_allocator, "high_watermark", 0) or 0
+                    ),
+                    "full_attention_token_slot_capacity": getattr(
+                        full_attention_allocator,
+                        "capacity",
+                        None,
+                    ),
+                    "full_attention_token_slot_start": getattr(
+                        full_attention_allocator,
+                        "start_slot",
+                        None,
                     ),
                 }
             )
@@ -6885,6 +7046,7 @@ class TokenPoolDecodeBackendState:
 
     def release_request(self, req_id: str) -> tuple[int | None, set[int], list[int]]:
         req_id = str(req_id)
+        self.deferred_prefill_requests.discard(req_id)
         req_slot = self.request_slots.get(req_id)
         self.clear_full_attention_rows([req_id])
         page_slots = self.release_request_page_state(req_id, req_slot)
@@ -6915,9 +7077,19 @@ class TokenPoolDecodeBackendState:
         if (
             pool is None
             or cache is None
-            or not bool(final_prefill)
-            or int(expected_length) != 0
         ):
+            return None
+        n = int(n)
+        if n < 1:
+            raise ValueError("authoritative prefill requires at least one token")
+        sliding_window = int(sliding_window)
+        if sliding_window <= 1:
+            return None
+        retained_tokens = min(
+            int(expected_length) + n,
+            sliding_window - 1,
+        )
+        if not final_prefill or n < retained_tokens:
             return None
         bind = getattr(cache, "bind_token_pool_authoritative_prefill", None)
         if bind is None:
@@ -6941,10 +7113,6 @@ class TokenPoolDecodeBackendState:
             can_bind = getattr(layer, "can_bind_token_pool_authoritative_prefill", None)
             if can_bind is None or not bool(can_bind()):
                 return None
-        sliding_window = int(sliding_window)
-        if sliding_window <= 1:
-            return None
-
         req_id = str(getattr(request, "req_id", request))
         req_slot = self.admit_request(req_id)
         current = self.request_length(req_slot)
@@ -6953,20 +7121,21 @@ class TokenPoolDecodeBackendState:
                 f"{req_id}: token table length {current} does not match "
                 f"computed tokens {int(expected_length)}"
             )
-        n = int(n)
-        if n < 1:
-            raise ValueError("authoritative prefill requires at least one token")
         new_length = current + n
         self.ensure_context_len(new_length)
-        kept_tokens = min(n, sliding_window - 1)
+        kept_tokens = int(retained_tokens)
         padded_tokens = n - kept_tokens
+        clear_before = max(new_length - (sliding_window - 1), 0)
         page_state_snapshot = self.snapshot_request_page_state(req_id, req_slot)
         try:
-            token_slots, token_slot_ids = self.allocate_page_aligned_slots(
-                req_id,
-                current + padded_tokens,
-                kept_tokens,
-                req_slot=req_slot,
+            token_slots, token_slot_ids, recycled_token_slot_ids = (
+                self.allocate_authoritative_prefill_slots(
+                    req_id,
+                    current + padded_tokens,
+                    kept_tokens,
+                    clear_before=clear_before,
+                    req_slot=req_slot,
+                )
             )
             reservation = TokenPoolAuthoritativePrefillReservation(
                 req_id=req_id,
@@ -6975,11 +7144,15 @@ class TokenPoolDecodeBackendState:
                 new_length=int(new_length),
                 kept_tokens=int(kept_tokens),
                 padded_tokens=int(padded_tokens),
+                clear_before=int(clear_before),
                 token_slots=token_slots,
                 token_slot_ids=tuple(int(slot) for slot in token_slot_ids),
                 expected_layer_ids=tuple(expected_layer_ids),
                 kv_pool=pool,
                 page_state_snapshot=page_state_snapshot,
+                recycled_token_slot_ids=tuple(
+                    int(slot) for slot in recycled_token_slot_ids
+                ),
             )
             bind(reservation)
             return reservation
@@ -7007,6 +7180,7 @@ class TokenPoolDecodeBackendState:
             self.discard_authoritative_prefill(reservation, cache=cache)
             raise RuntimeError("authoritative prefill token-table length changed before commit")
 
+        prefix_clear_result = TokenPoolRequestPrefixClearResult()
         try:
             reservation.flush_staged_kv()
             append_values = []
@@ -7033,11 +7207,25 @@ class TokenPoolDecodeBackendState:
             if unbind is None:
                 raise RuntimeError("cache cannot unbind authoritative prefill")
             unbind(reservation, rollback=False)
+            finalize = getattr(
+                cache,
+                "finalize_token_pool_authoritative_prefill",
+                None,
+            )
+            if finalize is not None:
+                finalize(reservation)
         except Exception:
             self.discard_authoritative_prefill(reservation, cache=cache)
             raise
 
         reservation.active = False
+        self.deferred_prefill_requests.discard(reservation.req_id)
+        prefix_clear_result = self.clear_request_prefix(
+            reservation.req_id,
+            reservation.req_slot,
+            reservation.clear_before,
+        )
+        reservation.clear_recycled_kv()
         return TokenPoolPrefillCommitResult(
             req_id=reservation.req_id,
             req_slot=int(reservation.req_slot),
@@ -7048,6 +7236,11 @@ class TokenPoolDecodeBackendState:
             allocated_token_slots=tuple(reservation.token_slot_ids),
             backfilled=False,
             authoritative=True,
+            kv_layer_writes=len(reservation.expected_layer_ids),
+            kv_tokens_written=(
+                int(reservation.kept_tokens) * len(reservation.expected_layer_ids)
+            ),
+            prefix_clear_result=prefix_clear_result,
         )
 
     def discard_authoritative_prefill(
@@ -7066,6 +7259,7 @@ class TokenPoolDecodeBackendState:
                     reservation.previous_length,
                 )
             self.restore_request_page_state(reservation.page_state_snapshot)
+            reservation.restore_recycled_kv()
         finally:
             try:
                 unbind = getattr(cache, "unbind_token_pool_authoritative_prefill", None)
@@ -7073,6 +7267,7 @@ class TokenPoolDecodeBackendState:
                     unbind(reservation, rollback=True)
             finally:
                 reservation.clear_staged_kv()
+                reservation.clear_recycled_kv()
                 reservation.active = False
 
     def commit_prefill_tokens(
@@ -7084,6 +7279,7 @@ class TokenPoolDecodeBackendState:
         cache: Any = None,
         sliding_window: int | None = None,
         final_prefill: bool = False,
+        defer_kv: bool = False,
     ) -> TokenPoolPrefillCommitResult:
         req_id = str(getattr(request, "req_id", request))
         allocator = self.allocator
@@ -7102,6 +7298,35 @@ class TokenPoolDecodeBackendState:
         new_length = current + n
         self.ensure_context_len(new_length)
         window = None if sliding_window is None else max(1, int(sliding_window))
+        if defer_kv:
+            if self.kv_pool is None or window is None:
+                raise RuntimeError(
+                    "deferred prefill requires token-pool KV and a sliding window"
+                )
+            return self._commit_deferred_prefill_tokens(
+                req_id=req_id,
+                req_slot=req_slot,
+                current=current,
+                n=n,
+                new_length=new_length,
+                cache=cache,
+                sliding_window=window,
+            )
+        if (
+            final_prefill
+            and self.kv_pool is not None
+            and window is not None
+            and req_id in self.deferred_prefill_requests
+        ):
+            return self._commit_deferred_final_prefill_tail(
+                req_id=req_id,
+                req_slot=req_slot,
+                current=current,
+                n=n,
+                new_length=new_length,
+                cache=cache,
+                sliding_window=window,
+            )
         keep_start = 0 if window is None else max(new_length - window, 0)
         keep_new_start = current if window is None else max(current, keep_start)
         keep_new = n - (keep_new_start - current)
@@ -7171,6 +7396,11 @@ class TokenPoolDecodeBackendState:
         if token_slots is not None and self.kv_pool is None:
             self.append_request_token_slots(req_id, token_slot_ids)
 
+        owner_layer_ids = (
+            self.prefill_sliding_owner_layer_ids(cache)
+            if self.kv_pool is not None and keep_new
+            else ()
+        )
         return TokenPoolPrefillCommitResult(
             req_id=req_id,
             req_slot=int(req_slot),
@@ -7180,6 +7410,173 @@ class TokenPoolDecodeBackendState:
             padded_tokens=int(pad_new),
             allocated_token_slots=tuple(int(slot) for slot in token_slot_ids),
             backfilled=bool(self.kv_pool is not None and keep_new),
+            kv_layer_writes=len(owner_layer_ids),
+            kv_tokens_written=int(keep_new) * len(owner_layer_ids),
+            prefix_clear_result=prefix_clear_result,
+        )
+
+    def _commit_deferred_prefill_tokens(
+        self,
+        *,
+        req_id: str,
+        req_slot: int,
+        current: int,
+        n: int,
+        new_length: int,
+        cache: Any,
+        sliding_window: int,
+    ) -> TokenPoolPrefillCommitResult:
+        import torch
+
+        owner_layer_ids = self.prefill_sliding_owner_layer_ids(cache)
+        padding = torch.full(
+            (int(n),),
+            self.table.padding_token,
+            dtype=self.table.dtype,
+            device=self.table.req_to_token.device,
+        )
+        self.append_table_slots(req_slot, padding)
+        clear_before = max(int(new_length) - (int(sliding_window) - 1), 0)
+        prefix_clear_result = self.clear_request_prefix(
+            req_id,
+            req_slot,
+            clear_before,
+        )
+        self.deferred_prefill_requests.add(str(req_id))
+        avoided_tokens_per_layer = min(int(n), int(sliding_window) - 1)
+        return TokenPoolPrefillCommitResult(
+            req_id=str(req_id),
+            req_slot=int(req_slot),
+            previous_length=int(current),
+            new_length=int(new_length),
+            kept_tokens=0,
+            padded_tokens=int(n),
+            deferred=True,
+            deferred_layer_writes_avoided=len(owner_layer_ids),
+            deferred_kv_tokens_avoided=(
+                avoided_tokens_per_layer * len(owner_layer_ids)
+            ),
+            prefix_clear_result=prefix_clear_result,
+        )
+
+    def _commit_deferred_final_prefill_tail(
+        self,
+        *,
+        req_id: str,
+        req_slot: int,
+        current: int,
+        n: int,
+        new_length: int,
+        cache: Any,
+        sliding_window: int,
+    ) -> TokenPoolPrefillCommitResult:
+        import torch
+
+        pool = self.kv_pool
+        if pool is None:
+            raise RuntimeError("deferred final prefill requires a token KV pool")
+        owner_layer_ids = self.prefill_sliding_owner_layer_ids(cache)
+        retained_tokens = min(int(new_length), int(sliding_window) - 1)
+        retained_start = int(new_length) - retained_tokens
+        if retained_tokens:
+            available = self.available_prefill_tail(cache, retained_tokens)
+            if available != retained_tokens:
+                raise RuntimeError(
+                    "deferred final prefill cache does not contain the retained tail"
+                )
+
+        page_state_snapshot = self.snapshot_request_page_state(req_id, req_slot)
+        table_snapshot = self.table.slots_for(req_slot).clone()
+        cleared_prefix_snapshot = int(
+            self.table._cleared_prefix_lengths[int(req_slot)]
+        )
+        token_slots = torch.empty(
+            (0,),
+            dtype=self.table.dtype,
+            device=self.table.req_to_token.device,
+        )
+        token_slot_ids: list[int] = []
+        overwritten_layer_kv: dict[int, tuple[Any, Any]] = {}
+        try:
+            if retained_tokens:
+                token_slots, token_slot_ids, _recycled = (
+                    self.allocate_authoritative_prefill_slots(
+                        req_id,
+                        retained_start,
+                        retained_tokens,
+                        clear_before=retained_start,
+                        req_slot=req_slot,
+                    )
+                )
+                overwritten_slots = [
+                    int(slot)
+                    for slot in token_slot_ids
+                    if int(slot) in page_state_snapshot.owned_slots
+                ]
+                if overwritten_slots:
+                    for layer_id in owner_layer_ids:
+                        overwritten_layer_kv[int(layer_id)] = pool.gather_kv(
+                            int(layer_id),
+                            overwritten_slots,
+                        )
+                self.backfill_prefill_tokens(
+                    cache,
+                    token_slots,
+                    retained_tokens,
+                    token_slot_ids=token_slot_ids,
+                    release_covered=False,
+                )
+
+            padding = torch.full(
+                (int(n),),
+                self.table.padding_token,
+                dtype=self.table.dtype,
+                device=self.table.req_to_token.device,
+            )
+            self.append_table_slots(req_slot, padding)
+            if retained_tokens:
+                self.table.req_to_token[
+                    int(req_slot), retained_start:int(new_length)
+                ].copy_(token_slots)
+        except Exception:
+            if self.request_length(req_slot) != int(current):
+                self.truncate_table_row(req_slot, int(current))
+            if int(current):
+                self.table.req_to_token[int(req_slot), : int(current)].copy_(
+                    table_snapshot
+                )
+            self.table._cleared_prefix_lengths[int(req_slot)] = (
+                cleared_prefix_snapshot
+            )
+            self.restore_request_page_state(page_state_snapshot)
+            if overwritten_layer_kv:
+                overwritten_slots = [
+                    int(slot)
+                    for slot in token_slot_ids
+                    if int(slot) in page_state_snapshot.owned_slots
+                ]
+                for layer_id, (keys, values) in overwritten_layer_kv.items():
+                    pool.set_kv(layer_id, overwritten_slots, keys, values)
+            raise
+
+        prefix_clear_result = self.clear_request_prefix(
+            req_id,
+            req_slot,
+            retained_start,
+        )
+        self.deferred_prefill_requests.discard(str(req_id))
+        return TokenPoolPrefillCommitResult(
+            req_id=str(req_id),
+            req_slot=int(req_slot),
+            previous_length=int(current),
+            new_length=int(new_length),
+            kept_tokens=int(retained_tokens),
+            padded_tokens=max(0, int(n) - int(retained_tokens)),
+            allocated_token_slots=tuple(int(slot) for slot in token_slot_ids),
+            backfilled=bool(retained_tokens),
+            full_tail_backfilled=bool(retained_tokens),
+            kv_layer_writes=(len(owner_layer_ids) if retained_tokens else 0),
+            kv_tokens_written=int(retained_tokens) * len(owner_layer_ids),
             prefix_clear_result=prefix_clear_result,
         )
 
@@ -7201,15 +7598,9 @@ class TokenPoolDecodeBackendState:
         if layers is None:
             raise RuntimeError("token-pool attention requires native Gemma cache layers")
         available = int(n)
-        saw_layer = False
-        for layer_id in sorted(getattr(pool, "layer_specs", {})):
-            if pool.target_layer(layer_id) != layer_id:
-                continue
-            if layer_id >= len(layers):
-                continue
+        owner_layer_ids = self.prefill_sliding_owner_layer_ids(cache)
+        for layer_id in owner_layer_ids:
             layer = layers[layer_id]
-            if not bool(getattr(layer, "is_sliding", False)):
-                continue
             keys = getattr(layer, "keys", None)
             values = getattr(layer, "values", None)
             if keys is None or values is None:
@@ -7217,10 +7608,27 @@ class TokenPoolDecodeBackendState:
             if int(keys.shape[0]) != 1 or int(values.shape[0]) != 1:
                 raise RuntimeError("token-pool prefill backfill expects one cache row")
             available = min(available, int(keys.shape[2]), int(values.shape[2]))
-            saw_layer = True
-        if not saw_layer:
-            raise RuntimeError("token-pool attention requires at least one sliding KV layer")
         return max(0, int(available))
+
+    def prefill_sliding_owner_layer_ids(self, cache: Any) -> tuple[int, ...]:
+        pool = self.kv_pool
+        if pool is None:
+            return ()
+        if cache is None:
+            raise RuntimeError("token-pool attention requires a cache for prefill backfill")
+        layers = getattr(cache, "layers", None)
+        if layers is None:
+            raise RuntimeError("token-pool attention requires native Gemma cache layers")
+        owner_layer_ids = tuple(
+            int(layer_id)
+            for layer_id in sorted(getattr(pool, "layer_specs", {}))
+            if pool.target_layer(layer_id) == layer_id
+            and layer_id < len(layers)
+            and bool(getattr(layers[layer_id], "is_sliding", False))
+        )
+        if not owner_layer_ids:
+            raise RuntimeError("token-pool attention requires at least one sliding KV layer")
+        return owner_layer_ids
 
     def backfill_prefill_tokens(
         self,
@@ -7239,14 +7647,8 @@ class TokenPoolDecodeBackendState:
         layers = getattr(cache, "layers", None)
         if layers is None:
             raise RuntimeError("token-pool attention requires native Gemma cache layers")
-        for layer_id in sorted(getattr(pool, "layer_specs", {})):
-            if pool.target_layer(layer_id) != layer_id:
-                continue
-            if layer_id >= len(layers):
-                continue
+        for layer_id in self.prefill_sliding_owner_layer_ids(cache):
             layer = layers[layer_id]
-            if not bool(getattr(layer, "is_sliding", False)):
-                continue
             keys = getattr(layer, "keys", None)
             values = getattr(layer, "values", None)
             if keys is None or values is None:
@@ -7533,6 +7935,86 @@ class TokenPoolDecodeBackendState:
                 raise RuntimeError("page-aligned token slot is not owned by request")
             slots.append(slot)
         return torch.as_tensor(slots, dtype=torch.int32, device=self.device), slots
+
+    def allocate_authoritative_prefill_slots(
+        self,
+        req_id: str,
+        start_position: int,
+        n: int,
+        *,
+        clear_before: int,
+        req_slot: int | None = None,
+    ) -> tuple[Any, list[int], list[int]]:
+        allocator = self.allocator
+        if allocator is None:
+            raise RuntimeError("token-pool allocator is not initialized")
+        alloc_page = getattr(allocator, "alloc_page_block_with_ids", None)
+        if alloc_page is None:
+            token_slots, token_slot_ids = allocator.alloc_slots_with_ids(n)
+            return token_slots, token_slot_ids, []
+
+        import torch
+
+        req_id = str(req_id)
+        block_size = self.block_size
+        start_position = int(start_position)
+        n = int(n)
+        clear_before = max(0, int(clear_before))
+        if n < 1:
+            raise ValueError("n must be >= 1")
+        page_table = self.request_page_tables.setdefault(req_id, {})
+        owned_slots = self.request_page_owned_slots.setdefault(req_id, set())
+        if req_slot is not None:
+            self.ensure_page_table_width(start_position + n)
+
+        target_blocks = {
+            logical_pos // block_size
+            for logical_pos in range(start_position, start_position + n)
+        }
+        recyclable = [
+            (int(logical_block), int(physical_block))
+            for logical_block, physical_block in sorted(page_table.items())
+            if int(logical_block) not in target_blocks
+            and (int(logical_block) + 1) * block_size <= clear_before
+        ]
+        recycled_physical_blocks: set[int] = set()
+        slots: list[int] = []
+        recycled_slots: list[int] = []
+        for logical_pos in range(start_position, start_position + n):
+            logical_block = logical_pos // block_size
+            physical_block = page_table.get(logical_block)
+            if physical_block is None:
+                if recyclable:
+                    old_logical_block, physical_block = recyclable.pop(0)
+                    page_table.pop(old_logical_block)
+                    if req_slot is not None:
+                        self.clear_page_table_block(
+                            int(req_slot),
+                            old_logical_block,
+                        )
+                    recycled_physical_blocks.add(int(physical_block))
+                else:
+                    physical_block, block_slots = alloc_page(block_size)
+                    owned_slots.update(int(slot) for slot in block_slots)
+                physical_block = int(physical_block)
+                page_table[logical_block] = physical_block
+            if req_slot is not None:
+                self.set_page_table_block(
+                    int(req_slot),
+                    logical_block,
+                    int(physical_block),
+                )
+            slot = int(physical_block) * block_size + (logical_pos % block_size)
+            if slot not in owned_slots:
+                raise RuntimeError("page-aligned token slot is not owned by request")
+            slots.append(slot)
+            if int(physical_block) in recycled_physical_blocks:
+                recycled_slots.append(slot)
+        return (
+            torch.as_tensor(slots, dtype=torch.int32, device=self.device),
+            slots,
+            recycled_slots,
+        )
 
     def release_expired_page_blocks(
         self,
@@ -8054,6 +8536,11 @@ class TokenPoolDecodeBackendState:
             full_targets
             and sliding_targets
             and full_targets.isdisjoint(sliding_targets)
+            and (
+                self.full_attention_allocator is self.allocator
+                or getattr(self.full_attention_allocator, "pool", None)
+                is self.allocator
+            )
         )
         request_list = list(requests)
         reservation_list = list(reservations)
@@ -8320,6 +8807,181 @@ class TokenSlotAllocator:
         return int(self._next_slot)
 
 
+class _TokenKVPoolSlotDomainAllocator:
+    """Monotonic allocator for a bounded physical-ID subrange of a KV pool."""
+
+    def __init__(
+        self,
+        pool: "TokenKVPool",
+        *,
+        start_slot: int,
+        end_slot: int,
+    ) -> None:
+        self.pool = pool
+        self.start_slot = int(start_slot)
+        self.end_slot = int(end_slot)
+        if self.start_slot < 0 or self.end_slot <= self.start_slot:
+            raise ValueError("token KV pool slot domain must be non-empty")
+        self.capacity = self.end_slot - self.start_slot
+        self.device = pool.device
+        self.dtype = None
+        self._next_slot = self.start_slot
+        self._free_slots: list[int] = []
+        self._free_slot_set: set[int] = set()
+        self._free_page_blocks: dict[int, list[int]] = {}
+        self._last_page_block_size: int | None = None
+        self._allocated_slots: set[int] = set()
+        self.high_watermark = 0
+
+    def _record_allocated(self, slots: Iterable[int]) -> list[int]:
+        slot_list = [int(slot) for slot in slots]
+        self._allocated_slots.update(slot_list)
+        self.high_watermark = max(self.high_watermark, len(self._allocated_slots))
+        self.pool._record_domain_allocated_slots(slot_list)
+        return slot_list
+
+    def _alloc_slot_list(self, n: int) -> list[int]:
+        n = int(n)
+        if n < 1:
+            raise ValueError("n must be >= 1")
+        slots: list[int] = []
+        if self._free_slots:
+            import heapq
+
+            while self._free_slots and len(slots) < n:
+                slot = int(heapq.heappop(self._free_slots))
+                if slot not in self._free_slot_set:
+                    continue
+                self._free_slot_set.remove(slot)
+                slots.append(slot)
+        needed = n - len(slots)
+        if needed:
+            if self._next_slot + needed > self.end_slot:
+                self._return_free_slots(slots)
+                raise RuntimeError("token KV pool full-attention capacity exceeded")
+            start = self._next_slot
+            slots.extend(range(start, start + needed))
+            self._next_slot += needed
+        return self._record_allocated(slots)
+
+    def alloc_slots(self, n: int):
+        import torch
+
+        return torch.as_tensor(
+            self._alloc_slot_list(n),
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+    def alloc_slots_with_ids(self, n: int):
+        import torch
+
+        slots = self._alloc_slot_list(n)
+        return torch.as_tensor(slots, dtype=torch.int32, device=self.device), slots
+
+    def alloc_page_block_with_ids(self, block_size: int) -> tuple[int, list[int]]:
+        block_size = int(block_size)
+        if block_size < 1:
+            raise ValueError("block_size must be >= 1")
+        self._last_page_block_size = block_size
+        reused = self._pop_cached_page_block(block_size)
+        if reused is None and len(self._free_slot_set) >= block_size:
+            free_slots = sorted(self._free_slot_set)
+            reused = _pop_aligned_free_slot_block(free_slots, block_size)
+            if reused is not None:
+                for slot in reused[1]:
+                    self._free_slot_set.remove(int(slot))
+                self._compact_free_heap_if_needed()
+        if reused is not None:
+            start_block, slots = reused
+            return start_block, self._record_allocated(slots)
+
+        start = self._next_slot
+        offset = start % block_size
+        if offset:
+            padding = block_size - offset
+            if start + padding > self.end_slot:
+                raise RuntimeError(
+                    "token KV pool full-attention page capacity exceeded"
+                )
+            padding_slots = list(range(start, start + padding))
+            self._return_free_slots(padding_slots)
+            start += padding
+            self._next_slot = start
+        if start + block_size > self.end_slot:
+            raise RuntimeError("token KV pool full-attention page capacity exceeded")
+        slots = list(range(start, start + block_size))
+        self._next_slot = start + block_size
+        return start // block_size, self._record_allocated(slots)
+
+    def _free_owned_slots(self, slots: Iterable[int]) -> None:
+        slot_list = [int(slot) for slot in slots]
+        for slot in slot_list:
+            if slot not in self._allocated_slots:
+                raise KeyError(f"token slot {slot} is not allocated in this domain")
+        for slot in slot_list:
+            self._allocated_slots.remove(slot)
+        self._return_free_slots(slot_list)
+        self.pool._forget_domain_allocated_slots(slot_list)
+
+    def _return_free_slots(self, slots: Iterable[int]) -> None:
+        import heapq
+
+        slot_list = [int(slot) for slot in slots]
+        for slot in slot_list:
+            if slot in self._free_slot_set:
+                raise RuntimeError(f"token slot {slot} is already free")
+        self._free_slot_set.update(slot_list)
+        self._free_slots.extend(slot_list)
+        heapq.heapify(self._free_slots)
+        _cache_aligned_free_slot_blocks(
+            self._free_page_blocks,
+            slot_list,
+            self._last_page_block_size,
+        )
+
+    def _pop_cached_page_block(
+        self,
+        block_size: int,
+    ) -> tuple[int, list[int]] | None:
+        cached_blocks = self._free_page_blocks.get(int(block_size))
+        while cached_blocks:
+            block = int(cached_blocks.pop())
+            slots = list(range(block * block_size, (block + 1) * block_size))
+            if all(slot in self._free_slot_set for slot in slots):
+                for slot in slots:
+                    self._free_slot_set.remove(slot)
+                self._compact_free_heap_if_needed()
+                if not cached_blocks:
+                    self._free_page_blocks.pop(int(block_size), None)
+                return block, slots
+        self._free_page_blocks.pop(int(block_size), None)
+        return None
+
+    def _compact_free_heap_if_needed(self) -> None:
+        if len(self._free_slots) <= 2 * len(self._free_slot_set) + 1024:
+            return
+        import heapq
+
+        self._free_slots = list(self._free_slot_set)
+        heapq.heapify(self._free_slots)
+
+    def free_slots(self, slots: Iterable[int] | Any) -> None:
+        self._free_owned_slots(_slot_values_to_list(slots))
+
+    @property
+    def allocated_count(self) -> int:
+        return len(self._allocated_slots)
+
+    @property
+    def free_count(self) -> int:
+        return self.capacity - self.allocated_count
+
+    @property
+    def next_slot(self) -> int:
+        return int(self._next_slot)
+
+
 class TokenKVPool:
     """Token-granularity KV storage with optional layer-level KV sharing."""
 
@@ -8332,6 +8994,7 @@ class TokenKVPool:
         device: Any = "cpu",
         defer_buffer_allocation: bool = False,
         validate_slot_writes: bool = True,
+        request_slot_capacity: int | None = None,
     ) -> None:
         import torch
 
@@ -8367,11 +9030,45 @@ class TokenKVPool:
             for layer_id in self.layer_specs:
                 if self._target_layers[layer_id] == layer_id:
                     self._allocate_layer_buffer(layer_id)
-        self._free_slots = list(range(self.capacity))
+        if request_slot_capacity is None:
+            request_slot_capacity = self.capacity
+        request_slot_capacity = int(request_slot_capacity)
+        if request_slot_capacity < 1 or request_slot_capacity > self.capacity:
+            raise ValueError("request_slot_capacity must be within pool capacity")
+        self.request_slot_capacity = request_slot_capacity
+        self._free_slots = list(range(self.request_slot_capacity))
         self._free_page_blocks: dict[int, list[int]] = {}
         self._last_page_block_size: int | None = None
         self._allocated_slots: set[int] = set()
+        self._request_allocated_slots: set[int] = set()
+        self.request_high_watermark = 0
+        self._full_attention_row_allocator = (
+            None
+            if self.request_slot_capacity >= self.capacity
+            else _TokenKVPoolSlotDomainAllocator(
+                self,
+                start_slot=self.request_slot_capacity,
+                end_slot=self.capacity,
+            )
+        )
         self.high_watermark = 0
+
+    @property
+    def full_attention_row_allocator(self):
+        allocator = self._full_attention_row_allocator
+        return self if allocator is None else allocator
+
+    def _record_domain_allocated_slots(self, slots: Iterable[int]) -> None:
+        slot_list = [int(slot) for slot in slots]
+        overlap = self._allocated_slots.intersection(slot_list)
+        if overlap:
+            raise RuntimeError(f"token slots already allocated: {sorted(overlap)}")
+        self._allocated_slots.update(slot_list)
+        self.high_watermark = max(self.high_watermark, len(self._allocated_slots))
+
+    def _forget_domain_allocated_slots(self, slots: Iterable[int]) -> None:
+        for slot in slots:
+            self._allocated_slots.remove(int(slot))
 
     def _alloc_slot_list(self, n: int) -> list[int]:
         n = int(n)
@@ -8381,7 +9078,12 @@ class TokenKVPool:
             raise RuntimeError("token KV pool capacity exceeded")
         slots = self._free_slots[:n]
         del self._free_slots[:n]
+        self._request_allocated_slots.update(slots)
         self._allocated_slots.update(slots)
+        self.request_high_watermark = max(
+            self.request_high_watermark,
+            len(self._request_allocated_slots),
+        )
         self.high_watermark = max(self.high_watermark, len(self._allocated_slots))
         return slots
 
@@ -8412,26 +9114,48 @@ class TokenKVPool:
         if reused is None:
             raise RuntimeError("token KV pool page capacity exceeded")
         start_block, slots = reused
+        self._request_allocated_slots.update(slots)
         self._allocated_slots.update(slots)
+        self.request_high_watermark = max(
+            self.request_high_watermark,
+            len(self._request_allocated_slots),
+        )
         self.high_watermark = max(self.high_watermark, len(self._allocated_slots))
         return start_block, slots
 
     def free_slots(self, slots: Iterable[int] | Any) -> None:
         values = _slot_values_to_list(slots)
-        freed: list[int] = []
+        request_slots: list[int] = []
+        full_attention_slots: list[int] = []
+        full_attention_allocator = self._full_attention_row_allocator
         for value in values:
             slot = int(value)
             if slot not in self._allocated_slots:
                 raise KeyError(f"token slot {slot} is not allocated")
+            if slot < self.request_slot_capacity:
+                if slot not in self._request_allocated_slots:
+                    raise KeyError(f"token slot {slot} is not request-owned")
+                request_slots.append(slot)
+            else:
+                if (
+                    full_attention_allocator is None
+                    or slot not in full_attention_allocator._allocated_slots
+                ):
+                    raise KeyError(f"token slot {slot} is not full-attention-owned")
+                full_attention_slots.append(slot)
+        for slot in request_slots:
+            self._request_allocated_slots.remove(slot)
             self._allocated_slots.remove(slot)
-            freed.append(slot)
-        self._free_slots.extend(freed)
+        self._free_slots.extend(request_slots)
         self._free_slots.sort()
         _cache_aligned_free_slot_blocks(
             self._free_page_blocks,
-            freed,
+            request_slots,
             self._last_page_block_size,
         )
+        if full_attention_slots:
+            assert full_attention_allocator is not None
+            full_attention_allocator._free_owned_slots(full_attention_slots)
 
     def set_kv(self, layer_id: int, slot_ids, key_states, value_states) -> None:
         import torch
@@ -8625,11 +9349,20 @@ class TokenKVPool:
 
     @property
     def free_count(self) -> int:
-        return len(self._free_slots)
+        allocator = self._full_attention_row_allocator
+        return len(self._free_slots) + (0 if allocator is None else allocator.free_count)
 
     @property
     def next_slot(self) -> int:
-        return self.capacity - len(self._free_slots)
+        return self.allocated_count
+
+    @property
+    def request_allocated_count(self) -> int:
+        return len(self._request_allocated_slots)
+
+    @property
+    def request_free_count(self) -> int:
+        return len(self._free_slots)
 
     def state_bytes(self) -> int:
         total = 0

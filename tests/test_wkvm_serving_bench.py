@@ -135,6 +135,10 @@ class TestWkvmServingBench(unittest.TestCase):
         self.assertEqual(result["peak_used_mib"], 1128)
         self.assertEqual(result["peak_delta_mib"], 128)
         self.assertEqual(result["sample_count"], 2)
+        self.assertEqual(result["device_uuid"], "GPU-test")
+        self.assertEqual(result["gpu_name"], "Test GPU")
+        self.assertEqual(result["driver_version"], "1.2.3")
+        self.assertEqual(result["memory_total_mib"], 24000)
 
     def test_provenance_separates_server_version_from_client_packages(self) -> None:
         args = types.SimpleNamespace(

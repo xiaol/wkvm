@@ -236,16 +236,27 @@ class NativeSlidingWindowLayer(_NativeGemmaLayer):
         self.sliding_window = int(sliding_window)
         self._dense_storage_released = False
         self._token_pool_authoritative_prefill = None
+        self._token_pool_authoritative_prefill_snapshot = None
 
     def can_bind_token_pool_authoritative_prefill(self) -> bool:
+        if (
+            self.layer_id is None
+            or self._token_pool_authoritative_prefill is not None
+            or self._token_pool_authoritative_prefill_snapshot is not None
+            or self._dense_storage_released
+        ):
+            return False
+        if not self.is_initialized:
+            return bool(
+                self.cumulative_length == 0
+                and self.keys is None
+                and self.values is None
+            )
         return bool(
-            self.layer_id is not None
-            and self._token_pool_authoritative_prefill is None
-            and not self.is_initialized
-            and self.cumulative_length == 0
-            and self.keys is None
-            and self.values is None
-            and not self._dense_storage_released
+            self.keys is not None
+            and self.values is not None
+            and int(self.keys.shape[0]) == 1
+            and int(self.values.shape[0]) == 1
         )
 
     def bind_token_pool_authoritative_prefill(self, reservation) -> None:
@@ -253,6 +264,34 @@ class NativeSlidingWindowLayer(_NativeGemmaLayer):
             raise DistinctCacheBatchError(
                 "sliding layer cannot enter authoritative token-pool prefill"
             )
+        previous_length = int(reservation.previous_length)
+        if int(self.cumulative_length) != previous_length:
+            raise DistinctCacheBatchError(
+                "sliding layer length does not match authoritative prefill"
+            )
+        expected_tail = min(previous_length, self.sliding_window - 1)
+        if previous_length > 0 and (
+            not self.is_initialized
+            or self.keys is None
+            or self.values is None
+            or int(self.keys.shape[2]) != expected_tail
+            or int(self.values.shape[2]) != expected_tail
+        ):
+            raise DistinctCacheBatchError(
+                "sliding layer tail does not match authoritative prefill"
+            )
+        self._token_pool_authoritative_prefill_snapshot = (
+            reservation,
+            (
+                self.keys,
+                self.values,
+                bool(self.is_initialized),
+                int(self.cumulative_length),
+                self.dtype,
+                self.device,
+                bool(self._dense_storage_released),
+            ),
+        )
         self._token_pool_authoritative_prefill = reservation
 
     def unbind_token_pool_authoritative_prefill(
@@ -263,15 +302,51 @@ class NativeSlidingWindowLayer(_NativeGemmaLayer):
     ) -> None:
         if self._token_pool_authoritative_prefill is not reservation:
             if self._token_pool_authoritative_prefill is None:
-                if rollback and self.layer_id in reservation.written_layer_ids:
-                    self._reset_token_pool_authoritative_prefill_state()
-                return
+                if rollback:
+                    self._restore_token_pool_authoritative_prefill_snapshot(
+                        reservation
+                    )
+                    return
             raise DistinctCacheBatchError(
                 "sliding layer has a different authoritative prefill reservation"
             )
         self._token_pool_authoritative_prefill = None
         if rollback:
-            self._reset_token_pool_authoritative_prefill_state()
+            self._restore_token_pool_authoritative_prefill_snapshot(reservation)
+
+    def finalize_token_pool_authoritative_prefill(self, reservation) -> None:
+        snapshot = self._token_pool_authoritative_prefill_snapshot
+        if snapshot is None:
+            return
+        if snapshot[0] is not reservation:
+            raise DistinctCacheBatchError(
+                "sliding layer has a different authoritative prefill snapshot"
+            )
+        if self._token_pool_authoritative_prefill is reservation:
+            raise DistinctCacheBatchError(
+                "sliding layer authoritative prefill is still bound"
+            )
+        self._token_pool_authoritative_prefill_snapshot = None
+
+    def _restore_token_pool_authoritative_prefill_snapshot(self, reservation) -> bool:
+        snapshot = self._token_pool_authoritative_prefill_snapshot
+        if snapshot is None:
+            return False
+        if snapshot[0] is not reservation:
+            raise DistinctCacheBatchError(
+                "sliding layer has a different authoritative prefill snapshot"
+            )
+        (
+            self.keys,
+            self.values,
+            self.is_initialized,
+            self.cumulative_length,
+            self.dtype,
+            self.device,
+            self._dense_storage_released,
+        ) = snapshot[1]
+        self._token_pool_authoritative_prefill_snapshot = None
+        return True
 
     def _reset_token_pool_authoritative_prefill_state(self) -> None:
         self.keys = None
@@ -281,6 +356,8 @@ class NativeSlidingWindowLayer(_NativeGemmaLayer):
         self.dtype = None
         self.device = None
         self._dense_storage_released = False
+        self._token_pool_authoritative_prefill = None
+        self._token_pool_authoritative_prefill_snapshot = None
 
     def update(self, key_states, value_states, *args, **kwargs):
         authoritative_prefill = self._token_pool_authoritative_prefill
@@ -289,6 +366,14 @@ class NativeSlidingWindowLayer(_NativeGemmaLayer):
                 raise DistinctCacheBatchError(
                     "authoritative token-pool prefill requires a sliding layer id"
                 )
+            if self._dense_storage_released:
+                raise DistinctCacheBatchError(
+                    "authoritative prefill requires a dense sliding tail"
+                )
+            if not self.is_initialized:
+                self.lazy_initialization(key_states, value_states)
+            full_keys = _cat_time(self.keys, key_states)
+            full_values = _cat_time(self.values, value_states)
             authoritative_prefill.write_layer_kv(
                 self.layer_id,
                 key_states,
@@ -298,10 +383,10 @@ class NativeSlidingWindowLayer(_NativeGemmaLayer):
             self.device = key_states.device
             self.is_initialized = True
             self.cumulative_length += int(key_states.shape[-2])
-            self.keys = None
-            self.values = None
-            self._dense_storage_released = True
-            return key_states, value_states
+            keep = self.sliding_window - 1
+            self.keys = full_keys[:, :, -keep:, :].contiguous()
+            self.values = full_values[:, :, -keep:, :].contiguous()
+            return full_keys, full_values
         if self._dense_storage_released:
             raise DistinctCacheBatchError(
                 "sliding KV storage was released for token-pool decode"
@@ -426,6 +511,14 @@ class NativeRoutedSpanLayer(_NativeGemmaLayer):
         self._gmean = None
         self._gcnt = 0
         self._dense_storage_released = False
+        self._route_decision_bulk_transfers = 0
+        self._route_decision_scalar_syncs_avoided = 0
+        self._route_decision_cpu_plans = 0
+        self._route_decision_ambiguous_cpu_plans = 0
+        self._route_parity_epsilon = 1.0e-3
+        self._slot_route_feats: list[list[Any]] = [
+            [] for _ in range(self.m_slots)
+        ]
 
     def lazy_initialization(self, key_states, value_states) -> None:
         import torch
@@ -441,6 +534,7 @@ class NativeRoutedSpanLayer(_NativeGemmaLayer):
         self._slot_mv = torch.zeros_like(self._slot_mk)
         self._slot_cnt = [0] * self.m_slots
         self._slot_spans: list[list[dict[str, Any]]] = [[] for _ in range(self.m_slots)]
+        self._slot_route_feats = [[] for _ in range(self.m_slots)]
         self._slot_span_tokens = [0] * self.m_slots
         self._bank_span_tokens = 0
         self._active_span_slots = 0
@@ -455,6 +549,14 @@ class NativeRoutedSpanLayer(_NativeGemmaLayer):
             raise NotImplementedError("native routed-span batched path is decode-only")
         ret_k = _cat_time(self.keys, key_states) if self.keys.numel() else key_states
         ret_v = _cat_time(self.values, value_states) if self.values.numel() else value_states
+        self._update_state(
+            key_states,
+            value_states,
+            batched_decode=batched_decode,
+        )
+        return ret_k, ret_v
+
+    def _update_state(self, key_states, value_states, *, batched_decode: bool) -> None:
         self.cumulative_length += key_states.shape[-2]
 
         rk = _cat_time(self._ring_k, key_states)
@@ -485,7 +587,6 @@ class NativeRoutedSpanLayer(_NativeGemmaLayer):
             self._pend_k = self._pend_k[:, :, n:].contiguous()
             self._pend_v = self._pend_v[:, :, n:].contiguous()
         self._materialize()
-        return ret_k, ret_v
 
     def commit_decode_token(self, key_states, value_states) -> bool:
         if (
@@ -781,12 +882,171 @@ class NativeRoutedSpanLayer(_NativeGemmaLayer):
         return n_routed
 
     def _route_decisions_span(self, cut_v):
+        """Apply the canonical sequential route policy on CPU."""
+
+        import torch
+
+        abs_start = self.sink + self._evicted
+        spans, n_routed = self._split_spans(abs_start, cut_v.shape[2])
+        feats_gpu, span_means_gpu = self._span_feature_tensors(cut_v, spans)
+        seed_gpu = None
+        seed_count = 0
+        if self._cent is None:
+            seed_gpu, seed_count = self._seed_centroids_gpu(feats_gpu)
+
+        packet_parts = [feats_gpu, span_means_gpu]
+        if seed_gpu is not None:
+            packet_parts.append(seed_gpu)
+        packet = torch.cat(packet_parts, dim=0).detach().cpu()
+        packet_values = packet.numpy()
+        span_count = len(spans)
+        feats = packet_values[:span_count]
+        span_means = packet_values[span_count : 2 * span_count]
+        if seed_gpu is not None:
+            self._cent = packet_values[2 * span_count :].copy()
+            self._n_active = seed_count
+        elif hasattr(self._cent, "detach"):
+            self._cent = self._cent.detach().cpu().numpy().copy()
+
+        assign, assign_ambiguous = self._assign_spans_cpu(feats)
+        keeps, keeps_ambiguous, keep_syncs = self._span_keeps_cpu(
+            feats,
+            spans,
+            assign,
+        )
+        ambiguous = assign_ambiguous or keeps_ambiguous
+
+        if bool(feats_gpu.is_cuda):
+            self._route_decision_bulk_transfers += 1
+        self._route_decision_cpu_plans += 1
+        if ambiguous:
+            self._route_decision_ambiguous_cpu_plans += 1
+        if bool(feats_gpu.is_cuda):
+            self._route_decision_scalar_syncs_avoided += (
+                span_count
+                + max(seed_count - 1, 0)
+                + 2 * span_count
+                + keep_syncs
+            )
+
+        self._commit_slot_route_feats(span_means, spans, assign, keeps)
+        return spans, assign, keeps, n_routed
+
+    def _seed_centroids_gpu(self, feats):
+        import torch
+
+        n0 = min(self.m_slots, feats.shape[0])
+        chosen = [feats[0]]
+        sims = feats @ feats[0]
+        for _ in range(n0 - 1):
+            next_index = sims.argmin().reshape(1)
+            next_feat = feats.index_select(0, next_index).squeeze(0)
+            chosen.append(next_feat)
+            sims = torch.maximum(sims, feats @ next_feat)
+        centroids = torch.zeros(
+            self.m_slots,
+            feats.shape[1],
+            dtype=feats.dtype,
+            device=feats.device,
+        )
+        centroids[:n0] = torch.stack(chosen)
+        return centroids, n0
+
+    def _assign_spans_cpu(self, feats) -> tuple[list[int], bool]:
+        import numpy as np
+
+        if hasattr(feats, "detach"):
+            feats = feats.detach().cpu().numpy()
+        if hasattr(self._cent, "detach"):
+            self._cent = self._cent.detach().cpu().numpy().copy()
+        centroids = self._cent
+        normalized_centroids = np.empty_like(centroids)
+        active_centroids = centroids[: self._n_active]
+        active_norms = np.linalg.norm(active_centroids, axis=1)
+        normalized_centroids[: self._n_active] = active_centroids / np.maximum(
+            active_norms[:, None],
+            np.float32(1.0e-12),
+        )
+
+        assign: list[int] = []
+        ambiguous = False
+        for feat in feats:
+            sims = normalized_centroids[: self._n_active] @ feat
+            best = int(np.argmax(sims))
+            ambiguous = ambiguous or self._route_argmax_is_ambiguous(sims)
+            best_score = float(sims[best])
+            if self._n_active < self.m_slots:
+                ambiguous = ambiguous or (
+                    abs(best_score - self.novelty_thresh)
+                    <= self._route_parity_epsilon
+                )
+            if best_score < self.novelty_thresh and self._n_active < self.m_slots:
+                best = self._n_active
+                centroids[best] = feat
+                self._n_active += 1
+            else:
+                centroids[best] = (
+                    centroids[best] * np.float32(0.9)
+                    + feat * np.float32(0.1)
+                )
+            centroid_norm = max(
+                float(np.linalg.norm(centroids[best])),
+                1.0e-12,
+            )
+            normalized_centroids[best] = (
+                centroids[best] / np.float32(centroid_norm)
+            )
+            assign.append(best)
+        return assign, ambiguous
+
+    def _assign_spans_scalar_reference(self, feats) -> list[int]:
+        import torch
+        from torch.nn import functional as F
+
+        if not isinstance(self._cent, torch.Tensor):
+            self._cent = torch.as_tensor(self._cent, device=feats.device)
+        elif self._cent.device != feats.device:
+            self._cent = self._cent.to(feats.device)
+        assign: list[int] = []
+        for j in range(feats.shape[0]):
+            sims = feats[j] @ F.normalize(
+                self._cent[: self._n_active],
+                dim=-1,
+            ).T
+            best = int(sims.argmax())
+            if (
+                float(sims[best]) < self.novelty_thresh
+                and self._n_active < self.m_slots
+            ):
+                best = self._n_active
+                self._cent[best] = feats[j]
+                self._n_active += 1
+            else:
+                self._cent[best] = self._cent[best] * 0.9 + feats[j] * 0.1
+            assign.append(best)
+        return assign
+
+    def _route_argmax_is_ambiguous(self, values) -> bool:
+        import numpy as np
+
+        if hasattr(values, "detach"):
+            values = values.detach().cpu().numpy()
+        if int(values.size) < 2:
+            return False
+        top = np.partition(values, -2)[-2:]
+        return float(top.max() - top.min()) <= self._route_parity_epsilon
+
+    def _route_decisions_span_scalar_reference(self, cut_v):
         import torch
         from torch.nn import functional as F
 
         abs_start = self.sink + self._evicted
         spans, n_routed = self._split_spans(abs_start, cut_v.shape[2])
-        feats = self._span_feats(cut_v, spans)
+        feats = self._span_feats_scalar_reference(cut_v, spans)
+        if self._cent is not None and not isinstance(self._cent, torch.Tensor):
+            self._cent = torch.as_tensor(self._cent, device=feats.device)
+        elif self._cent is not None and self._cent.device != feats.device:
+            self._cent = self._cent.to(feats.device)
         if self._cent is None:
             n0 = min(self.m_slots, feats.shape[0])
             chosen = [feats[0]]
@@ -809,7 +1069,7 @@ class NativeRoutedSpanLayer(_NativeGemmaLayer):
             else:
                 self._cent[best] = self._cent[best] * 0.9 + feats[j] * 0.1
             assign.append(best)
-        keeps = self._span_keeps(feats, spans, assign)
+        keeps = self._span_keeps_scalar_reference(feats, spans, assign)
         return spans, assign, keeps, n_routed
 
     def _split_spans(self, abs_start: int, n_tokens: int) -> tuple[list[tuple[int, int]], int]:
@@ -840,6 +1100,29 @@ class NativeRoutedSpanLayer(_NativeGemmaLayer):
         return spans, n_routed
 
     def _span_feats(self, cut_v, spans: list[tuple[int, int]]):
+        feats, _span_means = self._span_feature_tensors(cut_v, spans)
+        return feats
+
+    def _span_feature_tensors(self, cut_v, spans: list[tuple[int, int]]):
+        import torch
+        from torch.nn import functional as F
+
+        vf = cut_v[0].permute(1, 0, 2).reshape(cut_v.shape[2], -1).float()
+        mean = vf.mean(0)
+        total = self._gcnt + vf.shape[0]
+        self._gmean = mean if self._gmean is None else (self._gmean * self._gcnt + mean * vf.shape[0]) / total
+        self._gcnt = total
+        novelty = 1.0 - F.cosine_similarity(vf, self._gmean.unsqueeze(0), dim=-1)
+        selected = torch.stack(
+            [novelty[a:b].argmax() + a for a, b in spans]
+        ).to(torch.long)
+        feats = vf.index_select(0, selected)
+        span_means = torch.stack(
+            [F.normalize(vf[a:b].mean(0), dim=-1) for a, b in spans]
+        )
+        return F.normalize(feats, dim=-1), span_means
+
+    def _span_feats_scalar_reference(self, cut_v, spans: list[tuple[int, int]]):
         import torch
         from torch.nn import functional as F
 
@@ -853,6 +1136,103 @@ class NativeRoutedSpanLayer(_NativeGemmaLayer):
         return F.normalize(feats, dim=-1)
 
     def _span_keeps(self, feats, spans: list[tuple[int, int]], assign: list[int]) -> dict[int, list[int]]:
+        keeps, _ambiguous, _syncs = self._span_keeps_cpu(
+            feats,
+            spans,
+            assign,
+        )
+        return keeps
+
+    def _span_keeps_cpu(
+        self,
+        feats,
+        spans: list[tuple[int, int]],
+        assign: list[int],
+    ) -> tuple[dict[int, list[int]], bool, int]:
+        import numpy as np
+
+        if hasattr(feats, "detach"):
+            feats = feats.detach().cpu().numpy()
+
+        keeps: dict[int, list[int]] = {}
+        ambiguous = False
+        scalar_syncs = 0
+        for route_slot in set(assign):
+            old = self._slot_spans[route_slot]
+            old_feats = self._slot_route_feats[route_slot]
+            if len(old_feats) != len(old):
+                raise RuntimeError(
+                    f"routed-span feature bank desync in slot {route_slot}: "
+                    f"{len(old_feats)} != {len(old)}"
+                )
+            new_feats = [feats[j] for j in range(len(spans)) if assign[j] == route_slot]
+            cand_feats = old_feats + new_feats
+            cand_len = [sp["k"].shape[2] for sp in old] + [b - a for j, (a, b) in enumerate(spans) if assign[j] == route_slot]
+            if not cand_feats:
+                continue
+            x = np.stack(
+                [
+                    feature.detach().cpu().numpy()
+                    if hasattr(feature, "detach")
+                    else feature
+                    for feature in cand_feats
+                ]
+            )
+            candidate_mean = x.mean(0)
+            mean_norm = max(float(np.linalg.norm(candidate_mean)), 1.0e-12)
+            normalized_mean = candidate_mean / np.float32(mean_norm)
+            first_scores = np.float32(1.0) - x @ normalized_mean
+            first = int(np.argmax(first_scores))
+            scalar_syncs += 1
+            ambiguous = ambiguous or self._route_argmax_is_ambiguous(first_scores)
+            selected = [first]
+            used = cand_len[first]
+            min_dist = np.float32(1.0) - x @ x[first]
+            while used < self.span_budget:
+                if len(selected) == len(cand_feats):
+                    break
+                min_dist[selected] = np.float32(-1.0)
+                nxt = int(np.argmax(min_dist))
+                scalar_syncs += 2
+                ambiguous = ambiguous or self._route_argmax_is_ambiguous(min_dist)
+                next_dist = float(min_dist[nxt])
+                ambiguous = ambiguous or (
+                    abs(next_dist - self.dup_floor)
+                    <= self._route_parity_epsilon
+                )
+                if (
+                    next_dist < self.dup_floor
+                    or used + cand_len[nxt] > self.span_budget
+                ):
+                    break
+                selected.append(nxt)
+                used += cand_len[nxt]
+                min_dist = np.minimum(
+                    min_dist,
+                    np.float32(1.0) - x @ x[nxt],
+                )
+            keeps[route_slot] = sorted(selected)
+        return keeps, ambiguous, scalar_syncs
+
+    def _commit_slot_route_feats(
+        self,
+        span_means,
+        spans: list[tuple[int, int]],
+        assign: list[int],
+        keeps: dict[int, list[int]],
+    ) -> None:
+        for route_slot, selected in keeps.items():
+            new_feats = [
+                span_means[j].copy()
+                for j in range(len(spans))
+                if assign[j] == route_slot
+            ]
+            candidates = self._slot_route_feats[route_slot] + new_feats
+            self._slot_route_feats[route_slot] = [
+                candidates[index] for index in selected
+            ]
+
+    def _span_keeps_scalar_reference(self, feats, spans: list[tuple[int, int]], assign: list[int]) -> dict[int, list[int]]:
         import torch
         from torch.nn import functional as F
 
@@ -880,6 +1260,17 @@ class NativeRoutedSpanLayer(_NativeGemmaLayer):
                 min_dist = torch.minimum(min_dist, 1.0 - x @ x[nxt])
             keeps[route_slot] = sorted(selected)
         return keeps
+
+    def routing_sync_stats(self) -> dict[str, int]:
+        return {
+            "bulk_transfers": int(self._route_decision_bulk_transfers),
+            "scalar_syncs_avoided": int(self._route_decision_scalar_syncs_avoided),
+            "cpu_plans": int(self._route_decision_cpu_plans),
+            "cpu_authoritative_plans": int(self._route_decision_cpu_plans),
+            "ambiguous_cpu_plans": int(
+                self._route_decision_ambiguous_cpu_plans
+            ),
+        }
 
     def _materialize(self) -> None:
         parts_k = [self._sink_k]
@@ -1103,11 +1494,16 @@ class NativeGemmaRoutedCache:
             nonlocal total
             if tensor is None:
                 return
-            ptr = int(tensor.data_ptr())
+            if hasattr(tensor, "data_ptr"):
+                ptr = int(tensor.data_ptr())
+                tensor_bytes = tensor.numel() * tensor.element_size()
+            else:
+                ptr = int(tensor.__array_interface__["data"][0])
+                tensor_bytes = int(tensor.nbytes)
             if ptr in seen:
                 return
             seen.add(ptr)
-            total += tensor.numel() * tensor.element_size()
+            total += tensor_bytes
 
         for layer in self.layers:
             for tensor in (getattr(layer, "keys", None), getattr(layer, "values", None)):
@@ -1126,6 +1522,9 @@ class NativeGemmaRoutedCache:
                     "_gmean",
                 ):
                     add_tensor(getattr(layer, name, None))
+                for route_features in layer._slot_route_feats:
+                    for route_feature in route_features:
+                        add_tensor(route_feature)
                 total += layer.span_storage_bytes()
         for store in (self._shared_kv_by_layer, self._shared_kv_by_type):
             for key_states, value_states in store.values():
@@ -1155,6 +1554,9 @@ class NativeGemmaRoutedCache:
                 ):
                     setattr(layer, attr, None)
                 layer._slot_spans = [[] for _ in layer._slot_spans]
+                layer._slot_route_feats = [
+                    [] for _ in layer._slot_route_feats
+                ]
                 layer._slot_span_tokens = [0] * len(layer._slot_span_tokens)
                 layer._bank_span_tokens = 0
                 layer._active_span_slots = 0
@@ -1194,6 +1596,20 @@ class NativeGemmaRoutedCache:
         return released
 
     def bind_token_pool_authoritative_prefill(self, reservation) -> None:
+        if getattr(
+            self,
+            "_token_pool_authoritative_prefill_shared_snapshot",
+            None,
+        ) is not None:
+            raise DistinctCacheBatchError(
+                "cache already has an authoritative prefill snapshot"
+            )
+        self._ensure_shared_kv_store()
+        self._token_pool_authoritative_prefill_shared_snapshot = (
+            reservation,
+            dict(self._shared_kv_by_layer),
+            dict(self._shared_kv_by_type),
+        )
         bound_layers: list[NativeSlidingWindowLayer] = []
         try:
             for layer_idx in reservation.expected_layer_ids:
@@ -1210,6 +1626,9 @@ class NativeGemmaRoutedCache:
                     reservation,
                     rollback=True,
                 )
+            self._restore_token_pool_authoritative_prefill_shared_snapshot(
+                reservation
+            )
             raise
 
     def unbind_token_pool_authoritative_prefill(
@@ -1227,9 +1646,47 @@ class NativeGemmaRoutedCache:
                 rollback=rollback,
             )
         if rollback:
-            self.release_token_pool_covered_sliding_storage(
-                {"sliding_attention"}
+            self._restore_token_pool_authoritative_prefill_shared_snapshot(
+                reservation
             )
+
+    def finalize_token_pool_authoritative_prefill(self, reservation) -> None:
+        for layer_idx in reservation.expected_layer_ids:
+            layer = self.layers[int(layer_idx)]
+            if not isinstance(layer, NativeSlidingWindowLayer):
+                continue
+            layer.finalize_token_pool_authoritative_prefill(reservation)
+        snapshot = getattr(
+            self,
+            "_token_pool_authoritative_prefill_shared_snapshot",
+            None,
+        )
+        if snapshot is not None:
+            if snapshot[0] is not reservation:
+                raise DistinctCacheBatchError(
+                    "cache has a different authoritative prefill snapshot"
+                )
+            self._token_pool_authoritative_prefill_shared_snapshot = None
+
+    def _restore_token_pool_authoritative_prefill_shared_snapshot(
+        self,
+        reservation,
+    ) -> bool:
+        snapshot = getattr(
+            self,
+            "_token_pool_authoritative_prefill_shared_snapshot",
+            None,
+        )
+        if snapshot is None:
+            return False
+        if snapshot[0] is not reservation:
+            raise DistinctCacheBatchError(
+                "cache has a different authoritative prefill snapshot"
+            )
+        self._shared_kv_by_layer = snapshot[1]
+        self._shared_kv_by_type = snapshot[2]
+        self._token_pool_authoritative_prefill_shared_snapshot = None
+        return True
 
     def set_span_break_mask(self, mask: list[bool]) -> None:
         for layer in self.layers:
@@ -1507,6 +1964,7 @@ class _NativeGemmaPrefillBatchLayer:
         self.layers = layers
         self.row_widths = [int(width) for width in row_widths]
         self.is_sliding = bool(layers[0].is_sliding)
+        self._last_update_mode = "none"
 
     def update(self, key_states, value_states, *args, **kwargs):
         import torch
@@ -1515,6 +1973,12 @@ class _NativeGemmaPrefillBatchLayer:
             raise ValueError("prefill batch key/value shapes differ")
         if int(key_states.shape[0]) != len(self.layers):
             raise ValueError("prefill batch cache row count mismatch")
+        fast_result = self._update_homogeneous(key_states, value_states)
+        if fast_result is not None:
+            self._last_update_mode = "batched_homogeneous"
+            return fast_result
+
+        self._last_update_mode = "serial"
         padded_width = max(self.row_widths)
         key_rows = []
         value_rows = []
@@ -1538,6 +2002,113 @@ class _NativeGemmaPrefillBatchLayer:
             key_rows.append(row_keys)
             value_rows.append(row_values)
         return torch.cat(key_rows, dim=0), torch.cat(value_rows, dim=0)
+
+    def _update_homogeneous(self, key_states, value_states):
+        if key_states.ndim != 4 or len(set(self.row_widths)) != 1:
+            return None
+        if all(type(layer) is NativeSlidingWindowLayer for layer in self.layers):
+            return self._update_homogeneous_sliding(key_states, value_states)
+        if all(type(layer) is NativeRoutedSpanLayer for layer in self.layers):
+            return self._update_homogeneous_routed(key_states, value_states)
+        return None
+
+    def _homogeneous_readout(self, key_states, value_states):
+        initialized = bool(self.layers[0].is_initialized)
+        if any(bool(layer.is_initialized) != initialized for layer in self.layers[1:]):
+            return None
+
+        query_length = int(key_states.shape[2])
+        expected_width = self.row_widths[0]
+        if not initialized:
+            if expected_width != query_length:
+                return None
+            if any(layer.keys is not None or layer.values is not None for layer in self.layers):
+                return None
+            return key_states, value_states, False
+
+        first_keys = self.layers[0].keys
+        first_values = self.layers[0].values
+        if first_keys is None or first_values is None:
+            return None
+        old_width = int(first_keys.shape[2])
+        if expected_width != old_width + query_length:
+            return None
+        expected_key_shape = (1, int(key_states.shape[1]), old_width, int(key_states.shape[3]))
+        expected_value_shape = (
+            1,
+            int(value_states.shape[1]),
+            old_width,
+            int(value_states.shape[3]),
+        )
+        for layer in self.layers:
+            if (
+                layer.keys is None
+                or layer.values is None
+                or tuple(layer.keys.shape) != expected_key_shape
+                or tuple(layer.values.shape) != expected_value_shape
+                or layer.keys.dtype != key_states.dtype
+                or layer.values.dtype != value_states.dtype
+                or layer.keys.device != key_states.device
+                or layer.values.device != value_states.device
+            ):
+                return None
+
+        old_keys = _cat_batch([layer.keys for layer in self.layers], "prefill.keys")
+        old_values = _cat_batch([layer.values for layer in self.layers], "prefill.values")
+        return (
+            _cat_time(old_keys, key_states),
+            _cat_time(old_values, value_states),
+            True,
+        )
+
+    def _update_homogeneous_sliding(self, key_states, value_states):
+        layers = self.layers
+        first = layers[0]
+        if (
+            first.sliding_window <= 1
+            or any(layer.sliding_window != first.sliding_window for layer in layers[1:])
+            or any(layer._dense_storage_released for layer in layers)
+            or any(layer._token_pool_authoritative_prefill is not None for layer in layers)
+        ):
+            return None
+
+        readout = self._homogeneous_readout(key_states, value_states)
+        if readout is None:
+            return None
+        full_keys, full_values, was_initialized = readout
+        keep = int(first.sliding_window) - 1
+        cached_keys = full_keys[:, :, -keep:, :].contiguous()
+        cached_values = full_values[:, :, -keep:, :].contiguous()
+        query_length = int(key_states.shape[2])
+        for row, layer in enumerate(layers):
+            if not was_initialized:
+                layer.dtype = key_states.dtype
+                layer.device = key_states.device
+                layer.is_initialized = True
+            layer.cumulative_length += query_length
+            layer.keys = cached_keys[row : row + 1]
+            layer.values = cached_values[row : row + 1]
+        return full_keys, full_values
+
+    def _update_homogeneous_routed(self, key_states, value_states):
+        layers = self.layers
+        if any(layer._dense_storage_released for layer in layers):
+            return None
+        readout = self._homogeneous_readout(key_states, value_states)
+        if readout is None:
+            return None
+        full_keys, full_values, was_initialized = readout
+        for row, layer in enumerate(layers):
+            row_keys = key_states[row : row + 1]
+            row_values = value_states[row : row + 1]
+            if not was_initialized:
+                layer.lazy_initialization(row_keys, row_values)
+            layer._update_state(
+                row_keys,
+                row_values,
+                batched_decode=False,
+            )
+        return full_keys, full_values
 
     def get_seq_length(self) -> int:
         return max(int(layer.get_seq_length()) for layer in self.layers)
@@ -1915,16 +2486,6 @@ class GemmaRoutedSpanRunner:
             self._discard_cached_token_pool_decode_graph(graph)
             delattr(cache, "_padded_decode_graph")
         cache.release_tensor_storage()
-        import gc
-
-        gc.collect()
-        try:
-            import torch
-
-            if torch.cuda.is_available() and not torch.cuda.is_current_stream_capturing():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
         return True
 
     def _record_cuda_memory_snapshot(
