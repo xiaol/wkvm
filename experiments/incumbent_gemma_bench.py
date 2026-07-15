@@ -1349,7 +1349,7 @@ def make_row(
             "to same-run maximum request TTFT."
         ),
         "batch_wall_scope": "synchronous_batch_completion",
-        "decode_interval_scope": "batch_wall_minus_first_token_wall",
+        "decode_interval_scope": "separate_run_wall_time_subtraction",
         "decode_timing_method": "separate_run_subtraction",
         "decode_timing_source": (
             "max_tokens=N wall time minus a separate max_tokens=1 wall time"

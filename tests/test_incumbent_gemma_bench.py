@@ -398,6 +398,10 @@ class TestIncumbentGemmaBench(unittest.TestCase):
         self.assertEqual(row["batch_wall_s"], 8.0)
         self.assertEqual(row["batch_wall_scope"], "synchronous_batch_completion")
         self.assertEqual(row["decode_interval_s"], 7.0)
+        self.assertEqual(
+            row["decode_interval_scope"],
+            "separate_run_wall_time_subtraction",
+        )
         self.assertEqual(row["prefill_plus_first_scope"], "batch_max_tokens_1_wall")
         self.assertEqual(row["cohort_prefill_wall_s"], 1.0)
         self.assertEqual(row["cohort_prefill_scope"], "separate_run_batch_wall")
