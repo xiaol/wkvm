@@ -136,13 +136,21 @@ correctly restarts instead.
   15,088. Observed final prompts reach 15,014 tokens, and another 128 output
   tokens require at least 15,142 positions.
 
-## Reproduction
+## Historical benchmark reproduction (not a serving profile)
 
-Install the repository-side dependencies:
+The commands below reproduce this frozen B32 artifact. They include fixed-output
+and near-device-ceiling benchmark controls that are inappropriate for normal
+chat. For a conservative local UI setup, use the
+[`Open WebUI demo guide`](../../docs/OPEN_WEBUI_DEMO.md) instead.
+
+Install the repository-side benchmark dependencies:
 
 ```bash
 python -m pip install -e '.[gemma-server,open-webui-bench]'
 ```
+
+The `open-webui-bench` extra installs the harness client, not Open WebUI itself.
+This artifact used Open WebUI 0.10.2 installed as a separate application.
 
 Configure Open WebUI to forward session identity and point at the active engine:
 

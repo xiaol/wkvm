@@ -1,0 +1,34 @@
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:v0.10.2
+    container_name: wkvm-open-webui
+    network_mode: host
+    environment:
+      HOST: 127.0.0.1
+      PORT: "3000"
+      WEBUI_AUTH: "true"
+      ENABLE_OLLAMA_API: "false"
+      ENABLE_OPENAI_API: "true"
+      OPENAI_API_BASE_URLS: http://127.0.0.1:8000/v1
+      OPENAI_API_KEYS: wkvm-local
+      ENABLE_FORWARD_USER_INFO_HEADERS: "true"
+      ENABLE_WEBSOCKET_SUPPORT: "true"
+      ENABLE_PERSISTENT_CONFIG: "false"
+      DEFAULT_MODELS: wkvm-gemma-4-e4b-it
+      DEFAULT_MODEL_PARAMS: '{"temperature":0,"top_p":1,"function_calling":"legacy"}'
+      DEFAULT_MODEL_METADATA: '{"capabilities":{"builtin_tools":false,"vision":false,"file_upload":false,"file_context":false,"web_search":false,"image_generation":false,"code_interpreter":false,"terminal":false,"memory":false}}'
+      ENABLE_TITLE_GENERATION: "false"
+      ENABLE_TAGS_GENERATION: "false"
+      ENABLE_FOLLOW_UP_GENERATION: "false"
+      ENABLE_CONTEXT_COMPACTION: "false"
+      ENABLE_REALTIME_CHAT_SAVE: "false"
+      ENABLE_CODE_INTERPRETER: "false"
+      ENABLE_MEMORIES: "false"
+      ENABLE_WEB_SEARCH: "false"
+      ENABLE_IMAGE_GENERATION: "false"
+    volumes:
+      - open-webui-data:/app/backend/data
+    restart: unless-stopped
+
+volumes:
+  open-webui-data:
