@@ -509,7 +509,7 @@ class TestGemmaServerEngineArgs(unittest.TestCase):
             frozenset(),
         )
 
-    def test_production_profile_enables_checkpoint_native_graph_profile(self) -> None:
+    def test_production_profile_uses_checkpoint_native_eager_decode_profile(self) -> None:
         args = SimpleNamespace(
             native_gemma_production_profile=True,
             native_gemma_checkpoint_loader=False,
@@ -536,7 +536,7 @@ class TestGemmaServerEngineArgs(unittest.TestCase):
         self.assertEqual(args.native_gemma_projection_backend, "separate")
         self.assertEqual(args.native_gemma_weight_backend, "hf_live")
         self.assertFalse(args.native_gemma_release_hf_decoder_layers)
-        self.assertTrue(args.persistent_padded_decode_cuda_graph)
+        self.assertFalse(args.persistent_padded_decode_cuda_graph)
         self.assertEqual(args.persistent_padded_decode_steps, 128)
         self.assertEqual(args.sink, 16)
         self.assertEqual(args.window, 1024)

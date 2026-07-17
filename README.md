@@ -61,6 +61,32 @@ does **not** reuse the high-memory B32 benchmark recipe or `--ignore-eos`.
 - This UI path exercises approximate Gemma routed-span mode. WKVM's native
   RWKV-7 durable-state engine and API are separate paths.
 
+## Open WebUI live demo
+
+[![WKVM four-chat Open WebUI live demo](experiments/results/open_webui_live_demo_20260717.gif)](experiments/results/open_webui_live_demo_20260717.mp4)
+
+**On one RTX 4090, four real concurrent Open WebUI chats completed and
+validated their classic-prompt first turns and follow-ups (4/4 each), with
+first-turn browser p95 TTFT of 1.1227732s, p95 E2E of 3.79008975s, whole-GPU
+memory moving from 17,769 to 17,805 MiB, and zero provider, capture, probe, or
+validation errors.**
+
+The long-context recall lane contained exactly 12,000 rendered tokens, with its
+needle beginning at zero-based rendered-token index 252. It correctly returned
+`BLUE-742`, `Samarkand`, and `lantern`, at a browser-observed TTFT of 2.49666s
+and E2E of 4.639401s. Provider telemetry sampled after the four-chat high-water
+point reported `max_running=4` and `max_runnable_rows=4`; all 4/4 follow-ups
+were exact reuse hits, reusing 333 prefix tokens.
+
+This is a graph-free, corrected production-profile run using
+`routed_span_approximate`: a functional four-slot browser demo, not a
+controlled load test and **not a 10x Open WebUI measurement**. It demonstrates
+this prompt set and serving path; it does not establish quality equivalence or
+a universal engine ranking. See the [full report](experiments/results/open_webui_classic_prompts_20260717.md),
+[raw result JSON](experiments/results/open_webui_classic_prompts_20260717.json),
+or [full-quality MP4](experiments/results/open_webui_live_demo_20260717.mp4).
+The separately scoped provider-HTTP comparison follows.
+
 ## Performance evidence
 
 There is no honest workload-independent “WKVM is 10x faster” claim. The
@@ -73,11 +99,13 @@ workloads where vLLM remains faster.
 | Real Open WebUI 0.10.2, offered B32, 8 turns | 53.963 output tok/s | 0.586x; vLLM is 70.6% faster | 0.998x; effectively tied | accounting pass, strict reuse fail |
 | Repeated A800 strict short-session gate, B64/ctx16K/out32 | worst-repeat envelope | 0.790x | 1.400x | overall gate fail |
 
-The 48-turn result completed all 2,304 requests, but it is one paired run on a
-desktop RTX 4090 with WKVM `routed_span_approximate` versus incumbent `full_kv`
-semantics. The safe claim is: **on that predeclared long-lived workload, WKVM
-measured 11.151x vLLM and 26.079x SGLang end to end**. It does not establish a
-universal engine ranking or quality equivalence.
+The B16 x 48-turn result completed all 2,304 requests from a 36,864-token
+initial context: WKVM took 180.415s, vLLM took 2,011.890s, and SGLang took
+4,705.123s. It is one exploratory paired cohort on a desktop RTX 4090, with
+WKVM `routed_span_approximate` versus incumbent `full_kv` semantics. The safe
+claim is: **on that predeclared long-lived workload, WKVM measured 11.151x vLLM
+and 26.079x SGLang end to end**. It does not establish a universal engine
+ranking or quality equivalence.
 
 The real Open WebUI run completed 256/256 requests for every engine. WKVM
 retained 32 states, but only 125/224 continuations exactly matched parked token

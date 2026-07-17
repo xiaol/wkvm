@@ -1,0 +1,408 @@
+{
+  "acts": {
+    "all_requests": {
+      "e2e_p50_s": 2.728755,
+      "e2e_p95_s": 4.3125126,
+      "error_count": 0,
+      "output_tokens": 288,
+      "request_count": 9,
+      "success_count": 9,
+      "timed_e2e_count": 9,
+      "timed_ttft_count": 9,
+      "ttft_p50_s": 0.643848,
+      "ttft_p95_s": 1.9758987999999995
+    },
+    "concurrency_first_turn": {
+      "e2e_p50_s": 3.5267635000000004,
+      "e2e_p95_s": 3.79008975,
+      "error_count": 0,
+      "offered_concurrency": 4,
+      "output_tokens": 157,
+      "request_count": 4,
+      "success_count": 4,
+      "timed_e2e_count": 4,
+      "timed_ttft_count": 4,
+      "ttft_p50_s": 0.703147,
+      "ttft_p95_s": 1.1227732
+    },
+    "concurrency_follow_up": {
+      "e2e_p50_s": 2.4264735,
+      "e2e_p95_s": 2.69288925,
+      "error_count": 0,
+      "offered_concurrency": 4,
+      "output_tokens": 108,
+      "request_count": 4,
+      "success_count": 4,
+      "timed_e2e_count": 4,
+      "timed_ttft_count": 4,
+      "ttft_p50_s": 0.32725950000000004,
+      "ttft_p95_s": 0.3318597
+    },
+    "long_prompt": {
+      "e2e_p50_s": 4.639401,
+      "e2e_p95_s": 4.639401,
+      "error_count": 0,
+      "output_tokens": 23,
+      "request_count": 1,
+      "success_count": 1,
+      "timed_e2e_count": 1,
+      "timed_ttft_count": 1,
+      "ttft_p50_s": 2.49666,
+      "ttft_p95_s": 2.49666
+    }
+  },
+  "caveats": [
+    "This is a normal four-slot Open WebUI demo, not a controlled load test.",
+    "WKVM serves this demo with routed_span_approximate model-state semantics.",
+    "This capture is not a vLLM/SGLang comparison or proof of a 10x claim."
+  ],
+  "errors": [],
+  "generated_at": "2026-07-17T05:27:53.702990+00:00",
+  "kind": "wkvm.open_webui.demo_report",
+  "provenance": {
+    "capture": {
+      "browser": {
+        "channel": "chrome",
+        "engine": "chromium",
+        "version": "147.0.7727.116"
+      },
+      "captured_at": "2026-07-17T05:10:55.811Z",
+      "file_sha256": "0cd698cff668c60cc6a7881f0e335c00558c41d4a1950d0eaff2c369ad26a602",
+      "kind": "wkvm.open_webui.live_capture",
+      "schema_version": 1
+    },
+    "git_commit": "9200cdb7ca5f6a7c21c27c4a82c882e9fdfb80d4",
+    "measurement": {
+      "e2e": "browser submit to observed completion",
+      "offered_concurrency": 4,
+      "output_tokens": "response text encoded without special tokens",
+      "ttft": "browser submit to first observed streamed token"
+    },
+    "platform": "Linux-7.0.0-27-generic-x86_64-with-glibc2.43",
+    "python": "3.12.13",
+    "scenario": {
+      "capture_declared_sha256": "16246f8b90da888b5f4389ae6a741d416028a9be7ca069ecce20f90c785a04cd",
+      "capture_match": true,
+      "declared_sha256": "ff56156450c0eabfe3cd426cc2b74916cf28933489f406e1dd36fc59e34622c4",
+      "file_sha256": "16246f8b90da888b5f4389ae6a741d416028a9be7ca069ecce20f90c785a04cd"
+    },
+    "tokenizer": {
+      "match": {
+        "fields": {
+          "bos_token_id": true,
+          "chat_template_sha256": true,
+          "class": true,
+          "eos_token_id": true,
+          "vocab_size": true
+        },
+        "matched": true
+      },
+      "report": {
+        "bos_token_id": 2,
+        "chat_template_sha256": "2f1b4d75d067bae3fe44e676721c7f077d243bc007156cb9c2f8b5836613d082",
+        "class": "GemmaTokenizer",
+        "eos_token_id": 1,
+        "identity": null,
+        "vocab_size": 262144
+      },
+      "scenario": {
+        "bos_token_id": 2,
+        "chat_template_sha256": "2f1b4d75d067bae3fe44e676721c7f077d243bc007156cb9c2f8b5836613d082",
+        "class": "GemmaTokenizer",
+        "eos_token_id": 1,
+        "identity": null,
+        "vocab_size": 262144
+      }
+    }
+  },
+  "records": [
+    {
+      "capture_error": null,
+      "e2e_s": 4.639401,
+      "errors": [],
+      "label": "Long Context Needle",
+      "output_tokens": 23,
+      "phase": "long_prompt",
+      "prompt_id": "long-context-needle",
+      "response_characters": 77,
+      "response_sha256": "81f8604c7beb9afc70004194ef360caf68ed39d8b6a4052c2f1b1f62a3eb8098",
+      "response_text": "The codename is BLUE-742, the city is Samarkand, and the checksum is lantern.",
+      "success": true,
+      "ttft_s": 2.49666,
+      "validation": {
+        "passed": true,
+        "problems": []
+      }
+    },
+    {
+      "capture_error": null,
+      "e2e_s": 3.82218,
+      "errors": [],
+      "label": "Reasoning",
+      "output_tokens": 53,
+      "phase": "first_turn",
+      "prompt_id": "reasoning",
+      "response_characters": 154,
+      "response_sha256": "2bd074f80ffd2de40a8cd917f564d9530952b2aeb4c673c1b3fe1c74e6272071",
+      "response_text": "FINAL: USD 0.05\nThe ball costs $0.05, and the bat costs $1.05, which totals $1.10 and satisfies the condition that the bat costs $1.00 more than the ball.",
+      "success": true,
+      "ttft_s": 0.643848,
+      "validation": {
+        "passed": true,
+        "problems": []
+      }
+    },
+    {
+      "capture_error": null,
+      "e2e_s": 2.728755,
+      "errors": [],
+      "label": "Common Follow-up",
+      "output_tokens": 37,
+      "phase": "follow_up",
+      "prompt_id": "common-follow-up",
+      "response_characters": 102,
+      "response_sha256": "fbc8f8c1b3d3686ec4e35631d39cd7e736357600ac52da920a3b1c1215fbc5d7",
+      "response_text": "The ball costs $0.05, and the bat costs $1.05, totaling $1.10 with the bat being $1.00 more expensive.",
+      "success": true,
+      "ttft_s": 0.323409,
+      "validation": {
+        "passed": true,
+        "problems": []
+      }
+    },
+    {
+      "capture_error": null,
+      "e2e_s": 3.608245,
+      "errors": [],
+      "label": "Code",
+      "output_tokens": 58,
+      "phase": "first_turn",
+      "prompt_id": "code",
+      "response_characters": 176,
+      "response_sha256": "2d09bad224710e5cb43072e9bef29162bd777be0cf731ecb32b0657e0d701aa2",
+      "response_text": "python\nCollapse\nRun\nSave\nCopy\n1\n2\n3\n⌄\ndef is_palindrome(text):\n    processed_text = \"\".join(filter(str.isalnum, text)).lower()\n    return processed_text == processed_text[::-1]",
+      "success": true,
+      "ttft_s": 0.714865,
+      "validation": {
+        "passed": true,
+        "problems": []
+      }
+    },
+    {
+      "capture_error": null,
+      "e2e_s": 2.48965,
+      "errors": [],
+      "label": "Common Follow-up",
+      "output_tokens": 28,
+      "phase": "follow_up",
+      "prompt_id": "common-follow-up",
+      "response_characters": 136,
+      "response_sha256": "737fb2ea5cab3ecf8ce148e7c42a691001788696b20b9f6f317da5cb80e909a2",
+      "response_text": "The provided Python function is_palindrome(text) checks if a string is a palindrome while ignoring case and non-alphanumeric characters.",
+      "success": true,
+      "ttft_s": 0.331992,
+      "validation": {
+        "passed": true,
+        "problems": []
+      }
+    },
+    {
+      "capture_error": null,
+      "e2e_s": 2.255082,
+      "errors": [],
+      "label": "JSON",
+      "output_tokens": 14,
+      "phase": "first_turn",
+      "prompt_id": "json",
+      "response_characters": 44,
+      "response_sha256": "4a3c157ce41e974e1f0595aa5ee1d0396b6851a079cae16e0be592dadaa07396",
+      "response_text": "{\"engine\":\"WKVM\",\"slots\":4,\"status\":\"ready\"}",
+      "success": true,
+      "ttft_s": 1.194757,
+      "validation": {
+        "passed": true,
+        "problems": []
+      }
+    },
+    {
+      "capture_error": null,
+      "e2e_s": 2.30939,
+      "errors": [],
+      "label": "Common Follow-up",
+      "output_tokens": 23,
+      "phase": "follow_up",
+      "prompt_id": "common-follow-up",
+      "response_characters": 86,
+      "response_sha256": "8b0fa1ddfebdf90c9d306b84010cd0c647359c38eae040791a5babe4fcebaab3",
+      "response_text": "The previous answer was the JSON object: {\"engine\":\"WKVM\",\"slots\":4,\"status\":\"ready\"}.",
+      "success": true,
+      "ttft_s": 0.323144,
+      "validation": {
+        "passed": true,
+        "problems": []
+      }
+    },
+    {
+      "capture_error": null,
+      "e2e_s": 3.445282,
+      "errors": [],
+      "label": "Systems",
+      "output_tokens": 32,
+      "phase": "first_turn",
+      "prompt_id": "systems",
+      "response_characters": 207,
+      "response_sha256": "ea5a5eac0761f21df4b31092f08f7521e0027ba7c11ccb16225822127cb42954",
+      "response_text": "A bounded request queue helps an inference server remain stable by implementing backpressure, which prevents the system from entering an overload state when incoming request rates exceed processing capacity.",
+      "success": true,
+      "ttft_s": 0.691429,
+      "validation": {
+        "passed": true,
+        "problems": []
+      }
+    },
+    {
+      "capture_error": null,
+      "e2e_s": 2.363297,
+      "errors": [],
+      "label": "Common Follow-up",
+      "output_tokens": 20,
+      "phase": "follow_up",
+      "prompt_id": "common-follow-up",
+      "response_characters": 118,
+      "response_sha256": "f1182283abf9d9c47037de0ed9dfd605c832b77f26f7450cb1c05514877bdc8b",
+      "response_text": "A bounded request queue maintains stability by using backpressure to prevent overload when request rates are too high.",
+      "success": true,
+      "ttft_s": 0.33111,
+      "validation": {
+        "passed": true,
+        "problems": []
+      }
+    }
+  ],
+  "schema_version": 1,
+  "status": "passed",
+  "summary": {
+    "all_error_count": 0,
+    "all_request_count": 9,
+    "all_success_count": 9,
+    "capture_error_count": 0,
+    "e2e_p50_s": 3.5267635000000004,
+    "e2e_p95_s": 3.79008975,
+    "error_count": 0,
+    "offered_concurrency": 4,
+    "output_tokens": 157,
+    "overall_passed": true,
+    "probe_error_count": 0,
+    "request_count": 4,
+    "success_count": 4,
+    "timed_e2e_count": 4,
+    "timed_ttft_count": 4,
+    "total_output_tokens": 288,
+    "ttft_p50_s": 0.703147,
+    "ttft_p95_s": 1.1227732
+  },
+  "telemetry": {
+    "capture": {
+      "capture_errors": 0,
+      "probe_errors": 0
+    },
+    "concurrency": {
+      "gpu": {
+        "device_count": 1,
+        "devices": [
+          {
+            "baseline_used_mib": 17769,
+            "index": 0,
+            "name": "NVIDIA GeForce RTX 4090",
+            "peak_used_mib": 17805,
+            "total_mib": 24564
+          }
+        ],
+        "error": null,
+        "sample_count": 78,
+        "whole_gpu_baseline_used_mib": 17769,
+        "whole_gpu_peak_increase_mib": 36,
+        "whole_gpu_peak_used_mib": 17805
+      },
+      "provider": {
+        "first_turn_request_counts": {
+          "total_cancelled": 0,
+          "total_errors": 0,
+          "total_requests": 4,
+          "total_timed_out": 0
+        },
+        "follow_up_request_counts": {
+          "total_cancelled": 0,
+          "total_errors": 0,
+          "total_requests": 4,
+          "total_timed_out": 0
+        },
+        "follow_up_reuse": {
+          "prefix_tokens_reused": 333,
+          "session_reuse_hits": 4,
+          "sessions_opened": 0
+        },
+        "high_water": {
+          "max_runnable_rows": 4,
+          "max_running": 4
+        },
+        "request_counts": {
+          "total_cancelled": 0,
+          "total_errors": 0,
+          "total_requests": 8,
+          "total_timed_out": 0
+        }
+      }
+    },
+    "launch": {
+      "provider_engine_config": {
+        "source": "capture.acts.concurrency.provider.after.metrics.values.engine",
+        "values": {
+          "native_gemma_attention_backend": "sdpa_single_gqa",
+          "native_gemma_checkpoint_loader": true,
+          "native_gemma_projection_backend": "separate",
+          "native_gemma_weight_backend": "hf_live",
+          "persistent_padded_decode": true,
+          "persistent_padded_decode_cuda_graph": false,
+          "persistent_padded_decode_steps": 128,
+          "use_native_gemma_forward": true
+        }
+      },
+      "semantics": {
+        "source": "scenario.claim_scope.semantics",
+        "value": "routed_span_approximate"
+      }
+    },
+    "long_prompt": {
+      "gpu": {
+        "device_count": 1,
+        "devices": [
+          {
+            "baseline_used_mib": 17372,
+            "index": 0,
+            "name": "NVIDIA GeForce RTX 4090",
+            "peak_used_mib": 17769,
+            "total_mib": 24564
+          }
+        ],
+        "error": null,
+        "sample_count": 37,
+        "whole_gpu_baseline_used_mib": 17372,
+        "whole_gpu_peak_increase_mib": 397,
+        "whole_gpu_peak_used_mib": 17769
+      },
+      "provider": {
+        "high_water": {
+          "max_runnable_rows": 1,
+          "max_running": 1
+        },
+        "request_counts": {
+          "total_cancelled": 0,
+          "total_errors": 0,
+          "total_requests": 1,
+          "total_timed_out": 0
+        }
+      }
+    }
+  }
+}

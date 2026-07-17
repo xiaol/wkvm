@@ -2459,7 +2459,7 @@ def apply_native_gemma_production_profile(args) -> None:
     args.native_gemma_projection_backend = "separate"
     args.native_gemma_weight_backend = "hf_live"
     args.native_gemma_release_hf_decoder_layers = False
-    args.persistent_padded_decode_cuda_graph = True
+    args.persistent_padded_decode_cuda_graph = False
     args.persistent_padded_decode_steps = 128
     args.sink = 16
     args.window = 1024
@@ -2732,8 +2732,8 @@ def main() -> None:
         help=(
             "Use the measured checkpoint-native production profile: no HF model "
             "construction, native SDPA with single-row GQA, separate projections, "
-            "persistent padded CUDA graph decode, route_chunk=512, and 128 reserved "
-            "decode steps."
+            "persistent padded decode without CUDA graphs, route_chunk=512, and "
+            "128 reserved decode steps."
         ),
     )
     ap.add_argument(
