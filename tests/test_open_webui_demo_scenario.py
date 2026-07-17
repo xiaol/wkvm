@@ -284,15 +284,46 @@ def _capture_with_telemetry(scenario):
     return capture
 
 
+def _natural_long_source():
+    return "\n\n".join(
+        f"Passage {index} follows traveler{index} across valley{index}, where "
+        f"river{index} reflects amber{index} clouds while cedar{index} branches "
+        f"shelter fox{index} and lark{index}."
+        for index in range(1_500)
+    )
+
+
+def _long_source_provenance():
+    return {
+        "dataset_id": "test/natural-long-text",
+        "revision": "0123456789abcdef",
+        "config": "default",
+        "split": "train",
+        "row_indices": {"start": 0, "end_inclusive": 1_499},
+        "license": "test-only",
+        "normalized_source_text_sha256": "fixture",
+    }
+
+
 class TestOpenWebUIDemoScenario(unittest.TestCase):
     maxDiff = None
 
     def setUp(self):
         self.tokenizer = _FakeTokenizer()
-        self.scenario = build_scenario(self.tokenizer)
+        self.source_text = _natural_long_source()
+        self.source_provenance = _long_source_provenance()
+        self.scenario = build_scenario(
+            self.tokenizer,
+            long_source_text=self.source_text,
+            long_source_provenance=self.source_provenance,
+        )
 
     def test_default_long_prompt_is_exact_and_hashes_are_deterministic(self):
-        second = build_scenario(self.tokenizer)
+        second = build_scenario(
+            self.tokenizer,
+            long_source_text=self.source_text,
+            long_source_provenance=self.source_provenance,
+        )
 
         self.assertEqual(self.scenario, second)
         self.assertEqual(self.scenario["long_prompt"]["rendered_token_count"], 12_000)
@@ -330,6 +361,24 @@ class TestOpenWebUIDemoScenario(unittest.TestCase):
         self.assertTrue(all(re.fullmatch(r"[0-9a-f]{64}", value) for value in prompt_hashes))
         self.assertNotIn("/private/models", json.dumps(self.scenario))
         self.assertIsNone(self.scenario["tokenizer"]["identity"])
+        long_prompt = self.scenario["long_prompt"]
+        self.assertNotIn("archive archive", long_prompt["content"].casefold())
+        self.assertEqual(
+            long_prompt["source"]["dataset_id"],
+            "test/natural-long-text",
+        )
+        self.assertLess(
+            long_prompt["source"]["quality"]["repeated_4gram_fraction"],
+            0.08,
+        )
+
+    def test_pathological_repeated_source_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "pathologically dominant word"):
+            build_scenario(
+                self.tokenizer,
+                long_source_text="archive " * 20_000,
+                long_source_provenance=self.source_provenance,
+            )
 
     def test_report_validates_outputs_counts_tokens_and_calculates_percentiles(self):
         capture = _capture_for(self.scenario)
@@ -414,6 +463,9 @@ class TestOpenWebUIDemoScenario(unittest.TestCase):
         self.assertIn("routed_span_approximate", markdown)
         self.assertIn("not a vLLM/SGLang comparison", markdown)
         self.assertIn("not a controlled load test", markdown)
+        self.assertIn("## Long-Context Source", markdown)
+        self.assertIn("`test/natural-long-text`", markdown)
+        self.assertIn("not repeated filler", markdown)
 
     def test_report_preserves_optional_runtime_telemetry(self):
         report = build_report(
@@ -495,7 +547,15 @@ class TestOpenWebUIDemoScenario(unittest.TestCase):
         parser = build_parser()
 
         build_args = parser.parse_args(
-            ["build", "--tokenizer-path", "public/model", "--json", "scenario.json"]
+            [
+                "build",
+                "--tokenizer-path",
+                "public/model",
+                "--long-source-parquet",
+                "frankenstein.parquet",
+                "--json",
+                "scenario.json",
+            ]
         )
         report_args = parser.parse_args(
             [
@@ -511,6 +571,10 @@ class TestOpenWebUIDemoScenario(unittest.TestCase):
         )
 
         self.assertEqual(build_args.long_rendered_tokens, 12_000)
+        self.assertEqual(
+            str(build_args.long_source_parquet),
+            "frankenstein.parquet",
+        )
         self.assertEqual(str(report_args.capture_json), "capture.json")
         self.assertEqual(str(report_args.markdown), "report.md")
 

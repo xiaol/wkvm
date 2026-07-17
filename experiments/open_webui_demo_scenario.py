@@ -16,6 +16,7 @@ import math
 import os
 from pathlib import Path
 import platform
+import re
 import subprocess
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -26,16 +27,20 @@ REPORT_KIND = "wkvm.open_webui.demo_report"
 SCHEMA_VERSION = 1
 OFFERED_CONCURRENCY = 4
 NEEDLE_TARGET_RENDERED_TOKEN = 256
-FILLER_ATOMS = (
-    " archive",
-    " record",
-    " context",
-    " datum",
-    " ledger",
-    " reference",
-    " x",
-    " 0",
+HF_LONG_SOURCE_DATASET_ID = (
+    "Thermostatic/project-gutenberg-frankenstein-chapters"
 )
+HF_LONG_SOURCE_REVISION = "e37ee04474b60bdf4cc680dfc41ed9dd453cf7fc"
+HF_LONG_SOURCE_CONFIG = "default"
+HF_LONG_SOURCE_SPLIT = "train"
+HF_LONG_SOURCE_FILENAME = "frankenstein_chapters.parquet"
+HF_LONG_SOURCE_FILE_SHA256 = (
+    "512da16deee193ba4fe32e7e8273c1aef02568ab36975811b3345d9b337cad9b"
+)
+HF_LONG_SOURCE_TEXT_SHA256 = (
+    "cbac39268b43c020cc4d9d6ff0e690657ff91417c4165481733b42f5b129dfd4"
+)
+HF_LONG_SOURCE_ROWS = 28
 CAVEATS = (
     "This is a normal four-slot Open WebUI demo, not a controlled load test.",
     "WKVM serves this demo with routed_span_approximate model-state semantics.",
@@ -205,12 +210,13 @@ def percentile(values: Iterable[float], fraction: float) -> float | None:
     return samples[lower] * (1.0 - weight) + samples[upper] * weight
 
 
-def _exact_middle_text(
+def _exact_source_prefix(
     prefix: str,
+    source_text: str,
     suffix: str,
     target_tokens: int,
     count_tokens: Any,
-) -> tuple[str, int]:
+) -> tuple[str, int, int]:
     base_count = count_tokens(prefix + suffix)
     if base_count > target_tokens:
         raise ValueError(
@@ -218,34 +224,150 @@ def _exact_middle_text(
             f"{target_tokens}"
         )
     if base_count == target_tokens:
-        return prefix + suffix, base_count
+        return prefix + suffix, base_count, 0
+    if not source_text:
+        raise ValueError("natural long-context source text is empty")
+    if count_tokens(prefix + source_text + suffix) < target_tokens:
+        raise ValueError(
+            "natural long-context source is too short for the requested "
+            f"{target_tokens} rendered tokens"
+        )
 
-    for atom in FILLER_ATOMS:
-        low = 0
-        high = max(1, target_tokens - base_count + 8)
-        while count_tokens(prefix + atom * high + suffix) < target_tokens:
-            low = high
-            high *= 2
-            if high > target_tokens * 16:
-                break
-        if count_tokens(prefix + atom * high + suffix) < target_tokens:
-            continue
-        while low + 1 < high:
-            middle = (low + high) // 2
-            count = count_tokens(prefix + atom * middle + suffix)
-            if count < target_tokens:
-                low = middle
-            else:
-                high = middle
-        for repeats in range(max(0, low - 8), high + 9):
-            text = prefix + atom * repeats + suffix
-            count = count_tokens(text)
-            if count == target_tokens:
-                return text, count
+    low = 0
+    high = len(source_text)
+    while low < high:
+        middle = (low + high) // 2
+        count = count_tokens(prefix + source_text[:middle] + suffix)
+        if count < target_tokens:
+            low = middle + 1
+        else:
+            high = middle
+
+    exact_candidates: list[int] = []
+    for radius in (64, 512, 4096):
+        start = max(0, low - radius)
+        stop = min(len(source_text), low + radius)
+        exact_candidates = [
+            character_count
+            for character_count in range(start, stop + 1)
+            if count_tokens(
+                prefix + source_text[:character_count] + suffix
+            )
+            == target_tokens
+        ]
+        if exact_candidates:
+            break
+    if exact_candidates:
+        boundary_candidates = [
+            character_count
+            for character_count in exact_candidates
+            if character_count in {0, len(source_text)}
+            or source_text[character_count - 1].isspace()
+            or source_text[character_count].isspace()
+        ]
+        character_count = (
+            boundary_candidates[-1]
+            if boundary_candidates
+            else exact_candidates[-1]
+        )
+        return (
+            prefix + source_text[:character_count] + suffix,
+            target_tokens,
+            character_count,
+        )
     raise RuntimeError(
-        f"could not construct deterministic text with exactly {target_tokens} "
-        "rendered tokens"
+        "could not truncate the natural source to exactly "
+        f"{target_tokens} rendered tokens"
     )
+
+
+def natural_text_quality(text: str) -> dict[str, Any]:
+    words = re.findall(r"[\w]+(?:['’][\w]+)?", text.casefold())
+    if not words:
+        return {
+            "word_count": 0,
+            "unique_word_fraction": 0.0,
+            "dominant_word_fraction": 1.0,
+            "repeated_4gram_fraction": 1.0,
+        }
+    counts: dict[str, int] = {}
+    for word in words:
+        counts[word] = counts.get(word, 0) + 1
+    ngrams = [tuple(words[index : index + 4]) for index in range(len(words) - 3)]
+    repeated_4grams = len(ngrams) - len(set(ngrams))
+    return {
+        "word_count": len(words),
+        "unique_word_fraction": len(counts) / len(words),
+        "dominant_word_fraction": max(counts.values()) / len(words),
+        "repeated_4gram_fraction": (
+            repeated_4grams / len(ngrams) if ngrams else 0.0
+        ),
+    }
+
+
+def _validate_natural_source(text: str) -> dict[str, Any]:
+    quality = natural_text_quality(text)
+    if quality["word_count"] < 1_000:
+        raise ValueError("natural long-context source must contain at least 1,000 words")
+    if quality["dominant_word_fraction"] > 0.12:
+        raise ValueError("natural long-context source has a pathologically dominant word")
+    if quality["repeated_4gram_fraction"] > 0.08:
+        raise ValueError("natural long-context source has excessive repeated 4-grams")
+    return quality
+
+
+def load_hf_long_source(path: Path) -> tuple[str, dict[str, Any]]:
+    source_file_sha256 = file_sha256(path)
+    if source_file_sha256 != HF_LONG_SOURCE_FILE_SHA256:
+        raise ValueError(
+            f"unexpected Hugging Face source SHA-256 for {path}: "
+            f"{source_file_sha256}"
+        )
+    try:
+        import pyarrow.parquet as parquet
+    except ImportError as exc:
+        raise RuntimeError(
+            "pyarrow is required to read the pinned Hugging Face source parquet"
+        ) from exc
+    table = parquet.read_table(path, columns=["Chapter", "Text"])
+    rows = table.to_pylist()
+    if len(rows) != HF_LONG_SOURCE_ROWS:
+        raise ValueError(
+            f"expected {HF_LONG_SOURCE_ROWS} Hugging Face source rows, "
+            f"found {len(rows)}"
+        )
+    if any(
+        not isinstance(row.get("Chapter"), str)
+        or not isinstance(row.get("Text"), str)
+        or not row["Text"].strip()
+        for row in rows
+    ):
+        raise ValueError("Hugging Face source rows have an unexpected schema")
+    source_text = "\n\n".join(row["Text"].strip() for row in rows)
+    source_text_sha256 = text_sha256(source_text)
+    if source_text_sha256 != HF_LONG_SOURCE_TEXT_SHA256:
+        raise ValueError(
+            "normalized Hugging Face source text does not match its pinned "
+            "SHA-256"
+        )
+    provenance = {
+        "dataset_id": HF_LONG_SOURCE_DATASET_ID,
+        "revision": HF_LONG_SOURCE_REVISION,
+        "config": HF_LONG_SOURCE_CONFIG,
+        "split": HF_LONG_SOURCE_SPLIT,
+        "filename": HF_LONG_SOURCE_FILENAME,
+        "file_sha256": source_file_sha256,
+        "row_indices": {"start": 0, "end_inclusive": len(rows) - 1},
+        "row_count": len(rows),
+        "normalized_source_text_sha256": source_text_sha256,
+        "license": "MIT",
+        "upstream_rights": "Project Gutenberg public domain in the United States",
+        "work": {
+            "title": "Frankenstein; or, The Modern Prometheus",
+            "author": "Mary Wollstonecraft Shelley",
+        },
+    }
+    return source_text, provenance
 
 
 def _common_prefix_length(left: Sequence[int], right: Sequence[int]) -> int:
@@ -342,14 +464,24 @@ def _prompt_record(
     }
 
 
-def build_long_prompt(tokenizer: Any, target_tokens: int) -> dict[str, Any]:
+def build_long_prompt(
+    tokenizer: Any,
+    target_tokens: int,
+    *,
+    source_text: str,
+    source_provenance: Mapping[str, Any],
+) -> dict[str, Any]:
     if target_tokens < 320:
         raise ValueError("--long-rendered-tokens must be at least 320")
+    if not isinstance(source_provenance, Mapping) or not source_provenance:
+        raise ValueError("natural long-context source provenance is required")
+    source_quality = _validate_natural_source(source_text)
 
     preamble = (
-        "You are reading a deterministic archival record. Preserve all exact "
-        "facts because a question follows after a long continuation.\n"
-        "ARCHIVE START:"
+        "Long-context recall test using Mary Shelley's Frankenstein, sourced "
+        "from a pinned Hugging Face public-domain corpus. Read the text "
+        "carefully; one inserted record must be recalled after the excerpt.\n\n"
+        "SOURCE START\n\n"
     )
 
     def rendered_count(content: str) -> int:
@@ -360,9 +492,10 @@ def build_long_prompt(tokenizer: Any, target_tokens: int) -> dict[str, Any]:
             )
         )
 
-    before_needle, _ = _exact_middle_text(
+    before_needle, _, needle_source_character = _exact_source_prefix(
         preamble,
-        "\n",
+        source_text,
+        "\n\n",
         NEEDLE_TARGET_RENDERED_TOKEN,
         rendered_count,
     )
@@ -370,19 +503,22 @@ def build_long_prompt(tokenizer: Any, target_tokens: int) -> dict[str, Any]:
         "NEEDLE RECORD: codename BLUE-742; city Samarkand; checksum lantern."
     )
     prompt_suffix = (
-        "\nEND OF ARCHIVE. Report the codename, city, and checksum from the "
+        "\n\nSOURCE END\n\nReport the codename, city, and checksum from the "
         "NEEDLE RECORD in one concise sentence."
     )
-    content, rendered_tokens = _exact_middle_text(
-        before_needle + needle_text + "\nARCHIVE CONTINUATION:",
+    content, rendered_tokens, continuation_characters = _exact_source_prefix(
+        before_needle + needle_text + "\n\n",
+        source_text[needle_source_character:],
         prompt_suffix,
         target_tokens,
         rendered_count,
     )
+    excerpt_character_count = needle_source_character + continuation_characters
+    excerpt_text = source_text[:excerpt_character_count]
     prompt = _prompt_record(
         tokenizer,
         prompt_id="long-context-needle",
-        label="Long Context Needle",
+        label="12K Natural-Text Recall",
         content=content,
         validator={
             "kind": "contains_all",
@@ -421,6 +557,21 @@ def build_long_prompt(tokenizer: Any, target_tokens: int) -> dict[str, Any]:
             "city": "Samarkand",
             "checksum": "lantern",
         },
+    }
+    prompt["source"] = {
+        **dict(source_provenance),
+        "excerpt": {
+            "start_character": 0,
+            "end_character_exclusive": excerpt_character_count,
+            "character_count": excerpt_character_count,
+            "sha256": text_sha256(excerpt_text),
+            "needle_insertion_character": needle_source_character,
+        },
+        "quality": natural_text_quality(excerpt_text),
+        "transformation": (
+            "rows joined with two newlines; contiguous prefix truncated at a "
+            "tokenizer-aligned boundary; synthetic needle inserted"
+        ),
     }
     if rendered_tokens != target_tokens or prompt["rendered_token_count"] != target_tokens:
         raise AssertionError("long prompt did not reach the exact rendered-token target")
@@ -506,6 +657,8 @@ def build_classic_prompts(tokenizer: Any) -> list[dict[str, Any]]:
 def build_scenario(
     tokenizer: Any,
     *,
+    long_source_text: str,
+    long_source_provenance: Mapping[str, Any],
     long_rendered_tokens: int = 12_000,
     tokenizer_identity: str | None = None,
 ) -> dict[str, Any]:
@@ -528,7 +681,12 @@ def build_scenario(
             tokenizer,
             identity=tokenizer_identity,
         ),
-        "long_prompt": build_long_prompt(tokenizer, long_rendered_tokens),
+        "long_prompt": build_long_prompt(
+            tokenizer,
+            long_rendered_tokens,
+            source_text=long_source_text,
+            source_provenance=long_source_provenance,
+        ),
         "concurrent_prompts": build_classic_prompts(tokenizer),
         "follow_up": follow_up,
         "capture_plan": {
@@ -1197,6 +1355,14 @@ def build_report(
     capture_browser = capture.get("browser")
     if capture_browser is None:
         capture_browser = capture_provenance.get("browser")
+    long_prompt = scenario.get("long_prompt")
+    long_prompt_source = (
+        long_prompt.get("source")
+        if isinstance(long_prompt, Mapping)
+        else None
+    )
+    if not isinstance(long_prompt_source, Mapping):
+        long_prompt_source = {}
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -1242,6 +1408,7 @@ def build_report(
                 "report": report_tokenizer,
                 "match": tokenizer_match,
             },
+            "long_prompt_source": dict(long_prompt_source),
             "measurement": {
                 "ttft": "browser submit to first observed streamed token",
                 "e2e": "browser submit to observed completion",
@@ -1288,6 +1455,12 @@ def report_markdown(report: Mapping[str, Any]) -> str:
         long_telemetry = {}
     if not isinstance(concurrency_telemetry, Mapping):
         concurrency_telemetry = {}
+    provenance = report.get("provenance")
+    if not isinstance(provenance, Mapping):
+        provenance = {}
+    long_prompt_source = provenance.get("long_prompt_source")
+    if not isinstance(long_prompt_source, Mapping):
+        long_prompt_source = {}
     rows = (
         ("Long context", acts["long_prompt"], "1"),
         ("Classic first turn", acts["concurrency_first_turn"], "4"),
@@ -1442,6 +1615,17 @@ def report_markdown(report: Mapping[str, Any]) -> str:
     lines.extend(
         [
             "",
+            "## Long-Context Source",
+            "",
+            "The 12,000-token lane uses a contiguous natural-text excerpt, "
+            "not repeated filler.",
+            "",
+            f"- Hugging Face dataset: `{long_prompt_source.get('dataset_id', 'n/a')}`",
+            f"- Revision: `{long_prompt_source.get('revision', 'n/a')}`",
+            f"- License: `{long_prompt_source.get('license', 'n/a')}`",
+            f"- Source text SHA-256: "
+            f"`{long_prompt_source.get('normalized_source_text_sha256', 'n/a')}`",
+            "",
             "## Validation",
             "",
             "| Prompt | Phase | Result | Output tokens |",
@@ -1465,8 +1649,13 @@ def report_markdown(report: Mapping[str, Any]) -> str:
 def _build_command(args: argparse.Namespace) -> int:
     tokenizer = load_tokenizer(args.tokenizer_path)
     identity = _safe_tokenizer_identity(args.tokenizer_path, tokenizer)
+    source_text, source_provenance = load_hf_long_source(
+        args.long_source_parquet
+    )
     scenario = build_scenario(
         tokenizer,
+        long_source_text=source_text,
+        long_source_provenance=source_provenance,
         long_rendered_tokens=args.long_rendered_tokens,
         tokenizer_identity=identity,
     )
@@ -1475,6 +1664,10 @@ def _build_command(args: argparse.Namespace) -> int:
     print(
         "long rendered tokens: "
         f"{scenario['long_prompt']['rendered_token_count']}"
+    )
+    print(
+        "long source: "
+        f"{source_provenance['dataset_id']}@{source_provenance['revision']}"
     )
     return 0
 
@@ -1517,6 +1710,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     build = subparsers.add_parser("build", help="build deterministic demo prompts")
     build.add_argument("--tokenizer-path", required=True)
+    build.add_argument("--long-source-parquet", type=Path, required=True)
     build.add_argument("--long-rendered-tokens", type=int, default=12_000)
     build.add_argument("--json", type=Path, required=True)
     build.set_defaults(function=_build_command)
