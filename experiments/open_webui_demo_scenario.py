@@ -1471,6 +1471,9 @@ def report_markdown(report: Mapping[str, Any]) -> str:
     long_prompt_source = provenance.get("long_prompt_source")
     if not isinstance(long_prompt_source, Mapping):
         long_prompt_source = {}
+    long_prompt_work = long_prompt_source.get("work")
+    if not isinstance(long_prompt_work, Mapping):
+        long_prompt_work = {}
     rows = (
         ("Long context", acts["long_prompt"], "1"),
         ("Classic first turn", acts["concurrency_first_turn"], "4"),
@@ -1630,10 +1633,16 @@ def report_markdown(report: Mapping[str, Any]) -> str:
             "The 12,000-token lane uses a contiguous natural-text excerpt, "
             "not repeated filler.",
             "",
+            f"- Work: *{long_prompt_work.get('title', 'n/a')}* by "
+            f"{long_prompt_work.get('author', 'n/a')}",
             f"- Hugging Face dataset: `{long_prompt_source.get('dataset_id', 'n/a')}`",
-            f"- Revision: `{long_prompt_source.get('revision', 'n/a')}`",
+            f"- Document ID: `{long_prompt_source.get('document_id', 'n/a')}`",
+            f"- Dataset revision: `{long_prompt_source.get('revision', 'n/a')}`",
+            f"- Parquet revision: `{long_prompt_source.get('parquet_revision', 'n/a')}`",
             f"- License: `{long_prompt_source.get('license', 'n/a')}`",
-            f"- Source text SHA-256: "
+            f"- Document text SHA-256: "
+            f"`{long_prompt_source.get('document_text_sha256', 'n/a')}`",
+            f"- Selected body SHA-256: "
             f"`{long_prompt_source.get('normalized_source_text_sha256', 'n/a')}`",
             "",
             "## Validation",

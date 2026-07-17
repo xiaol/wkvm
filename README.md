@@ -67,16 +67,30 @@ does **not** reuse the high-memory B32 benchmark recipe or `--ignore-eos`.
 
 **On one RTX 4090, four real concurrent Open WebUI chats completed and
 validated their classic-prompt first turns and follow-ups (4/4 each), with
-first-turn browser p95 TTFT of 1.1227732s, p95 E2E of 3.79008975s, whole-GPU
-memory moving from 17,769 to 17,805 MiB, and zero provider, capture, probe, or
+first-turn browser p95 TTFT of 0.525 s, p95 E2E of 2.217 s, whole-GPU memory
+moving from 18,230 to 18,340 MiB, and zero provider, capture, probe, or
 validation errors.**
 
-The long-context recall lane contained exactly 12,000 rendered tokens, with its
-needle beginning at zero-based rendered-token index 252. It correctly returned
-`BLUE-742`, `Samarkand`, and `lantern`, at a browser-observed TTFT of 2.49666s
-and E2E of 4.639401s. Provider telemetry sampled after the four-chat high-water
-point reported `max_running=4` and `max_runnable_rows=4`; all 4/4 follow-ups
-were exact reuse hits, reusing 333 prefix tokens.
+The long-context recall lane now uses natural prose rather than repeated
+filler: a contiguous excerpt of Lewis Carroll's *Alice's Adventures in
+Wonderland* from the Hugging Face dataset `common-pile/project_gutenberg`,
+document `11`, whose row metadata declares `Public Domain`. The prompt contained
+exactly 12,000 rendered tokens, with its needle beginning at zero-based rendered
+token index 253. It correctly returned `BLUE-742`, `Samarkand`, and `lantern`,
+at a browser-observed TTFT of 1.736 s and E2E of 3.173 s.
+
+The source is pinned to dataset revision
+`01dc90a5002f8977c7fb03a372c14bca29c65cf1`, converted-Parquet revision
+`d0bf09a2c2f6f73952733d7a1fe9a34b1cb4348c`, and document-text SHA-256
+`f17aa0bf7466424a8b357b688678666bad7a0148963ef349016a3098faa6bd1e`.
+Fetch and verify it with `scripts/fetch_open_webui_demo_source.sh`; the helper
+uses `hf datasets sql` and requires the Hugging Face CLI's DuckDB support.
+
+Provider telemetry sampled after the four-chat high-water point reported
+`max_running=4` and `max_runnable_rows=4`; all 4/4 follow-ups were exact reuse
+hits, reusing 333 prefix tokens. Open WebUI emitted one additional provider-side
+request during the long-context act, so the report keeps its 9 scored browser
+turns separate from provider request counters.
 
 This is a graph-free, corrected production-profile run using
 `routed_span_approximate`: a functional four-slot browser demo, not a
