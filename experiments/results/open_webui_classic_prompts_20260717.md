@@ -6,11 +6,13 @@
 
 | Act | Offered concurrency | Success | Output tokens | TTFT p50 | TTFT p95 | E2E p50 | E2E p95 |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Long context | 1 | 1/1 | 23 | 1.736 s | 1.736 s | 3.173 s | 3.173 s |
-| Classic first turn | 4 | 4/4 | 157 | 0.367 s | 0.525 s | 2.047 s | 2.217 s |
-| Common follow-up | 4 | 4/4 | 108 | 0.265 s | 0.269 s | 1.763 s | 1.926 s |
+| Long context | 1 | 1/1 | 23 | 2.162 s | 2.162 s | 3.705 s | 3.705 s |
+| Classic first turn | 4 | 4/4 | 2730 | 0.438 s | 0.495 s | 15.173 s | 18.509 s |
+| Common follow-up | 4 | 4/4 | 2462 | 0.457 s | 0.459 s | 16.241 s | 16.651 s |
 
-The four classic first turns are submitted as one synchronized UI cohort. Their browser-observed TTFT is p50 0.367 s and p95 0.525 s; E2E is p50 2.047 s and p95 2.217 s.
+The four classic first turns are submitted as one synchronized UI cohort. Their browser-observed TTFT is p50 0.438 s and p95 0.495 s; E2E is p50 15.173 s and p95 18.509 s.
+
+**Act 2 output length:** first-turn minimum 500 tokens; follow-up minimum 584 tokens; required minimum 500 tokens per turn.
 
 ## Runtime Evidence
 
@@ -18,15 +20,15 @@ Provider maxima are observed lifetime high-water gauges from the act's provider 
 
 | Act | Whole-GPU baseline | Whole-GPU peak | Provider requests | Errors | Cancelled | Timed out | Max running | Max runnable rows |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Long context | 17,442 MiB | 18,246 MiB | 2 | 0 | 0 | 0 | 2 | 2 |
-| Concurrency | 18,230 MiB | 18,340 MiB | 8 | 0 | 0 | 0 | 4 | 4 |
+| Long context | 17,575 MiB | 18,121 MiB | 1 | 0 | 0 | 0 | 1 | 1 |
+| Concurrency | 18,117 MiB | 18,360 MiB | 8 | 0 | 0 | 0 | 4 | 4 |
 
 | Concurrency provider phase | Requests | Errors | Cancelled | Timed out |
 |---|---:|---:|---:|---:|
 | Classic first turn | 4 | 0 | 0 | 0 |
 | Common follow-up | 4 | 0 | 0 | 0 |
 
-**Follow-up reuse:** 4 reuse hits; 0 sessions opened; 333 prefix tokens reused.
+**Follow-up reuse:** 3 reuse hits; 1 session opened; 2,605 prefix tokens reused.
 
 **Capture health:** 0 capture errors; 0 probe errors.
 
@@ -52,14 +54,14 @@ The 12,000-token lane uses a contiguous natural-text excerpt, not repeated fille
 | Prompt | Phase | Result | Output tokens |
 |---|---|---:|---:|
 | 12K Natural-Text Recall | long_prompt | PASS | 23 |
-| Reasoning | first_turn | PASS | 53 |
-| Common Follow-up | follow_up | PASS | 37 |
-| Code | first_turn | PASS | 58 |
-| Common Follow-up | follow_up | PASS | 28 |
-| JSON | first_turn | PASS | 14 |
-| Common Follow-up | follow_up | PASS | 23 |
-| Systems | first_turn | PASS | 32 |
-| Common Follow-up | follow_up | PASS | 20 |
+| Monty Hall Reasoning | first_turn | PASS | 500 |
+| Common Follow-up | follow_up | PASS | 643 |
+| Python Grouping | first_turn | PASS | 885 |
+| Common Follow-up | follow_up | PASS | 601 |
+| DR JSON Runbook | first_turn | PASS | 790 |
+| Common Follow-up | follow_up | PASS | 634 |
+| GPU Admission Control | first_turn | PASS | 555 |
+| Common Follow-up | follow_up | PASS | 584 |
 
 ## Caveats
 

@@ -1,54 +1,62 @@
 {
   "acts": {
     "all_requests": {
-      "e2e_p50_s": 1.949728,
-      "e2e_p95_s": 2.7972971999999996,
+      "e2e_p50_s": 16.069348,
+      "e2e_p95_s": 18.087371,
       "error_count": 0,
-      "output_tokens": 288,
+      "output_tokens": 5215,
+      "output_tokens_max": 885,
+      "output_tokens_min": 23,
       "request_count": 9,
       "success_count": 9,
       "timed_e2e_count": 9,
       "timed_ttft_count": 9,
-      "ttft_p50_s": 0.297246,
-      "ttft_p95_s": 1.2614941999999996
+      "ttft_p50_s": 0.455063,
+      "ttft_p95_s": 1.4993797999999996
     },
     "concurrency_first_turn": {
-      "e2e_p50_s": 2.0473925,
-      "e2e_p95_s": 2.21748315,
+      "e2e_p50_s": 15.172543000000001,
+      "e2e_p95_s": 18.5085135,
       "error_count": 0,
       "offered_concurrency": 4,
-      "output_tokens": 157,
+      "output_tokens": 2730,
+      "output_tokens_max": 885,
+      "output_tokens_min": 500,
       "request_count": 4,
       "success_count": 4,
       "timed_e2e_count": 4,
       "timed_ttft_count": 4,
-      "ttft_p50_s": 0.3670735,
-      "ttft_p95_s": 0.5245369999999999
+      "ttft_p50_s": 0.438053,
+      "ttft_p95_s": 0.49506215000000003
     },
     "concurrency_follow_up": {
-      "e2e_p50_s": 1.7629675,
-      "e2e_p95_s": 1.9256308,
+      "e2e_p50_s": 16.240791,
+      "e2e_p95_s": 16.65081455,
       "error_count": 0,
       "offered_concurrency": 4,
-      "output_tokens": 108,
+      "output_tokens": 2462,
+      "output_tokens_max": 643,
+      "output_tokens_min": 584,
       "request_count": 4,
       "success_count": 4,
       "timed_e2e_count": 4,
       "timed_ttft_count": 4,
-      "ttft_p50_s": 0.2645065,
-      "ttft_p95_s": 0.2689668
+      "ttft_p50_s": 0.456509,
+      "ttft_p95_s": 0.45850835
     },
     "long_prompt": {
-      "e2e_p50_s": 3.17302,
-      "e2e_p95_s": 3.17302,
+      "e2e_p50_s": 3.704832,
+      "e2e_p95_s": 3.704832,
       "error_count": 0,
       "output_tokens": 23,
+      "output_tokens_max": 23,
+      "output_tokens_min": 23,
       "request_count": 1,
       "success_count": 1,
       "timed_e2e_count": 1,
       "timed_ttft_count": 1,
-      "ttft_p50_s": 1.736405,
-      "ttft_p95_s": 1.736405
+      "ttft_p50_s": 2.162237,
+      "ttft_p95_s": 2.162237
     }
   },
   "caveats": [
@@ -57,7 +65,7 @@
     "This capture is not a vLLM/SGLang comparison or proof of a 10x claim."
   ],
   "errors": [],
-  "generated_at": "2026-07-17T07:35:56.836801+00:00",
+  "generated_at": "2026-07-17T08:47:29.421275+00:00",
   "kind": "wkvm.open_webui.demo_report",
   "provenance": {
     "capture": {
@@ -66,12 +74,12 @@
         "engine": "chromium",
         "version": "147.0.7727.116"
       },
-      "captured_at": "2026-07-17T07:28:10.922Z",
-      "file_sha256": "755d9fdaeec4f84036253724a4cafaf9ac9671b9c552f05f72d2943c63e60e7f",
+      "captured_at": "2026-07-17T08:38:23.604Z",
+      "file_sha256": "6a3a404242a53d81f5e7fed5a255ee8cc04ca4db300c91d6f942068d94c3c0cc",
       "kind": "wkvm.open_webui.live_capture",
       "schema_version": 1
     },
-    "git_commit": "6a51043e360f8e756aeea407a366fad8f1001b88",
+    "git_commit": "3fe33912b837057304bab08b6646637f8c74ed6b",
     "long_prompt_source": {
       "body_start_character": 584,
       "config": "default",
@@ -113,10 +121,10 @@
     "platform": "Linux-7.0.0-27-generic-x86_64-with-glibc2.43",
     "python": "3.12.13",
     "scenario": {
-      "capture_declared_sha256": "3ab7c1989aaa8a44c2769478f1586e455e5386e8c92eb0052897071995a4a3af",
+      "capture_declared_sha256": "9b5b01b442841a2ae5f1fed86003a31a9e20ce372526da5d775a91c5959724ff",
       "capture_match": true,
-      "declared_sha256": "69ff12cad06d6b858f2028acc2ebf3b5793dc51b897c7a31bf413cf181cdf153",
-      "file_sha256": "3ab7c1989aaa8a44c2769478f1586e455e5386e8c92eb0052897071995a4a3af"
+      "declared_sha256": "8b30ecb271ba2504c33141b6791829b686215e90dfaf7e14bf2a161251824622",
+      "file_sha256": "9b5b01b442841a2ae5f1fed86003a31a9e20ce372526da5d775a91c5959724ff"
     },
     "tokenizer": {
       "match": {
@@ -150,7 +158,7 @@
   "records": [
     {
       "capture_error": null,
-      "e2e_s": 3.17302,
+      "e2e_s": 3.704832,
       "errors": [],
       "label": "12K Natural-Text Recall",
       "output_tokens": 23,
@@ -160,7 +168,7 @@
       "response_sha256": "81f8604c7beb9afc70004194ef360caf68ed39d8b6a4052c2f1b1f62a3eb8098",
       "response_text": "The codename is BLUE-742, the city is Samarkand, and the checksum is lantern.",
       "success": true,
-      "ttft_s": 1.736405,
+      "ttft_s": 2.162237,
       "validation": {
         "passed": true,
         "problems": []
@@ -168,17 +176,17 @@
     },
     {
       "capture_error": null,
-      "e2e_s": 2.233713,
+      "e2e_s": 12.332892,
       "errors": [],
-      "label": "Reasoning",
-      "output_tokens": 53,
+      "label": "Monty Hall Reasoning",
+      "output_tokens": 500,
       "phase": "first_turn",
       "prompt_id": "reasoning",
-      "response_characters": 154,
-      "response_sha256": "2bd074f80ffd2de40a8cd917f564d9530952b2aeb4c673c1b3fe1c74e6272071",
-      "response_text": "FINAL: USD 0.05\nThe ball costs $0.05, and the bat costs $1.05, which totals $1.10 and satisfies the condition that the bat costs $1.00 more than the ball.",
+      "response_characters": 2197,
+      "response_sha256": "32515ff6c4165e4b0bc2f44324c754a80b6cfe155971e3216f9c687e777aa4fa",
+      "response_text": "Setup\nImagine three doors: Door 1, Door 2, and Door 3. Behind one is a valuable car, and behind the other two are goats. You, the contestant, select one door initially. The host, who knows where the car is, then intervenes. This scenario tests probabilistic reasoning under conditional knowledge, which often defies initial intuition.\n\nInitial probabilities\nBefore any action, the probability that your initial choice is correct is P(Car at chosen door)=1/3. Consequently, the combined probability that the car is behind one of the two unchosen doors is P(Car elsewhere)=2/3. This initial distribution is crucial for the subsequent analysis.\n\nHost rule\nThe host must open a door that you did not pick and which contains a goat. This action is not random; it is constrained by perfect knowledge. The host's action concentrates the initial 2/3 probability from the unchosen set onto the single remaining unopened door.\n\nStaying\nIf you decide to stay with your original choice, your probability of winning remains exactly what it was at the start. Since your initial selection had a 1/3 chance of being correct, staying guarantees a 1/3 probability of winning the car.\n\nSwitching\nWhen you switch, you are essentially betting on the initial 2/3 probability that the car was not behind your first choice. The host's elimination process ensures that the remaining unchosen door inherits this entire 2/3 probability mass.\n\nHundred-door intuition\nConsider 100 doors. You pick one (1/100 chance). The host opens 98 goat doors from the remaining 99. The remaining door holds the concentrated 99/100 probability. Switching is overwhelmingly advantageous in this larger scale scenario.\n\nCommon mistake\nThe frequent error is assuming that after the host opens a goat door, the remaining two doors (your original and the other) revert to an equal 50/50 chance. This ignores the critical information provided by the host's deliberate, non-random action.\n\nVerdict\nBecause the host's action is informative, the probabilities are not reset. The initial 1/3 chance stays with your first pick, while the 2/3 chance shifts entirely to the single door you did not initially select.\n\nFINAL: SWITCH; WIN PROBABILITY = 2/3",
       "success": true,
-      "ttft_s": 0.297246,
+      "ttft_s": 0.505094,
       "validation": {
         "passed": true,
         "problems": []
@@ -186,17 +194,17 @@
     },
     {
       "capture_error": null,
-      "e2e_s": 1.949728,
+      "e2e_s": 16.692917,
       "errors": [],
       "label": "Common Follow-up",
-      "output_tokens": 37,
+      "output_tokens": 643,
       "phase": "follow_up",
       "prompt_id": "common-follow-up",
-      "response_characters": 102,
-      "response_sha256": "fbc8f8c1b3d3686ec4e35631d39cd7e736357600ac52da920a3b1c1215fbc5d7",
-      "response_text": "The ball costs $0.05, and the bat costs $1.05, totaling $1.10 with the bat being $1.00 more expensive.",
+      "response_characters": 3065,
+      "response_sha256": "47bf22838a3fec1f3dda365ea9f035bbadde59c4338a83a18fd561f9b8ddbce2",
+      "response_text": "Original goal\nThe primary objective of the initial response was to clearly and rigorously explain the counter-intuitive nature of the Monty Hall problem to a technically minded, skeptical engineer. The explanation needed to be structured, adhering strictly to eight numbered sections with specific headings, while maintaining a precise word count and avoiding redundancy. The core challenge was translating probabilistic concepts into a format that satisfied a demand for logical rigor over mere intuition.\n\nStrongest part\nThe most effective element of the initial explanation was the clear delineation between the probabilities associated with \"staying\" versus \"switching.\" By explicitly stating that staying retains the initial 1/3 probability, the argument immediately establishes a baseline against which the switching advantage can be measured. This direct comparison is mathematically sound and highly persuasive for an analytical audience.\n\nHidden assumption\nA subtle, yet critical, assumption embedded in the initial explanation is the host's perfect adherence to the rules, specifically that the host always has a goat to reveal. If the host were allowed to randomly open a door (even if it contained a goat), the problem's structure would fundamentally change, invalidating the concentration of probability onto the single remaining door.\n\nDeeper explanation\nThe mechanism relies on conditional probability, specifically Bayes' Theorem, though it was explained intuitively. We are calculating P(Car at Door B∣Host opens Door C). The host's knowledge acts as a powerful piece of evidence, updating our prior belief (P(Car elsewhere)=2/3) into a much stronger posterior belief when Door C is revealed.\n\nConcrete example\nTo solidify the concept, consider a simplified scenario where the car is behind Door 1. If you pick Door 1, the host can open Door 2 or Door 3. If you pick Door 2, the host must open Door 3. This forced action is what transfers the 2/3 probability mass; the host's choice is not independent of the car's location.\n\nEdge case\nAn interesting edge case arises if the host were allowed to open multiple goat doors, say k doors, where k<2. If k=1 (the original problem), the remaining probability is 2/3. If k increases, the probability of the remaining unchosen door becomes (2/3)/(2−k+1), demonstrating the scaling effect of the host's information.\n\nPractical improvement\nA practical improvement for future explanations would be to explicitly introduce the notation P(A∣B) early on, perhaps using a brief JSON structure like {\"prior\": 1/3, \"evidence\": \"Host reveals goat\"}. This caters directly to the engineer's preference for formal notation while keeping the prose accessible.\n\nFinal takeaway\nThe key insight is that the host's action is not a random event that resets the odds; it is an informed filtering process. The initial 2/3 chance that you were wrong is not discarded; it is simply relocated. Therefore, the optimal strategy is always to switch, leading to the conclusion: FINAL: SWITCH; WIN PROBABILITY = 2/3.\n\nREVISION COMPLETE",
       "success": true,
-      "ttft_s": 0.264914,
+      "ttft_s": 0.455063,
       "validation": {
         "passed": true,
         "problems": []
@@ -204,17 +212,17 @@
     },
     {
       "capture_error": null,
-      "e2e_s": 2.125514,
+      "e2e_s": 17.076629,
       "errors": [],
-      "label": "Code",
-      "output_tokens": 58,
+      "label": "Python Grouping",
+      "output_tokens": 885,
       "phase": "first_turn",
       "prompt_id": "code",
-      "response_characters": 176,
-      "response_sha256": "2d09bad224710e5cb43072e9bef29162bd777be0cf731ecb32b0657e0d701aa2",
-      "response_text": "python\nCollapse\nRun\nSave\nCopy\n1\n2\n3\n⌄\ndef is_palindrome(text):\n    processed_text = \"\".join(filter(str.isalnum, text)).lower()\n    return processed_text == processed_text[::-1]",
+      "response_characters": 3092,
+      "response_sha256": "164eebf5c974d7fb145ea473363ed27a3931b628a66af0e67de7702ab6c38ac4",
+      "response_text": "Design\n\nWe use a dictionary where the key is a canonical representation of an anagram group, specifically a sorted tuple of the word's characters. This ensures all anagrams map to the same key. To maintain the order of first appearance, we iterate through the input words sequentially. We use a list of lists to store the final groups, appending to the correct group when a new word is encountered, thus preserving the order of the first member of each group.\n\nImplementation\npython\nCollapse\nRun\nSave\nCopy\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n32\n33\n34\n35\n36\n⌄\n⌄\n⌄\n⌄\n⌄\n⌄\nfrom typing import Iterable, List, Dict, Tuple\n\n\ndef group_anagrams(words: Iterable[str]) -> List[List[str]]:\n    \"\"\"\n    Groups anagrams from an iterable of strings while preserving the order \n    of the first appearance of each group.\n\n\n    Args:\n        words: An iterable of strings.\n\n\n    Returns:\n        A list of lists, where each inner list contains anagrams.\n    \"\"\"\n    # Map: canonical_key -> list_of_words_in_that_group\n    groups: Dict[Tuple[str, ...], List[str]] = {}\n    \n    for word in words:\n        # Canonical key: sorted tuple of characters (case-sensitive)\n        key = tuple(sorted(word))\n        \n        if key not in groups:\n            groups[key] = []\n        \n        groups[key].append(word)\n        \n    # Reconstruct the result list while preserving the order of first appearance.\n    # We iterate over the input words again to determine the order of keys encountered.\n    ordered_keys = []\n    seen_keys = set()\n    for word in words:\n        key = tuple(sorted(word))\n        if key not in seen_keys:\n            ordered_keys.append(key)\n            seen_keys.add(key)\n            \n    return [groups[key] for key in ordered_keys]\nVerification\n\nThe implementation correctly uses a sorted tuple of characters as the canonical key, ensuring anagrams group together case-sensitively. The crucial step for ordering is iterating over the input words a second time to build ordered_keys, guaranteeing that the resulting list of groups reflects the order of the first word encountered for each unique anagram set. Edge cases like empty input, empty strings, and Unicode characters are handled naturally by Python's sorting and tuple creation. The time complexity is O(N⋅KlogK), where N is the number of words and K is the maximum length of a word, dominated by sorting each word.\n\npython\nCollapse\nRun\nSave\nCopy\n1\n2\n3\n4\n5\n6\n7\n8\nassert group_anagrams([]).__len__() == 0\nassert group_anagrams([\"\"]).__len__() == 1 and group_anagrams([\"\"])[0] == [\"\"]\nassert group_anagrams([\"a\", \"b\"]).__len__() == 2\nassert group_anagrams([\"eat\", \"tea\", \"tan\", \"ate\", \"nat\", \"bat\"]) == [[\"eat\", \"tea\", \"ate\"], [\"tan\", \"nat\"], [\"bat\"]]\nassert group_anagrams([\"a\", \"A\"]) == [[\"a\"], [\"A\"]] # Case sensitive\nassert group_anagrams([\"résumé\", \"ésumér\"]) == [[\"résumé\", \"ésumér\"]] # Unicode\nassert group_anagrams([\"abc\", \"abc\"]) == [[\"abc\", \"abc\"]] # Duplicates\nassert group_anagrams(iter([\"listen\", \"silent\"])) == [[\"listen\", \"silent\"]] # Generator input\n\nCODE REVIEW: PASS",
       "success": true,
-      "ttft_s": 0.385188,
+      "ttft_s": 0.428153,
       "validation": {
         "passed": true,
         "problems": []
@@ -222,17 +230,17 @@
     },
     {
       "capture_error": null,
-      "e2e_s": 1.78908,
+      "e2e_s": 16.069348,
       "errors": [],
       "label": "Common Follow-up",
-      "output_tokens": 28,
+      "output_tokens": 601,
       "phase": "follow_up",
       "prompt_id": "common-follow-up",
-      "response_characters": 136,
-      "response_sha256": "737fb2ea5cab3ecf8ce148e7c42a691001788696b20b9f6f317da5cb80e909a2",
-      "response_text": "The provided Python function is_palindrome(text) checks if a string is a palindrome while ignoring case and non-alphanumeric characters.",
+      "response_characters": 2909,
+      "response_sha256": "d1f8cc0151e59045abae03df0734a94052fdd837da38e9d81bc641618f9d2891",
+      "response_text": "Original goal\nThe primary objective was to implement group_anagrams in production-ready Python 3.11, adhering strictly to several constraints: case-sensitive matching, preserving the input order of the first member of each group, and ensuring no mutation of the input iterable. The solution successfully navigated the complexity of maintaining insertion order while using a hash map for efficient grouping, which is a common pattern in algorithmic design problems.\n\nStrongest part\nThe most robust aspect of the solution is the two-pass approach used to guarantee order preservation. Instead of relying on dict insertion order (which, while guaranteed in Python 3.7+, is less explicit for this specific requirement), the code explicitly reconstructs the order by iterating over the original input sequence again. This makes the ordering logic transparent and highly reliable across Python versions.\n\nHidden assumption\nA subtle hidden assumption made in the implementation is that the input Iterable[str] can be iterated over twice without significant performance penalty or resource exhaustion. If the input were a one-time-use generator that could not be reset or re-iterated, the current two-pass structure would fail, necessitating a different, potentially less efficient, data structure approach.\n\nDeeper explanation\nThe canonical key generation, tuple(sorted(word)), is the core mechanism for anagram identification. By sorting the characters, we normalize all permutations of the same letters into a single, unique, hashable representation. Using a tuple instead of a list ensures the key is immutable, which is a strict requirement for dictionary keys in Python.\n\nConcrete example\nConsider the input [\"ab\", \"ba\", \"c\"]. The first pass maps ('a', 'b') to [\"ab\", \"ba\"] and ('c',) to [\"c\"]. The second pass iterates: \"ab\" yields ('a', 'b'), which is recorded first. Then \"ba\" is skipped as its key is seen. Finally, \"c\" yields ('c',), which is recorded second. The result is [[\"ab\", \"ba\"], [\"c\"]].\n\nEdge case\nThe handling of empty strings (\"\") is a critical edge case. An empty string sorts to an empty tuple (). If the input is [\"\", \"a\"], the keys are () and ('a',). The resulting groups will correctly be [[\"\"], [\"a\"]], demonstrating correct behavior for zero-length inputs.\n\nPractical improvement\nFor extremely large inputs where memory usage is paramount, the second pass could be optimized. Instead of storing the entire input iterable, one could use an auxiliary structure (like a list of tuples (key, word)) during the first pass, which preserves order while still allowing a single pass to build the final ordered result structure.\n\nFinal takeaway\nThe solution successfully balances time efficiency (O(N⋅KlogK)) with strict adherence to ordering and immutability constraints. The explicit ordering mechanism is key to meeting the prompt's requirements perfectly. CODE REVIEW: PASS\n\nREVISION COMPLETE",
       "success": true,
-      "ttft_s": 0.261214,
+      "ttft_s": 0.45417,
       "validation": {
         "passed": true,
         "problems": []
@@ -240,17 +248,17 @@
     },
     {
       "capture_error": null,
-      "e2e_s": 1.580865,
+      "e2e_s": 18.761199,
       "errors": [],
-      "label": "JSON",
-      "output_tokens": 14,
+      "label": "DR JSON Runbook",
+      "output_tokens": 790,
       "phase": "first_turn",
       "prompt_id": "json",
-      "response_characters": 44,
-      "response_sha256": "4a3c157ce41e974e1f0595aa5ee1d0396b6851a079cae16e0be592dadaa07396",
-      "response_text": "{\"engine\":\"WKVM\",\"slots\":4,\"status\":\"ready\"}",
+      "response_characters": 3374,
+      "response_sha256": "7a042aaae53b816318338ce76e2772e9a19f8637b77856eac317d571b4d35f79",
+      "response_text": "{\n\"status\": \"ready\",\n\"service\": \"checkout-api\",\n\"rto_minutes\": 30,\n\"rpo_minutes\": 5,\n\"stages\": [\n{\n\"id\": \"stage-01\",\n\"name\": \"Detect\",\n\"owner\": \"SRE Team\",\n\"action\": \"Monitor dashboards for elevated error rates or latency spikes across all production endpoints immediately.\",\n\"success_signal\": \"Alerting system confirms service degradation exceeding predefined thresholds.\",\n\"rollback\": \"No action required; continue monitoring until automated recovery initiates successfully.\"\n},\n{\n\"id\": \"stage-02\",\n\"name\": \"Triage\",\n\"owner\": \"On-Call Engineer\",\n\"action\": \"Analyze recent deployment logs and infrastructure metrics to pinpoint the root cause of the failure.\",\n\"success_signal\": \"Root cause identified, such as database connection failure or resource exhaustion.\",\n\"rollback\": \"Revert the most recent configuration change or deployment to the stable previous version.\"\n},\n{\n\"id\": \"stage-03\",\n\"name\": \"Contain\",\n\"owner\": \"Platform Team\",\n\"action\": \"Isolate the affected service instances to prevent further impact on dependent upstream systems.\",\n\"success_signal\": \"Traffic routing confirms that the failing instances are no longer receiving live requests.\",\n\"rollback\": \"Gradually reintroduce traffic to the isolated instances while monitoring stability closely.\"\n},\n{\n\"id\": \"stage-04\",\n\"name\": \"Fail Over\",\n\"owner\": \"Infrastructure Lead\",\n\"action\": \"Initiate automated failover procedures to the designated secondary or standby production region.\",\n\"success_signal\": \"Load balancer successfully directs all incoming traffic to the healthy secondary cluster.\",\n\"rollback\": \"Execute a controlled traffic shift back to the original primary region if failover fails.\"\n},\n{\n\"id\": \"stage-05\",\n\"name\": \"Verify Data\",\n\"owner\": \"Data Engineer\",\n\"action\": \"Validate transactional integrity and data consistency between the primary and secondary data stores.\",\n\"success_signal\": \"Database replication lag is zero, and recent transactions are fully synchronized across both sites.\",\n\"rollback\": \"Halt the failover process and investigate data synchronization issues before proceeding further.\"\n},\n{\n\"id\": \"stage-06\",\n\"name\": \"Restore Traffic\",\n\"owner\": \"SRE Team\",\n\"action\": \"Gradually ramp up traffic to the newly active failover environment using canary deployment techniques.\",\n\"success_signal\": \"Service latency remains within acceptable bounds while handling increasing production load.\",\n\"rollback\": \"Immediately divert all traffic back to the previous stable state if performance degrades unexpectedly.\"\n},\n{\n\"id\": \"stage-07\",\n\"name\": \"Observe\",\n\"owner\": \"Monitoring Specialist\",\n\"action\": \"Maintain heightened monitoring levels for at least one hour to confirm sustained operational stability post-recovery.\",\n\"success_signal\": \"All key performance indicators remain green and stable across the entire service stack.\",\n\"rollback\": \"If instability reappears, initiate a full rollback to the pre-incident operational state immediately.\"\n},\n{\n\"id\": \"stage-08\",\n\"name\": \"Close\",\n\"owner\": \"Incident Manager\",\n\"action\": \"Document the entire incident timeline, root cause analysis, and implement preventative measures moving forward.\",\n\"success_signal\": \"Post-mortem report is approved, and all identified action items are assigned owners.\",\n\"rollback\": \"This stage is terminal; no rollback is necessary once the incident is formally closed.\"\n}\n],\n\"final_check\": \"DR PLAN COMPLETE\"\n}",
       "success": true,
-      "ttft_s": 0.549128,
+      "ttft_s": 0.438215,
       "validation": {
         "passed": true,
         "problems": []
@@ -258,17 +266,17 @@
     },
     {
       "capture_error": null,
-      "e2e_s": 1.681706,
+      "e2e_s": 16.412234,
       "errors": [],
       "label": "Common Follow-up",
-      "output_tokens": 23,
+      "output_tokens": 634,
       "phase": "follow_up",
       "prompt_id": "common-follow-up",
-      "response_characters": 86,
-      "response_sha256": "8b0fa1ddfebdf90c9d306b84010cd0c647359c38eae040791a5babe4fcebaab3",
-      "response_text": "The previous answer was the JSON object: {\"engine\":\"WKVM\",\"slots\":4,\"status\":\"ready\"}.",
+      "response_characters": 3530,
+      "response_sha256": "57b66ed07f123648b57835a0038ab4f05a1989b129ae92052e61b477683717d8",
+      "response_text": "Original goal\nThe primary objective was to generate a highly structured, valid JSON document serving as a disaster-recovery runbook for the checkout-api service. This required strict adherence to specific structural constraints, including predefined root keys (status, service, rto_minutes, etc.), exact counts for stages (eight), and precise ordering for all nested elements. Furthermore, each stage needed specific word counts for its operational instructions, success signals, and rollback procedures, demanding careful linguistic crafting.\n\nStrongest part\nThe most successful aspect of the initial output was the rigorous adherence to the complex structural requirements. The JSON schema was perfectly maintained, ensuring that the required keys were present in the correct sequence for every object, from the root level down to the individual stage definitions. This meticulous formatting demonstrates a high level of constraint satisfaction, which is crucial for automated parsing in real-world operational tools.\n\nHidden assumption\nA significant hidden assumption made during the generation process was that the failure mode would be recoverable via a standard regional failover mechanism. The runbook implicitly assumes that the underlying infrastructure supports active-passive or active-active redundancy capable of handling the transition described in stage-04 Fail Over. If the failure were application-level corruption rather than infrastructure loss, this failover strategy might be insufficient.\n\nDeeper explanation\nThe inclusion of specific word counts for actions (12-16 words) and signals (6-10 words) forces a level of operational precision into the documentation. This constraint moves the output beyond mere placeholders; it demands actionable, concise language suitable for high-stress, time-sensitive incident response scenarios. For instance, the action in stage-03 Contain is deliberately detailed to guide immediate isolation efforts.\n\nConcrete example\nConsider the transition from stage-02 Triage to stage-03 Contain. The triage action is to \"Analyze recent deployment logs and infrastructure metrics to pinpoint the root cause.\" If the analysis points to a memory leak, the containment action must then be precise, perhaps involving scaling down the affected pods or applying a temporary resource limit, as detailed in the original runbook's instructions.\n\nEdge case\nAn edge case not fully addressed is the scenario where the secondary region itself is compromised or unavailable during the failover attempt. If the target environment in stage-04 Fail Over is also unhealthy, the runbook lacks a clear tertiary escalation path, potentially leading to a prolonged outage beyond the defined RTO. A manual intervention trigger would be necessary here.\n\nPractical improvement\nA practical improvement would involve adding a dedicated \"Communication\" field to each stage object. This field would mandate who needs to be notified (e.g., \"Stakeholders,\" \"Executive Team\") at that specific point in the recovery process. This enhances the runbook's utility by integrating communication protocols alongside technical steps.\n\nFinal takeaway\nThe exercise successfully demonstrated the ability to generate highly constrained, complex data structures while maintaining operational relevance. The strict adherence to formatting rules, combined with the technical depth of the stages, results in a robust template. The entire process confirms the successful completion of the task: DR PLAN COMPLETE.\n\nREVISION COMPLETE",
       "success": true,
-      "ttft_s": 0.264099,
+      "ttft_s": 0.458606,
       "validation": {
         "passed": true,
         "problems": []
@@ -276,17 +284,17 @@
     },
     {
       "capture_error": null,
-      "e2e_s": 1.969271,
+      "e2e_s": 13.268457,
       "errors": [],
-      "label": "Systems",
-      "output_tokens": 32,
+      "label": "GPU Admission Control",
+      "output_tokens": 555,
       "phase": "first_turn",
       "prompt_id": "systems",
-      "response_characters": 207,
-      "response_sha256": "ea5a5eac0761f21df4b31092f08f7521e0027ba7c11ccb16225822127cb42954",
-      "response_text": "A bounded request queue helps an inference server remain stable by implementing backpressure, which prevents the system from entering an overload state when incoming request rates exceed processing capacity.",
+      "response_characters": 3301,
+      "response_sha256": "006f473b26a05c633349faa42324cf18a3b0e02a3404b73c3b89475d22cf65bb",
+      "response_text": "Operating goal\nThe primary objective is to maintain predictable latency and resource utilization for GPU inference requests despite bursty traffic. We aim to ensure that the four active generation slots are utilized efficiently without catastrophic resource exhaustion. This requires a robust admission control mechanism that gracefully handles periods of high demand, preventing system collapse under sustained overload conditions. The system must prioritize stability over accepting every single request.\n\nAdmission path\nIncoming requests first pass through a rate limiter, which checks against the current capacity derived from the four active slots. If capacity exists, the request is admitted and assigned a slot token. If the system is nearing its defined capacity threshold, the admission controller initiates a soft rejection, signaling potential future delays. This path manages the initial ingress flow to prevent immediate resource saturation.\n\nQueue bound\nA strictly enforced bounded queue is implemented to buffer requests that are admitted but cannot be immediately processed by the GPU. This queue size is carefully tuned to absorb short bursts without causing excessive memory pressure. Once the bounded queue reaches its maximum capacity, subsequent requests are immediately rejected, preventing unbounded growth during severe overload events.\n\nBackpressure\nWhen the bounded queue approaches its limit, the system applies explicit backpressure upstream to the request ingress layer. This mechanism signals upstream clients or load balancers to temporarily slow down their submission rate. This proactive throttling is crucial for managing overload gracefully, allowing the GPU processing pipeline time to catch up to the incoming request rate.\n\nFairness\nTo ensure fairness among competing requests, a weighted fair queuing (WFQ) approach is employed within the bounded queue. This guarantees that no single stream or user can monopolize the four available slots, even during periods of high contention. This mechanism directly addresses starvation prevention, ensuring equitable access to the limited computational resources.\n\nTimeouts and cancellation\nEach request is assigned a maximum tolerable Time To First Token (TTFT) threshold. If a request remains in the queue beyond this limit, it is automatically cancelled and rejected, preventing indefinite waiting. This mechanism is vital for user experience and resource cleanup, freeing up queue space for newer, more time-sensitive requests.\n\nMetrics\nKey operational metrics tracked include the current utilization of the four slots, the average queue depth, and the p95 TTFT. Monitoring the rate of accepted versus rejected requests provides insight into the system's load profile. The system reports throughput in tokens/second to allow operators to tune admission thresholds effectively.\n\nFailure drill\nIn a catastrophic failure scenario, the admission controller immediately halts all new admissions and drains the bounded queue gracefully. Operator-visible signals are triggered, indicating severe overload and resource constraints. This controlled shutdown ensures a clean state, allowing for subsequent recovery and preventing data corruption or resource leaks during the failure event.\n\nSYSTEM VERDICT: STABLE UNDER OVERLOAD",
       "success": true,
-      "ttft_s": 0.348959,
+      "ttft_s": 0.437891,
       "validation": {
         "passed": true,
         "problems": []
@@ -294,17 +302,17 @@
     },
     {
       "capture_error": null,
-      "e2e_s": 1.736855,
+      "e2e_s": 14.902256,
       "errors": [],
       "label": "Common Follow-up",
-      "output_tokens": 20,
+      "output_tokens": 584,
       "phase": "follow_up",
       "prompt_id": "common-follow-up",
-      "response_characters": 118,
-      "response_sha256": "f1182283abf9d9c47037de0ed9dfd605c832b77f26f7450cb1c05514877bdc8b",
-      "response_text": "A bounded request queue maintains stability by using backpressure to prevent overload when request rates are too high.",
+      "response_characters": 3354,
+      "response_sha256": "cabc1f29d0022d6dbfbc034f47ee1c7795e98a0c623eaa64c93f35200406a450",
+      "response_text": "Original goal\nThe initial design aimed to implement bounded admission control for a GPU inference server featuring exactly four active generation slots. The core requirement was managing a bursty request stream to maintain predictable latency. This involved establishing clear boundaries for queueing and rejection under high load. The system needed to balance throughput maximization with guaranteed service quality for admitted requests, preventing resource exhaustion entirely.\n\nStrongest part\nThe integration of both a bounded queue and explicit backpressure represents the strongest architectural feature. This dual approach allows the system to absorb minor spikes via the queue while actively signaling upstream congestion when the queue nears capacity. This proactive throttling, rather than reactive rejection, significantly enhances system resilience during transient overload periods, leading to smoother operational behavior.\n\nHidden assumption\nA key hidden assumption made in the initial design is the homogeneity of request processing time. The model assumes that all requests, once admitted, require a relatively similar amount of GPU time. If a few requests become significantly longer-running outliers, the WFQ fairness mechanism might struggle to compensate effectively, potentially leading to disproportionate latency for shorter jobs.\n\nDeeper explanation\nThe interplay between the admission path and the queue bound dictates the system's overload behavior. When the admission controller permits requests faster than the four slots can process them, the bounded queue fills. Once full, the system transitions from soft throttling to hard rejection, which is the defined overload response. This transition point is critical for stability management.\n\nConcrete example\nConsider a scenario where the system is running at 90% capacity. A sudden burst arrives, exceeding the remaining 10% capacity. The admission controller rejects the first few requests, while the bounded queue accepts the next batch. If the queue hits its limit, the backpressure signal is sent, perhaps triggering an HTTP 429 response to the client, effectively managing the overload.\n\nEdge case\nThe most challenging edge case involves sustained, low-level traffic that never triggers the hard queue limit but continuously stresses the four slots. In this scenario, starvation prevention via WFQ is paramount. If the WFQ weights are poorly tuned, a low-priority stream could theoretically monopolize the slots over a very long duration, even if the queue remains technically below its hard bound.\n\nPractical improvement\nA practical improvement would involve implementing dynamic slot allocation based on request priority metadata, rather than purely FIFO within the WFQ. For instance, high-priority requests could be granted a temporary \"priority token\" allowing them to bypass the standard queueing discipline when the system is under moderate stress, improving perceived latency for critical workloads.\n\nFinal takeaway\nThe successful implementation hinges on the precise calibration of the bounded queue size relative to the expected burst duration and the responsiveness of the backpressure mechanism. Continuous monitoring of p95 TTFT against the defined thresholds is non-negotiable for operational health. SYSTEM VERDICT: STABLE UNDER OVERLOAD.\n\nREVISION COMPLETE",
       "success": true,
-      "ttft_s": 0.269682,
+      "ttft_s": 0.457955,
       "validation": {
         "passed": true,
         "problems": []
@@ -318,20 +326,22 @@
     "all_request_count": 9,
     "all_success_count": 9,
     "capture_error_count": 0,
-    "e2e_p50_s": 2.0473925,
-    "e2e_p95_s": 2.21748315,
+    "e2e_p50_s": 15.172543000000001,
+    "e2e_p95_s": 18.5085135,
     "error_count": 0,
     "offered_concurrency": 4,
-    "output_tokens": 157,
+    "output_tokens": 2730,
+    "output_tokens_max": 885,
+    "output_tokens_min": 500,
     "overall_passed": true,
     "probe_error_count": 0,
     "request_count": 4,
     "success_count": 4,
     "timed_e2e_count": 4,
     "timed_ttft_count": 4,
-    "total_output_tokens": 288,
-    "ttft_p50_s": 0.3670735,
-    "ttft_p95_s": 0.5245369999999999
+    "total_output_tokens": 5215,
+    "ttft_p50_s": 0.438053,
+    "ttft_p95_s": 0.49506215000000003
   },
   "telemetry": {
     "capture": {
@@ -343,18 +353,18 @@
         "device_count": 1,
         "devices": [
           {
-            "baseline_used_mib": 18230,
+            "baseline_used_mib": 18117,
             "index": 0,
             "name": "NVIDIA GeForce RTX 4090",
-            "peak_used_mib": 18340,
+            "peak_used_mib": 18360,
             "total_mib": 24564
           }
         ],
         "error": null,
-        "sample_count": 60,
-        "whole_gpu_baseline_used_mib": 18230,
-        "whole_gpu_peak_increase_mib": 110,
-        "whole_gpu_peak_used_mib": 18340
+        "sample_count": 186,
+        "whole_gpu_baseline_used_mib": 18117,
+        "whole_gpu_peak_increase_mib": 243,
+        "whole_gpu_peak_used_mib": 18360
       },
       "provider": {
         "first_turn_request_counts": {
@@ -370,9 +380,9 @@
           "total_timed_out": 0
         },
         "follow_up_reuse": {
-          "prefix_tokens_reused": 333,
-          "session_reuse_hits": 4,
-          "sessions_opened": 0
+          "prefix_tokens_reused": 2605,
+          "session_reuse_hits": 3,
+          "sessions_opened": 1
         },
         "high_water": {
           "max_runnable_rows": 4,
@@ -410,28 +420,28 @@
         "device_count": 1,
         "devices": [
           {
-            "baseline_used_mib": 17442,
+            "baseline_used_mib": 17575,
             "index": 0,
             "name": "NVIDIA GeForce RTX 4090",
-            "peak_used_mib": 18246,
+            "peak_used_mib": 18121,
             "total_mib": 24564
           }
         ],
         "error": null,
-        "sample_count": 40,
-        "whole_gpu_baseline_used_mib": 17442,
-        "whole_gpu_peak_increase_mib": 804,
-        "whole_gpu_peak_used_mib": 18246
+        "sample_count": 42,
+        "whole_gpu_baseline_used_mib": 17575,
+        "whole_gpu_peak_increase_mib": 546,
+        "whole_gpu_peak_used_mib": 18121
       },
       "provider": {
         "high_water": {
-          "max_runnable_rows": 2,
-          "max_running": 2
+          "max_runnable_rows": 1,
+          "max_running": 1
         },
         "request_counts": {
           "total_cancelled": 0,
           "total_errors": 0,
-          "total_requests": 2,
+          "total_requests": 1,
           "total_timed_out": 0
         }
       }

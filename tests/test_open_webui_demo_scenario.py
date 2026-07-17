@@ -72,15 +72,15 @@ def _capture_for(scenario):
 
     answers = {
         "reasoning": (
-            "1. Setup 6. Hundred-door intuition "
+            "Setup Hundred-door intuition "
             "FINAL: SWITCH; WIN PROBABILITY = 2/3 "
             + details("reasoning")
         ),
         "code": (
-            "## Design\n## Implementation\n```python\n"
+            "Design\nImplementation\npython\n"
             "def group_anagrams(words):\n    return []\n"
-            "assert group_anagrams([]) == []\n```\n"
-            "## Verification\nCODE REVIEW: PASS\n"
+            "assert group_anagrams([]) == []\n"
+            "Verification\nCODE REVIEW: PASS\n"
             + details("code")
         ),
         "json": json.dumps(
@@ -106,7 +106,7 @@ def _capture_for(scenario):
         ),
     }
     follow_up_response = (
-        "1. Original goal 8. Final takeaway REVISION COMPLETE "
+        "Original goal Final takeaway REVISION COMPLETE "
         + details("follow_up")
     )
     sessions = []

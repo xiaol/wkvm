@@ -965,8 +965,18 @@ def validate_response(
             problems.append("validator has invalid expected_substrings")
         else:
             for item in expected:
-                needle = item if case_sensitive else item.casefold()
-                if needle not in haystack:
+                rendered_item = re.sub(
+                    r"^(?:#{1,6}\s+|\d+[.)]\s+)",
+                    "",
+                    item,
+                )
+                candidates = {item, rendered_item}
+                needles = (
+                    candidates
+                    if case_sensitive
+                    else {candidate.casefold() for candidate in candidates}
+                )
+                if not any(needle in haystack for needle in needles):
                     problems.append(f"missing expected substring: {item}")
     elif kind == "json_equals":
         try:
@@ -1601,7 +1611,7 @@ def _format_seconds(value: Any) -> str:
 
 
 def _format_count(value: Any) -> str:
-    return str(value) if type(value) is int and value >= 0 else "n/a"
+    return f"{value:,}" if type(value) is int and value >= 0 else "n/a"
 
 
 def _format_mib(value: Any) -> str:
@@ -1741,6 +1751,8 @@ def report_markdown(report: Mapping[str, Any]) -> str:
     reuse = concurrency_provider.get("follow_up_reuse")
     if not isinstance(reuse, Mapping):
         reuse = {}
+    sessions_opened = reuse.get("sessions_opened")
+    session_noun = "session" if sessions_opened == 1 else "sessions"
     capture_telemetry = telemetry.get("capture")
     if not isinstance(capture_telemetry, Mapping):
         capture_telemetry = {}
@@ -1752,7 +1764,7 @@ def report_markdown(report: Mapping[str, Any]) -> str:
             "",
             "**Follow-up reuse:** "
             f"{_format_count(reuse.get('session_reuse_hits'))} reuse hits; "
-            f"{_format_count(reuse.get('sessions_opened'))} sessions opened; "
+            f"{_format_count(sessions_opened)} {session_noun} opened; "
             f"{_format_count(reuse.get('prefix_tokens_reused'))} prefix tokens reused.",
             "",
             "**Capture health:** "
