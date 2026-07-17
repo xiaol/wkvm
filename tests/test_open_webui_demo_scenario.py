@@ -293,7 +293,7 @@ def _natural_long_source():
     )
 
 
-def _long_source_provenance():
+def _long_source_provenance(source_text):
     return {
         "dataset_id": "test/natural-long-text",
         "revision": "0123456789abcdef",
@@ -301,7 +301,9 @@ def _long_source_provenance():
         "split": "train",
         "row_indices": {"start": 0, "end_inclusive": 1_499},
         "license": "test-only",
-        "normalized_source_text_sha256": "fixture",
+        "normalized_source_text_sha256": hashlib.sha256(
+            source_text.encode()
+        ).hexdigest(),
     }
 
 
@@ -311,7 +313,7 @@ class TestOpenWebUIDemoScenario(unittest.TestCase):
     def setUp(self):
         self.tokenizer = _FakeTokenizer()
         self.source_text = _natural_long_source()
-        self.source_provenance = _long_source_provenance()
+        self.source_provenance = _long_source_provenance(self.source_text)
         self.scenario = build_scenario(
             self.tokenizer,
             long_source_text=self.source_text,
@@ -373,11 +375,32 @@ class TestOpenWebUIDemoScenario(unittest.TestCase):
         )
 
     def test_pathological_repeated_source_is_rejected(self):
+        repeated_source = "archive " * 20_000
         with self.assertRaisesRegex(ValueError, "pathologically dominant word"):
             build_scenario(
                 self.tokenizer,
-                long_source_text="archive " * 20_000,
-                long_source_provenance=self.source_provenance,
+                long_source_text=repeated_source,
+                long_source_provenance=_long_source_provenance(repeated_source),
+            )
+
+    def test_pathological_repeated_4grams_are_rejected(self):
+        repeated_phrase = " ".join(f"word{index}" for index in range(20))
+        repeated_source = (repeated_phrase + " ") * 1_000
+        with self.assertRaisesRegex(ValueError, "excessive repeated 4-grams"):
+            build_scenario(
+                self.tokenizer,
+                long_source_text=repeated_source,
+                long_source_provenance=_long_source_provenance(repeated_source),
+            )
+
+    def test_false_source_provenance_is_rejected(self):
+        false_provenance = dict(self.source_provenance)
+        false_provenance["normalized_source_text_sha256"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "declared SHA-256"):
+            build_scenario(
+                self.tokenizer,
+                long_source_text=self.source_text,
+                long_source_provenance=false_provenance,
             )
 
     def test_report_validates_outputs_counts_tokens_and_calculates_percentiles(self):
@@ -551,8 +574,8 @@ class TestOpenWebUIDemoScenario(unittest.TestCase):
                 "build",
                 "--tokenizer-path",
                 "public/model",
-                "--long-source-parquet",
-                "frankenstein.parquet",
+                "--long-source-text",
+                "alice.txt",
                 "--json",
                 "scenario.json",
             ]
@@ -572,8 +595,8 @@ class TestOpenWebUIDemoScenario(unittest.TestCase):
 
         self.assertEqual(build_args.long_rendered_tokens, 12_000)
         self.assertEqual(
-            str(build_args.long_source_parquet),
-            "frankenstein.parquet",
+            str(build_args.long_source_text),
+            "alice.txt",
         )
         self.assertEqual(str(report_args.capture_json), "capture.json")
         self.assertEqual(str(report_args.markdown), "report.md")

@@ -27,20 +27,22 @@ REPORT_KIND = "wkvm.open_webui.demo_report"
 SCHEMA_VERSION = 1
 OFFERED_CONCURRENCY = 4
 NEEDLE_TARGET_RENDERED_TOKEN = 256
-HF_LONG_SOURCE_DATASET_ID = (
-    "Thermostatic/project-gutenberg-frankenstein-chapters"
+HF_LONG_SOURCE_DATASET_ID = "common-pile/project_gutenberg"
+HF_LONG_SOURCE_REVISION = "01dc90a5002f8977c7fb03a372c14bca29c65cf1"
+HF_LONG_SOURCE_PARQUET_REVISION = (
+    "d0bf09a2c2f6f73952733d7a1fe9a34b1cb4348c"
 )
-HF_LONG_SOURCE_REVISION = "e37ee04474b60bdf4cc680dfc41ed9dd453cf7fc"
 HF_LONG_SOURCE_CONFIG = "default"
 HF_LONG_SOURCE_SPLIT = "train"
-HF_LONG_SOURCE_FILENAME = "frankenstein_chapters.parquet"
-HF_LONG_SOURCE_FILE_SHA256 = (
-    "512da16deee193ba4fe32e7e8273c1aef02568ab36975811b3345d9b337cad9b"
+HF_LONG_SOURCE_FILENAME = "default/partial-train/0000.parquet"
+HF_LONG_SOURCE_DOCUMENT_ID = "11"
+HF_LONG_SOURCE_DOCUMENT_SHA256 = (
+    "f17aa0bf7466424a8b357b688678666bad7a0148963ef349016a3098faa6bd1e"
 )
+HF_LONG_SOURCE_BODY_START_CHARACTER = 584
 HF_LONG_SOURCE_TEXT_SHA256 = (
-    "cbac39268b43c020cc4d9d6ff0e690657ff91417c4165481733b42f5b129dfd4"
+    "39a7d2489030568740bd76d860a15e705e6fc2e1330051eb21ed66ae2f260034"
 )
-HF_LONG_SOURCE_ROWS = 28
 CAVEATS = (
     "This is a normal four-slot Open WebUI demo, not a controlled load test.",
     "WKVM serves this demo with routed_span_approximate model-state semantics.",
@@ -305,10 +307,17 @@ def natural_text_quality(text: str) -> dict[str, Any]:
     }
 
 
-def _validate_natural_source(text: str) -> dict[str, Any]:
+def _validate_natural_source(
+    text: str,
+    *,
+    minimum_words: int = 1_000,
+) -> dict[str, Any]:
     quality = natural_text_quality(text)
-    if quality["word_count"] < 1_000:
-        raise ValueError("natural long-context source must contain at least 1,000 words")
+    if quality["word_count"] < minimum_words:
+        raise ValueError(
+            "natural long-context source must contain at least "
+            f"{minimum_words:,} words"
+        )
     if quality["dominant_word_fraction"] > 0.12:
         raise ValueError("natural long-context source has a pathologically dominant word")
     if quality["repeated_4gram_fraction"] > 0.08:
@@ -317,33 +326,18 @@ def _validate_natural_source(text: str) -> dict[str, Any]:
 
 
 def load_hf_long_source(path: Path) -> tuple[str, dict[str, Any]]:
-    source_file_sha256 = file_sha256(path)
-    if source_file_sha256 != HF_LONG_SOURCE_FILE_SHA256:
+    document_text = path.read_text(encoding="utf-8")
+    document_text_sha256 = text_sha256(document_text)
+    if document_text_sha256 != HF_LONG_SOURCE_DOCUMENT_SHA256:
         raise ValueError(
-            f"unexpected Hugging Face source SHA-256 for {path}: "
-            f"{source_file_sha256}"
+            f"unexpected Hugging Face document SHA-256 for {path}: "
+            f"{document_text_sha256}"
         )
-    try:
-        import pyarrow.parquet as parquet
-    except ImportError as exc:
-        raise RuntimeError(
-            "pyarrow is required to read the pinned Hugging Face source parquet"
-        ) from exc
-    table = parquet.read_table(path, columns=["Chapter", "Text"])
-    rows = table.to_pylist()
-    if len(rows) != HF_LONG_SOURCE_ROWS:
+    source_text = document_text[HF_LONG_SOURCE_BODY_START_CHARACTER:]
+    if not source_text.startswith("CHAPTER I.\nDown the Rabbit-Hole"):
         raise ValueError(
-            f"expected {HF_LONG_SOURCE_ROWS} Hugging Face source rows, "
-            f"found {len(rows)}"
+            "Hugging Face document body does not begin at the pinned marker"
         )
-    if any(
-        not isinstance(row.get("Chapter"), str)
-        or not isinstance(row.get("Text"), str)
-        or not row["Text"].strip()
-        for row in rows
-    ):
-        raise ValueError("Hugging Face source rows have an unexpected schema")
-    source_text = "\n\n".join(row["Text"].strip() for row in rows)
     source_text_sha256 = text_sha256(source_text)
     if source_text_sha256 != HF_LONG_SOURCE_TEXT_SHA256:
         raise ValueError(
@@ -353,18 +347,19 @@ def load_hf_long_source(path: Path) -> tuple[str, dict[str, Any]]:
     provenance = {
         "dataset_id": HF_LONG_SOURCE_DATASET_ID,
         "revision": HF_LONG_SOURCE_REVISION,
+        "parquet_revision": HF_LONG_SOURCE_PARQUET_REVISION,
         "config": HF_LONG_SOURCE_CONFIG,
         "split": HF_LONG_SOURCE_SPLIT,
         "filename": HF_LONG_SOURCE_FILENAME,
-        "file_sha256": source_file_sha256,
-        "row_indices": {"start": 0, "end_inclusive": len(rows) - 1},
-        "row_count": len(rows),
+        "document_id": HF_LONG_SOURCE_DOCUMENT_ID,
+        "document_text_sha256": document_text_sha256,
+        "body_start_character": HF_LONG_SOURCE_BODY_START_CHARACTER,
         "normalized_source_text_sha256": source_text_sha256,
-        "license": "MIT",
-        "upstream_rights": "Project Gutenberg public domain in the United States",
+        "license": "Public Domain",
+        "source_url": "https://www.gutenberg.org/ebooks/11.txt.utf-8",
         "work": {
-            "title": "Frankenstein; or, The Modern Prometheus",
-            "author": "Mary Wollstonecraft Shelley",
+            "title": "Alice's Adventures in Wonderland",
+            "author": "Lewis Carroll",
         },
     }
     return source_text, provenance
@@ -475,11 +470,21 @@ def build_long_prompt(
         raise ValueError("--long-rendered-tokens must be at least 320")
     if not isinstance(source_provenance, Mapping) or not source_provenance:
         raise ValueError("natural long-context source provenance is required")
-    source_quality = _validate_natural_source(source_text)
+    source_text_sha256 = text_sha256(source_text)
+    if (
+        source_provenance.get("normalized_source_text_sha256")
+        != source_text_sha256
+    ):
+        raise ValueError(
+            "natural long-context source text does not match its declared "
+            "SHA-256"
+        )
+    _validate_natural_source(source_text)
 
     preamble = (
-        "Long-context recall test using Mary Shelley's Frankenstein, sourced "
-        "from a pinned Hugging Face public-domain corpus. Read the text "
+        "Long-context recall test using Lewis Carroll's Alice's Adventures in "
+        "Wonderland, sourced from a pinned Hugging Face public-domain corpus. "
+        "Read the text "
         "carefully; one inserted record must be recalled after the excerpt.\n\n"
         "SOURCE START\n\n"
     )
@@ -515,6 +520,10 @@ def build_long_prompt(
     )
     excerpt_character_count = needle_source_character + continuation_characters
     excerpt_text = source_text[:excerpt_character_count]
+    excerpt_quality = _validate_natural_source(
+        excerpt_text,
+        minimum_words=100,
+    )
     prompt = _prompt_record(
         tokenizer,
         prompt_id="long-context-needle",
@@ -567,10 +576,11 @@ def build_long_prompt(
             "sha256": text_sha256(excerpt_text),
             "needle_insertion_character": needle_source_character,
         },
-        "quality": natural_text_quality(excerpt_text),
+        "quality": excerpt_quality,
         "transformation": (
-            "rows joined with two newlines; contiguous prefix truncated at a "
-            "tokenizer-aligned boundary; synthetic needle inserted"
+            "document body selected at a pinned character offset; contiguous "
+            "prefix truncated at a tokenizer-aligned boundary; synthetic "
+            "needle inserted"
         ),
     }
     if rendered_tokens != target_tokens or prompt["rendered_token_count"] != target_tokens:
@@ -1650,7 +1660,7 @@ def _build_command(args: argparse.Namespace) -> int:
     tokenizer = load_tokenizer(args.tokenizer_path)
     identity = _safe_tokenizer_identity(args.tokenizer_path, tokenizer)
     source_text, source_provenance = load_hf_long_source(
-        args.long_source_parquet
+        args.long_source_text
     )
     scenario = build_scenario(
         tokenizer,
@@ -1710,7 +1720,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     build = subparsers.add_parser("build", help="build deterministic demo prompts")
     build.add_argument("--tokenizer-path", required=True)
-    build.add_argument("--long-source-parquet", type=Path, required=True)
+    build.add_argument("--long-source-text", type=Path, required=True)
     build.add_argument("--long-rendered-tokens", type=int, default=12_000)
     build.add_argument("--json", type=Path, required=True)
     build.set_defaults(function=_build_command)
