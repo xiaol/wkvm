@@ -1,20 +1,20 @@
 {
   "acts": {
     "all_requests": {
-      "e2e_p50_s": 2.728755,
-      "e2e_p95_s": 4.3125126,
+      "e2e_p50_s": 1.949728,
+      "e2e_p95_s": 2.7972971999999996,
       "error_count": 0,
       "output_tokens": 288,
       "request_count": 9,
       "success_count": 9,
       "timed_e2e_count": 9,
       "timed_ttft_count": 9,
-      "ttft_p50_s": 0.643848,
-      "ttft_p95_s": 1.9758987999999995
+      "ttft_p50_s": 0.297246,
+      "ttft_p95_s": 1.2614941999999996
     },
     "concurrency_first_turn": {
-      "e2e_p50_s": 3.5267635000000004,
-      "e2e_p95_s": 3.79008975,
+      "e2e_p50_s": 2.0473925,
+      "e2e_p95_s": 2.21748315,
       "error_count": 0,
       "offered_concurrency": 4,
       "output_tokens": 157,
@@ -22,12 +22,12 @@
       "success_count": 4,
       "timed_e2e_count": 4,
       "timed_ttft_count": 4,
-      "ttft_p50_s": 0.703147,
-      "ttft_p95_s": 1.1227732
+      "ttft_p50_s": 0.3670735,
+      "ttft_p95_s": 0.5245369999999999
     },
     "concurrency_follow_up": {
-      "e2e_p50_s": 2.4264735,
-      "e2e_p95_s": 2.69288925,
+      "e2e_p50_s": 1.7629675,
+      "e2e_p95_s": 1.9256308,
       "error_count": 0,
       "offered_concurrency": 4,
       "output_tokens": 108,
@@ -35,20 +35,20 @@
       "success_count": 4,
       "timed_e2e_count": 4,
       "timed_ttft_count": 4,
-      "ttft_p50_s": 0.32725950000000004,
-      "ttft_p95_s": 0.3318597
+      "ttft_p50_s": 0.2645065,
+      "ttft_p95_s": 0.2689668
     },
     "long_prompt": {
-      "e2e_p50_s": 4.639401,
-      "e2e_p95_s": 4.639401,
+      "e2e_p50_s": 3.17302,
+      "e2e_p95_s": 3.17302,
       "error_count": 0,
       "output_tokens": 23,
       "request_count": 1,
       "success_count": 1,
       "timed_e2e_count": 1,
       "timed_ttft_count": 1,
-      "ttft_p50_s": 2.49666,
-      "ttft_p95_s": 2.49666
+      "ttft_p50_s": 1.736405,
+      "ttft_p95_s": 1.736405
     }
   },
   "caveats": [
@@ -57,7 +57,7 @@
     "This capture is not a vLLM/SGLang comparison or proof of a 10x claim."
   ],
   "errors": [],
-  "generated_at": "2026-07-17T05:27:53.702990+00:00",
+  "generated_at": "2026-07-17T07:35:56.836801+00:00",
   "kind": "wkvm.open_webui.demo_report",
   "provenance": {
     "capture": {
@@ -66,12 +66,44 @@
         "engine": "chromium",
         "version": "147.0.7727.116"
       },
-      "captured_at": "2026-07-17T05:10:55.811Z",
-      "file_sha256": "0cd698cff668c60cc6a7881f0e335c00558c41d4a1950d0eaff2c369ad26a602",
+      "captured_at": "2026-07-17T07:28:10.922Z",
+      "file_sha256": "755d9fdaeec4f84036253724a4cafaf9ac9671b9c552f05f72d2943c63e60e7f",
       "kind": "wkvm.open_webui.live_capture",
       "schema_version": 1
     },
-    "git_commit": "9200cdb7ca5f6a7c21c27c4a82c882e9fdfb80d4",
+    "git_commit": "6a51043e360f8e756aeea407a366fad8f1001b88",
+    "long_prompt_source": {
+      "body_start_character": 584,
+      "config": "default",
+      "dataset_id": "common-pile/project_gutenberg",
+      "document_id": "11",
+      "document_text_sha256": "f17aa0bf7466424a8b357b688678666bad7a0148963ef349016a3098faa6bd1e",
+      "excerpt": {
+        "character_count": 45095,
+        "end_character_exclusive": 45095,
+        "needle_insertion_character": 807,
+        "sha256": "5baffd38a9e6f09a5f4bab94def716d3181061606c52d098cc70c8d65895d270",
+        "start_character": 0
+      },
+      "filename": "default/partial-train/0000.parquet",
+      "license": "Public Domain",
+      "normalized_source_text_sha256": "39a7d2489030568740bd76d860a15e705e6fc2e1330051eb21ed66ae2f260034",
+      "parquet_revision": "d0bf09a2c2f6f73952733d7a1fe9a34b1cb4348c",
+      "quality": {
+        "dominant_word_fraction": 0.047591274932928966,
+        "repeated_4gram_fraction": 0.017152858809801632,
+        "unique_word_fraction": 0.16925230374431355,
+        "word_count": 8573
+      },
+      "revision": "01dc90a5002f8977c7fb03a372c14bca29c65cf1",
+      "source_url": "https://www.gutenberg.org/ebooks/11.txt.utf-8",
+      "split": "train",
+      "transformation": "document body selected at a pinned character offset; contiguous prefix truncated at a tokenizer-aligned boundary; synthetic needle inserted",
+      "work": {
+        "author": "Lewis Carroll",
+        "title": "Alice's Adventures in Wonderland"
+      }
+    },
     "measurement": {
       "e2e": "browser submit to observed completion",
       "offered_concurrency": 4,
@@ -81,10 +113,10 @@
     "platform": "Linux-7.0.0-27-generic-x86_64-with-glibc2.43",
     "python": "3.12.13",
     "scenario": {
-      "capture_declared_sha256": "16246f8b90da888b5f4389ae6a741d416028a9be7ca069ecce20f90c785a04cd",
+      "capture_declared_sha256": "3ab7c1989aaa8a44c2769478f1586e455e5386e8c92eb0052897071995a4a3af",
       "capture_match": true,
-      "declared_sha256": "ff56156450c0eabfe3cd426cc2b74916cf28933489f406e1dd36fc59e34622c4",
-      "file_sha256": "16246f8b90da888b5f4389ae6a741d416028a9be7ca069ecce20f90c785a04cd"
+      "declared_sha256": "69ff12cad06d6b858f2028acc2ebf3b5793dc51b897c7a31bf413cf181cdf153",
+      "file_sha256": "3ab7c1989aaa8a44c2769478f1586e455e5386e8c92eb0052897071995a4a3af"
     },
     "tokenizer": {
       "match": {
@@ -118,9 +150,9 @@
   "records": [
     {
       "capture_error": null,
-      "e2e_s": 4.639401,
+      "e2e_s": 3.17302,
       "errors": [],
-      "label": "Long Context Needle",
+      "label": "12K Natural-Text Recall",
       "output_tokens": 23,
       "phase": "long_prompt",
       "prompt_id": "long-context-needle",
@@ -128,7 +160,7 @@
       "response_sha256": "81f8604c7beb9afc70004194ef360caf68ed39d8b6a4052c2f1b1f62a3eb8098",
       "response_text": "The codename is BLUE-742, the city is Samarkand, and the checksum is lantern.",
       "success": true,
-      "ttft_s": 2.49666,
+      "ttft_s": 1.736405,
       "validation": {
         "passed": true,
         "problems": []
@@ -136,7 +168,7 @@
     },
     {
       "capture_error": null,
-      "e2e_s": 3.82218,
+      "e2e_s": 2.233713,
       "errors": [],
       "label": "Reasoning",
       "output_tokens": 53,
@@ -146,7 +178,7 @@
       "response_sha256": "2bd074f80ffd2de40a8cd917f564d9530952b2aeb4c673c1b3fe1c74e6272071",
       "response_text": "FINAL: USD 0.05\nThe ball costs $0.05, and the bat costs $1.05, which totals $1.10 and satisfies the condition that the bat costs $1.00 more than the ball.",
       "success": true,
-      "ttft_s": 0.643848,
+      "ttft_s": 0.297246,
       "validation": {
         "passed": true,
         "problems": []
@@ -154,7 +186,7 @@
     },
     {
       "capture_error": null,
-      "e2e_s": 2.728755,
+      "e2e_s": 1.949728,
       "errors": [],
       "label": "Common Follow-up",
       "output_tokens": 37,
@@ -164,7 +196,7 @@
       "response_sha256": "fbc8f8c1b3d3686ec4e35631d39cd7e736357600ac52da920a3b1c1215fbc5d7",
       "response_text": "The ball costs $0.05, and the bat costs $1.05, totaling $1.10 with the bat being $1.00 more expensive.",
       "success": true,
-      "ttft_s": 0.323409,
+      "ttft_s": 0.264914,
       "validation": {
         "passed": true,
         "problems": []
@@ -172,7 +204,7 @@
     },
     {
       "capture_error": null,
-      "e2e_s": 3.608245,
+      "e2e_s": 2.125514,
       "errors": [],
       "label": "Code",
       "output_tokens": 58,
@@ -182,7 +214,7 @@
       "response_sha256": "2d09bad224710e5cb43072e9bef29162bd777be0cf731ecb32b0657e0d701aa2",
       "response_text": "python\nCollapse\nRun\nSave\nCopy\n1\n2\n3\n⌄\ndef is_palindrome(text):\n    processed_text = \"\".join(filter(str.isalnum, text)).lower()\n    return processed_text == processed_text[::-1]",
       "success": true,
-      "ttft_s": 0.714865,
+      "ttft_s": 0.385188,
       "validation": {
         "passed": true,
         "problems": []
@@ -190,7 +222,7 @@
     },
     {
       "capture_error": null,
-      "e2e_s": 2.48965,
+      "e2e_s": 1.78908,
       "errors": [],
       "label": "Common Follow-up",
       "output_tokens": 28,
@@ -200,7 +232,7 @@
       "response_sha256": "737fb2ea5cab3ecf8ce148e7c42a691001788696b20b9f6f317da5cb80e909a2",
       "response_text": "The provided Python function is_palindrome(text) checks if a string is a palindrome while ignoring case and non-alphanumeric characters.",
       "success": true,
-      "ttft_s": 0.331992,
+      "ttft_s": 0.261214,
       "validation": {
         "passed": true,
         "problems": []
@@ -208,7 +240,7 @@
     },
     {
       "capture_error": null,
-      "e2e_s": 2.255082,
+      "e2e_s": 1.580865,
       "errors": [],
       "label": "JSON",
       "output_tokens": 14,
@@ -218,7 +250,7 @@
       "response_sha256": "4a3c157ce41e974e1f0595aa5ee1d0396b6851a079cae16e0be592dadaa07396",
       "response_text": "{\"engine\":\"WKVM\",\"slots\":4,\"status\":\"ready\"}",
       "success": true,
-      "ttft_s": 1.194757,
+      "ttft_s": 0.549128,
       "validation": {
         "passed": true,
         "problems": []
@@ -226,7 +258,7 @@
     },
     {
       "capture_error": null,
-      "e2e_s": 2.30939,
+      "e2e_s": 1.681706,
       "errors": [],
       "label": "Common Follow-up",
       "output_tokens": 23,
@@ -236,7 +268,7 @@
       "response_sha256": "8b0fa1ddfebdf90c9d306b84010cd0c647359c38eae040791a5babe4fcebaab3",
       "response_text": "The previous answer was the JSON object: {\"engine\":\"WKVM\",\"slots\":4,\"status\":\"ready\"}.",
       "success": true,
-      "ttft_s": 0.323144,
+      "ttft_s": 0.264099,
       "validation": {
         "passed": true,
         "problems": []
@@ -244,7 +276,7 @@
     },
     {
       "capture_error": null,
-      "e2e_s": 3.445282,
+      "e2e_s": 1.969271,
       "errors": [],
       "label": "Systems",
       "output_tokens": 32,
@@ -254,7 +286,7 @@
       "response_sha256": "ea5a5eac0761f21df4b31092f08f7521e0027ba7c11ccb16225822127cb42954",
       "response_text": "A bounded request queue helps an inference server remain stable by implementing backpressure, which prevents the system from entering an overload state when incoming request rates exceed processing capacity.",
       "success": true,
-      "ttft_s": 0.691429,
+      "ttft_s": 0.348959,
       "validation": {
         "passed": true,
         "problems": []
@@ -262,7 +294,7 @@
     },
     {
       "capture_error": null,
-      "e2e_s": 2.363297,
+      "e2e_s": 1.736855,
       "errors": [],
       "label": "Common Follow-up",
       "output_tokens": 20,
@@ -272,7 +304,7 @@
       "response_sha256": "f1182283abf9d9c47037de0ed9dfd605c832b77f26f7450cb1c05514877bdc8b",
       "response_text": "A bounded request queue maintains stability by using backpressure to prevent overload when request rates are too high.",
       "success": true,
-      "ttft_s": 0.33111,
+      "ttft_s": 0.269682,
       "validation": {
         "passed": true,
         "problems": []
@@ -286,8 +318,8 @@
     "all_request_count": 9,
     "all_success_count": 9,
     "capture_error_count": 0,
-    "e2e_p50_s": 3.5267635000000004,
-    "e2e_p95_s": 3.79008975,
+    "e2e_p50_s": 2.0473925,
+    "e2e_p95_s": 2.21748315,
     "error_count": 0,
     "offered_concurrency": 4,
     "output_tokens": 157,
@@ -298,8 +330,8 @@
     "timed_e2e_count": 4,
     "timed_ttft_count": 4,
     "total_output_tokens": 288,
-    "ttft_p50_s": 0.703147,
-    "ttft_p95_s": 1.1227732
+    "ttft_p50_s": 0.3670735,
+    "ttft_p95_s": 0.5245369999999999
   },
   "telemetry": {
     "capture": {
@@ -311,18 +343,18 @@
         "device_count": 1,
         "devices": [
           {
-            "baseline_used_mib": 17769,
+            "baseline_used_mib": 18230,
             "index": 0,
             "name": "NVIDIA GeForce RTX 4090",
-            "peak_used_mib": 17805,
+            "peak_used_mib": 18340,
             "total_mib": 24564
           }
         ],
         "error": null,
-        "sample_count": 78,
-        "whole_gpu_baseline_used_mib": 17769,
-        "whole_gpu_peak_increase_mib": 36,
-        "whole_gpu_peak_used_mib": 17805
+        "sample_count": 60,
+        "whole_gpu_baseline_used_mib": 18230,
+        "whole_gpu_peak_increase_mib": 110,
+        "whole_gpu_peak_used_mib": 18340
       },
       "provider": {
         "first_turn_request_counts": {
@@ -378,28 +410,28 @@
         "device_count": 1,
         "devices": [
           {
-            "baseline_used_mib": 17372,
+            "baseline_used_mib": 17442,
             "index": 0,
             "name": "NVIDIA GeForce RTX 4090",
-            "peak_used_mib": 17769,
+            "peak_used_mib": 18246,
             "total_mib": 24564
           }
         ],
         "error": null,
-        "sample_count": 37,
-        "whole_gpu_baseline_used_mib": 17372,
-        "whole_gpu_peak_increase_mib": 397,
-        "whole_gpu_peak_used_mib": 17769
+        "sample_count": 40,
+        "whole_gpu_baseline_used_mib": 17442,
+        "whole_gpu_peak_increase_mib": 804,
+        "whole_gpu_peak_used_mib": 18246
       },
       "provider": {
         "high_water": {
-          "max_runnable_rows": 1,
-          "max_running": 1
+          "max_runnable_rows": 2,
+          "max_running": 2
         },
         "request_counts": {
           "total_cancelled": 0,
           "total_errors": 0,
-          "total_requests": 1,
+          "total_requests": 2,
           "total_timed_out": 0
         }
       }
