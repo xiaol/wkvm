@@ -203,7 +203,7 @@ launch_open_webui() {
     "ENABLE_WEBSOCKET_SUPPORT=true"
     "ENABLE_PERSISTENT_CONFIG=false"
     "DEFAULT_MODELS=$SERVED_MODEL_NAME"
-    'DEFAULT_MODEL_PARAMS={"temperature":0,"top_p":1,"function_calling":"legacy"}'
+    'DEFAULT_MODEL_PARAMS={"temperature":0,"top_p":1,"function_calling":"legacy","max_tokens":1152}'
     'DEFAULT_MODEL_METADATA={"capabilities":{"builtin_tools":false,"vision":false,"file_upload":false,"file_context":false,"web_search":false,"image_generation":false,"code_interpreter":false,"terminal":false,"memory":false}}'
     "ENABLE_TITLE_GENERATION=false"
     "ENABLE_TAGS_GENERATION=false"

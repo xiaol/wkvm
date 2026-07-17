@@ -191,12 +191,16 @@ class TestOpenWebUIDemoRender(unittest.TestCase):
                     "ttft_p95_s": 1.57,
                     "e2e_p50_s": 7.5,
                     "e2e_p95_s": 8.85,
+                    "output_tokens": 2_080,
+                    "output_tokens_min": 520,
                 },
                 "concurrency_follow_up": {
                     "offered_concurrency": 4,
                     "request_count": 4,
                     "success_count": 4,
                     "error_count": 0,
+                    "output_tokens": 2_120,
+                    "output_tokens_min": 530,
                 },
                 "all_requests": {
                     "request_count": 9,
@@ -244,6 +248,9 @@ class TestOpenWebUIDemoRender(unittest.TestCase):
         self.assertEqual(evidence.metrics.peak_vram_mib, 18420.5)
         self.assertEqual(evidence.metrics.max_running, 4)
         self.assertEqual(evidence.metrics.max_runnable_rows, 4)
+        self.assertEqual(evidence.metrics.first_turn_min_output_tokens, 520)
+        self.assertEqual(evidence.metrics.follow_up_min_output_tokens, 530)
+        self.assertEqual(evidence.metrics.act_2_total_output_tokens, 4_200)
         self.assertEqual(evidence.metrics.exact_reuse_hits, 4)
         self.assertEqual(evidence.metrics.provider_error_count, 0)
         self.assertIn("exact reuse hits 4/4", evidence.metrics.provider_summary or "")

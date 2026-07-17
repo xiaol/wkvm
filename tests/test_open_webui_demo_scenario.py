@@ -6,6 +6,7 @@ import re
 import unittest
 
 from experiments.open_webui_demo_scenario import (
+    ACT_2_MIN_OUTPUT_TOKENS,
     CAVEATS,
     build_parser,
     build_report,
@@ -66,22 +67,48 @@ class _FakeTokenizer:
 
 
 def _capture_for(scenario):
+    def details(prefix):
+        return " ".join(f"{prefix}_{index}" for index in range(540))
+
     answers = {
         "reasoning": (
-            "The equations give x + (x + USD 1.00) = USD 1.10. "
-            "FINAL: USD 0.05"
+            "1. Setup 6. Hundred-door intuition "
+            "FINAL: SWITCH; WIN PROBABILITY = 2/3 "
+            + details("reasoning")
         ),
         "code": (
-            "```python\ndef is_palindrome(text):\n"
-            "    normalized = ''.join(c.lower() for c in text if c.isalnum())\n"
-            "    return normalized == normalized[::-1]\n```"
+            "## Design\n## Implementation\n```python\n"
+            "def group_anagrams(words):\n    return []\n"
+            "assert group_anagrams([]) == []\n```\n"
+            "## Verification\nCODE REVIEW: PASS\n"
+            + details("code")
         ),
-        "json": '{"engine":"WKVM","slots":4,"status":"ready"}',
+        "json": json.dumps(
+            {
+                "status": "ready",
+                "service": "checkout-api",
+                "rto_minutes": 30,
+                "rpo_minutes": 5,
+                "stages": [
+                    {"id": f"stage-{index + 1:02d}"}
+                    for index in range(8)
+                ],
+                "final_check": "DR PLAN COMPLETE",
+                "details": [f"json_detail_{index}" for index in range(540)],
+            },
+            indent=2,
+        ),
         "systems": (
-            "A bounded queue applies backpressure before overload can exhaust "
-            "the server's resources."
+            "A bounded queue applies backpressure before overload. "
+            "bounded queue fairness p95 TTFT tokens/second "
+            "SYSTEM VERDICT: STABLE UNDER OVERLOAD "
+            + details("systems")
         ),
     }
+    follow_up_response = (
+        "1. Original goal 8. Final takeaway REVISION COMPLETE "
+        + details("follow_up")
+    )
     sessions = []
     for index, prompt in enumerate(scenario["concurrent_prompts"]):
         sessions.append(
@@ -103,7 +130,7 @@ def _capture_for(scenario):
                         "ttft_s": 0.25 + index * 0.1,
                         "e2e_s": 0.75 + index * 0.1,
                     },
-                    "response_text": "The previous response states its core result.",
+                    "response_text": follow_up_response,
                     "error": None,
                 },
             }
@@ -374,6 +401,25 @@ class TestOpenWebUIDemoScenario(unittest.TestCase):
             0.08,
         )
 
+    def test_every_act_2_turn_requires_500_output_tokens(self):
+        validators = [
+            prompt["validator"]
+            for prompt in self.scenario["concurrent_prompts"]
+        ]
+        validators.append(self.scenario["follow_up"]["validator"])
+
+        self.assertEqual(ACT_2_MIN_OUTPUT_TOKENS, 500)
+        self.assertTrue(
+            all(
+                validator["min_output_tokens"] == ACT_2_MIN_OUTPUT_TOKENS
+                for validator in validators
+            )
+        )
+        self.assertEqual(
+            self.scenario["capture_plan"]["act_2_min_output_tokens"],
+            ACT_2_MIN_OUTPUT_TOKENS,
+        )
+
     def test_pathological_repeated_source_is_rejected(self):
         repeated_source = "archive " * 20_000
         with self.assertRaisesRegex(ValueError, "pathologically dominant word"):
@@ -416,6 +462,14 @@ class TestOpenWebUIDemoScenario(unittest.TestCase):
         self.assertEqual(report["summary"]["all_request_count"], 9)
         self.assertEqual(report["summary"]["all_success_count"], 9)
         self.assertEqual(report["summary"]["all_error_count"], 0)
+        self.assertGreaterEqual(
+            report["acts"]["concurrency_first_turn"]["output_tokens_min"],
+            ACT_2_MIN_OUTPUT_TOKENS,
+        )
+        self.assertGreaterEqual(
+            report["acts"]["concurrency_follow_up"]["output_tokens_min"],
+            ACT_2_MIN_OUTPUT_TOKENS,
+        )
         self.assertAlmostEqual(report["summary"]["ttft_p50_s"], 2.5)
         self.assertAlmostEqual(report["summary"]["ttft_p95_s"], 3.85)
         self.assertAlmostEqual(report["summary"]["e2e_p50_s"], 5.5)
@@ -432,6 +486,42 @@ class TestOpenWebUIDemoScenario(unittest.TestCase):
             report["provenance"]["capture"]["browser"]["version"], "test"
         )
         self.assertAlmostEqual(percentile([1, 2, 3, 4], 0.95), 3.85)
+        long_record = next(
+            record for record in report["records"] if record["phase"] == "long_prompt"
+        )
+        self.assertLess(long_record["output_tokens"], ACT_2_MIN_OUTPUT_TOKENS)
+        self.assertTrue(long_record["success"])
+
+    def test_short_first_turn_fails_output_token_validation(self):
+        capture = _capture_for(self.scenario)
+        reasoning_session = next(
+            session
+            for session in capture["acts"]["concurrency"]["sessions"]
+            if session["prompt_id"] == "reasoning"
+        )
+        reasoning_session["first_turn"]["response_text"] = (
+            "1. Setup 6. Hundred-door intuition "
+            "FINAL: SWITCH; WIN PROBABILITY = 2/3"
+        )
+
+        report = build_report(capture, self.scenario, self.tokenizer)
+
+        failed = [record for record in report["records"] if not record["success"]]
+        self.assertEqual([record["prompt_id"] for record in failed], ["reasoning"])
+        self.assertIn("fewer than 500 output tokens", "\n".join(report["errors"]))
+
+    def test_short_follow_up_fails_output_token_validation(self):
+        capture = _capture_for(self.scenario)
+        capture["acts"]["concurrency"]["sessions"][0]["follow_up"][
+            "response_text"
+        ] = "1. Original goal 8. Final takeaway REVISION COMPLETE"
+
+        report = build_report(capture, self.scenario, self.tokenizer)
+
+        failed = [record for record in report["records"] if not record["success"]]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["phase"], "follow_up")
+        self.assertIn("fewer than 500 output tokens", "\n".join(report["errors"]))
 
     def test_invalid_classic_json_fails_validation_and_is_reported(self):
         capture = _capture_for(self.scenario)
@@ -489,6 +579,10 @@ class TestOpenWebUIDemoScenario(unittest.TestCase):
         self.assertIn("## Long-Context Source", markdown)
         self.assertIn("`test/natural-long-text`", markdown)
         self.assertIn("not repeated filler", markdown)
+        self.assertIn(
+            "**Act 2 output length:** first-turn minimum",
+            markdown,
+        )
 
     def test_report_preserves_optional_runtime_telemetry(self):
         report = build_report(

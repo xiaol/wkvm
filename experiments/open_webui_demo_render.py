@@ -126,6 +126,9 @@ class Metrics:
     exact_reuse_hits: int
     provider_error_count: int
     provider_summary: str | None
+    first_turn_min_output_tokens: int | None
+    follow_up_min_output_tokens: int | None
+    act_2_total_output_tokens: int | None
 
 
 @dataclass(frozen=True)
@@ -893,6 +896,20 @@ def load_evidence(capture_path: Path, report_path: Path) -> Evidence:
         f"max_running {max_running} · max_runnable_rows {max_runnable_rows} · "
         f"exact reuse hits {exact_reuse_hits}/{offered} · errors {provider_errors}"
     )
+    first_turn_min_output_tokens = metric_scope.get("output_tokens_min")
+    if type(first_turn_min_output_tokens) is not int:
+        first_turn_min_output_tokens = None
+    follow_up_min_output_tokens = follow_up_scope.get("output_tokens_min")
+    if type(follow_up_min_output_tokens) is not int:
+        follow_up_min_output_tokens = None
+    first_turn_output_tokens = metric_scope.get("output_tokens")
+    follow_up_output_tokens = follow_up_scope.get("output_tokens")
+    act_2_total_output_tokens = (
+        first_turn_output_tokens + follow_up_output_tokens
+        if type(first_turn_output_tokens) is int
+        and type(follow_up_output_tokens) is int
+        else None
+    )
     metrics = Metrics(
         offered_concurrency=offered,
         success_count=success,
@@ -909,6 +926,9 @@ def load_evidence(capture_path: Path, report_path: Path) -> Evidence:
         exact_reuse_hits=exact_reuse_hits,
         provider_error_count=provider_errors,
         provider_summary=provider_summary,
+        first_turn_min_output_tokens=first_turn_min_output_tokens,
+        follow_up_min_output_tokens=follow_up_min_output_tokens,
+        act_2_total_output_tokens=act_2_total_output_tokens,
     )
 
     model = _model_identity(capture, report)
@@ -987,6 +1007,18 @@ def build_visual_specs(
         f"exact reuse hits · report errors {metrics.error_count} · "
         f"provider errors {metrics.provider_error_count}"
     )
+    length_row = None
+    if (
+        metrics.first_turn_min_output_tokens is not None
+        and metrics.follow_up_min_output_tokens is not None
+    ):
+        length_row = (
+            "Act 2 output · minimum "
+            f"{min(metrics.first_turn_min_output_tokens, metrics.follow_up_min_output_tokens):,} "
+            "tokens/turn"
+        )
+        if metrics.act_2_total_output_tokens is not None:
+            length_row += f" · {metrics.act_2_total_output_tokens:,} tokens total"
     long_scale = (
         f"{evidence.long_act.rendered_token_count:,} rendered tokens · "
         if evidence.long_act.rendered_token_count is not None
@@ -1018,7 +1050,9 @@ def build_visual_specs(
             eyebrow="WKVM × OPEN WEBUI · RECORDED BROWSER EVIDENCE",
             title="One long chat. Four concurrent chats.",
             subtitle=f"{evidence.model} · {evidence.gpu}",
-            rows=(
+            rows=tuple(
+                row
+                for row in (
                 f"LONG CHAT · {evidence.long_act.prompt.summary}",
                 f"{long_scale}TTFT {_fmt_seconds(evidence.long_act.ttft_s)} · "
                 f"E2E {_fmt_seconds(evidence.long_act.e2e_s)}",
@@ -1030,7 +1064,10 @@ def build_visual_specs(
                 f"E2E p50/p95 {_fmt_seconds(metrics.e2e_p50_s)} / "
                 f"{_fmt_seconds(metrics.e2e_p95_s)} · {vram}",
                 provider_row,
+                length_row,
                 reuse_row,
+                )
+                if row is not None
             ),
             footer=f"{evidence_hash} · {evidence.provenance}",
             caveat=caveat,
@@ -1060,17 +1097,22 @@ def build_visual_specs(
             role="montage_overlay",
             eyebrow="ACT 2 · FOUR CHATS ALIGNED AT FIRST-TURN SUBMIT t=0",
             title="Open WebUI → WKVM · first turns + follow-ups",
-            rows=(
+            rows=tuple(
+                row
+                for row in (
                 f"offered concurrency {metrics.offered_concurrency} · first turns "
                 f"{metrics.success_count}/{metrics.offered_concurrency} · follow-ups "
                 f"{metrics.follow_up_success_count}/{metrics.offered_concurrency}",
                 f"TTFT p50/p95 {_fmt_seconds(metrics.ttft_p50_s)} / "
                 f"{_fmt_seconds(metrics.ttft_p95_s)} · E2E p50/p95 "
                 f"{_fmt_seconds(metrics.e2e_p50_s)} / {_fmt_seconds(metrics.e2e_p95_s)}",
+                length_row,
                 provider_row,
                 f"{metrics.exact_reuse_hits}/{metrics.offered_concurrency} exact reuse "
                 f"hits · errors {metrics.error_count} report / "
                 f"{metrics.provider_error_count} provider · {vram} · {montage_speed_note}",
+                )
+                if row is not None
             ),
             caveat=f"semantics: {SEMANTICS} · {TEN_X_CAVEAT}",
             pane_labels=pane_labels,
@@ -1088,6 +1130,14 @@ def build_visual_specs(
                 "complete in four recorded chats.",
                 f"✓ Provider observed max_running {metrics.max_running} and "
                 f"max_runnable_rows {metrics.max_runnable_rows}.",
+                (
+                    "✓ Every Act 2 response contains at least "
+                    f"{min(metrics.first_turn_min_output_tokens, metrics.follow_up_min_output_tokens):,} "
+                    "measured output tokens."
+                    if metrics.first_turn_min_output_tokens is not None
+                    and metrics.follow_up_min_output_tokens is not None
+                    else "✓ Act 2 output-length evidence is recorded in the report."
+                ),
                 f"✓ {metrics.exact_reuse_hits}/{metrics.offered_concurrency} exact reuse "
                 f"hits · errors {metrics.error_count} report / "
                 f"{metrics.provider_error_count} provider.",

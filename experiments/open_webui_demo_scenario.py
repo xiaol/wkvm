@@ -26,6 +26,7 @@ SCENARIO_KIND = "wkvm.open_webui.demo_scenario"
 REPORT_KIND = "wkvm.open_webui.demo_report"
 SCHEMA_VERSION = 1
 OFFERED_CONCURRENCY = 4
+ACT_2_MIN_OUTPUT_TOKENS = 500
 NEEDLE_TARGET_RENDERED_TOKEN = 256
 HF_LONG_SOURCE_DATASET_ID = "common-pile/project_gutenberg"
 HF_LONG_SOURCE_REVISION = "01dc90a5002f8977c7fb03a372c14bca29c65cf1"
@@ -602,53 +603,126 @@ def build_classic_prompts(tokenizer: Any) -> list[dict[str, Any]]:
     specifications = (
         (
             "reasoning",
-            "Reasoning",
-            "A bat and a ball cost $1.10 in total. The bat costs $1.00 more "
-            "than the ball. How much does the ball cost? Put the numeric answer "
-            "first in the form `FINAL: USD X.XX`, then verify it in at most two "
-            "sentences.",
+            "Monty Hall Reasoning",
+            "Classic reasoning task: explain the Monty Hall problem to a "
+            "skeptical engineer. A contestant chooses one of three closed doors "
+            "hiding one car and two goats. The host knows every location, always "
+            "opens an unchosen goat door, and always offers the contestant a "
+            "switch. Write exactly eight numbered sections with these literal "
+            "headings: `1. Setup`, `2. Initial probabilities`, `3. Host rule`, "
+            "`4. Staying`, `5. Switching`, `6. Hundred-door intuition`, "
+            "`7. Common mistake`, and `8. Verdict`. Each section must contain "
+            "60 to 70 substantive words. Use equations where helpful, do not "
+            "use a table, and do not repeat an explanation. End with this exact "
+            "standalone line: `FINAL: SWITCH; WIN PROBABILITY = 2/3`.",
             {
                 "kind": "contains_all",
                 "case_sensitive": False,
-                "expected_substrings": ["FINAL: USD 0.05"],
+                "expected_substrings": [
+                    "1. Setup",
+                    "6. Hundred-door intuition",
+                    "FINAL: SWITCH; WIN PROBABILITY = 2/3",
+                ],
+                "min_output_tokens": ACT_2_MIN_OUTPUT_TOKENS,
             },
         ),
         (
             "code",
-            "Code",
-            "Write a compact Python function `is_palindrome(text)` that ignores "
-            "case and non-alphanumeric characters. Return only a Python code "
-            "block containing the function.",
+            "Python Grouping",
+            "Classic coding task: write and explain a production-ready Python "
+            "3.11 implementation of `group_anagrams(words: Iterable[str]) -> "
+            "list[list[str]]`. Groups must appear in the order their first "
+            "member appears; words inside each group must retain input order; "
+            "matching is case-sensitive; Unicode characters and empty strings "
+            "are valid; do not mutate the input. Return exactly three sections. "
+            "Under `## Design`, write 70 to 90 words explaining the "
+            "representation and ordering guarantees. Under `## Implementation`, "
+            "provide one directly runnable Python code block defining "
+            "`group_anagrams` with imports, type hints, and a useful docstring. "
+            "Under `## Verification`, write 110 to 140 words explaining "
+            "correctness, edge cases, and complexity, then provide a second "
+            "Python code block containing at least eight compact assert "
+            "statements without custom failure messages, "
+            "covering empty input, empty strings, duplicates, case differences, "
+            "Unicode, singleton groups, stable ordering, and generator input. "
+            "Use normal Python `==` comparisons in every assertion and never "
+            "call a nonstandard `.equals` method. "
+            "State the time complexity accurately. Keep the complete response "
+            "near 550 to 750 output tokens. End with the exact standalone line "
+            "`CODE REVIEW: PASS`.",
             {
                 "kind": "contains_all",
                 "case_sensitive": True,
-                "expected_substrings": ["def is_palindrome", "return"],
+                "expected_substrings": [
+                    "## Design",
+                    "def group_anagrams",
+                    "## Verification",
+                    "assert",
+                    "CODE REVIEW: PASS",
+                ],
+                "min_output_tokens": ACT_2_MIN_OUTPUT_TOKENS,
             },
         ),
         (
             "json",
-            "JSON",
-            "Return only this JSON object, with no Markdown fence or commentary: "
-            '{"engine":"WKVM","slots":4,"status":"ready"}',
+            "DR JSON Runbook",
+            "Classic structured-output task: create a disaster-recovery runbook "
+            "for a service named `checkout-api`. Return only pretty-printed valid "
+            "JSON with two-space indentation and no Markdown fence or commentary. "
+            "The root keys, in order, must be `status`, `service`, `rto_minutes`, "
+            "`rpo_minutes`, `stages`, and `final_check`. Set `status` to `ready`, "
+            "`service` to `checkout-api`, `rto_minutes` to 30, `rpo_minutes` to "
+            "5, and `final_check` to `DR PLAN COMPLETE`. `stages` must contain "
+            "exactly eight objects in this order: `stage-01 Detect`, `stage-02 "
+            "Triage`, `stage-03 Contain`, `stage-04 Fail Over`, `stage-05 Verify "
+            "Data`, `stage-06 Restore Traffic`, `stage-07 Observe`, and `stage-08 "
+            "Close`. Every stage object must contain exactly these keys in order: "
+            "`id`, `name`, `owner`, `action`, `success_signal`, and `rollback`. "
+            "For every stage, make `action` 12 to 16 words, `success_signal` 6 to "
+            "10 words, and `rollback` 6 to 10 words. Make every instruction "
+            "operational and distinct.",
             {
-                "kind": "json_equals",
-                "expected_json": {
-                    "engine": "WKVM",
-                    "slots": 4,
+                "kind": "json_object_contains",
+                "expected_items": {
                     "status": "ready",
+                    "service": "checkout-api",
+                    "rto_minutes": 30,
+                    "rpo_minutes": 5,
+                    "final_check": "DR PLAN COMPLETE",
                 },
+                "required_keys": ["stages"],
+                "expected_list_lengths": {"stages": 8},
+                "min_output_tokens": ACT_2_MIN_OUTPUT_TOKENS,
             },
         ),
         (
             "systems",
-            "Systems",
-            "In one sentence, explain why a bounded request queue helps an "
-            "inference server remain stable. Include the exact terms "
-            "`backpressure` and `overload`.",
+            "GPU Admission Control",
+            "Classic systems task: design bounded admission control for a GPU "
+            "inference server with exactly four active generation slots and a "
+            "bursty stream of requests. Write exactly eight numbered sections "
+            "with these literal headings: `1. Operating goal`, `2. Admission "
+            "path`, `3. Queue bound`, `4. Backpressure`, `5. Fairness`, "
+            "`6. Timeouts and cancellation`, `7. Metrics`, and `8. Failure "
+            "drill`. Each section must contain 75 to 85 substantive words. "
+            "Explain overload behavior, queue rejection, starvation prevention, "
+            "cleanup, and operator-visible signals. Include the exact terms "
+            "`bounded queue`, `backpressure`, `overload`, `fairness`, `p95 TTFT`, "
+            "and `tokens/second`. Do not use filler or repeat a paragraph. End "
+            "with the exact standalone line `SYSTEM VERDICT: STABLE UNDER "
+            "OVERLOAD`.",
             {
                 "kind": "contains_all",
                 "case_sensitive": False,
-                "expected_substrings": ["backpressure", "overload"],
+                "expected_substrings": [
+                    "backpressure",
+                    "overload",
+                    "bounded queue",
+                    "p95 TTFT",
+                    "tokens/second",
+                    "SYSTEM VERDICT: STABLE UNDER OVERLOAD",
+                ],
+                "min_output_tokens": ACT_2_MIN_OUTPUT_TOKENS,
             },
         ),
     )
@@ -673,15 +747,32 @@ def build_scenario(
     tokenizer_identity: str | None = None,
 ) -> dict[str, Any]:
     follow_up_content = (
-        "Summarize your previous answer in one short sentence without adding "
-        "new claims."
+        "Create a second-pass review of your previous answer without changing "
+        "its subject or contradicting any correct conclusion. Write exactly "
+        "eight numbered sections with these literal headings: `1. Original "
+        "goal`, `2. Strongest part`, `3. Hidden assumption`, `4. Deeper "
+        "explanation`, `5. Concrete example`, `6. Edge case`, `7. Practical "
+        "improvement`, and `8. Final takeaway`. Each section must contain 85 to "
+        "95 substantive words. Use prose, with short inline code or JSON "
+        "fragments when useful; do not use a table or repeat sentences. Preserve "
+        "the previous answer's all-capital final marker verbatim somewhere in "
+        "section 8. End with the exact standalone line `REVISION COMPLETE`."
     )
     follow_up = {
         "prompt_id": "common-follow-up",
         "label": "Common Follow-up",
         "content": follow_up_content,
         "content_sha256": text_sha256(follow_up_content),
-        "validator": {"kind": "non_empty", "min_characters": 1},
+        "validator": {
+            "kind": "contains_all",
+            "case_sensitive": False,
+            "expected_substrings": [
+                "1. Original goal",
+                "8. Final takeaway",
+                "REVISION COMPLETE",
+            ],
+            "min_output_tokens": ACT_2_MIN_OUTPUT_TOKENS,
+        },
     }
     scenario: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -702,6 +793,7 @@ def build_scenario(
         "capture_plan": {
             "offered_concurrency": OFFERED_CONCURRENCY,
             "classic_prompt_count": OFFERED_CONCURRENCY,
+            "act_2_min_output_tokens": ACT_2_MIN_OUTPUT_TOKENS,
             "acts": ["long_prompt", "concurrency", "follow_up"],
         },
         "claim_scope": {
@@ -858,6 +950,8 @@ def capture_records(capture: Mapping[str, Any]) -> list[dict[str, Any]]:
 def validate_response(
     response_text: str,
     validator: Mapping[str, Any],
+    *,
+    output_tokens: int | None = None,
 ) -> dict[str, Any]:
     kind = validator.get("kind")
     problems: list[str] = []
@@ -882,6 +976,55 @@ def validate_response(
         else:
             if parsed != validator.get("expected_json"):
                 problems.append("JSON value does not match expected_json")
+    elif kind == "json_object_contains":
+        try:
+            parsed = json.loads(response_text.strip())
+        except (json.JSONDecodeError, TypeError) as exc:
+            problems.append(f"response is not strict JSON: {exc}")
+        else:
+            if not isinstance(parsed, dict):
+                problems.append("JSON value is not an object")
+            else:
+                expected_items = validator.get("expected_items")
+                if not isinstance(expected_items, Mapping):
+                    problems.append("validator has invalid expected_items")
+                else:
+                    for key, expected_value in expected_items.items():
+                        if parsed.get(key) != expected_value:
+                            problems.append(
+                                f"JSON field {key!r} does not match expected value"
+                            )
+                required_keys = validator.get("required_keys", [])
+                if not isinstance(required_keys, list) or not all(
+                    isinstance(key, str) and key for key in required_keys
+                ):
+                    problems.append("validator has invalid required_keys")
+                else:
+                    for key in required_keys:
+                        if key not in parsed:
+                            problems.append(f"JSON object is missing key: {key}")
+                expected_list_lengths = validator.get(
+                    "expected_list_lengths",
+                    {},
+                )
+                if not isinstance(expected_list_lengths, Mapping) or not all(
+                    isinstance(key, str)
+                    and key
+                    and type(length) is int
+                    and length >= 0
+                    for key, length in expected_list_lengths.items()
+                ):
+                    problems.append("validator has invalid expected_list_lengths")
+                else:
+                    for key, expected_length in expected_list_lengths.items():
+                        value = parsed.get(key)
+                        if not isinstance(value, list):
+                            problems.append(f"JSON field {key!r} is not an array")
+                        elif len(value) != expected_length:
+                            problems.append(
+                                f"JSON field {key!r} does not contain "
+                                f"{expected_length} items"
+                            )
     elif kind == "non_empty":
         minimum = validator.get("min_characters", 1)
         if type(minimum) is not int or minimum < 1:
@@ -890,6 +1033,20 @@ def validate_response(
             problems.append(f"response has fewer than {minimum} characters")
     else:
         problems.append(f"unsupported validator kind: {kind!r}")
+    minimum_output_tokens = validator.get("min_output_tokens")
+    if minimum_output_tokens is not None:
+        if (
+            type(minimum_output_tokens) is not int
+            or minimum_output_tokens < 1
+        ):
+            problems.append("validator has invalid min_output_tokens")
+        elif output_tokens is None:
+            problems.append("output token count is unavailable")
+        elif output_tokens < minimum_output_tokens:
+            problems.append(
+                "response has fewer than "
+                f"{minimum_output_tokens} output tokens: {output_tokens}"
+            )
     return {"passed": not problems, "problems": problems}
 
 
@@ -922,13 +1079,19 @@ def _prompt_validators(scenario: Mapping[str, Any]) -> dict[str, Mapping[str, An
 def _metrics(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     ttft = [record["ttft_s"] for record in records if record.get("ttft_s") is not None]
     e2e = [record["e2e_s"] for record in records if record.get("e2e_s") is not None]
+    output_token_counts = [
+        int(record.get("output_tokens", 0))
+        for record in records
+    ]
     return {
         "request_count": len(records),
         "timed_ttft_count": len(ttft),
         "timed_e2e_count": len(e2e),
         "success_count": sum(record.get("success") is True for record in records),
         "error_count": sum(record.get("success") is not True for record in records),
-        "output_tokens": sum(int(record.get("output_tokens", 0)) for record in records),
+        "output_tokens": sum(output_token_counts),
+        "output_tokens_min": min(output_token_counts) if output_token_counts else None,
+        "output_tokens_max": max(output_token_counts) if output_token_counts else None,
         "ttft_p50_s": percentile(ttft, 0.50),
         "ttft_p95_s": percentile(ttft, 0.95),
         "e2e_p50_s": percentile(e2e, 0.50),
@@ -1271,8 +1434,13 @@ def build_report(
     for index, record in enumerate(records):
         prompt_id = record["prompt_id"]
         validator = validators.get(prompt_id)
+        output_tokens = len(encode_text(tokenizer, record["response_text"]))
         validation = (
-            validate_response(record["response_text"], validator)
+            validate_response(
+                record["response_text"],
+                validator,
+                output_tokens=output_tokens,
+            )
             if validator is not None
             else {"passed": False, "problems": ["no scenario validator for prompt"]}
         )
@@ -1287,7 +1455,6 @@ def build_report(
             record_errors.append("missing valid E2E latency")
         if not validation["passed"]:
             record_errors.extend(validation["problems"])
-        output_tokens = len(encode_text(tokenizer, record["response_text"]))
         enriched_record = {
             **record,
             "response_sha256": text_sha256(record["response_text"]),
@@ -1505,6 +1672,12 @@ def report_markdown(report: Mapping[str, Any]) -> str:
             f"and p95 {_format_seconds(summary['ttft_p95_s'])}; E2E is p50 "
             f"{_format_seconds(summary['e2e_p50_s'])} and p95 "
             f"{_format_seconds(summary['e2e_p95_s'])}.",
+            "",
+            "**Act 2 output length:** first-turn minimum "
+            f"{_format_count(acts['concurrency_first_turn'].get('output_tokens_min'))} "
+            "tokens; follow-up minimum "
+            f"{_format_count(acts['concurrency_follow_up'].get('output_tokens_min'))} "
+            f"tokens; required minimum {ACT_2_MIN_OUTPUT_TOKENS} tokens per turn.",
             "",
             "## Runtime Evidence",
             "",
