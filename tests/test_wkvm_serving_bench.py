@@ -82,7 +82,8 @@ class TestWkvmServingBench(unittest.TestCase):
         def fake_check_output(command, **kwargs):
             calls.append((command, kwargs))
             return (
-                "0, GPU-test, NVIDIA Test GPU, 595.71.05, 24564, 12345\n"
+                "0, GPU-test, NVIDIA Test GPU, 595.71.05, 24564, 12345, "
+                "P2, 71, 94, 62, 2520, 10501, 421.5, 450.0\n"
             )
 
         old_check_output = bench.subprocess.check_output
@@ -97,7 +98,15 @@ class TestWkvmServingBench(unittest.TestCase):
         self.assertEqual(gpu["driver_version"], "595.71.05")
         self.assertEqual(gpu["memory_total_mib"], 24564)
         self.assertEqual(gpu["memory_used_mib"], 12345)
+        self.assertEqual(gpu["pstate"], "P2")
+        self.assertEqual(gpu["temperature_gpu_c"], 71.0)
+        self.assertEqual(gpu["gpu_utilization_percent"], 94.0)
+        self.assertEqual(gpu["sm_clock_mhz"], 2520.0)
+        self.assertEqual(gpu["power_draw_w"], 421.5)
         self.assertIn("--id=GPU-test", calls[0][0])
+        self.assertTrue(
+            any("clocks.current.sm" in argument for argument in calls[0][0])
+        )
 
     def test_whole_gpu_monitor_records_baseline_peak_and_scope(self) -> None:
         samples = iter(
@@ -109,6 +118,14 @@ class TestWkvmServingBench(unittest.TestCase):
                     "driver_version": "1.2.3",
                     "memory_total_mib": 24000,
                     "memory_used_mib": 1000,
+                    "pstate": "P8",
+                    "temperature_gpu_c": 42.0,
+                    "gpu_utilization_percent": 0.0,
+                    "memory_utilization_percent": 0.0,
+                    "sm_clock_mhz": 210.0,
+                    "memory_clock_mhz": 405.0,
+                    "power_draw_w": 22.0,
+                    "power_limit_w": 450.0,
                 },
                 {
                     "index": 0,
@@ -117,6 +134,14 @@ class TestWkvmServingBench(unittest.TestCase):
                     "driver_version": "1.2.3",
                     "memory_total_mib": 24000,
                     "memory_used_mib": 1128,
+                    "pstate": "P2",
+                    "temperature_gpu_c": 68.0,
+                    "gpu_utilization_percent": 96.0,
+                    "memory_utilization_percent": 48.0,
+                    "sm_clock_mhz": 2520.0,
+                    "memory_clock_mhz": 10501.0,
+                    "power_draw_w": 410.0,
+                    "power_limit_w": 450.0,
                 },
             ]
         )
@@ -139,6 +164,19 @@ class TestWkvmServingBench(unittest.TestCase):
         self.assertEqual(result["gpu_name"], "Test GPU")
         self.assertEqual(result["driver_version"], "1.2.3")
         self.assertEqual(result["memory_total_mib"], 24000)
+        telemetry = result["gpu_runtime_telemetry"]
+        self.assertEqual(telemetry["sample_count"], 2)
+        self.assertEqual(telemetry["active_sample_count"], 1)
+        self.assertEqual(telemetry["pstates"], ["P2", "P8"])
+        self.assertEqual(telemetry["active_pstates"], ["P2"])
+        self.assertEqual(
+            telemetry["active_metrics"]["sm_clock_mhz"]["mean"],
+            2520.0,
+        )
+        self.assertEqual(
+            telemetry["metrics"]["temperature_gpu_c"]["max"],
+            68.0,
+        )
 
     def test_provenance_separates_server_version_from_client_packages(self) -> None:
         args = types.SimpleNamespace(

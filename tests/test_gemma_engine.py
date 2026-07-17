@@ -28,6 +28,9 @@ class TestGemmaEngineMetrics(unittest.TestCase):
         metrics.token_pool_full_attention_row_appends = 6
         metrics.token_pool_full_attention_row_invalidations = 7
         metrics.token_pool_full_attention_coverage_splits = 8
+        metrics.token_pool_full_attention_capacity_microbatch_groups = 2
+        metrics.token_pool_full_attention_capacity_microbatch_rows = 8
+        metrics.token_pool_full_attention_capacity_microbatch_max_rows = 4
         metrics.persistent_padded_decode_cuda_graph_skips = 1
         metrics.persistent_padded_decode_cuda_graph_skip_reasons[
             "capture_failed:RuntimeError"
@@ -38,6 +41,10 @@ class TestGemmaEngineMetrics(unittest.TestCase):
         metrics.cuda_peak_reserved_advances_by_phase["prefill_forward"] = 456
         data = metrics.as_dict()
         self.assertEqual(data["steps"], 2)
+        self.assertEqual(data["mixed_batch_model_calls"], 0)
+        self.assertEqual(data["mixed_batch_rows"], 0)
+        self.assertEqual(data["mixed_batch_opportunities"], 0)
+        self.assertEqual(data["mixed_batch_fallbacks"], 0)
         self.assertEqual(data["decode_timing_total_s"], 0.125)
         self.assertEqual(data["backpressure_reasons"], {"no_free_slots": 1})
         self.assertEqual(
@@ -61,6 +68,18 @@ class TestGemmaEngineMetrics(unittest.TestCase):
         self.assertEqual(data["token_pool_full_attention_row_appends"], 6)
         self.assertEqual(data["token_pool_full_attention_row_invalidations"], 7)
         self.assertEqual(data["token_pool_full_attention_coverage_splits"], 8)
+        self.assertEqual(
+            data["token_pool_full_attention_capacity_microbatch_groups"],
+            2,
+        )
+        self.assertEqual(
+            data["token_pool_full_attention_capacity_microbatch_rows"],
+            8,
+        )
+        self.assertEqual(
+            data["token_pool_full_attention_capacity_microbatch_max_rows"],
+            4,
+        )
         self.assertEqual(data["persistent_padded_decode_cuda_graph_skips"], 1)
         self.assertEqual(
             data["persistent_padded_decode_cuda_graph_skip_reasons"],
@@ -131,6 +150,121 @@ class TestGemmaSchedulerAssumptions(unittest.TestCase):
         }
         values.update(overrides)
         return SimpleNamespace(**values)
+
+    def test_native_bench_rejects_packet_mode_without_prefill_batching(self) -> None:
+        from experiments.native_gemma_bench import (
+            validate_routed_packet_benchmark_args,
+        )
+
+        with self.assertRaisesRegex(ValueError, "prefill-microbatch-rows"):
+            validate_routed_packet_benchmark_args(
+                SimpleNamespace(
+                    batched_routed_packets=True,
+                    prefill_microbatch_rows=1,
+                )
+            )
+
+        validate_routed_packet_benchmark_args(
+            SimpleNamespace(
+                batched_routed_packets=True,
+                prefill_microbatch_rows=2,
+            )
+        )
+        validate_routed_packet_benchmark_args(
+            SimpleNamespace(
+                batched_routed_packets=True,
+                prefill_microbatch_rows=0,
+            )
+        )
+
+    def test_native_bench_payload_records_routed_packet_evidence(self) -> None:
+        from experiments.native_gemma_bench import build_benchmark_payload
+
+        args = self.native_bench_payload_args(
+            batched_routed_packets=True,
+            prefill_microbatch_rows=2,
+        )
+        payload = build_benchmark_payload(
+            args,
+            path="/models/gemma",
+            rows=[
+                {
+                    "B": 2,
+                    "success_count": 2,
+                    "error_count": 0,
+                    "green": True,
+                    "routed_packets": {
+                        "packet_batches": 3,
+                        "capacity_fallback_batches": 1,
+                    },
+                }
+            ],
+            usable_gib=7.5,
+            token_pool_triton_env={},
+        )
+
+        self.assertEqual(
+            payload["routed_packet_evidence"],
+            {
+                "required": True,
+                "passed": True,
+                "packet_batches": 3,
+                "capacity_fallback_batches": 1,
+                "rows_with_packet_stats": 1,
+                "rows_with_packets": 1,
+                "row_count": 1,
+                "successful_rows": 1,
+                "all_rows_successful": True,
+            },
+        )
+        self.assertTrue(payload["summary"]["routed_packet_evidence_passed"])
+        self.assertEqual(payload["summary"]["routed_packet_batches"], 3)
+
+    def test_native_bench_routed_packet_evidence_rejects_zero_batches(self) -> None:
+        from experiments.native_gemma_bench import routed_packet_evidence_summary
+
+        evidence = routed_packet_evidence_summary(
+            [
+                {
+                    "B": 2,
+                    "success_count": 2,
+                    "error_count": 0,
+                    "error": None,
+                    "routed_packets": {
+                        "packet_batches": 0,
+                        "capacity_fallback_batches": 2,
+                    }
+                }
+            ],
+            required=True,
+        )
+
+        self.assertFalse(evidence["passed"])
+        self.assertEqual(evidence["packet_batches"], 0)
+        self.assertEqual(evidence["capacity_fallback_batches"], 2)
+
+    def test_native_bench_routed_packet_evidence_rejects_row_errors(self) -> None:
+        from experiments.native_gemma_bench import routed_packet_evidence_summary
+
+        evidence = routed_packet_evidence_summary(
+            [
+                {
+                    "B": 2,
+                    "success_count": 1,
+                    "error_count": 1,
+                    "error": "synthetic failure",
+                    "routed_packets": {
+                        "packet_batches": 3,
+                        "capacity_fallback_batches": 0,
+                    },
+                }
+            ],
+            required=True,
+        )
+
+        self.assertFalse(evidence["passed"])
+        self.assertEqual(evidence["packet_batches"], 3)
+        self.assertFalse(evidence["all_rows_successful"])
 
     def test_native_bench_hf_boundary_summary_uses_row_evidence(self) -> None:
         from experiments.native_gemma_bench import hf_boundary_summary
@@ -691,6 +825,7 @@ class TestGemmaSchedulerAssumptions(unittest.TestCase):
                 enable_token_pool_paged_split_triton=False,
                 token_pool_triton_strict=True,
                 token_pool_sliding_paged_metadata_only=True,
+                token_pool_route_boundary_batch=True,
             )
 
             report = apply_token_pool_triton_bench_env(args)
@@ -703,6 +838,7 @@ class TestGemmaSchedulerAssumptions(unittest.TestCase):
                 report["WKVM_TOKEN_POOL_SLIDING_PAGED_METADATA_ONLY"],
                 "1",
             )
+            self.assertEqual(report["WKVM_TOKEN_POOL_ROUTE_BOUNDARY_BATCH"], "1")
         finally:
             for name, value in old_env.items():
                 if value is None:
@@ -880,6 +1016,29 @@ class TestGemmaSchedulerAssumptions(unittest.TestCase):
         self.assertEqual(stats["native_gemma_projection_backend"], "qkv_gate_up_packed")
         self.assertEqual(engine.runner.native_gemma_projection_backend, "qkv_gate_up_packed")
 
+    def test_engine_exposes_opt_in_batched_routed_packets(self) -> None:
+        from wkvm.gemma_engine import GemmaNativeEngine
+        from wkvm.models.gemma import gemma4_e4b_routed_span_config
+
+        cfg = gemma4_e4b_routed_span_config(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention",),
+        )
+        engine = GemmaNativeEngine(
+            model=FakeModel(),
+            config=cfg,
+            num_slots=2,
+            batched_routed_packets=True,
+            routed_packet_workspace_bytes=4096,
+        )
+
+        stats = engine.stats()
+        self.assertTrue(stats["batched_routed_packets"])
+        self.assertEqual(stats["routed_packet_workspace_bytes"], 4096)
+        self.assertTrue(stats["routed_packets"]["enabled"])
+        self.assertEqual(stats["routed_packets"]["workspace_max_bytes"], 4096)
+
     def test_release_hf_decoder_layers_requires_owned_weight_backend(self) -> None:
         from wkvm.gemma_engine import GemmaNativeEngine
         from wkvm.models.gemma import gemma4_e4b_routed_span_config
@@ -1021,6 +1180,7 @@ class FakeBatchRunner:
         self.prefill_calls: list[list[int]] = []
         self.prefill_chunk_calls: list[tuple[list[int], int]] = []
         self.prefill_chunk_cache_ids: list[int] = []
+        self.prefill_chunk_compute_logits: list[bool] = []
         self.caches_built = 0
         self.decode_batch_calls: list[tuple[list[int], list[int]]] = []
         self.decode_batch_token_pool_contexts = []
@@ -1036,9 +1196,19 @@ class FakeBatchRunner:
         self.prefill_calls.append(list(token_ids))
         return FakeLogit(100 + len(self.prefill_calls)), FakeCache()
 
-    def prefill_chunk_step(self, cache, token_ids, slots, *, start_pos, break_mask=None):
+    def prefill_chunk_step(
+        self,
+        cache,
+        token_ids,
+        slots,
+        *,
+        start_pos,
+        break_mask=None,
+        compute_logits=True,
+    ):
         self.prefill_chunk_calls.append((list(token_ids), int(start_pos)))
         self.prefill_chunk_cache_ids.append(id(cache))
+        self.prefill_chunk_compute_logits.append(bool(compute_logits))
         return FakeLogits([100 + len(self.prefill_chunk_calls)])
 
     def decode_batch(self, caches, last_tokens, *, position_ids=None, token_pool_decode=None):
@@ -1056,12 +1226,21 @@ class FakeFailingPrefillRunner(FakeBatchRunner):
     def prefill(self, token_ids, slots, *, break_mask=None):
         raise RuntimeError("synthetic prefill failure")
 
-    def prefill_chunk_step(self, cache, token_ids, slots, *, start_pos, break_mask=None):
+    def prefill_chunk_step(self, *args, **kwargs):
         raise RuntimeError("synthetic prefill failure")
 
 
 class FakeFailingContinuationPrefillRunner(FakeBatchRunner):
-    def prefill_chunk_step(self, cache, token_ids, slots, *, start_pos, break_mask=None):
+    def prefill_chunk_step(
+        self,
+        cache,
+        token_ids,
+        slots,
+        *,
+        start_pos,
+        break_mask=None,
+        compute_logits=True,
+    ):
         if start_pos > 0:
             raise RuntimeError("synthetic continuation prefill failure")
         return super().prefill_chunk_step(
@@ -1070,6 +1249,7 @@ class FakeFailingContinuationPrefillRunner(FakeBatchRunner):
             slots,
             start_pos=start_pos,
             break_mask=break_mask,
+            compute_logits=compute_logits,
         )
 
 
@@ -1091,11 +1271,21 @@ class FakeAuthoritativePrefillRunner(FakeBatchRunner):
         self.last_cache = cache
         return cache
 
-    def prefill_chunk_step(self, cache, token_ids, slots, *, start_pos, break_mask=None):
+    def prefill_chunk_step(
+        self,
+        cache,
+        token_ids,
+        slots,
+        *,
+        start_pos,
+        break_mask=None,
+        compute_logits=True,
+    ):
         import torch
 
         self.prefill_chunk_calls.append((list(token_ids), int(start_pos)))
         self.prefill_chunk_cache_ids.append(id(cache))
+        self.prefill_chunk_compute_logits.append(bool(compute_logits))
         width = len(token_ids)
         start = int(start_pos) * 4
         keys = torch.arange(
@@ -1152,9 +1342,19 @@ class FakeSessionTokenPoolRunner(FakeAuthoritativePrefillRunner):
         self.last_keys = keys
         self.last_values = values
 
-    def prefill_chunk_step(self, cache, token_ids, slots, *, start_pos, break_mask=None):
+    def prefill_chunk_step(
+        self,
+        cache,
+        token_ids,
+        slots,
+        *,
+        start_pos,
+        break_mask=None,
+        compute_logits=True,
+    ):
         self.prefill_chunk_calls.append((list(token_ids), int(start_pos)))
         self.prefill_chunk_cache_ids.append(id(cache))
+        self.prefill_chunk_compute_logits.append(bool(compute_logits))
         self._prefill_cache(cache, token_ids, start_pos)
         return FakeLogits([100 + len(self.prefill_chunk_calls)])
 
@@ -1166,11 +1366,13 @@ class FakeSessionTokenPoolRunner(FakeAuthoritativePrefillRunner):
         *,
         start_positions,
         break_masks=None,
+        compute_logits=True,
     ):
         logits = []
         for cache, token_ids, start_pos in zip(caches, token_rows, start_positions):
             self.prefill_chunk_calls.append((list(token_ids), int(start_pos)))
             self.prefill_chunk_cache_ids.append(id(cache))
+            self.prefill_chunk_compute_logits.append(bool(compute_logits))
             self._prefill_cache(cache, token_ids, start_pos)
             logits.append(100 + len(self.prefill_chunk_calls))
         return FakeLogits(logits)
@@ -1365,6 +1567,7 @@ class FakePersistentPaddedCache:
         self.remaining = reserve_steps
         self.remaining_capacity_calls = 0
         self.commit_count = 0
+        self.route_boundary = False
 
     def padded_decode_remaining_capacity(self) -> int:
         self.remaining_capacity_calls += 1
@@ -1379,6 +1582,9 @@ class FakePersistentPaddedCache:
         self.commit_count += 1
         for cache in caches:
             cache.restored_from_persistent_padded = True
+
+    def padded_decode_route_boundary_reached(self) -> bool:
+        return bool(self.route_boundary)
 
 
 class FakePersistentPaddedBatchRunner(FakeBatchRunner):
@@ -1899,7 +2105,7 @@ class TestGemmaRoutedSpanRunner(unittest.TestCase):
         self.assertEqual(second_info["persistent_padded_decode_cuda_graph_captured"], 0)
         self.assertEqual(second_info["persistent_padded_decode_cuda_graph_cache_hit"], 1)
 
-    def test_dense_padded_decode_skips_cuda_graphs(self) -> None:
+    def test_dense_padded_decode_uses_cuda_graphs_without_token_pool_metadata(self) -> None:
         import torch
         from unittest.mock import patch
 
@@ -1938,7 +2144,7 @@ class TestGemmaRoutedSpanRunner(unittest.TestCase):
 
         class FakeGraph:
             def __init__(self, model, cache, batch_size, **kwargs) -> None:
-                created.append(self)
+                created.append((self, kwargs.get("token_pool_decode")))
 
         with patch("wkvm.runner.gemma_runner._GraphedPaddedDecodeStep", FakeGraph):
             runner.decode_batch_padded_persistent(
@@ -1954,11 +2160,11 @@ class TestGemmaRoutedSpanRunner(unittest.TestCase):
                 reserve_steps=4,
             )
 
-        self.assertEqual(len(created), 0)
+        self.assertEqual(len(created), 2)
         self.assertEqual(len(eager_calls), 2)
-        self.assertEqual(
-            runner.last_decode_batch_info["persistent_padded_decode_cuda_graph_skip"],
-            "unavailable",
+        self.assertTrue(all(context is None for _graph, context in created))
+        self.assertTrue(
+            all(hasattr(cache, "_padded_decode_graph") for cache in eager_calls)
         )
         self.assertFalse(runner._token_pool_decode_graph_cache)
 
@@ -2145,6 +2351,7 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         *,
         num_slots: int,
         prefill_microbatch_rows: int,
+        continuation_prefill_microbatch_rows: int | None = None,
         prefill_chunk: int = 2048,
     ):
         import torch
@@ -2189,6 +2396,9 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
                 max_tokens_per_request_per_step=prefill_chunk,
             ),
             prefill_microbatch_rows=prefill_microbatch_rows,
+            continuation_prefill_microbatch_rows=(
+                continuation_prefill_microbatch_rows
+            ),
             prefill_chunk=prefill_chunk,
             persistent_exact_decode=False,
             persistent_padded_decode=False,
@@ -2549,6 +2759,10 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
                 ([8, 9], 8),
             ],
         )
+        self.assertEqual(
+            runner.prefill_chunk_compute_logits,
+            [False, False, True],
+        )
         self.assertEqual(runner.caches_built, 1)
         self.assertEqual(len(set(runner.prefill_chunk_cache_ids)), 1)
         self.assertEqual(engine.metrics.prefill_calls, 3)
@@ -2796,6 +3010,41 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         self.assertTrue(all(req.status is RequestStatus.PARKED for req in reqs))
         engine.close_sessions([req.req_id for req in reqs])
         self.assertEqual(engine.stats()["token_pool"]["active_request_slots"], 0)
+
+    def test_continuation_prefill_can_use_larger_row_cap(self) -> None:
+        engine, _runner = self._make_sliding_session_token_pool_engine(
+            num_slots=4,
+            prefill_microbatch_rows=2,
+            continuation_prefill_microbatch_rows=4,
+        )
+        reqs = [
+            Request(
+                prompt_token_ids=[1, 2, 3, 4, 5],
+                max_new_tokens=3,
+                req_id=f"continuation-batch-{row}",
+            )
+            for row in range(4)
+        ]
+        for req in reqs:
+            engine.add_session_request(req)
+        for _ in range(3):
+            engine.step()
+        self.assertTrue(all(req.status is RequestStatus.PARKED for req in reqs))
+        initial_prefill_model_calls = engine.metrics.prefill_model_calls
+        self.assertEqual(initial_prefill_model_calls, 2)
+
+        engine.continue_session_requests(
+            {req.req_id: [7, 8] for req in reqs},
+            max_new_tokens=2,
+        )
+        engine.step()
+
+        self.assertEqual(
+            engine.metrics.prefill_model_calls - initial_prefill_model_calls,
+            1,
+        )
+        self.assertEqual(engine.metrics.max_prefill_batch_rows, 4)
+        self.assertEqual(engine.stats()["continuation_prefill_microbatch_rows"], 4)
 
     def test_decode_batch_uses_one_runner_call_for_compatible_rows(self) -> None:
         from wkvm.gemma_engine import GemmaNativeEngine
@@ -3683,6 +3932,105 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         self.assertEqual(set(sampled), {"a", "b"})
         self.assertEqual(engine.metrics.decode_microbatch_splits, 1)
         self.assertEqual(engine.metrics.token_pool_full_attention_coverage_splits, 1)
+
+    def test_capacity_microbatch_keeps_full_attention_rows_batched(self) -> None:
+        from unittest.mock import patch
+
+        from wkvm.gemma_engine import GemmaNativeEngine
+        from wkvm.models.gemma import gemma4_e4b_routed_span_config
+
+        cfg = gemma4_e4b_routed_span_config(
+            num_hidden_layers=2,
+            num_kv_shared_layers=0,
+            layer_types=("sliding_attention", "full_attention"),
+        )
+        engine = GemmaNativeEngine(
+            model=FakeModel(),
+            config=cfg,
+            num_slots=4,
+            scheduler_config=SchedulerConfig(
+                max_tokens_per_step=16,
+                max_running_requests=4,
+                max_tokens_per_request_per_step=8,
+            ),
+        )
+        runner = FakePersistentPaddedBatchRunner()
+        engine.runner = runner  # type: ignore[assignment]
+        engine._token_kv_pool = object()  # type: ignore[assignment]
+        reqs = [
+            Request(prompt_token_ids=[index, index + 1], max_new_tokens=3, req_id=f"r{index}")
+            for index in range(0, 8, 2)
+        ]
+        for req in reqs:
+            req.output_token_ids.append(9)
+            req.num_computed_tokens = req.num_tokens - 1
+            engine._caches[req.req_id] = FakeCache()
+
+        discarded = []
+        flushed = []
+
+        def prepare(rows, **kwargs):
+            return tuple(req.req_id for req in rows)
+
+        def context(prepared):
+            covered = {"sliding_attention"}
+            if len(prepared) <= 2:
+                covered.add("full_attention")
+            return SimpleNamespace(
+                covered_decode_layer_types=lambda: frozenset(covered)
+            )
+
+        engine._token_pool_prepare_decode_model_batch = prepare  # type: ignore[method-assign]
+        engine._token_pool_decode_context = context  # type: ignore[method-assign]
+        engine._token_pool_discard_decode_reservations = (  # type: ignore[method-assign]
+            lambda prepared: discarded.append(prepared)
+        )
+        engine._token_pool_commit_decode_reservations = (  # type: ignore[method-assign]
+            lambda prepared: None
+        )
+        engine._token_pool_full_attention_owner_layer_ids = (  # type: ignore[method-assign]
+            lambda: (1,)
+        )
+
+        def flush(key):
+            flushed.append(tuple(key))
+            engine._persistent_padded_decode_groups.pop(tuple(key), None)
+
+        engine._flush_padded_decode_group = flush  # type: ignore[method-assign]
+
+        with patch.dict(
+            os.environ,
+            {"WKVM_TOKEN_POOL_FULL_ATTENTION_CAPACITY_MICROBATCH": "1"},
+        ):
+            sampled = engine._execute_decode_model_batch(reqs)
+
+        self.assertEqual(set(sampled), {req.req_id for req in reqs})
+        self.assertEqual(len(discarded), 1)
+        self.assertEqual(
+            [len(start[0]) for start in runner.persistent_padded_starts],
+            [2, 2],
+        )
+        self.assertEqual(engine.metrics.token_pool_full_attention_coverage_splits, 1)
+        self.assertEqual(
+            engine.metrics.token_pool_full_attention_capacity_microbatch_groups,
+            2,
+        )
+        self.assertEqual(
+            engine.metrics.token_pool_full_attention_capacity_microbatch_rows,
+            4,
+        )
+        self.assertEqual(
+            engine.metrics.token_pool_full_attention_capacity_microbatch_max_rows,
+            2,
+        )
+        self.assertEqual(
+            flushed,
+            [("r0", "r2", "r4", "r6")],
+        )
+        self.assertEqual(
+            engine._capacity_decode_group_keys,
+            {("r0", "r2"), ("r4", "r6")},
+        )
 
     def test_token_kv_layer_specs_include_full_and_shared_aliases(self) -> None:
         import torch
@@ -5123,6 +5471,86 @@ class TestGemmaNativeEngineDecodeBatch(unittest.TestCase):
         self.assertEqual(runner.merged_cache.remaining_capacity_calls, 2)
         self.assertEqual(runner.merged_cache.commit_count, 1)
         self.assertTrue(all(req.status.is_finished for req in reqs))
+
+    def test_persistent_padded_decode_flushes_at_route_boundary(self) -> None:
+        from wkvm.gemma_engine import GemmaNativeEngine
+        from wkvm.models.gemma import gemma4_e4b_routed_span_config
+
+        cfg = gemma4_e4b_routed_span_config(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("sliding_attention",),
+        )
+        engine = GemmaNativeEngine(
+            model=FakeModel(),
+            config=cfg,
+            num_slots=2,
+            scheduler_config=SchedulerConfig(
+                max_tokens_per_step=16,
+                max_running_requests=2,
+                max_tokens_per_request_per_step=8,
+            ),
+            persistent_exact_decode=False,
+            persistent_padded_decode_steps=3,
+        )
+        runner = FakePersistentPaddedBatchRunner()
+        runner.allow_padded_route_boundary = True
+        engine.runner = runner  # type: ignore[assignment]
+
+        reqs = [
+            Request(prompt_token_ids=[1, 2, 3], max_new_tokens=5, req_id="a"),
+            Request(prompt_token_ids=[4, 5, 6], max_new_tokens=5, req_id="b"),
+        ]
+        for req in reqs:
+            engine.add_request(req)
+
+        engine.step()
+        engine.step()
+        self.assertIsNotNone(runner.merged_cache)
+        runner.merged_cache.route_boundary = True  # type: ignore[union-attr]
+        engine.step()
+
+        self.assertEqual(engine.metrics.token_pool_route_boundary_batches, 1)
+        self.assertEqual(engine.metrics.token_pool_route_boundary_flushes, 1)
+        self.assertEqual(engine.metrics.persistent_padded_decode_splits, 1)
+        self.assertFalse(engine._persistent_padded_decode_groups)
+        self.assertEqual(runner.merged_cache.commit_count, 1)  # type: ignore[union-attr]
+
+    def test_route_boundary_opt_in_reserves_one_step(self) -> None:
+        from types import SimpleNamespace
+
+        from wkvm.gemma_engine import GemmaNativeEngine
+        from wkvm.models.gemma import gemma4_e4b_routed_span_config
+
+        cfg = gemma4_e4b_routed_span_config(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention",),
+        )
+        engine = GemmaNativeEngine(
+            model=FakeModel(),
+            config=cfg,
+            num_slots=1,
+            persistent_padded_decode_steps=8,
+        )
+        engine.runner.allow_padded_route_boundary = True
+        request = Request(
+            prompt_token_ids=[1, 2, 3],
+            max_new_tokens=8,
+            req_id="boundary",
+        )
+        request.output_token_ids.append(9)
+        request.num_computed_tokens = request.num_tokens
+        engine._caches[request.req_id] = SimpleNamespace(
+            layers=[
+                SimpleNamespace(
+                    route_chunk=4,
+                    _pend_k=SimpleNamespace(shape=(1, 1, 3, 2)),
+                )
+            ]
+        )
+
+        self.assertEqual(engine._persistent_padded_reserve_steps([request]), 1)
 
     def test_persistent_padded_token_pool_graph_shape_metrics(self) -> None:
         from wkvm.gemma_engine import GemmaNativeEngine

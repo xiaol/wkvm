@@ -130,6 +130,19 @@ class TestGemmaPrefillBatchRunner(unittest.TestCase):
                 self.assertEqual(expected_span["pos"], actual_span["pos"])
                 self.assertTrue(torch.equal(expected_span["k"], actual_span["k"]))
                 self.assertTrue(torch.equal(expected_span["v"], actual_span["v"]))
+        self.assertEqual(len(expected._slot_route_feats), len(actual._slot_route_feats))
+        for expected_slot, actual_slot in zip(
+            expected._slot_route_feats,
+            actual._slot_route_feats,
+        ):
+            self.assertEqual(len(expected_slot), len(actual_slot))
+            for expected_feature, actual_feature in zip(expected_slot, actual_slot):
+                self.assertTrue(
+                    torch.equal(
+                        torch.as_tensor(expected_feature),
+                        torch.as_tensor(actual_feature),
+                    )
+                )
 
     @staticmethod
     def _real_attention_configs():
@@ -462,6 +475,130 @@ class TestGemmaPrefillBatchRunner(unittest.TestCase):
         self.assertEqual(pool.allocated_count, 0)
         self.assertEqual(pool.kv_set_calls, 0)
 
+    def test_authoritative_final_prefill_keeps_homogeneous_sliding_batching(
+        self,
+    ) -> None:
+        import torch
+
+        from wkvm.models.gemma import gemma4_e4b_routed_span_config
+        from wkvm.runner.gemma_runner import (
+            GemmaRoutedSpanRunner,
+            NativeGemmaRoutedCache,
+        )
+        from wkvm.runner.gemma_token_pool import (
+            ReqToTokenTable,
+            TokenKVLayerSpec,
+            TokenKVPool,
+            TokenPoolDecodeBackendState,
+        )
+
+        hf_config = SimpleNamespace(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("sliding_attention",),
+            sliding_window=4,
+        )
+        native_config = gemma4_e4b_routed_span_config(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("sliding_attention",),
+            num_kv_heads=1,
+            head_dim=1,
+            sliding_window=4,
+        )
+        caches = [
+            NativeGemmaRoutedCache(hf_config, native_config)
+            for _ in range(2)
+        ]
+        pool = TokenKVPool(
+            capacity=16,
+            layer_specs=[
+                TokenKVLayerSpec(
+                    layer_id=0,
+                    num_kv_heads=1,
+                    head_dim=1,
+                    dtype=torch.float32,
+                )
+            ],
+            defer_buffer_allocation=True,
+        )
+        backend = TokenPoolDecodeBackendState(
+            table=ReqToTokenTable(max_requests=2, max_context_len=8),
+            allocator=pool,
+            kv_pool=pool,
+            block_size=4,
+        )
+        requests = [SimpleNamespace(req_id=f"row-{row}") for row in range(2)]
+        model = _OneLayerPrefillModel(hf_config)
+        runner = GemmaRoutedSpanRunner(model, _RecordingBank(native_config))
+        runner.prefill_batch_step(
+            caches,
+            [[1, 2], [6, 7]],
+            [{"gemma_routed_span": 0}, {"gemma_routed_span": 1}],
+            start_positions=[0, 0],
+        )
+        for request, cache in zip(requests, caches):
+            result = backend.commit_prefill_tokens(
+                request,
+                2,
+                expected_length=0,
+                cache=cache,
+                sliding_window=4,
+                final_prefill=False,
+                defer_kv=True,
+            )
+            self.assertTrue(result.deferred)
+
+        reservations = [
+            backend.prepare_authoritative_prefill(
+                request,
+                3,
+                expected_length=2,
+                cache=cache,
+                sliding_window=4,
+                final_prefill=True,
+            )
+            for request, cache in zip(requests, caches)
+        ]
+        self.assertTrue(all(reservation is not None for reservation in reservations))
+
+        token_rows = [[3, 4, 5], [8, 9, 10]]
+        runner.prefill_batch_step(
+            caches,
+            token_rows,
+            [{"gemma_routed_span": 0}, {"gemma_routed_span": 1}],
+            start_positions=[2, 2],
+        )
+
+        self.assertEqual(model.calls[-1]["update_mode"], "batched_homogeneous")
+        for row, (request, cache, reservation) in enumerate(
+            zip(requests, caches, reservations)
+        ):
+            self.assertEqual(reservation.written_layer_ids, {0})
+            staged_keys, staged_values = reservation.pending_layer_kv[0]
+            expected_keys = torch.tensor(
+                token_rows[row],
+                dtype=torch.float32,
+            ).reshape(1, 1, 3, 1)
+            self.assertTrue(torch.equal(staged_keys, expected_keys))
+            self.assertTrue(torch.equal(staged_values, expected_keys + 100))
+            self.assertTrue(torch.equal(cache.layers[0].keys, expected_keys))
+            self.assertTrue(torch.equal(cache.layers[0].values, expected_keys + 100))
+
+            result = backend.commit_authoritative_prefill(
+                reservation,
+                cache=cache,
+            )
+            pooled_keys, pooled_values = pool.gather_kv(
+                0,
+                result.allocated_token_slots,
+            )
+            self.assertTrue(torch.equal(pooled_keys, expected_keys[0].permute(1, 0, 2)))
+            self.assertTrue(
+                torch.equal(pooled_values, (expected_keys + 100)[0].permute(1, 0, 2))
+            )
+            self.assertEqual(backend.request_length(reservation.req_slot), 5)
+
     def test_ragged_sliding_state_uses_serial_fallback(self) -> None:
         import torch
 
@@ -500,6 +637,7 @@ class TestGemmaPrefillBatchRunner(unittest.TestCase):
         from wkvm.runner.gemma_runner import (
             NativeGemmaRoutedCache,
             _NativeGemmaPrefillBatchLayer,
+            _RoutedPacketWorkspace,
         )
 
         hf_config = SimpleNamespace(
@@ -531,8 +669,13 @@ class TestGemmaPrefillBatchRunner(unittest.TestCase):
             NativeGemmaRoutedCache(hf_config, native_config)
             for _ in range(2)
         ]
+        packet_caches = [
+            NativeGemmaRoutedCache(hf_config, native_config)
+            for _ in range(2)
+        ]
+        packet_workspace = _RoutedPacketWorkspace(1024 * 1024)
         break_mask = [False, True, False, False, True, False] * 4
-        for cache in serial_caches + batched_caches:
+        for cache in serial_caches + batched_caches + packet_caches:
             cache.set_span_break_mask(break_mask)
 
         next_token = 1
@@ -571,9 +714,28 @@ class TestGemmaPrefillBatchRunner(unittest.TestCase):
                     key_states,
                     value_states,
                 )
+                packet_layers = [
+                    cache.layers[layer_idx] for cache in packet_caches
+                ]
+                packet_batch_layer = _NativeGemmaPrefillBatchLayer(
+                    packet_layers,
+                    [
+                        layer.get_mask_sizes(query_length)[0]
+                        for layer in packet_layers
+                    ],
+                    routed_packet_workspace=packet_workspace,
+                )
+                packet_keys, packet_values = packet_batch_layer.update(
+                    key_states,
+                    value_states,
+                )
 
                 self.assertEqual(
                     batch_layer._last_update_mode,
+                    "batched_homogeneous",
+                )
+                self.assertEqual(
+                    packet_batch_layer._last_update_mode,
                     "batched_homogeneous",
                 )
                 self.assertTrue(
@@ -588,6 +750,8 @@ class TestGemmaPrefillBatchRunner(unittest.TestCase):
                         torch.cat([row[1] for row in expected_rows]),
                     )
                 )
+                self.assertTrue(torch.equal(packet_keys, actual_keys))
+                self.assertTrue(torch.equal(packet_values, actual_values))
                 for expected_cache, actual_cache in zip(
                     serial_caches,
                     batched_caches,
@@ -596,9 +760,124 @@ class TestGemmaPrefillBatchRunner(unittest.TestCase):
                         expected_cache.layers[layer_idx],
                         actual_cache.layers[layer_idx],
                     )
-            for cache in serial_caches + batched_caches:
+                for expected_cache, packet_cache in zip(
+                    serial_caches,
+                    packet_caches,
+                ):
+                    self._assert_routed_layer_equal(
+                        expected_cache.layers[layer_idx],
+                        packet_cache.layers[layer_idx],
+                    )
+            for cache in serial_caches + batched_caches + packet_caches:
                 self.assertEqual(cache.layers[0].coord.pending_operations, 0)
             next_token += query_length * 2
+
+        packet_stats = packet_workspace.stats()
+        self.assertGreater(packet_stats["packet_batches"], 0)
+        self.assertGreater(packet_stats["packet_folds"], packet_stats["packet_batches"])
+        self.assertEqual(packet_stats["d2h_copies"], 0)
+
+    def test_homogeneous_routed_packet_cuda_state_matches_serial(self) -> None:
+        import torch
+
+        from wkvm.models.gemma import GemmaRoutedSpanConfig
+        from wkvm.runner.gemma_runner import (
+            NativeGemmaRoutedCache,
+            _NativeGemmaPrefillBatchLayer,
+            _RoutedPacketWorkspace,
+        )
+
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for routed packet state parity")
+        hf_config = SimpleNamespace(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention",),
+            sliding_window=8,
+        )
+        native_config = GemmaRoutedSpanConfig(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention",),
+            num_kv_heads=1,
+            head_dim=2,
+            sink_tokens=1,
+            ring_tokens=2,
+            pending_tokens=3,
+            routed_slots=2,
+            reps_per_slot=1,
+            span_budget_tokens=4,
+            max_span_tokens=2,
+            sliding_window=8,
+        )
+        serial_caches = [
+            NativeGemmaRoutedCache(hf_config, native_config)
+            for _ in range(2)
+        ]
+        packet_caches = [
+            NativeGemmaRoutedCache(hf_config, native_config)
+            for _ in range(2)
+        ]
+        workspace = _RoutedPacketWorkspace(1024 * 1024)
+        break_mask = [False, True, False, False, True, False] * 4
+        for cache in serial_caches + packet_caches:
+            cache.set_span_break_mask(break_mask)
+
+        next_token = 1
+        for query_length in (5, 4, 3):
+            first_row = torch.arange(
+                next_token,
+                next_token + query_length * 2,
+                dtype=torch.float32,
+                device="cuda",
+            ).reshape(1, 1, query_length, 2)
+            key_states = torch.cat([first_row, first_row + 50], dim=0)
+            value_states = torch.cat(
+                [first_row + 10, (first_row + 10) * 3],
+                dim=0,
+            )
+            expected_rows = [
+                serial_caches[row].layers[0].update(
+                    key_states[row : row + 1],
+                    value_states[row : row + 1],
+                )
+                for row in range(2)
+            ]
+            packet_layers = [cache.layers[0] for cache in packet_caches]
+            packet_batch_layer = _NativeGemmaPrefillBatchLayer(
+                packet_layers,
+                [
+                    layer.get_mask_sizes(query_length)[0]
+                    for layer in packet_layers
+                ],
+                routed_packet_workspace=workspace,
+            )
+
+            packet_keys, packet_values = packet_batch_layer.update(
+                key_states,
+                value_states,
+            )
+
+            self.assertTrue(
+                torch.equal(packet_keys, torch.cat([row[0] for row in expected_rows]))
+            )
+            self.assertTrue(
+                torch.equal(packet_values, torch.cat([row[1] for row in expected_rows]))
+            )
+            for serial_cache, packet_cache in zip(
+                serial_caches,
+                packet_caches,
+            ):
+                self._assert_routed_layer_equal(
+                    serial_cache.layers[0],
+                    packet_cache.layers[0],
+                )
+            next_token += query_length * 2
+
+        stats = workspace.stats()
+        self.assertGreater(stats["packet_batches"], 0)
+        self.assertEqual(stats["d2h_copies"], stats["packet_batches"])
+        self.assertGreater(stats["packet_folds"], stats["packet_batches"])
 
     def test_routed_rows_fold_with_independent_value_features(self) -> None:
         import torch
@@ -647,6 +926,146 @@ class TestGemmaPrefillBatchRunner(unittest.TestCase):
         self.assertEqual(int(first.keys.shape[0]), 1)
         self.assertEqual(int(second.keys.shape[0]), 1)
 
+    def test_routed_packet_capacity_falls_back_to_serial_with_parity(self) -> None:
+        import torch
+
+        from wkvm.models.gemma import GemmaRoutedSpanConfig
+        from wkvm.runner.gemma_runner import (
+            NativeGemmaRoutedCache,
+            _NativeGemmaPrefillBatchLayer,
+            _RoutedPacketWorkspace,
+        )
+
+        hf_config = SimpleNamespace(
+            num_hidden_layers=2,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention", "full_attention"),
+            sliding_window=8,
+        )
+        native_config = GemmaRoutedSpanConfig(
+            num_hidden_layers=2,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention", "full_attention"),
+            num_kv_heads=1,
+            head_dim=2,
+            sink_tokens=1,
+            ring_tokens=1,
+            pending_tokens=2,
+            routed_slots=2,
+            reps_per_slot=1,
+            span_budget_tokens=4,
+            max_span_tokens=2,
+            sliding_window=8,
+        )
+        serial_caches = [
+            NativeGemmaRoutedCache(hf_config, native_config)
+            for _ in range(2)
+        ]
+        fallback_caches = [
+            NativeGemmaRoutedCache(hf_config, native_config)
+            for _ in range(2)
+        ]
+        workspace = _RoutedPacketWorkspace(1)
+        values = torch.arange(20, dtype=torch.float32).reshape(2, 1, 5, 2)
+
+        for layer_idx in range(2):
+            layer_values = values + layer_idx * 50
+            expected_rows = [
+                serial_caches[row].layers[layer_idx].update(
+                    layer_values[row : row + 1],
+                    layer_values[row : row + 1] + 100,
+                )
+                for row in range(2)
+            ]
+            fallback_layers = [
+                cache.layers[layer_idx] for cache in fallback_caches
+            ]
+            batch_layer = _NativeGemmaPrefillBatchLayer(
+                fallback_layers,
+                [5, 5],
+                routed_packet_workspace=workspace,
+            )
+            actual_keys, actual_values = batch_layer.update(
+                layer_values,
+                layer_values + 100,
+            )
+
+            self.assertTrue(
+                torch.equal(actual_keys, torch.cat([row[0] for row in expected_rows]))
+            )
+            self.assertTrue(
+                torch.equal(actual_values, torch.cat([row[1] for row in expected_rows]))
+            )
+            for serial_cache, fallback_cache in zip(
+                serial_caches,
+                fallback_caches,
+            ):
+                self._assert_routed_layer_equal(
+                    serial_cache.layers[layer_idx],
+                    fallback_cache.layers[layer_idx],
+                )
+
+        for cache in serial_caches + fallback_caches:
+            self.assertEqual(cache.layers[0].coord.pending_operations, 0)
+
+        stats = workspace.stats()
+        self.assertEqual(stats["packet_batches"], 0)
+        self.assertEqual(stats["capacity_fallback_batches"], 1)
+        self.assertEqual(stats["capacity_fallback_request_rows"], 2)
+        self.assertGreater(stats["capacity_fallback_packet_rows"], 0)
+        self.assertGreater(stats["capacity_fallback_bytes"], 1)
+        self.assertEqual(stats["workspace_allocations"], 0)
+
+    def test_routed_packet_workspace_reports_allocated_buffer_bytes(self) -> None:
+        import torch
+
+        from wkvm.runner.gemma_runner import _RoutedPacketWorkspace
+
+        workspace = _RoutedPacketWorkspace(4096)
+        packet = workspace.transfer(
+            [
+                torch.arange(8, dtype=torch.float32).reshape(2, 4),
+                torch.arange(12, dtype=torch.float32).reshape(3, 4),
+            ]
+        )
+
+        self.assertEqual(packet.shape, (5, 4))
+        stats = workspace.stats()
+        self.assertEqual(stats["workspace_device_buffer_bytes"], 80)
+        self.assertEqual(stats["workspace_host_buffer_bytes"], 80)
+        self.assertEqual(stats["workspace_pinned_host_buffer_bytes"], 0)
+        self.assertEqual(stats["workspace_combined_buffer_bytes"], 160)
+        self.assertEqual(stats["workspace_payload_high_water_bytes"], 80)
+
+    def test_routed_packet_workspace_uses_one_cuda_to_host_copy(self) -> None:
+        import torch
+
+        from wkvm.runner.gemma_runner import _RoutedPacketWorkspace
+
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for pinned routed packet transfer")
+        workspace = _RoutedPacketWorkspace(4096)
+        parts = [
+            torch.arange(8, dtype=torch.float32, device="cuda").reshape(2, 4),
+            torch.arange(12, dtype=torch.float32, device="cuda").reshape(3, 4),
+        ]
+
+        packet = workspace.transfer(parts)
+
+        self.assertTrue(
+            torch.equal(
+                torch.from_numpy(packet.copy()),
+                torch.cat(parts).cpu(),
+            )
+        )
+        stats = workspace.stats()
+        self.assertEqual(stats["packet_batches"], 1)
+        self.assertEqual(stats["d2h_copies"], 1)
+        self.assertEqual(stats["packet_rows"], 5)
+        self.assertEqual(stats["workspace_device_buffer_bytes"], 80)
+        self.assertEqual(stats["workspace_pinned_host_buffer_bytes"], 80)
+        self.assertEqual(stats["workspace_combined_buffer_bytes"], 160)
+
 
 class _EngineCache:
     def __init__(self) -> None:
@@ -659,6 +1078,7 @@ class _EngineBatchRunner:
         self.batch_calls = 0
         self.serial_calls = 0
         self.last_caches = []
+        self.compute_logits_calls = []
 
     def build_cache(self, slots):
         return _EngineCache()
@@ -675,11 +1095,13 @@ class _EngineBatchRunner:
         *,
         start_positions,
         break_masks,
+        compute_logits=True,
     ):
         import torch
 
         self.batch_calls += 1
         self.last_caches = list(caches)
+        self.compute_logits_calls.append(bool(compute_logits))
         for cache in caches:
             cache.mutations += 1
         if self.fail_batch:
@@ -738,6 +1160,7 @@ class TestGemmaPrefillBatchEngine(unittest.TestCase):
 
         self.assertEqual(runner.batch_calls, 1)
         self.assertEqual(runner.serial_calls, 0)
+        self.assertEqual(runner.compute_logits_calls, [True])
         self.assertEqual(engine.metrics.prefill_calls, 2)
         self.assertEqual(engine.metrics.prefill_model_calls, 1)
         self.assertEqual(engine.metrics.batched_prefill_model_calls, 1)
@@ -746,6 +1169,24 @@ class TestGemmaPrefillBatchEngine(unittest.TestCase):
         self.assertEqual([request.output_token_ids for request in requests], [[3], [4]])
         self.assertEqual(len(finished), 2)
         self.assertTrue(all(request.status is RequestStatus.FINISHED_LENGTH for request in requests))
+
+    def test_non_closing_batch_does_not_request_logits(self) -> None:
+        from wkvm.core.request import Request
+
+        engine, runner = self._engine()
+        requests = [
+            Request(prompt_token_ids=list(range(8)), max_new_tokens=1, req_id="a"),
+            Request(prompt_token_ids=list(range(8, 16)), max_new_tokens=1, req_id="b"),
+        ]
+        for request in requests:
+            engine.add_request(request)
+
+        self.assertEqual(engine.step(), [])
+
+        self.assertEqual(runner.batch_calls, 1)
+        self.assertEqual(runner.compute_logits_calls, [False])
+        self.assertEqual([request.num_computed_tokens for request in requests], [4, 4])
+        self.assertEqual([request.output_token_ids for request in requests], [[], []])
 
     def test_mutating_batch_failure_never_retries_serially(self) -> None:
         from wkvm.core.request import Request, RequestStatus

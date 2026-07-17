@@ -17,11 +17,15 @@ from wkvm.gemma_server import (
     BoundedGemmaService,
     QueueFull,
     ServiceUnavailable,
+    _ChatTurn,
+    _TokenSSEWriter,
     _chat_stop_token_ids,
+    _write_token_sse_stream,
     apply_native_gemma_production_profile,
     engine_kwargs_from_args,
     main,
     run_server,
+    scheduler_config_from_args,
     serve,
     validate_native_gemma_loader_args,
 )
@@ -351,10 +355,43 @@ class SigtermServer:
         self.server_close_calls += 1
 
 
+class RecordingWFile:
+    def __init__(self, *, fail_on_write: int | None = None):
+        self.fail_on_write = fail_on_write
+        self.writes = []
+        self.flush_calls = 0
+
+    def write(self, payload):
+        write_number = len(self.writes) + 1
+        if self.fail_on_write == write_number:
+            raise BrokenPipeError("synthetic disconnect")
+        self.writes.append(payload)
+
+    def flush(self):
+        self.flush_calls += 1
+
+
+class ClosableEventIterator:
+    def __init__(self, events):
+        self.events = iter(events)
+        self.closed = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self.events)
+
+    def close(self):
+        self.closed = True
+
+
 class TestGemmaServerEngineArgs(unittest.TestCase):
     def test_native_forward_flags_are_passed_to_engine_kwargs(self) -> None:
         args = SimpleNamespace(
+            prefill_chunk=2048,
             prefill_microbatch_rows=1,
+            continuation_prefill_microbatch_rows=8,
             decode_microbatch_rows=8,
             decode_microbatch_bytes=370_000_000,
             decode_batch_planner="length_bucketed",
@@ -372,6 +409,9 @@ class TestGemmaServerEngineArgs(unittest.TestCase):
             native_gemma_projection_backend="separate",
             native_gemma_weight_backend="hf_live",
             native_gemma_release_hf_decoder_layers=False,
+            native_gemma_kv_sharing_fast_prefill=True,
+            batched_routed_packets=True,
+            routed_packet_workspace_bytes=32 * 1024 * 1024,
             enable_token_pool_metadata=True,
             enable_token_pool_attention=True,
             token_pool_max_context_len=16_384,
@@ -382,7 +422,9 @@ class TestGemmaServerEngineArgs(unittest.TestCase):
 
         kwargs = engine_kwargs_from_args(args)
 
+        self.assertEqual(kwargs["prefill_chunk"], 2048)
         self.assertEqual(kwargs["prefill_microbatch_rows"], 1)
+        self.assertEqual(kwargs["continuation_prefill_microbatch_rows"], 8)
         self.assertEqual(kwargs["decode_microbatch_rows"], 8)
         self.assertEqual(kwargs["decode_microbatch_bytes"], 370_000_000)
         self.assertEqual(kwargs["decode_batch_planner"], "length_bucketed")
@@ -400,12 +442,55 @@ class TestGemmaServerEngineArgs(unittest.TestCase):
         self.assertEqual(kwargs["native_gemma_projection_backend"], "separate")
         self.assertEqual(kwargs["native_gemma_weight_backend"], "hf_live")
         self.assertFalse(kwargs["native_gemma_release_hf_decoder_layers"])
+        self.assertTrue(kwargs["native_gemma_kv_sharing_fast_prefill"])
+        self.assertTrue(kwargs["batched_routed_packets"])
+        self.assertEqual(kwargs["routed_packet_workspace_bytes"], 32 * 1024 * 1024)
         self.assertTrue(kwargs["enable_token_pool_metadata"])
         self.assertTrue(kwargs["enable_token_pool_attention"])
         self.assertEqual(kwargs["token_pool_max_context_len"], 16_384)
         self.assertEqual(kwargs["token_pool_capacity"], 49_152)
         self.assertEqual(kwargs["token_pool_paged_block_size"], 64)
         self.assertEqual(kwargs["finished_trace_limit"], 128)
+
+    def test_scheduler_profile_uses_prefill_chunk_and_completion_lane(self) -> None:
+        config = scheduler_config_from_args(
+            SimpleNamespace(
+                slots=4,
+                prefill_chunk=2048,
+                completion_prefill_lane_size=4,
+            )
+        )
+
+        self.assertEqual(config.max_tokens_per_request_per_step, 2048)
+        self.assertEqual(config.max_running_requests, 4)
+        self.assertEqual(config.completion_prefill_lane_size, 4)
+        self.assertEqual(config.max_tokens_per_step, 4 + 4 * 2048)
+
+    def test_cli_rejects_invalid_prefill_profile_before_optional_imports(self) -> None:
+        cases = (
+            ("--prefill-chunk", "0", "--prefill-chunk must be >= 1"),
+            (
+                "--continuation-prefill-microbatch-rows",
+                "-1",
+                "--continuation-prefill-microbatch-rows must be >= 0 or omitted",
+            ),
+            (
+                "--stream-flush-tokens",
+                "0",
+                "--stream-flush-tokens must be >= 1",
+            ),
+        )
+        for option, value, expected in cases:
+            with self.subTest(option=option):
+                stderr = io.StringIO()
+                with patch.object(sys, "stderr", stderr), patch.object(
+                    sys,
+                    "argv",
+                    ["wkvm-gemma-server", "--model", "unused", option, value],
+                ), self.assertRaises(SystemExit) as raised:
+                    main()
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn(expected, stderr.getvalue())
 
     def test_chat_stop_tokens_are_opt_in_and_can_be_ignored(self) -> None:
         full_config = SimpleNamespace(eos_token_id=[1, 2])
@@ -481,6 +566,94 @@ class TestGemmaServerEngineArgs(unittest.TestCase):
 
 
 class TestBoundedGemmaService(unittest.TestCase):
+    @staticmethod
+    def _decode_token_sse_writes(writes):
+        events = []
+        for block in b"".join(writes).decode().strip().split("\n\n"):
+            data_line = next(
+                line for line in block.splitlines() if line.startswith("data: ")
+            )
+            events.append(json.loads(data_line.removeprefix("data: ")))
+        return events
+
+    def test_token_sse_writer_batches_after_first_token_in_exact_order(self) -> None:
+        wfile = RecordingWFile()
+        writer = _TokenSSEWriter(wfile, flush_tokens=3)
+
+        writer.send({"type": "queued", "req_id": "r"})
+        self.assertEqual((len(wfile.writes), wfile.flush_calls), (1, 1))
+        writer.send({"type": "token", "token": 1})
+        self.assertEqual((len(wfile.writes), wfile.flush_calls), (2, 2))
+        writer.send({"type": "token", "token": 2})
+        writer.send({"type": "token", "token": 3})
+        self.assertEqual((len(wfile.writes), wfile.flush_calls), (2, 2))
+        writer.send({"type": "token", "token": 4})
+        self.assertEqual((len(wfile.writes), wfile.flush_calls), (3, 3))
+        writer.send({"type": "token", "token": 5})
+        writer.send({"type": "finish", "finish_reason": "length"})
+        self.assertEqual((len(wfile.writes), wfile.flush_calls), (4, 4))
+        self.assertEqual(wfile.writes[2].count(b"event: token\n"), 3)
+        self.assertIn(b"event: finish\n", wfile.writes[3])
+
+        events = self._decode_token_sse_writes(wfile.writes)
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["queued", "token", "token", "token", "token", "token", "finish"],
+        )
+        self.assertEqual(
+            [event["token"] for event in events if event["type"] == "token"],
+            [1, 2, 3, 4, 5],
+        )
+
+    def test_token_sse_writer_default_preserves_per_event_writes(self) -> None:
+        wfile = RecordingWFile()
+        writer = _TokenSSEWriter(wfile)
+
+        for event in (
+            {"type": "queued"},
+            {"type": "token", "token": 1},
+            {"type": "token", "token": 2},
+            {"type": "finish", "finish_reason": "length"},
+        ):
+            writer.send(event)
+
+        self.assertEqual(len(wfile.writes), 4)
+        self.assertEqual(wfile.flush_calls, 4)
+        self.assertTrue(all(payload.count(b"\n\n") == 1 for payload in wfile.writes))
+
+    def test_token_sse_disconnect_closes_source_iterator(self) -> None:
+        wfile = RecordingWFile(fail_on_write=2)
+        stream_iter = ClosableEventIterator(
+            [
+                {"type": "token", "token": 1},
+                {"type": "finish", "finish_reason": "length"},
+            ]
+        )
+
+        _write_token_sse_stream(
+            wfile,
+            stream_iter,
+            {"type": "queued", "req_id": "r"},
+            flush_tokens=8,
+        )
+
+        self.assertTrue(stream_iter.closed)
+        self.assertEqual(len(wfile.writes), 1)
+        self.assertEqual(wfile.flush_calls, 1)
+
+    def test_http_listen_backlog_covers_b16_queue(self) -> None:
+        service = BoundedGemmaService(
+            FakeEngine(),
+            max_queue=16,
+            batch_wait_s=0.0,
+        )
+        server = serve(service, port=0)
+        try:
+            self.assertGreaterEqual(server.request_queue_size, 16)
+        finally:
+            service.close()
+            server.server_close()
+
     def test_batch_wait_is_not_shortened_by_enqueue_notifications(self) -> None:
         engine = FakeEngine()
         original_step = engine.step
@@ -1363,6 +1536,388 @@ class TestBoundedGemmaService(unittest.TestCase):
             metrics = service.metrics()["server"]
             self.assertEqual(metrics["tracked_requests"], 2)
             self.assertEqual(metrics["completed_tracked_requests"], 2)
+        finally:
+            service.close()
+
+
+class TestTokenSessionStream(unittest.TestCase):
+    def test_forced_stream_hides_candidate_before_overwrite_processing(self) -> None:
+        turn = _ChatTurn(
+            session_id="forced",
+            response_id="turn",
+            prompt_token_ids=[1],
+            max_new_tokens=2,
+            break_mask=None,
+            deadline=None,
+            session_kind="token",
+            input_mode="initial_prompt",
+            forced_output_token_ids=[91, 92],
+            request=SimpleNamespace(output_token_ids=[65]),
+            state="running",
+        )
+
+        self.assertEqual(BoundedGemmaService._chat_turn_tokens(turn), [])
+
+    def test_forced_stream_uses_forced_prefix_before_request_overwrite(self) -> None:
+        turn = _ChatTurn(
+            session_id="forced",
+            response_id="turn",
+            prompt_token_ids=[1],
+            max_new_tokens=2,
+            break_mask=None,
+            deadline=None,
+            session_kind="token",
+            input_mode="initial_prompt",
+            forced_output_token_ids=[91, 92],
+            request=SimpleNamespace(output_token_ids=[65, 13]),
+            state="running",
+            candidate_output_token_ids=[65],
+        )
+
+        self.assertEqual(BoundedGemmaService._chat_turn_tokens(turn), [91])
+
+    @staticmethod
+    def _start_server(engine, **service_kwargs):
+        service = BoundedGemmaService(
+            engine,
+            max_queue=8,
+            batch_wait_s=0.0,
+            **service_kwargs,
+        )
+        server = serve(service, port=0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return service, server, thread
+
+    @staticmethod
+    def _stop_server(service, server, thread):
+        service.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    @staticmethod
+    def _post(host, port, body):
+        request = urllib.request.Request(
+            f"http://{host}:{port}/v1/stream",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, response.headers, response.read()
+
+    @staticmethod
+    def _sse_events(raw):
+        events = []
+        for block in raw.decode().strip().split("\n\n"):
+            data_line = next(
+                line for line in block.splitlines() if line.startswith("data: ")
+            )
+            events.append(json.loads(data_line.removeprefix("data: ")))
+        return events
+
+    def test_http_token_session_reuses_delta_continuation(self) -> None:
+        engine = FakeSessionEngine(num_slots=2)
+        service, server, thread = self._start_server(engine)
+        host, port = server.server_address
+        try:
+            status, headers, raw = self._post(
+                host,
+                port,
+                {
+                    "session_id": "token-session",
+                    "prompt_ids": [1, 2],
+                    "max_tokens": 2,
+                    "req_id": "token-turn-1",
+                },
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(headers.get_content_type(), "text/event-stream")
+            first_events = self._sse_events(raw)
+            self.assertEqual(
+                [event["type"] for event in first_events],
+                ["queued", "token", "token", "finish"],
+            )
+            self.assertEqual(
+                [event["token"] for event in first_events if event["type"] == "token"],
+                [65, 13],
+            )
+            first_metrics = first_events[-1]["metrics"]
+            self.assertEqual(first_metrics["http_session_id"], "token-session")
+            self.assertEqual(first_metrics["session_kind"], "token")
+            self.assertEqual(first_metrics["session_input_mode"], "initial_prompt")
+            self.assertEqual(first_metrics["session_input_tokens"], 2)
+            self.assertFalse(first_metrics["session_reused"])
+
+            _, _, raw = self._post(
+                host,
+                port,
+                {
+                    "session_id": "token-session",
+                    "delta_ids": [9, 10],
+                    "max_tokens": 2,
+                    "req_id": "token-turn-2",
+                },
+            )
+            second_events = self._sse_events(raw)
+            second_metrics = second_events[-1]["metrics"]
+            self.assertEqual(second_metrics["session_input_mode"], "continuation_delta")
+            self.assertEqual(second_metrics["session_input_tokens"], 2)
+            self.assertTrue(second_metrics["session_reused"])
+            self.assertEqual(len(engine.started), 1)
+            self.assertEqual(len(engine.continuations), 1)
+            self.assertEqual(engine.continuations[0][1], [9, 10])
+            self.assertEqual(service.health()["token_sessions"], 1)
+        finally:
+            self._stop_server(service, server, thread)
+
+    def test_distinct_token_sessions_can_overlap(self) -> None:
+        service = BoundedGemmaService(
+            NeverFinishSessionEngine(num_slots=2),
+            max_queue=4,
+            batch_wait_s=0.0,
+        )
+        first = service.stream_token_session(
+            session_id="first",
+            prompt_ids=[1],
+            max_tokens=2,
+            req_id="first-turn",
+        )
+        second = service.stream_token_session(
+            session_id="second",
+            prompt_ids=[2],
+            max_tokens=2,
+            req_id="second-turn",
+        )
+        try:
+            self.assertEqual(next(first)["type"], "queued")
+            self.assertEqual(next(second)["type"], "queued")
+            deadline = time.perf_counter() + 2
+            while service.health()["token_sessions"] < 2 and time.perf_counter() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(service.health()["token_sessions"], 2)
+            self.assertEqual(set(service._chat_active_turns), {"first", "second"})
+        finally:
+            first.close()
+            second.close()
+            service.close()
+
+    def test_duplicate_active_token_turn_returns_conflict(self) -> None:
+        engine = NeverFinishSessionEngine(num_slots=1)
+        service, server, thread = self._start_server(engine)
+        host, port = server.server_address
+        first = service.stream_token_session(
+            session_id="busy",
+            prompt_ids=[1],
+            max_tokens=2,
+            req_id="busy-turn-1",
+        )
+        try:
+            self.assertEqual(next(first)["type"], "queued")
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                self._post(
+                    host,
+                    port,
+                    {
+                        "session_id": "busy",
+                        "delta_ids": [2],
+                        "max_tokens": 2,
+                        "req_id": "busy-turn-2",
+                    },
+                )
+            self.assertEqual(raised.exception.code, 409)
+            payload = json.loads(raised.exception.read())
+            self.assertEqual(payload["error"]["code"], "session_busy")
+            self.assertIn("already has an active turn", payload["error"]["message"])
+        finally:
+            first.close()
+            self._stop_server(service, server, thread)
+
+    def test_http_token_session_invariants_are_explicit(self) -> None:
+        service, server, thread = self._start_server(FakeSessionEngine(num_slots=2))
+        host, port = server.server_address
+
+        def assert_bad_request(body, message):
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                self._post(host, port, body)
+            self.assertEqual(raised.exception.code, 400)
+            payload = json.loads(raised.exception.read())
+            self.assertIn(message, payload["error"])
+
+        try:
+            assert_bad_request(
+                {"delta_ids": [1], "max_tokens": 1},
+                "require an explicit session_id",
+            )
+            assert_bad_request(
+                {
+                    "session_id": "both",
+                    "prompt_ids": [1],
+                    "delta_ids": [2],
+                    "max_tokens": 1,
+                },
+                "requires exactly one",
+            )
+            assert_bad_request(
+                {
+                    "session_id": "unknown",
+                    "delta_ids": [1],
+                    "max_tokens": 1,
+                },
+                "unknown token session unknown",
+            )
+
+            self._post(
+                host,
+                port,
+                {
+                    "session_id": "existing",
+                    "prompt_ids": [1],
+                    "max_tokens": 1,
+                },
+            )
+            assert_bad_request(
+                {
+                    "session_id": "existing",
+                    "prompt_ids": [2],
+                    "max_tokens": 1,
+                },
+                "already exists; send delta_ids",
+            )
+        finally:
+            self._stop_server(service, server, thread)
+
+    def test_token_session_lru_and_ttl_close_parked_state(self) -> None:
+        engine = FakeSessionEngine(num_slots=1)
+        service = BoundedGemmaService(
+            engine,
+            max_queue=4,
+            batch_wait_s=0.0,
+            max_chat_sessions=1,
+            chat_session_ttl_s=0.02,
+        )
+        try:
+            list(
+                service.stream_token_session(
+                    session_id="first",
+                    prompt_ids=[1],
+                    max_tokens=1,
+                    req_id="first-turn",
+                )
+            )
+            first_engine_id = engine.started[0][0]
+            deadline = time.perf_counter() + 2
+            while (
+                first_engine_id not in engine.closed_sessions
+                and time.perf_counter() < deadline
+            ):
+                time.sleep(0.01)
+            self.assertIn(first_engine_id, engine.closed_sessions)
+            self.assertEqual(service.health()["token_sessions"], 0)
+
+            service.chat_session_ttl_s = 60.0
+            list(
+                service.stream_token_session(
+                    session_id="second",
+                    prompt_ids=[2],
+                    max_tokens=1,
+                    req_id="second-turn",
+                )
+            )
+            second_engine_id = engine.started[1][0]
+            list(
+                service.stream_token_session(
+                    session_id="third",
+                    prompt_ids=[3],
+                    max_tokens=1,
+                    req_id="third-turn",
+                )
+            )
+            self.assertIn(second_engine_id, engine.closed_sessions)
+            self.assertNotIn(second_engine_id, engine.scheduler.requests)
+            self.assertEqual(service.health()["token_sessions"], 1)
+        finally:
+            service.close()
+
+    def test_teacher_forcing_is_opt_in(self) -> None:
+        service = BoundedGemmaService(
+            FakeSessionEngine(num_slots=1),
+            max_queue=2,
+            batch_wait_s=0.0,
+        )
+        try:
+            with self.assertRaisesRegex(ValueError, "teacher forcing is disabled"):
+                service.stream_token_session(
+                    session_id="disabled",
+                    prompt_ids=[1],
+                    forced_output_ids=[9],
+                    max_tokens=1,
+                    req_id="disabled-turn",
+                )
+        finally:
+            service.close()
+
+    def test_teacher_forced_outputs_and_continuation_reuse(self) -> None:
+        engine = FakeSessionEngine(num_slots=1)
+        service = BoundedGemmaService(
+            engine,
+            max_queue=4,
+            batch_wait_s=0.0,
+            enable_token_session_teacher_forcing=True,
+        )
+        try:
+            first_events = list(
+                service.stream_token_session(
+                    session_id="forced",
+                    prompt_ids=[1, 2],
+                    forced_output_ids=[91, 92],
+                    max_tokens=2,
+                    req_id="forced-turn-1",
+                )
+            )
+            self.assertEqual(
+                [event["token"] for event in first_events if event["type"] == "token"],
+                [91, 92],
+            )
+            forcing = first_events[-1]["metrics"]["teacher_forcing"]
+            self.assertTrue(forcing["enabled"])
+            self.assertEqual(forcing["candidate_output_ids"], [65, 13])
+            self.assertEqual(forcing["forced_output_ids"], [91, 92])
+            self.assertTrue(forcing["selected_outputs_match_forced"])
+            self.assertFalse(forcing["candidate_outputs_match_forced"])
+            self.assertEqual(forcing["scalar_overwrite_count"], 2)
+            self.assertGreaterEqual(forcing["scalar_overwrite_s"], 0.0)
+            self.assertEqual(
+                forcing["overhead_contract"],
+                {
+                    "timed": True,
+                    "full_vocabulary_mask": False,
+                    "gpu_logit_elements_mutated_per_row": 0,
+                    "mutation": "one_pending_token_scalar_overwrite",
+                    "row_mutation_scope": "request_loop",
+                },
+            )
+
+            second_events = list(
+                service.stream_token_session(
+                    session_id="forced",
+                    delta_ids=[7],
+                    forced_output_ids=[93, 94],
+                    max_tokens=2,
+                    req_id="forced-turn-2",
+                )
+            )
+            second_finish = second_events[-1]
+            self.assertEqual(
+                [event["token"] for event in second_events if event["type"] == "token"],
+                [93, 94],
+            )
+            self.assertTrue(second_finish["metrics"]["session_reused"])
+            self.assertEqual(len(engine.started), 1)
+            self.assertEqual(engine.continuations[0][1], [7])
+            parked = next(iter(engine.scheduler.parked.values()))
+            self.assertEqual(parked.prompt_token_ids, [1, 2, 91, 92, 7])
         finally:
             service.close()
 

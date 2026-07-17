@@ -14,6 +14,7 @@ _TOKEN_POOL_ATTENTION_BACKEND = None
 _NATIVE_GEMMA_FUSED_OPS = None
 _NATIVE_GEMMA_FUSED_OPS_UNAVAILABLE = False
 _NATIVE_GEMMA_FUSED_RMS_NORM_ENABLED = None
+_KV_SHARING_FAST_PREFILL_MIN_TAIL_QUERY_LENGTH = 128
 
 
 _NATIVE_FORWARD_TIMING_STATS: dict[str, float | int] = {
@@ -56,6 +57,10 @@ _NATIVE_FORWARD_TIMING_STATS: dict[str, float | int] = {
     "token_pool_kv_write_calls": 0,
     "token_pool_kv_write_tokens": 0,
     "token_pool_kv_write_wall_s": 0.0,
+    "dense_gqa_prefill_calls": 0,
+    "dense_gqa_prefill_fallbacks": 0,
+    "dense_gqa_decode_calls": 0,
+    "dense_gqa_decode_fallbacks": 0,
 }
 
 
@@ -1625,6 +1630,89 @@ def _attention_forward_token_pool_gqa(
     return result.output, result.weights
 
 
+def _attention_forward_token_pool_mixed(
+    attn,
+    query_states,
+    key_states,
+    value_states,
+    attention_mask,
+    *,
+    backend: str,
+    token_pool_attention_call,
+):
+    """Run q=1 rows from token-pool KV and prefill rows from dense KV."""
+
+    torch = _torch()
+    row_count = int(query_states.shape[0])
+    q_lens = tuple(int(value) for value in token_pool_attention_call.q_lens)
+    if len(q_lens) != row_count:
+        raise ValueError("token-pool mixed q_lens must match query batch")
+    if any(q_len < 1 or q_len > int(query_states.shape[2]) for q_len in q_lens):
+        raise ValueError("token-pool mixed q_lens exceed the padded query width")
+    decode_rows = torch.as_tensor(
+        token_pool_attention_call.decode_row_indices,
+        dtype=torch.long,
+        device=query_states.device,
+    )
+    prefill_rows = torch.as_tensor(
+        token_pool_attention_call.prefill_row_indices,
+        dtype=torch.long,
+        device=query_states.device,
+    )
+    decode_query = query_states.index_select(0, decode_rows)[:, :, :1, :]
+    decode_result = _token_pool_attention_backend().decode_call(
+        attn,
+        decode_query,
+        attention_call=token_pool_attention_call.backend_decode_call(),
+        timing_enabled=_native_forward_timing_enabled(),
+    )
+
+    if key_states is None or value_states is None:
+        raise RuntimeError("token-pool mixed prefill requires dense key/value states")
+    prefill_query = query_states.index_select(0, prefill_rows)
+    prefill_keys = key_states.index_select(0, prefill_rows)
+    prefill_values = value_states.index_select(0, prefill_rows)
+    prefill_mask = attention_mask
+    if prefill_mask is not None and int(prefill_mask.shape[0]) == row_count:
+        prefill_mask = prefill_mask.index_select(0, prefill_rows)
+    from wkvm.runner.gemma_token_pool import TokenPoolAttentionCall
+
+    prefill_output, _ = _attention_forward(
+        attn,
+        prefill_query,
+        prefill_keys,
+        prefill_values,
+        prefill_mask,
+        backend=backend,
+        token_pool_attention_call=TokenPoolAttentionCall(),
+    )
+
+    output = torch.zeros(
+        (
+            row_count,
+            int(query_states.shape[2]),
+            int(query_states.shape[1]),
+            int(query_states.shape[3]),
+        ),
+        dtype=query_states.dtype,
+        device=query_states.device,
+    )
+    output.index_copy_(0, prefill_rows, prefill_output)
+    decode_output = torch.zeros(
+        (
+            int(decode_rows.numel()),
+            int(query_states.shape[2]),
+            int(query_states.shape[1]),
+            int(query_states.shape[3]),
+        ),
+        dtype=query_states.dtype,
+        device=query_states.device,
+    )
+    decode_output[:, :1].copy_(decode_result.output)
+    output.index_copy_(0, decode_rows, decode_output)
+    return output, None
+
+
 def _is_recoverable_token_pool_triton_error(exc: RuntimeError) -> bool:
     from wkvm.runner.gemma_token_pool_attention import (
         is_recoverable_token_pool_triton_error,
@@ -1670,6 +1758,16 @@ def _attention_forward(
             current_key_states,
             current_value_states,
         )
+    if bool(getattr(token_pool_attention_call, "mixed_attention_enabled", False)):
+        return _attention_forward_token_pool_mixed(
+            attn,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            backend=backend,
+            token_pool_attention_call=token_pool_attention_call,
+        )
     result = _token_pool_attention_backend().try_decode_call(
         attn,
         query_states,
@@ -1695,22 +1793,41 @@ def _attention_forward(
     if backend == "sdpa_single_gqa":
         backend = "sdpa"
     if backend == "triton_dense_gqa":
+        is_decode = query_states.shape[2] == 1
         if (
-            query_states.shape[2] == 1
-            and attn.num_key_value_groups > 1
+            attn.num_key_value_groups > 1
             and bool(getattr(query_states, "is_cuda", False))
+            and not attn.training
+            and not torch.is_grad_enabled()
         ):
-            from wkvm.runner.gemma_token_pool_triton import dense_padded_gqa_decode
+            if is_decode:
+                from wkvm.runner.gemma_token_pool_triton import dense_padded_gqa_decode
 
-            attn_output = dense_padded_gqa_decode(
-                query_states,
-                key_states,
-                value_states,
-                attention_mask,
-                num_key_value_groups=attn.num_key_value_groups,
-                scaling=attn.scaling,
-            )
+                attn_output = dense_padded_gqa_decode(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attention_mask,
+                    num_key_value_groups=attn.num_key_value_groups,
+                    scaling=attn.scaling,
+                )
+                _record_native_count("dense_gqa_decode_calls")
+            else:
+                from wkvm.runner.gemma_token_pool_triton import dense_gqa_prefill
+
+                attn_output = dense_gqa_prefill(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attention_mask,
+                    num_key_value_groups=attn.num_key_value_groups,
+                    scaling=attn.scaling,
+                )
+                _record_native_count("dense_gqa_prefill_calls")
             return attn_output, None
+        _record_native_count(
+            "dense_gqa_decode_fallbacks" if is_decode else "dense_gqa_prefill_fallbacks"
+        )
         backend = "sdpa"
     key_states = _repeat_kv(key_states, attn.num_key_value_groups)
     value_states = _repeat_kv(value_states, attn.num_key_value_groups)
@@ -1758,6 +1875,58 @@ def _gemma4_kv_shared_layer_index(config: Any, layer_idx: int) -> int | None:
     return len(prev_layers) - 1 - prev_layers[::-1].index(current_layer_type)
 
 
+def _normalize_wkvm_logits_indices(
+    indices,
+    *,
+    batch_size: int,
+    query_length: int,
+    device,
+):
+    torch = _torch()
+    normalized = torch.as_tensor(
+        indices,
+        dtype=torch.long,
+        device=device,
+    ).reshape(-1)
+    if normalized.numel() != int(batch_size):
+        raise ValueError("wkvm_logits_indices must contain one index per batch row")
+    if bool(torch.any(normalized < 0)) or bool(
+        torch.any(normalized >= int(query_length))
+    ):
+        raise ValueError("wkvm_logits_indices contains an invalid query index")
+    return normalized
+
+
+def _gather_batch_query_tensor(tensor, indices):
+    """Gather one query position per batch row while allowing batch broadcast."""
+
+    torch = _torch()
+    batch_size = int(indices.numel())
+    if tensor.ndim < 2 or int(tensor.shape[0]) not in {1, batch_size}:
+        raise ValueError("fast-prefill tensor is not batch/query aligned")
+    rows = torch.arange(batch_size, dtype=torch.long, device=indices.device)
+    if int(tensor.shape[0]) == 1:
+        rows = torch.zeros_like(rows)
+    return tensor[rows, indices].unsqueeze(1)
+
+
+def _gather_attention_mask_query_rows(attention_mask, indices, query_length: int):
+    if attention_mask is None:
+        return None
+    batch_size = int(indices.numel())
+    if (
+        attention_mask.ndim != 4
+        or int(attention_mask.shape[0]) not in {1, batch_size}
+        or int(attention_mask.shape[-2]) != int(query_length)
+    ):
+        raise ValueError("fast-prefill attention mask is not batch/query aligned")
+    torch = _torch()
+    rows = torch.arange(batch_size, dtype=torch.long, device=indices.device)
+    if int(attention_mask.shape[0]) == 1:
+        rows = torch.zeros_like(rows)
+    return attention_mask[rows, :, indices, :].unsqueeze(-2)
+
+
 @dataclass
 class NativeGemma4PrefixOutput:
     hidden_states: Any
@@ -1766,6 +1935,7 @@ class NativeGemma4PrefixOutput:
     per_layer_inputs: Any | None
     position_ids: Any
     causal_mask_mapping: dict[str, Any]
+    kv_sharing_owner_only: bool = False
 
 
 @dataclass
@@ -2314,7 +2484,6 @@ class NativeGemma4TextDecoderLayer:
                 self._gate_up_proj = _PackedLinear(
                     hf_layer.mlp.gate_proj,
                     hf_layer.mlp.up_proj,
-                    cache=False,
                 )
         self.hf_layer = None if owned else hf_layer
 
@@ -2592,6 +2761,139 @@ class NativeGemma4TextPrefix:
             self.num_layers if self.release_hf_decoder_layers else 0
         )
         self.unique_layer_types = set(self.config.layer_types[: self.num_layers])
+        self.kv_sharing_fast_prefill_split_layer = (
+            self._kv_sharing_fast_prefill_split_layer()
+        )
+        self.kv_sharing_fast_prefill_eligible = (
+            self.kv_sharing_fast_prefill_split_layer is not None
+        )
+        self.kv_sharing_fast_prefill_calls = 0
+        self.kv_sharing_fast_prefill_owner_tokens = 0
+        self.kv_sharing_fast_prefill_tail_tokens = 0
+        self.kv_sharing_fast_prefill_fallbacks = 0
+        self.kv_sharing_owner_only_calls = 0
+        self.kv_sharing_owner_only_tokens = 0
+        self.kv_sharing_owner_only_fallbacks = 0
+
+    def _kv_sharing_fast_prefill_split_layer(self) -> int | None:
+        total_layers = int(self.config.num_hidden_layers)
+        shared_layers = int(getattr(self.config, "num_kv_shared_layers", 0) or 0)
+        split_layer = total_layers - shared_layers
+        layer_types = tuple(getattr(self.config, "layer_types", ()))
+        if (
+            self.num_layers != total_layers
+            or split_layer < 1
+            or split_layer >= total_layers
+            or len(layer_types) != total_layers
+        ):
+            return None
+        owner_layers = self.layers[:split_layer]
+        tail_layers = self.layers[split_layer:]
+        if any(layer.attn_meta.is_kv_shared_layer for layer in owner_layers):
+            return None
+        if len(tail_layers) != shared_layers or any(
+            not layer.attn_meta.is_kv_shared_layer for layer in tail_layers
+        ):
+            return None
+        for layer in tail_layers:
+            source_idx = layer.attn_meta.kv_shared_layer_index
+            if (
+                source_idx is None
+                or source_idx < 0
+                or source_idx >= split_layer
+                or layer_types[source_idx] != layer.layer_type
+                or not owner_layers[source_idx].attn_meta.store_full_length_kv
+            ):
+                return None
+        return split_layer
+
+    def _should_use_kv_sharing_fast_prefill(
+        self,
+        *,
+        hidden_states,
+        position_embeddings,
+        causal_mask_mapping,
+        past_key_values,
+        wkvm_token_pool_decode,
+        wkvm_logits_indices,
+    ) -> bool:
+        batch_size, query_length = hidden_states.shape[:2]
+        if (
+            not self.kv_sharing_fast_prefill_eligible
+            or int(query_length) < _KV_SHARING_FAST_PREFILL_MIN_TAIL_QUERY_LENGTH
+            or wkvm_token_pool_decode is not None
+            or wkvm_logits_indices is None
+            or any(layer.attn_meta.training for layer in self.layers)
+        ):
+            return False
+        query_lengths = getattr(past_key_values, "query_lengths", None)
+        if query_lengths is not None and (
+            len(query_lengths) != int(batch_size)
+            or any(int(length) != int(query_length) for length in query_lengths)
+        ):
+            return False
+        for layer_type in self.unique_layer_types:
+            embeddings = position_embeddings.get(layer_type)
+            if embeddings is None or len(embeddings) != 2:
+                return False
+            for tensor in embeddings:
+                if (
+                    tensor.ndim < 2
+                    or int(tensor.shape[0]) not in {1, int(batch_size)}
+                    or int(tensor.shape[1]) != int(query_length)
+                ):
+                    return False
+            mask = causal_mask_mapping.get(layer_type)
+            if mask is not None and (
+                mask.ndim != 4
+                or int(mask.shape[0]) not in {1, int(batch_size)}
+                or int(mask.shape[-2]) != int(query_length)
+            ):
+                return False
+        return True
+
+    def _should_use_kv_sharing_owner_only(
+        self,
+        *,
+        hidden_states,
+        position_embeddings,
+        causal_mask_mapping,
+        past_key_values,
+        wkvm_token_pool_decode,
+    ) -> bool:
+        batch_size, query_length = hidden_states.shape[:2]
+        if (
+            not self.kv_sharing_fast_prefill_eligible
+            or int(query_length) <= 1
+            or wkvm_token_pool_decode is not None
+            or any(layer.attn_meta.training for layer in self.layers)
+        ):
+            return False
+        query_lengths = getattr(past_key_values, "query_lengths", None)
+        if query_lengths is not None and (
+            len(query_lengths) != int(batch_size)
+            or any(int(length) != int(query_length) for length in query_lengths)
+        ):
+            return False
+        for layer_type in self.unique_layer_types:
+            embeddings = position_embeddings.get(layer_type)
+            if embeddings is None or len(embeddings) != 2:
+                return False
+            for tensor in embeddings:
+                if (
+                    tensor.ndim < 2
+                    or int(tensor.shape[0]) not in {1, int(batch_size)}
+                    or int(tensor.shape[1]) != int(query_length)
+                ):
+                    return False
+            mask = causal_mask_mapping.get(layer_type)
+            if mask is not None and (
+                mask.ndim != 4
+                or int(mask.shape[0]) not in {1, int(batch_size)}
+                or int(mask.shape[-2]) != int(query_length)
+            ):
+                return False
+        return True
 
     def __call__(self, *args, **kwargs) -> NativeGemma4PrefixOutput:
         return self.forward(*args, **kwargs)
@@ -2608,6 +2910,9 @@ class NativeGemma4TextPrefix:
         use_cache: bool | None = None,
         apply_final_norm: bool = False,
         wkvm_token_pool_decode=None,
+        wkvm_kv_sharing_fast_prefill: bool = False,
+        wkvm_kv_sharing_owner_only: bool = False,
+        wkvm_logits_indices=None,
         **kwargs,
     ) -> NativeGemma4PrefixOutput:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -2688,19 +2993,108 @@ class NativeGemma4TextPrefix:
             _record_native_timing("text_rotary_wall_s", time.perf_counter() - phase_start)
         shared_kv_states = kwargs.pop("shared_kv_states", UserDict())
 
+        owner_only_requested = bool(
+            wkvm_kv_sharing_fast_prefill and wkvm_kv_sharing_owner_only
+        )
+        owner_only = owner_only_requested and self._should_use_kv_sharing_owner_only(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            causal_mask_mapping=causal_mask_mapping,
+            past_key_values=past_key_values,
+            wkvm_token_pool_decode=wkvm_token_pool_decode,
+        )
+        if owner_only_requested and not owner_only:
+            self.kv_sharing_owner_only_fallbacks += 1
+
+        fast_prefill_indices = None
+        if (
+            wkvm_kv_sharing_fast_prefill
+            and not owner_only_requested
+            and wkvm_logits_indices is not None
+        ):
+            fast_prefill_indices = _normalize_wkvm_logits_indices(
+                wkvm_logits_indices,
+                batch_size=hidden_states.shape[0],
+                query_length=hidden_states.shape[1],
+                device=hidden_states.device,
+            )
+        fast_prefill = (
+            bool(wkvm_kv_sharing_fast_prefill)
+            and not owner_only_requested
+            and self._should_use_kv_sharing_fast_prefill(
+                hidden_states=hidden_states,
+                position_embeddings=position_embeddings,
+                causal_mask_mapping=causal_mask_mapping,
+                past_key_values=past_key_values,
+                wkvm_token_pool_decode=wkvm_token_pool_decode,
+                wkvm_logits_indices=fast_prefill_indices,
+            )
+        )
+        if (
+            wkvm_kv_sharing_fast_prefill
+            and not owner_only_requested
+            and not fast_prefill
+        ):
+            self.kv_sharing_fast_prefill_fallbacks += 1
+        split_layer = self.kv_sharing_fast_prefill_split_layer
+        owner_hidden_states = None
+        tail_position_embeddings = None
+        tail_causal_mask_mapping = None
+        tail_position_ids = None
+
         phase_start = time.perf_counter() if timing_enabled else 0.0
         for i, native_layer in enumerate(self.layers):
+            if owner_only and i == split_layer:
+                break
+            if fast_prefill and i == split_layer:
+                owner_hidden_states = hidden_states
+                hidden_states = _gather_batch_query_tensor(
+                    hidden_states,
+                    fast_prefill_indices,
+                )
+                tail_position_embeddings = {
+                    layer_type: tuple(
+                        _gather_batch_query_tensor(tensor, fast_prefill_indices)
+                        for tensor in embeddings
+                    )
+                    for layer_type, embeddings in position_embeddings.items()
+                }
+                tail_causal_mask_mapping = {
+                    layer_type: _gather_attention_mask_query_rows(
+                        mask,
+                        fast_prefill_indices,
+                        owner_hidden_states.shape[1],
+                    )
+                    for layer_type, mask in causal_mask_mapping.items()
+                }
+                tail_position_ids = _gather_batch_query_tensor(
+                    position_ids,
+                    fast_prefill_indices,
+                )
             layer_type = self.config.layer_types[i]
-            per_layer_input = (
-                per_layer_inputs[:, :, i, :] if per_layer_inputs is not None else None
-            )
+            if per_layer_inputs is None:
+                per_layer_input = None
+            elif fast_prefill and i >= split_layer:
+                per_layer_input = _gather_batch_query_tensor(
+                    per_layer_inputs[:, :, i, :],
+                    fast_prefill_indices,
+                )
+            else:
+                per_layer_input = per_layer_inputs[:, :, i, :]
+            layer_position_embeddings = position_embeddings
+            layer_causal_mask_mapping = causal_mask_mapping
+            layer_position_ids = position_ids
+            if fast_prefill and i >= split_layer:
+                layer_position_embeddings = tail_position_embeddings
+                layer_causal_mask_mapping = tail_causal_mask_mapping
+                layer_position_ids = tail_position_ids
             hidden_states = native_layer(
                 hidden_states,
                 per_layer_input,
                 shared_kv_states=shared_kv_states,
-                position_embeddings=position_embeddings[layer_type],
-                attention_mask=causal_mask_mapping[layer_type],
-                position_ids=position_ids,
+                position_embeddings=layer_position_embeddings[layer_type],
+                attention_mask=layer_causal_mask_mapping[layer_type],
+                position_ids=layer_position_ids,
                 past_key_values=past_key_values,
                 wkvm_token_pool_decode=wkvm_token_pool_decode,
                 **kwargs,
@@ -2708,7 +3102,7 @@ class NativeGemma4TextPrefix:
         if timing_enabled:
             _record_native_timing("text_layers_wall_s", time.perf_counter() - phase_start)
 
-        if apply_final_norm:
+        if apply_final_norm and not owner_only:
             if self.num_layers != int(self.config.num_hidden_layers):
                 raise ValueError("apply_final_norm requires running the full text stack")
             phase_start = time.perf_counter() if timing_enabled else 0.0
@@ -2718,6 +3112,30 @@ class NativeGemma4TextPrefix:
                     "text_final_norm_wall_s",
                     time.perf_counter() - phase_start,
                 )
+
+        if fast_prefill:
+            scatter_indices = fast_prefill_indices.reshape(-1, 1, 1).expand(
+                -1,
+                1,
+                hidden_states.shape[-1],
+            )
+            hidden_states = owner_hidden_states.scatter(
+                1,
+                scatter_indices,
+                hidden_states,
+            )
+            self.kv_sharing_fast_prefill_calls += 1
+            self.kv_sharing_fast_prefill_owner_tokens += int(
+                owner_hidden_states.shape[0] * owner_hidden_states.shape[1]
+            )
+            self.kv_sharing_fast_prefill_tail_tokens += int(
+                owner_hidden_states.shape[0]
+            )
+        elif owner_only:
+            self.kv_sharing_owner_only_calls += 1
+            self.kv_sharing_owner_only_tokens += int(
+                hidden_states.shape[0] * hidden_states.shape[1]
+            )
 
         clear_shared_kv_store = getattr(
             past_key_values,
@@ -2734,6 +3152,7 @@ class NativeGemma4TextPrefix:
             per_layer_inputs=per_layer_inputs,
             position_ids=position_ids,
             causal_mask_mapping=causal_mask_mapping,
+            kv_sharing_owner_only=owner_only,
         )
 
     def to(self, *args, **kwargs):
@@ -2837,6 +3256,36 @@ class NativeGemma4ForCausalLM:
         logits_to_keep: int | Any = 0,
         **kwargs,
     ) -> NativeGemma4CausalLMOutput:
+        # Ragged mixed batches and KV-sharing fast prefill both use one
+        # per-row query index. The latter forwards it into the text stack so
+        # the shared tail can execute only those query positions.
+        wkvm_logits_indices = kwargs.pop("wkvm_logits_indices", None)
+        wkvm_kv_sharing_fast_prefill = bool(
+            kwargs.pop("wkvm_kv_sharing_fast_prefill", False)
+        )
+        wkvm_compute_logits = bool(kwargs.pop("wkvm_compute_logits", True))
+        query_input = input_ids if input_ids is not None else inputs_embeds
+        if wkvm_logits_indices is None and (
+            wkvm_kv_sharing_fast_prefill
+            and wkvm_compute_logits
+            and isinstance(logits_to_keep, int)
+            and logits_to_keep == 1
+            and query_input is not None
+        ):
+            torch = _torch()
+            wkvm_logits_indices = torch.full(
+                (query_input.shape[0],),
+                int(query_input.shape[1]) - 1,
+                dtype=torch.long,
+                device=query_input.device,
+            )
+        if wkvm_logits_indices is not None and query_input is not None:
+            wkvm_logits_indices = _normalize_wkvm_logits_indices(
+                wkvm_logits_indices,
+                batch_size=query_input.shape[0],
+                query_length=query_input.shape[1],
+                device=query_input.device,
+            )
         full_stack = self.num_layers == int(self.config.num_hidden_layers)
         text_out = self.text_prefix(
             input_ids=input_ids,
@@ -2847,16 +3296,39 @@ class NativeGemma4ForCausalLM:
             per_layer_inputs=per_layer_inputs,
             use_cache=use_cache,
             apply_final_norm=full_stack,
+            wkvm_kv_sharing_fast_prefill=wkvm_kv_sharing_fast_prefill,
+            wkvm_kv_sharing_owner_only=(
+                wkvm_kv_sharing_fast_prefill and not wkvm_compute_logits
+            ),
+            wkvm_logits_indices=wkvm_logits_indices,
             **kwargs,
         )
         hidden_states = text_out.hidden_states
-        if isinstance(logits_to_keep, int):
+        if bool(getattr(text_out, "kv_sharing_owner_only", False)):
+            return NativeGemma4CausalLMOutput(
+                logits=None,
+                hidden_states=hidden_states,
+                past_key_values=text_out.past_key_values,
+                shared_kv_states=text_out.shared_kv_states,
+            )
+        if wkvm_logits_indices is not None:
+            torch = _torch()
+            indices = wkvm_logits_indices.to(device=hidden_states.device)
+            row_indices = torch.arange(
+                hidden_states.shape[0],
+                dtype=torch.long,
+                device=hidden_states.device,
+            )
+            hidden_states_for_logits = hidden_states[row_indices, indices].unsqueeze(1)
+        elif isinstance(logits_to_keep, int):
             slice_indices = slice(-logits_to_keep, None)
+            hidden_states_for_logits = hidden_states[:, slice_indices, :]
         else:
             slice_indices = logits_to_keep
+            hidden_states_for_logits = hidden_states[:, slice_indices, :]
         timing_enabled = _native_forward_timing_enabled()
         phase_start = time.perf_counter() if timing_enabled else 0.0
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        logits = self.lm_head(hidden_states_for_logits)
         if timing_enabled:
             _record_native_timing("lm_head_wall_s", time.perf_counter() - phase_start)
         if self.config.final_logit_softcapping is not None:

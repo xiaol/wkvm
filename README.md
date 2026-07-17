@@ -18,6 +18,24 @@ Gemma-4-E4B-it on one RTX 4090. vLLM and SGLang are full-KV transformer engines;
 
 The repeated checkpoint-native A800 comparison is recorded in [`experiments/results/gemma_a800_reliable_20260716/report.md`](experiments/results/gemma_a800_reliable_20260716/report.md). Its gate requires three cold sequential runs per engine on the same physical GPU, an idle baseline, exact source/model/prompt identities, and matching output fingerprints. The report keeps comparable same-run vLLM ratios separate from SGLang's excluded post-measurement timing probe, and labels WKVM's routed-span semantics as approximate rather than full-KV equivalent.
 
+The strict short-session A800 gate remains **FAIL**: the worst-repeat envelope
+is 0.790x versus vLLM and 1.400x versus SGLang at B64/ctx16K/out32.
+
+A new single paired RTX 4090 cohort passes a scoped, complete-session
+provider-HTTP gate on a predeclared long-lived workload: B16, 48 turns,
+36,864 initial tokens, 32 new input tokens per continuation, and 64 output
+tokens per request. WKVM completes in **180.415s**, versus **2,011.890s** for
+vLLM and **4,705.123s** for SGLang: **11.151x** and **26.079x** respectively.
+All 2,304 requests succeed, exact source/replay linkage passes, and each engine
+stays below 24,200 MiB whole-device use. This is exploratory rather than
+publication-grade: one repeat, dirty tree, desktop GPU baseline, and WKVM
+`routed_span_approximate` versus incumbent `full_kv` semantics. See the
+[`48-turn E2E report`](experiments/results/gemma_4090_48turn_10x_20260717.md).
+
+The scoped implementation, cold-path audit, and publication route are in
+[`docs/10X_E2E_PLAN.md`](docs/10X_E2E_PLAN.md). The plan keeps fixed-short-
+session, warm-continuation, and long-lived complete-session claims separate.
+
 ### Model downloads through HF-Mirror
 
 The checkpoint used by the Gemma examples is `google/gemma-4-E4B-it`. Follow [HF-Mirror's download guide](https://hf-mirror.com/) for Hugging Face assets: install the client, point it at the mirror, and resume into a local directory.

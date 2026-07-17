@@ -11,6 +11,7 @@ def make_scheduler(
     num_slots: int = 4,
     max_tokens_per_step: int = 64,
     max_per_request: int = 64,
+    completion_prefill_lane_size: int = 0,
 ) -> Scheduler:
     spec = ModelStateSpec(families=(StateFamilySpec(name="wkv", bytes_per_slot=8),))
     return Scheduler(
@@ -18,6 +19,7 @@ def make_scheduler(
             max_tokens_per_step=max_tokens_per_step,
             max_running_requests=num_slots,
             max_tokens_per_request_per_step=max_per_request,
+            completion_prefill_lane_size=completion_prefill_lane_size,
         ),
         StateArena(spec, num_slots=num_slots),
     )
@@ -80,6 +82,224 @@ class TestNoPhasesInvariant(unittest.TestCase):
         # a's decode token comes off the budget before b's prefill chunk.
         self.assertEqual(out.num_scheduled_tokens[a.req_id], 1)
         self.assertEqual(out.num_scheduled_tokens[b.req_id], 7)
+
+    def test_completion_prefill_lane_finishes_before_next_lane(self) -> None:
+        sched = make_scheduler(
+            num_slots=4,
+            max_tokens_per_step=12,
+            max_per_request=4,
+            completion_prefill_lane_size=2,
+        )
+        requests = [
+            Request(prompt_token_ids=list(range(8)), max_new_tokens=2, req_id=req_id)
+            for req_id in ("a", "b", "c", "d")
+        ]
+        for request in requests:
+            sched.add_request(request)
+
+        first, _ = run_step(sched)
+        second, _ = run_step(sched)
+        third, _ = run_step(sched)
+
+        self.assertEqual(first.num_scheduled_tokens, {"a": 4, "b": 4})
+        self.assertEqual(second.num_scheduled_tokens, {"a": 4, "b": 4})
+        self.assertEqual(
+            third.num_scheduled_tokens,
+            {"a": 1, "b": 1, "c": 4, "d": 4},
+        )
+        self.assertEqual(sched.completion_prefill_lane_starts, 2)
+        self.assertEqual(sched.completion_prefill_lane_completions, 1)
+
+    def test_completion_prefill_lane_does_not_refill_ragged_lane(self) -> None:
+        sched = make_scheduler(
+            num_slots=3,
+            max_tokens_per_step=11,
+            max_per_request=4,
+            completion_prefill_lane_size=2,
+        )
+        a = Request(prompt_token_ids=list(range(4)), max_new_tokens=3, req_id="a")
+        b = Request(prompt_token_ids=list(range(8)), max_new_tokens=3, req_id="b")
+        c = Request(prompt_token_ids=list(range(4)), max_new_tokens=3, req_id="c")
+        for request in (a, b, c):
+            sched.add_request(request)
+
+        first, _ = run_step(sched)
+        second, _ = run_step(sched)
+
+        self.assertEqual(first.num_scheduled_tokens, {"a": 4, "b": 4})
+        self.assertEqual(second.num_scheduled_tokens, {"a": 1, "b": 4})
+        self.assertEqual([request.req_id for request in sched.waiting], ["c"])
+
+    def test_completion_prefill_lane_prioritizes_decode_ready_rows(self) -> None:
+        sched = make_scheduler(
+            num_slots=3,
+            max_tokens_per_step=11,
+            max_per_request=4,
+            completion_prefill_lane_size=2,
+        )
+        decode = Request(prompt_token_ids=[1], max_new_tokens=3, req_id="decode")
+        first_prefill = Request(
+            prompt_token_ids=list(range(8)), max_new_tokens=2, req_id="prefill-a"
+        )
+        second_prefill = Request(
+            prompt_token_ids=list(range(8)), max_new_tokens=2, req_id="prefill-b"
+        )
+        for request in (decode, first_prefill, second_prefill):
+            sched.add_request(request)
+
+        run_step(sched)
+        second, _ = run_step(sched)
+
+        self.assertEqual(
+            list(second.num_scheduled_tokens),
+            ["decode", "prefill-a"],
+        )
+        self.assertEqual(second.num_scheduled_tokens["decode"], 1)
+        self.assertEqual(second.num_scheduled_tokens["prefill-a"], 4)
+        self.assertEqual([request.req_id for request in sched.waiting], ["prefill-b"])
+
+    def test_completion_prefill_lane_preserves_fifo_under_arrivals(self) -> None:
+        sched = make_scheduler(
+            num_slots=4,
+            max_tokens_per_step=12,
+            max_per_request=4,
+            completion_prefill_lane_size=2,
+        )
+        requests = {
+            req_id: Request(
+                prompt_token_ids=list(range(8)),
+                max_new_tokens=1,
+                req_id=req_id,
+            )
+            for req_id in "abcdefgh"
+        }
+        for req_id in "abcd":
+            sched.add_request(requests[req_id])
+
+        admitted_order = []
+        for step in range(8):
+            if step == 1:
+                sched.add_request(requests["e"])
+                sched.add_request(requests["f"])
+            if step == 2:
+                sched.add_request(requests["g"])
+                sched.add_request(requests["h"])
+            output, _ = run_step(sched)
+            admitted_order.extend(request.req_id for request in output.admitted)
+
+        self.assertEqual(admitted_order, list("abcdefgh"))
+        self.assertEqual(sched.completion_prefill_lane_starts, 4)
+        self.assertEqual(sched.completion_prefill_lane_completions, 4)
+        self.assertEqual(sched.completion_prefill_lane_cancellations, 0)
+        self.assertFalse(sched.running)
+        self.assertFalse(sched.waiting)
+
+    def test_completion_prefill_lane_validates_full_lane_budget(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires max_tokens_per_step"):
+            make_scheduler(
+                num_slots=4,
+                max_tokens_per_step=11,
+                max_per_request=4,
+                completion_prefill_lane_size=2,
+            )
+        with self.assertRaisesRegex(ValueError, "must not exceed"):
+            make_scheduler(
+                num_slots=1,
+                max_tokens_per_step=10,
+                max_per_request=4,
+                completion_prefill_lane_size=2,
+            )
+
+    def test_completion_prefill_lane_retires_on_terminal_prefill(self) -> None:
+        sched = make_scheduler(
+            num_slots=2,
+            max_tokens_per_step=10,
+            max_per_request=4,
+            completion_prefill_lane_size=2,
+        )
+        requests = [
+            Request(prompt_token_ids=[1, 2], max_new_tokens=1, req_id=req_id)
+            for req_id in ("a", "b")
+        ]
+        for request in requests:
+            sched.add_request(request)
+
+        out = sched.schedule()
+        sched.update_from_output(out, {req.req_id: [9] for req in requests})
+
+        self.assertEqual(sched.completion_prefill_lane_starts, 1)
+        self.assertEqual(sched.completion_prefill_lane_completions, 1)
+        self.assertEqual(sched.completion_prefill_lane_cancellations, 0)
+        self.assertEqual(sched._completion_prefill_lane, [])
+
+    def test_completion_prefill_lane_retires_as_cancelled_on_abort(self) -> None:
+        sched = make_scheduler(
+            num_slots=2,
+            max_tokens_per_step=12,
+            max_per_request=4,
+            completion_prefill_lane_size=2,
+        )
+        requests = [
+            Request(prompt_token_ids=list(range(8)), max_new_tokens=2, req_id=req_id)
+            for req_id in ("a", "b")
+        ]
+        for request in requests:
+            sched.add_request(request)
+
+        sched.schedule()
+        sched.abort_request("a")
+        sched.abort_request("b")
+
+        self.assertEqual(sched.completion_prefill_lane_completions, 0)
+        self.assertEqual(sched.completion_prefill_lane_cancellations, 1)
+        self.assertEqual(sched._completion_prefill_lane, [])
+
+    def test_completion_prefill_lane_retires_as_cancelled_on_failure(self) -> None:
+        sched = make_scheduler(
+            num_slots=2,
+            max_tokens_per_step=12,
+            max_per_request=4,
+            completion_prefill_lane_size=2,
+        )
+        requests = [
+            Request(prompt_token_ids=list(range(8)), max_new_tokens=2, req_id=req_id)
+            for req_id in ("a", "b")
+        ]
+        for request in requests:
+            sched.add_request(request)
+
+        sched.schedule()
+        self.assertIsNotNone(sched.fail_request("a"))
+        self.assertIsNotNone(sched.fail_request("b"))
+
+        self.assertEqual(sched.completion_prefill_lane_completions, 0)
+        self.assertEqual(sched.completion_prefill_lane_cancellations, 1)
+        self.assertEqual(sched._completion_prefill_lane, [])
+
+    def test_completion_prefill_lane_abort_after_prefill_counts_completion(self) -> None:
+        sched = make_scheduler(
+            num_slots=2,
+            max_tokens_per_step=12,
+            max_per_request=4,
+            completion_prefill_lane_size=2,
+        )
+        requests = [
+            Request(prompt_token_ids=list(range(8)), max_new_tokens=2, req_id=req_id)
+            for req_id in ("a", "b")
+        ]
+        for request in requests:
+            sched.add_request(request)
+
+        first = sched.schedule()
+        sched.update_from_output(first, {})
+        second = sched.schedule()
+        sched.update_from_output(second, {})
+        sched.abort_request("a")
+        sched.abort_request("b")
+
+        self.assertEqual(sched.completion_prefill_lane_completions, 1)
+        self.assertEqual(sched.completion_prefill_lane_cancellations, 0)
+        self.assertEqual(sched._completion_prefill_lane, [])
 
 
 class TestExactAdmission(unittest.TestCase):

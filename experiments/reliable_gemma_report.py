@@ -30,6 +30,7 @@ MODEL_IDENTITY_SCHEMA = "wkvm.model_checkpoint_identity.sha256.v1"
 REQUIRED_ENGINES = frozenset({"wkvm-native", "vllm", "sglang"})
 MINIMUM_PUBLIC_REPEATS = 3
 MAXIMUM_IDLE_BASELINE_GIB = 1.0
+PUBLIC_E2E_CLAIM_RATIO = 10.0
 SOURCE_EXCLUDED_PATH_PATTERNS = [
     "experiments/results/**",
     "**/__pycache__/**",
@@ -1046,6 +1047,26 @@ def _validate_row(
         ),
         source=source,
     )
+    mem_cap_gib = _required_number(
+        data.get("mem_cap_gib"), source=source, field="mem_cap_gib", positive=True
+    )
+    headroom_gib = _required_number(
+        data.get("headroom_gib"), source=source, field="headroom_gib"
+    )
+    memory_gate_gib = mem_cap_gib - headroom_gib
+    reported_engine_delta_gib = _required_number(
+        row.get("peak_engine_delta_gib"),
+        source=source,
+        field="peak_engine_delta_gib",
+    )
+    if not _close(reported_engine_delta_gib, peak_delta_gib):
+        _fail(f"{source}: peak_engine_delta_gib disagrees with GPU telemetry")
+    if peak_delta_gib > memory_gate_gib + 0.02 or row.get("green") is not True:
+        _fail(
+            f"{source}: row failed memory gate; peak delta "
+            f"{peak_delta_gib:.3f} GiB exceeds {memory_gate_gib:.3f} GiB or "
+            "green is not true"
+        )
     decode_comparable, decode_interval, decode_throughput, decode_exclusion = (
         _decode_metrics(
             row,
@@ -1474,6 +1495,10 @@ def build_summary(
                 numerator["metrics"]["e2e_output_tok_s"]["median"]
                 / denominator["metrics"]["e2e_output_tok_s"]["median"]
             )
+            conservative_e2e_ratio = (
+                numerator["metrics"]["e2e_output_tok_s"]["min"]
+                / denominator["metrics"]["e2e_output_tok_s"]["max"]
+            )
             input_ratio = None
             input_exclusion = None
             if (
@@ -1517,10 +1542,40 @@ def build_summary(
                     "median_cohort_input_ratio": input_ratio,
                     "cohort_input_ratio_exclusion": input_exclusion,
                     "median_e2e_output_ratio": e2e_ratio,
+                    "conservative_e2e_output_ratio": conservative_e2e_ratio,
+                    "ten_x_e2e_claim_pass": (
+                        conservative_e2e_ratio >= PUBLIC_E2E_CLAIM_RATIO
+                    ),
                     "median_comparable_decode_ratio": decode_ratio,
                     "decode_ratio_exclusion": decode_exclusion,
                 }
             )
+    claim_batches = []
+    for batch in sorted(groups_by_batch):
+        batch_comparisons = [
+            comparison
+            for comparison in comparisons
+            if comparison["B"] == batch
+        ]
+        ratios = {
+            comparison["denominator_engine"]: comparison[
+                "conservative_e2e_output_ratio"
+            ]
+            for comparison in batch_comparisons
+        }
+        claim_batches.append(
+            {
+                "B": batch,
+                "incumbent_conservative_ratios": ratios,
+                "passes_all_incumbents": (
+                    set(ratios) == {"vllm", "sglang"}
+                    and all(
+                        ratio >= PUBLIC_E2E_CLAIM_RATIO
+                        for ratio in ratios.values()
+                    )
+                ),
+            }
+        )
     return {
         "schema": SUMMARY_SCHEMA,
         "status": "pass",
@@ -1528,11 +1583,22 @@ def build_summary(
         "contract": contract,
         "groups": result_groups,
         "comparisons": comparisons,
+        "ten_x_e2e_claim_gate": {
+            "threshold_ratio": PUBLIC_E2E_CLAIM_RATIO,
+            "metric": "e2e_output_tok_s",
+            "method": "minimum_wkvm_over_maximum_incumbent",
+            "observed_repeat_envelope_not_confidence_interval": True,
+            "batches": claim_batches,
+            "any_batch_passes_all_incumbents": any(
+                batch["passes_all_incumbents"] for batch in claim_batches
+            ),
+        },
         "caveats": [
             "routed_span_approximate and full_kv are different model-state semantics",
             "whole-device memory includes every process on the selected GPU",
             "SGLang separate max_tokens=1 prefill is excluded from cohort-input ratios",
             "SGLang separate-run subtraction is excluded from decode ratios",
+            "the 10x gate applies to E2E output throughput and uses the worst observed repeated-run envelope",
         ],
     }
 
@@ -1658,6 +1724,25 @@ def render_markdown(summary: dict[str, Any]) -> str:
             f"{comparison['denominator_engine']} | "
             f"{input_text} | "
             f"{comparison['median_e2e_output_ratio']:.3f}x | {decode_text} |"
+        )
+    claim_gate = summary["ten_x_e2e_claim_gate"]
+    lines.extend(
+        [
+            "",
+            "## 10x E2E Claim Gate",
+            "",
+            "This observed-run gate passes only when minimum WKVM E2E output throughput divided by maximum incumbent throughput is at least 10.000x for both vLLM and SGLang at the same B. It is deliberately stricter than a median ratio and is not a statistical confidence interval.",
+            "",
+            "| B | Conservative WKVM / vLLM | Conservative WKVM / SGLang | All incumbents |",
+            "|---:|---:|---:|---|",
+        ]
+    )
+    for batch in claim_gate["batches"]:
+        ratios = batch["incumbent_conservative_ratios"]
+        status = "PASS" if batch["passes_all_incumbents"] else "FAIL"
+        lines.append(
+            f"| {batch['B']} | {ratios['vllm']:.3f}x | "
+            f"{ratios['sglang']:.3f}x | **{status}** |"
         )
     lines.extend(["", "## Artifacts", ""])
     for artifact in contract["artifacts"]:

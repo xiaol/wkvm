@@ -921,6 +921,200 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
 
         self.assertLess((hf_decode - native_decode).abs().max().item(), 2e-6)
 
+    def test_triton_dense_gqa_eval_grad_falls_back_to_autograd_sdpa(self) -> None:
+        import torch
+        from types import SimpleNamespace
+        import wkvm.runner.gemma_native_forward as native_forward
+
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for Triton GQA autograd fallback")
+        torch.manual_seed(24)
+        query = torch.randn(
+            1,
+            4,
+            3,
+            16,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        keys = torch.randn(
+            1,
+            2,
+            5,
+            16,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        values = torch.randn_like(keys, requires_grad=True)
+        attn = SimpleNamespace(
+            num_key_value_groups=2,
+            scaling=16**-0.5,
+            training=False,
+            attention_dropout=0.0,
+        )
+
+        with torch.enable_grad():
+            output, weights = native_forward._attention_forward(
+                attn,
+                query,
+                keys,
+                values,
+                None,
+                backend="triton_dense_gqa",
+            )
+            self.assertIsNone(weights)
+            self.assertTrue(output.requires_grad)
+            output.square().sum().backward()
+
+        self.assertIsNotNone(query.grad)
+        self.assertIsNotNone(keys.grad)
+        self.assertIsNotNone(values.grad)
+        self.assertTrue(torch.isfinite(query.grad).all())
+        self.assertTrue(torch.isfinite(keys.grad).all())
+        self.assertTrue(torch.isfinite(values.grad).all())
+
+    def test_triton_dense_gqa_prefill_matches_unexpanded_reference_on_cuda(self) -> None:
+        import torch
+        from types import SimpleNamespace
+        import wkvm.runner.gemma_native_forward as native_forward
+
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for Triton GQA prefill")
+        torch.manual_seed(24)
+        batch = 2
+        kv_heads = 2
+        groups = 4
+        query_length = 37
+        key_length = 53
+        head_dim = 64
+        query = torch.randn(
+            batch,
+            kv_heads * groups,
+            query_length,
+            head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        keys = torch.randn(
+            batch,
+            kv_heads,
+            key_length,
+            head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        values = torch.randn_like(keys)
+        key_positions = torch.arange(key_length, device="cuda").reshape(1, 1, 1, -1)
+        query_positions = (
+            torch.arange(query_length, device="cuda").reshape(1, 1, -1, 1)
+            + key_length
+            - query_length
+        )
+        boolean_mask = key_positions <= query_positions
+        boolean_mask = boolean_mask.expand(batch, -1, -1, -1).clone()
+        boolean_mask[1, :, :, -1] = False
+        attn = SimpleNamespace(
+            num_key_value_groups=groups,
+            scaling=head_dim**-0.5,
+            training=False,
+            attention_dropout=0.0,
+        )
+        additive_mask = torch.zeros(
+            boolean_mask.shape,
+            dtype=query.dtype,
+            device=query.device,
+        )
+        additive_mask.masked_fill_(~boolean_mask, torch.finfo(query.dtype).min)
+        original_repeat_kv = native_forward._repeat_kv
+        native_forward.reset_native_forward_timing_stats()
+
+        def fail_repeat_kv(*_args, **_kwargs):
+            raise AssertionError("native GQA prefill must not expand K/V heads")
+
+        try:
+            native_forward._repeat_kv = fail_repeat_kv
+            for attention_mask in (boolean_mask, additive_mask):
+                with self.subTest(mask_dtype=attention_mask.dtype):
+                    with torch.inference_mode():
+                        expected, _ = native_forward._attention_forward_manual_gqa(
+                            attn,
+                            query,
+                            keys,
+                            values,
+                            attention_mask,
+                        )
+                        actual, weights = native_forward._attention_forward(
+                            attn,
+                            query,
+                            keys,
+                            values,
+                            attention_mask,
+                            backend="triton_dense_gqa",
+                        )
+                    self.assertIsNone(weights)
+                    self.assertEqual(
+                        tuple(actual.shape),
+                        (batch, query_length, kv_heads * groups, head_dim),
+                    )
+                    self.assertLess((expected - actual).abs().max().item(), 0.03)
+            timing = native_forward.native_forward_timing_stats()
+            self.assertGreaterEqual(timing["dense_gqa_prefill_calls"], 2)
+            self.assertEqual(timing["dense_gqa_prefill_fallbacks"], 0)
+        finally:
+            native_forward._repeat_kv = original_repeat_kv
+            native_forward.reset_native_forward_timing_stats()
+
+    def test_triton_dense_gqa_prefill_all_masked_rows_are_zero(self) -> None:
+        import torch
+        from types import SimpleNamespace
+        import wkvm.runner.gemma_native_forward as native_forward
+
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for Triton GQA masked-row handling")
+        torch.manual_seed(25)
+        query = torch.randn(2, 4, 3, 16, device="cuda", dtype=torch.bfloat16)
+        keys = torch.randn(2, 2, 5, 16, device="cuda", dtype=torch.bfloat16)
+        values = torch.randn_like(keys)
+        valid = torch.ones(2, 1, 3, 5, device="cuda", dtype=torch.bool)
+        valid[1] = False
+        attn = SimpleNamespace(
+            num_key_value_groups=2,
+            scaling=16**-0.5,
+            training=False,
+            attention_dropout=0.0,
+        )
+        original_repeat_kv = native_forward._repeat_kv
+
+        def fail_repeat_kv(*_args, **_kwargs):
+            raise AssertionError("masked-row test must exercise Triton GQA prefill")
+
+        try:
+            native_forward._repeat_kv = fail_repeat_kv
+            with torch.inference_mode():
+                for attention_mask in (
+                    valid,
+                    torch.zeros_like(valid, dtype=query.dtype).masked_fill(
+                        ~valid,
+                        torch.finfo(query.dtype).min,
+                    ),
+                ):
+                    with self.subTest(mask_dtype=attention_mask.dtype):
+                        actual, weights = native_forward._attention_forward(
+                            attn,
+                            query,
+                            keys,
+                            values,
+                            attention_mask,
+                            backend="triton_dense_gqa",
+                        )
+                        self.assertIsNone(weights)
+                        self.assertTrue(torch.isfinite(actual).all())
+                        self.assertTrue(torch.equal(actual[1], torch.zeros_like(actual[1])))
+        finally:
+            native_forward._repeat_kv = original_repeat_kv
+
     def test_token_pool_attention_matches_ragged_manual_gqa(self) -> None:
         import torch
         from transformers.models.gemma4.modeling_gemma4 import Gemma4TextDecoderLayer
@@ -993,6 +1187,127 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
 
         self.assertIsNone(actual_weights)
         self.assertLess((expected - actual).abs().max().item(), 1e-6)
+
+    def test_token_pool_mixed_attention_matches_partitioned_rows(self) -> None:
+        from types import SimpleNamespace
+
+        import torch
+
+        from wkvm.runner.gemma_native_forward import (
+            _attention_forward,
+            _attention_forward_manual_gqa,
+        )
+        from wkvm.runner.gemma_token_pool import (
+            TokenKVLayerSpec,
+            TokenKVPool,
+            TokenPoolDecodeContext,
+            TokenPoolMixedBatchContext,
+            build_decode_metadata_from_token_slot_rows,
+            resolve_token_pool_attention_call,
+        )
+
+        torch.manual_seed(37)
+        attn = SimpleNamespace(
+            num_key_value_groups=2,
+            scaling=0.5,
+            attention_dropout=0.0,
+            training=False,
+        )
+        pool = TokenKVPool(
+            capacity=3,
+            layer_specs=[
+                TokenKVLayerSpec(
+                    layer_id=0,
+                    num_kv_heads=1,
+                    head_dim=4,
+                    dtype=torch.float32,
+                )
+            ],
+            dtype=torch.float32,
+        )
+        slots = pool.alloc_slots(3)
+        historical_keys = torch.randn(2, 1, 4)
+        historical_values = torch.randn(2, 1, 4)
+        pool.set_kv(0, slots[:2], historical_keys, historical_values)
+        metadata = build_decode_metadata_from_token_slot_rows(
+            [[int(value) for value in slots.tolist()]],
+            req_slots=[0],
+            logical_seq_lens=[3],
+            out_cache_loc=slots[-1:],
+        )
+        context = TokenPoolMixedBatchContext(
+            decode_context=TokenPoolDecodeContext(
+                metadata_by_layer_type={"sliding_attention": metadata},
+                kv_pool=pool,
+                covered_layer_types=frozenset({"sliding_attention"}),
+            ),
+            q_lens=(1, 3),
+            decode_row_indices=(0,),
+            prefill_row_indices=(1,),
+        )
+        query = torch.randn(2, 2, 3, 4)
+        current_keys = torch.randn(2, 1, 3, 4)
+        current_values = torch.randn(2, 1, 3, 4)
+        dense_keys = torch.zeros_like(current_keys)
+        dense_values = torch.zeros_like(current_values)
+        dense_keys[0, :, :1] = current_keys[0, :, :1]
+        dense_values[0, :, :1] = current_values[0, :, :1]
+        dense_keys[1] = current_keys[1]
+        dense_values[1] = current_values[1]
+        attention_mask = torch.tril(
+            torch.ones(2, 1, 3, 3, dtype=torch.bool)
+        )
+        mixed_call = resolve_token_pool_attention_call(
+            context,
+            0,
+            "sliding_attention",
+            attention_mask_present=True,
+            query_seq_len=3,
+        )
+        bound = mixed_call.bind_layer_kv(
+            current_keys,
+            current_values,
+            has_past_key_values=True,
+        )
+
+        with torch.inference_mode():
+            actual, weights = _attention_forward(
+                attn,
+                query,
+                dense_keys,
+                dense_values,
+                attention_mask,
+                backend="manual_gqa",
+                token_pool_attention_call=bound.attention_call,
+            )
+            pooled_keys, pooled_values = pool.gather_kv(0, slots)
+            expected_decode, _ = _attention_forward_manual_gqa(
+                attn,
+                query[0:1, :, :1],
+                pooled_keys.permute(1, 0, 2).unsqueeze(0),
+                pooled_values.permute(1, 0, 2).unsqueeze(0),
+                None,
+            )
+            expected_prefill, _ = _attention_forward_manual_gqa(
+                attn,
+                query[1:2],
+                dense_keys[1:2],
+                dense_values[1:2],
+                attention_mask[1:2],
+            )
+
+        self.assertIsNone(weights)
+        self.assertLess((actual[0:1, :1] - expected_decode).abs().max().item(), 1e-6)
+        self.assertTrue(torch.equal(actual[0, 1:], torch.zeros_like(actual[0, 1:])))
+        self.assertLess((actual[1:2] - expected_prefill).abs().max().item(), 1e-6)
+        self.assertLess(
+            (pooled_keys[-1] - current_keys[0, :, 0]).abs().max().item(),
+            1e-6,
+        )
+        self.assertLess(
+            (pooled_values[-1] - current_values[0, :, 0]).abs().max().item(),
+            1e-6,
+        )
 
     def test_attention_forward_respects_disabled_token_pool_plan(self) -> None:
         import torch
@@ -2960,6 +3275,433 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
                 1e-6,
             )
 
+    def test_kv_sharing_fast_prefill_matches_selected_rows_and_reduces_tail_work(self) -> None:
+        from unittest import mock
+
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM
+        from wkvm.runner.gemma_native_forward import NativeGemma4ForCausalLM
+
+        torch.manual_seed(62)
+        cfg = _tiny_shared_config()
+        hf_model = Gemma4ForCausalLM(cfg).eval()
+        reference_model = NativeGemma4ForCausalLM(hf_model).eval()
+        fast_model = NativeGemma4ForCausalLM(hf_model).eval()
+        query_length = 128
+        input_ids = (
+            torch.arange(2 * query_length).reshape(2, query_length)
+            % (cfg.vocab_size - 1)
+        ) + 1
+        position_ids = torch.arange(input_ids.shape[1]).expand(input_ids.shape[0], -1)
+        mask = _causal_mask(
+            input_ids.shape[0],
+            input_ids.shape[1],
+            dtype=torch.float32,
+            device=input_ids.device,
+        )
+        mask_mapping = {"sliding_attention": mask, "full_attention": mask}
+        selected = torch.tensor([1, query_length - 1])
+
+        self.assertTrue(fast_model.text_prefix.kv_sharing_fast_prefill_eligible)
+        self.assertEqual(fast_model.text_prefix.kv_sharing_fast_prefill_split_layer, 2)
+        patches = [
+            mock.patch.object(layer, "forward", wraps=layer.forward)
+            for layer in fast_model.text_prefix.layers
+        ]
+        layer_forwards = [patch.start() for patch in patches]
+        try:
+            with torch.inference_mode():
+                expected = reference_model(
+                    input_ids=input_ids,
+                    attention_mask=mask_mapping,
+                    position_ids=position_ids,
+                    use_cache=False,
+                    logits_to_keep=1,
+                    wkvm_logits_indices=selected,
+                )
+                actual = fast_model(
+                    input_ids=input_ids,
+                    attention_mask=mask_mapping,
+                    position_ids=position_ids,
+                    use_cache=False,
+                    logits_to_keep=1,
+                    wkvm_logits_indices=selected,
+                    wkvm_kv_sharing_fast_prefill=True,
+                )
+        finally:
+            for patch in reversed(patches):
+                patch.stop()
+
+        self.assertEqual(
+            tuple(actual.hidden_states.shape),
+            (2, query_length, cfg.hidden_size),
+        )
+        self.assertLess((expected.logits - actual.logits).abs().max().item(), 5e-6)
+        self.assertTrue(torch.equal(expected.logits.argmax(-1), actual.logits.argmax(-1)))
+        for row, query_index in enumerate(selected.tolist()):
+            self.assertLess(
+                (
+                    expected.hidden_states[row, query_index]
+                    - actual.hidden_states[row, query_index]
+                ).abs().max().item(),
+                5e-6,
+            )
+        self.assertEqual(
+            [tuple(call.call_args.args[0].shape) for call in layer_forwards],
+            [(2, query_length, cfg.hidden_size)] * 2
+            + [(2, 1, cfg.hidden_size)] * 2,
+        )
+        prefix = fast_model.text_prefix
+        self.assertEqual(prefix.kv_sharing_fast_prefill_calls, 1)
+        self.assertEqual(prefix.kv_sharing_fast_prefill_owner_tokens, 256)
+        self.assertEqual(prefix.kv_sharing_fast_prefill_tail_tokens, 2)
+        self.assertEqual(prefix.kv_sharing_fast_prefill_fallbacks, 0)
+
+    def test_kv_sharing_fast_prefill_default_last_index_preserves_owner_cache(self) -> None:
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM
+        from wkvm.models.gemma import GemmaRoutedSpanConfig
+        from wkvm.runner.gemma_native_forward import NativeGemma4ForCausalLM
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+
+        torch.manual_seed(63)
+        cfg = _tiny_shared_config()
+        hf_model = Gemma4ForCausalLM(cfg).eval()
+        reference_model = NativeGemma4ForCausalLM(hf_model).eval()
+        fast_model = NativeGemma4ForCausalLM(hf_model).eval()
+        native_cfg = GemmaRoutedSpanConfig(
+            num_hidden_layers=cfg.num_hidden_layers,
+            num_kv_shared_layers=cfg.num_kv_shared_layers,
+            layer_types=tuple(cfg.layer_types),
+            num_kv_heads=cfg.num_key_value_heads,
+            head_dim=cfg.head_dim,
+            sliding_window=cfg.sliding_window,
+        )
+        reference_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+        fast_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+        query_length = 128
+        input_ids = (
+            torch.arange(query_length).reshape(1, query_length)
+            % (cfg.vocab_size - 1)
+        ) + 1
+        position_ids = torch.arange(input_ids.shape[1]).unsqueeze(0)
+        mask = _causal_mask(
+            1,
+            input_ids.shape[1],
+            dtype=torch.float32,
+            device=input_ids.device,
+        )
+        mask_mapping = {"sliding_attention": mask, "full_attention": mask}
+
+        with torch.inference_mode():
+            expected = reference_model(
+                input_ids=input_ids,
+                attention_mask=mask_mapping,
+                position_ids=position_ids,
+                past_key_values=reference_cache,
+                use_cache=True,
+                logits_to_keep=1,
+            )
+            actual = fast_model(
+                input_ids=input_ids,
+                attention_mask=mask_mapping,
+                position_ids=position_ids,
+                past_key_values=fast_cache,
+                use_cache=True,
+                logits_to_keep=1,
+                wkvm_kv_sharing_fast_prefill=True,
+            )
+
+        self.assertLess((expected.logits - actual.logits).abs().max().item(), 5e-6)
+        for expected_layer, actual_layer in zip(
+            reference_cache.layers,
+            fast_cache.layers,
+            strict=True,
+        ):
+            self.assertTrue(torch.equal(expected_layer.keys, actual_layer.keys))
+            self.assertTrue(torch.equal(expected_layer.values, actual_layer.values))
+        prefix = fast_model.text_prefix
+        self.assertEqual(prefix.kv_sharing_fast_prefill_calls, 1)
+        self.assertEqual(prefix.kv_sharing_fast_prefill_owner_tokens, query_length)
+        self.assertEqual(prefix.kv_sharing_fast_prefill_tail_tokens, 1)
+        self.assertEqual(prefix.kv_sharing_fast_prefill_fallbacks, 0)
+
+    def test_kv_sharing_owner_only_skips_tail_norm_and_lm_head(self) -> None:
+        from unittest import mock
+
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM
+        from wkvm.models.gemma import GemmaRoutedSpanConfig
+        from wkvm.runner.gemma_native_forward import NativeGemma4ForCausalLM
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+
+        torch.manual_seed(65)
+        cfg = _tiny_shared_config()
+        model = NativeGemma4ForCausalLM(Gemma4ForCausalLM(cfg).eval()).eval()
+        native_cfg = GemmaRoutedSpanConfig(
+            num_hidden_layers=cfg.num_hidden_layers,
+            num_kv_shared_layers=cfg.num_kv_shared_layers,
+            layer_types=tuple(cfg.layer_types),
+            num_kv_heads=cfg.num_key_value_heads,
+            head_dim=cfg.head_dim,
+            sliding_window=cfg.sliding_window,
+        )
+        cache = NativeGemmaRoutedCache(cfg, native_cfg)
+        input_ids = torch.tensor([[1, 7, 9, 11, 13, 15, 17, 19]])
+        position_ids = torch.arange(input_ids.shape[1]).unsqueeze(0)
+        mask = _causal_mask(
+            1,
+            input_ids.shape[1],
+            dtype=torch.float32,
+            device=input_ids.device,
+        )
+        layer_patches = [
+            mock.patch.object(layer, "forward", wraps=layer.forward)
+            for layer in model.text_prefix.layers
+        ]
+        layer_forwards = [patch.start() for patch in layer_patches]
+        norm_patch = mock.patch.object(
+            model.text_prefix.text_model.norm,
+            "forward",
+            wraps=model.text_prefix.text_model.norm.forward,
+        )
+        head_patch = mock.patch.object(
+            model.lm_head,
+            "forward",
+            wraps=model.lm_head.forward,
+        )
+        norm_forward = norm_patch.start()
+        head_forward = head_patch.start()
+        try:
+            with torch.inference_mode():
+                out = model(
+                    input_ids=input_ids,
+                    attention_mask={
+                        "sliding_attention": mask,
+                        "full_attention": mask,
+                    },
+                    position_ids=position_ids,
+                    past_key_values=cache,
+                    use_cache=True,
+                    logits_to_keep=1,
+                    wkvm_kv_sharing_fast_prefill=True,
+                    wkvm_compute_logits=False,
+                )
+        finally:
+            head_patch.stop()
+            norm_patch.stop()
+            for patch in reversed(layer_patches):
+                patch.stop()
+
+        self.assertIsNone(out.logits)
+        self.assertEqual([call.call_count for call in layer_forwards], [1, 1, 0, 0])
+        norm_forward.assert_not_called()
+        head_forward.assert_not_called()
+        self.assertEqual([layer.cumulative_length for layer in cache.layers], [8, 8])
+        prefix = model.text_prefix
+        self.assertEqual(prefix.kv_sharing_owner_only_calls, 1)
+        self.assertEqual(prefix.kv_sharing_owner_only_tokens, 8)
+        self.assertEqual(prefix.kv_sharing_owner_only_fallbacks, 0)
+
+    def test_owner_only_chunks_then_closing_fast_tail_match_full_path(self) -> None:
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM
+        from wkvm.models.gemma import GemmaRoutedSpanConfig
+        from wkvm.runner.gemma_native_forward import NativeGemma4ForCausalLM
+        from wkvm.runner.gemma_runner import (
+            GemmaRoutedSpanRunner,
+            NativeGemmaRoutedCache,
+        )
+
+        class Bank:
+            def __init__(self, config) -> None:
+                self.config = config
+
+            def ingest_positions(self, slots, positions, break_mask=None) -> None:
+                pass
+
+        torch.manual_seed(66)
+        cfg = _tiny_shared_config()
+        hf_model = Gemma4ForCausalLM(cfg).eval()
+        reference_model = NativeGemma4ForCausalLM(hf_model).eval()
+        fast_model = NativeGemma4ForCausalLM(hf_model).eval()
+        native_cfg = GemmaRoutedSpanConfig(
+            num_hidden_layers=cfg.num_hidden_layers,
+            num_kv_shared_layers=cfg.num_kv_shared_layers,
+            layer_types=tuple(cfg.layer_types),
+            num_kv_heads=cfg.num_key_value_heads,
+            head_dim=cfg.head_dim,
+            sink_tokens=1,
+            ring_tokens=256,
+            routed_slots=2,
+            reps_per_slot=1,
+            span_budget_tokens=256,
+            pending_tokens=256,
+            sliding_window=cfg.sliding_window,
+            max_span_tokens=256,
+        )
+        reference_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+        fast_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+        reference_runner = GemmaRoutedSpanRunner(
+            reference_model,
+            Bank(native_cfg),
+            use_native_gemma_forward=True,
+        )
+        fast_runner = GemmaRoutedSpanRunner(
+            fast_model,
+            Bank(native_cfg),
+            use_native_gemma_forward=True,
+            native_gemma_kv_sharing_fast_prefill=True,
+        )
+        chunks = [
+            list(range(1, 9)),
+            list(range(9, 17)),
+            [1 + (value % (cfg.vocab_size - 1)) for value in range(128)],
+        ]
+        start = 0
+        expected_logits = None
+        actual_logits = None
+        with torch.inference_mode():
+            for index, chunk in enumerate(chunks):
+                expected_logits = reference_runner.prefill_chunk_step(
+                    reference_cache,
+                    chunk,
+                    {},
+                    start_pos=start,
+                )
+                actual_logits = fast_runner.prefill_chunk_step(
+                    fast_cache,
+                    chunk,
+                    {},
+                    start_pos=start,
+                    compute_logits=index == len(chunks) - 1,
+                )
+                if index < len(chunks) - 1:
+                    self.assertIsNone(actual_logits)
+                start += len(chunk)
+
+        self.assertIsNotNone(actual_logits)
+        self.assertLess((expected_logits - actual_logits).abs().max().item(), 5e-6)
+        for expected_layer, actual_layer in zip(
+            reference_cache.layers,
+            fast_cache.layers,
+            strict=True,
+        ):
+            self.assertEqual(expected_layer.cumulative_length, actual_layer.cumulative_length)
+            self.assertTrue(torch.equal(expected_layer.keys, actual_layer.keys))
+            self.assertTrue(torch.equal(expected_layer.values, actual_layer.values))
+        prefix = fast_model.text_prefix
+        self.assertEqual(prefix.kv_sharing_owner_only_calls, 2)
+        self.assertEqual(prefix.kv_sharing_owner_only_tokens, 16)
+        self.assertEqual(prefix.kv_sharing_owner_only_fallbacks, 0)
+        self.assertEqual(prefix.kv_sharing_fast_prefill_calls, 1)
+        self.assertEqual(prefix.kv_sharing_fast_prefill_owner_tokens, 128)
+        self.assertEqual(prefix.kv_sharing_fast_prefill_tail_tokens, 1)
+
+    def test_kv_sharing_fast_prefill_small_closing_query_falls_back(self) -> None:
+        from unittest import mock
+
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM
+        from wkvm.runner.gemma_native_forward import NativeGemma4ForCausalLM
+
+        torch.manual_seed(67)
+        cfg = _tiny_shared_config()
+        model = NativeGemma4ForCausalLM(Gemma4ForCausalLM(cfg).eval()).eval()
+        query_length = 33
+        input_ids = (
+            torch.arange(query_length).reshape(1, query_length)
+            % (cfg.vocab_size - 1)
+        ) + 1
+        position_ids = torch.arange(query_length).unsqueeze(0)
+        mask = _causal_mask(1, query_length, dtype=torch.float32, device=input_ids.device)
+        patches = [
+            mock.patch.object(layer, "forward", wraps=layer.forward)
+            for layer in model.text_prefix.layers
+        ]
+        layer_forwards = [patch.start() for patch in patches]
+        try:
+            with torch.inference_mode():
+                out = model(
+                    input_ids=input_ids,
+                    attention_mask={
+                        "sliding_attention": mask,
+                        "full_attention": mask,
+                    },
+                    position_ids=position_ids,
+                    use_cache=False,
+                    logits_to_keep=1,
+                    wkvm_kv_sharing_fast_prefill=True,
+                )
+        finally:
+            for patch in reversed(patches):
+                patch.stop()
+
+        self.assertIsNotNone(out.logits)
+        self.assertEqual(
+            [tuple(call.call_args.args[0].shape) for call in layer_forwards],
+            [(1, query_length, cfg.hidden_size)] * cfg.num_hidden_layers,
+        )
+        prefix = model.text_prefix
+        self.assertEqual(prefix.kv_sharing_fast_prefill_calls, 0)
+        self.assertEqual(prefix.kv_sharing_fast_prefill_fallbacks, 1)
+
+    def test_kv_sharing_fast_prefill_strict_gates_count_fallbacks(self) -> None:
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM
+        from wkvm.runner.gemma_native_forward import NativeGemma4ForCausalLM
+
+        torch.manual_seed(64)
+        cfg = _tiny_shared_config()
+        hf_model = Gemma4ForCausalLM(cfg).eval()
+        model = NativeGemma4ForCausalLM(hf_model).eval()
+        partial = NativeGemma4ForCausalLM(hf_model, num_layers=3).eval()
+        no_shared = NativeGemma4ForCausalLM(
+            Gemma4ForCausalLM(_tiny_config()).eval()
+        ).eval()
+        self.assertFalse(partial.text_prefix.kv_sharing_fast_prefill_eligible)
+        self.assertIsNone(partial.text_prefix.kv_sharing_fast_prefill_split_layer)
+        self.assertFalse(no_shared.text_prefix.kv_sharing_fast_prefill_eligible)
+        self.assertIsNone(no_shared.text_prefix.kv_sharing_fast_prefill_split_layer)
+
+        one_token = torch.tensor([[7]])
+        one_position = torch.tensor([[0]])
+        one_mask = _causal_mask(1, 1, dtype=torch.float32, device=one_token.device)
+        with torch.inference_mode():
+            model(
+                input_ids=one_token,
+                position_ids=one_position,
+                attention_mask={
+                    "sliding_attention": one_mask,
+                    "full_attention": one_mask,
+                },
+                use_cache=False,
+                logits_to_keep=1,
+                wkvm_kv_sharing_fast_prefill=True,
+            )
+
+            input_ids = torch.tensor([[1, 7, 9]])
+            position_ids = torch.arange(3).unsqueeze(0)
+            mask = _causal_mask(1, 3, dtype=torch.float32, device=input_ids.device)
+            model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask={
+                    "sliding_attention": mask,
+                    "full_attention": mask,
+                },
+                use_cache=False,
+                logits_to_keep=1,
+                wkvm_token_pool_decode=object(),
+                wkvm_kv_sharing_fast_prefill=True,
+            )
+
+        prefix = model.text_prefix
+        self.assertEqual(prefix.kv_sharing_fast_prefill_calls, 0)
+        self.assertEqual(prefix.kv_sharing_fast_prefill_owner_tokens, 0)
+        self.assertEqual(prefix.kv_sharing_fast_prefill_tail_tokens, 0)
+        self.assertEqual(prefix.kv_sharing_fast_prefill_fallbacks, 2)
+
     def test_causal_lm_bridge_exposes_runner_model_interface(self) -> None:
         import torch
         from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM
@@ -3350,6 +4092,52 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
         self.assertIsNotNone(native_layer._qkv_proj)
         self.assertIsNotNone(native_layer._gate_up_proj)
 
+    def test_hf_live_gate_up_packed_projection_is_persistent(self) -> None:
+        from unittest import mock
+
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4TextDecoderLayer
+        from wkvm.runner.gemma_native_forward import NativeGemma4TextDecoderLayer
+
+        torch.manual_seed(48)
+        cfg = _tiny_config()
+        hf_layer = Gemma4TextDecoderLayer(cfg, layer_idx=0).eval()
+        native_layer = NativeGemma4TextDecoderLayer(
+            hf_layer,
+            native_projection_backend="gate_up_packed",
+            native_weight_backend="hf_live",
+        )
+        packed = native_layer._gate_up_proj
+        hidden = torch.randn(2, 5, cfg.hidden_size)
+
+        self.assertTrue(packed.cache)
+        self.assertIsNone(packed._weight)
+        with mock.patch.object(packed, "_build", wraps=packed._build) as build:
+            first = packed(hidden)
+            cached_weight = packed._weight
+            second = packed(hidden)
+
+            self.assertEqual(build.call_count, 1)
+            self.assertIs(packed._weight, cached_weight)
+            expected_bytes = sum(
+                linear.weight.numel() * linear.weight.element_size()
+                for linear in packed.linears
+            )
+            self.assertEqual(
+                packed._weight.numel() * packed._weight.element_size(),
+                expected_bytes,
+            )
+            for first_piece, second_piece in zip(first, second, strict=True):
+                self.assertTrue(torch.equal(first_piece, second_piece))
+
+            with torch.no_grad():
+                hf_layer.mlp.gate_proj.weight.add_(1)
+            refreshed = packed(hidden)
+
+            self.assertEqual(build.call_count, 2)
+            self.assertIsNot(packed._weight, cached_weight)
+            self.assertFalse(torch.equal(first[0], refreshed[0]))
+
     def test_owned_packed_projection_drops_replaced_individual_snapshots(self) -> None:
         from transformers.models.gemma4.modeling_gemma4 import Gemma4TextDecoderLayer
         from wkvm.runner.gemma_native_forward import NativeGemma4TextDecoderLayer
@@ -3475,6 +4263,102 @@ class TestNativeGemma4TextDecoderLayer(unittest.TestCase):
                     )
 
                 self.assertLess((expected - actual).abs().max().item(), 2e-6)
+
+    def test_persistent_packed_causal_lm_matches_separate_prefill_and_decode(self) -> None:
+        import torch
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM
+        from wkvm.models.gemma import GemmaRoutedSpanConfig
+        from wkvm.runner.gemma_native_forward import NativeGemma4ForCausalLM
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+
+        torch.manual_seed(50)
+        cfg = _tiny_shared_config()
+        hf_model = Gemma4ForCausalLM(cfg).eval()
+        separate_model = NativeGemma4ForCausalLM(
+            hf_model,
+            native_attention_backend="sdpa",
+            native_projection_backend="separate",
+        )
+        packed_model = NativeGemma4ForCausalLM(
+            hf_model,
+            native_attention_backend="sdpa",
+            native_projection_backend="qkv_gate_up_packed",
+        )
+        native_cfg = GemmaRoutedSpanConfig(
+            num_hidden_layers=cfg.num_hidden_layers,
+            num_kv_shared_layers=cfg.num_kv_shared_layers,
+            layer_types=tuple(cfg.layer_types),
+            num_kv_heads=cfg.num_key_value_heads,
+            head_dim=cfg.head_dim,
+            sliding_window=cfg.sliding_window,
+        )
+        separate_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+        packed_cache = NativeGemmaRoutedCache(cfg, native_cfg)
+        input_ids = torch.tensor([[1, 7, 9, 11, 13]])
+        position_ids = torch.arange(input_ids.shape[1]).unsqueeze(0)
+        mask = _causal_mask(
+            1,
+            input_ids.shape[1],
+            dtype=torch.float32,
+            device=input_ids.device,
+        )
+        mask_mapping = {"sliding_attention": mask, "full_attention": mask}
+        decode_ids = torch.tensor([[17]])
+        decode_position_ids = torch.tensor([[input_ids.shape[1]]])
+
+        with torch.inference_mode():
+            separate_prefill = separate_model(
+                input_ids=input_ids,
+                attention_mask=mask_mapping,
+                position_ids=position_ids,
+                past_key_values=separate_cache,
+                use_cache=True,
+                logits_to_keep=1,
+            )
+            packed_prefill = packed_model(
+                input_ids=input_ids,
+                attention_mask=mask_mapping,
+                position_ids=position_ids,
+                past_key_values=packed_cache,
+                use_cache=True,
+                logits_to_keep=1,
+            )
+            separate_decode = separate_model(
+                input_ids=decode_ids,
+                attention_mask={"sliding_attention": None, "full_attention": None},
+                position_ids=decode_position_ids,
+                past_key_values=separate_cache,
+                use_cache=True,
+                logits_to_keep=1,
+            )
+            packed_decode = packed_model(
+                input_ids=decode_ids,
+                attention_mask={"sliding_attention": None, "full_attention": None},
+                position_ids=decode_position_ids,
+                past_key_values=packed_cache,
+                use_cache=True,
+                logits_to_keep=1,
+            )
+
+        for separate, packed in (
+            (separate_prefill.logits, packed_prefill.logits),
+            (separate_decode.logits, packed_decode.logits),
+        ):
+            self.assertLess((separate - packed).abs().max().item(), 5e-6)
+            self.assertTrue(torch.equal(separate.argmax(-1), packed.argmax(-1)))
+        for separate_layer, packed_layer in zip(
+            separate_cache.layers,
+            packed_cache.layers,
+            strict=True,
+        ):
+            self.assertLess(
+                (separate_layer.keys - packed_layer.keys).abs().max().item(),
+                1e-6,
+            )
+            self.assertLess(
+                (separate_layer.values - packed_layer.values).abs().max().item(),
+                1e-6,
+            )
 
     def test_causal_lm_sdpa_backend_matches_manual_backend(self) -> None:
         import torch

@@ -52,6 +52,11 @@ class Scheduler:
         self.parked: dict[str, Request] = {}
         self.requests: dict[str, Request] = {}
         self._park_on_finish: set[str] = set()
+        self._completion_prefill_lane: list[str] = []
+        self._completion_prefill_lane_cancelled = False
+        self.completion_prefill_lane_starts = 0
+        self.completion_prefill_lane_completions = 0
+        self.completion_prefill_lane_cancellations = 0
         # Called with each finishing request BEFORE its slots are released —
         # the one moment end-of-life state is still addressable (the engine
         # uses it for snapshot-on-finish; see wkvm/store.py).
@@ -72,6 +77,10 @@ class Scheduler:
         if req is None or req.status.is_finished:
             return  # abort is idempotent
         if req.status is RequestStatus.RUNNING:
+            self._retire_completion_prefill_member(
+                req_id,
+                cancelled=req.num_computed_tokens < req.num_prompt_tokens,
+            )
             self._release(req)
         elif req.status is RequestStatus.PARKED:
             self._release_parked(req)
@@ -95,6 +104,10 @@ class Scheduler:
         if req is None or req.status.is_finished:
             return None
         if req.status is RequestStatus.RUNNING:
+            self._retire_completion_prefill_member(
+                req_id,
+                cancelled=req.num_computed_tokens < req.num_prompt_tokens,
+            )
             self._release(req)
         elif req.status is RequestStatus.PARKED:
             self._release_parked(req)
@@ -111,6 +124,12 @@ class Scheduler:
     # -- the loop ----------------------------------------------------------
 
     def schedule(self) -> SchedulerOutput:
+        if self.config.completion_prefill_lane_size:
+            return self._schedule_completion_prefill_lane()
+
+        return self._schedule_default()
+
+    def _schedule_default(self) -> SchedulerOutput:
         out = SchedulerOutput()
         budget = self.config.max_tokens_per_step
 
@@ -154,6 +173,83 @@ class Scheduler:
 
         return out
 
+    def _schedule_completion_prefill_lane(self) -> SchedulerOutput:
+        out = SchedulerOutput()
+        budget = self.config.max_tokens_per_step
+
+        for req in self.running:
+            if req.num_computed_tokens < req.num_prompt_tokens:
+                continue
+            if budget <= 0:
+                break
+            n = min(
+                req.num_scheduled_gap,
+                budget,
+                self.config.max_tokens_per_request_per_step,
+            )
+            if n <= 0:
+                continue
+            out.num_scheduled_tokens[req.req_id] = n
+            budget -= n
+
+        for req_id in list(self._completion_prefill_lane):
+            req = self.requests.get(req_id)
+            if req is None or req.status is not RequestStatus.RUNNING:
+                completed = (
+                    req is not None
+                    and req.num_computed_tokens >= req.num_prompt_tokens
+                    and req.status
+                    in (
+                        RequestStatus.FINISHED_STOPPED,
+                        RequestStatus.FINISHED_LENGTH,
+                        RequestStatus.PARKED,
+                    )
+                )
+                self._retire_completion_prefill_member(
+                    req_id,
+                    cancelled=not completed,
+                )
+            elif req.num_computed_tokens >= req.num_prompt_tokens:
+                self._retire_completion_prefill_member(req_id, cancelled=False)
+
+        if not self._completion_prefill_lane:
+            lane_size = self.config.completion_prefill_lane_size
+            self._completion_prefill_lane = [
+                req.req_id
+                for req in self.running
+                if req.num_computed_tokens < req.num_prompt_tokens
+            ][:lane_size]
+            while (
+                len(self._completion_prefill_lane) < lane_size
+                and self.waiting
+                and len(self.running) < self.config.max_running_requests
+                and self.arena.can_admit()
+            ):
+                req = self.waiting.popleft()
+                req.slots = self.arena.allocate()
+                req.status = RequestStatus.RUNNING
+                self.running.append(req)
+                out.admitted.append(req)
+                self._completion_prefill_lane.append(req.req_id)
+            if self._completion_prefill_lane:
+                self.completion_prefill_lane_starts += 1
+
+        for req_id in self._completion_prefill_lane:
+            if budget <= 0:
+                break
+            req = self.requests[req_id]
+            n = min(
+                req.num_scheduled_gap,
+                budget,
+                self.config.max_tokens_per_request_per_step,
+            )
+            if n <= 0:
+                continue
+            out.num_scheduled_tokens[req.req_id] = n
+            budget -= n
+
+        return out
+
     # -- results -----------------------------------------------------------
 
     def update_from_output(
@@ -186,6 +282,17 @@ class Scheduler:
                     req.status = RequestStatus.FINISHED_LENGTH
                     break
             if req.status.is_finished:
+                self._retire_completion_prefill_member(
+                    req.req_id,
+                    cancelled=(
+                        req.num_computed_tokens < req.num_prompt_tokens
+                        or req.status
+                        not in (
+                            RequestStatus.FINISHED_STOPPED,
+                            RequestStatus.FINISHED_LENGTH,
+                        )
+                    ),
+                )
                 if self.on_finish is not None:
                     self.on_finish(req)
                 if req.req_id in self._park_on_finish:
@@ -236,6 +343,25 @@ class Scheduler:
         self.running.append(request)
 
     # -- internals -----------------------------------------------------------
+
+    def _retire_completion_prefill_member(
+        self,
+        req_id: str,
+        *,
+        cancelled: bool,
+    ) -> None:
+        if req_id not in self._completion_prefill_lane:
+            return
+        if cancelled:
+            self._completion_prefill_lane_cancelled = True
+        self._completion_prefill_lane.remove(req_id)
+        if self._completion_prefill_lane:
+            return
+        if self._completion_prefill_lane_cancelled:
+            self.completion_prefill_lane_cancellations += 1
+        else:
+            self.completion_prefill_lane_completions += 1
+        self._completion_prefill_lane_cancelled = False
 
     def _release(self, req: Request) -> None:
         self.running.remove(req)

@@ -57,6 +57,7 @@ def chunked_scheduler_config(
     token_budget: int | None,
     chunk: int,
     require_full_prefill_budget: bool = False,
+    completion_prefill_lane_size: int = 0,
 ) -> SchedulerConfig:
     if not prompts:
         raise ValueError("prompts must not be empty")
@@ -73,6 +74,7 @@ def chunked_scheduler_config(
         max_tokens_per_step=max(budget, len(prompts)),
         max_running_requests=slots,
         max_tokens_per_request_per_step=max(1, min(max_prompt, budget, chunk)),
+        completion_prefill_lane_size=int(completion_prefill_lane_size),
     )
 
 
@@ -107,6 +109,7 @@ def run(args) -> None:
         token_budget=args.token_budget,
         chunk=args.chunk,
         require_full_prefill_budget=True,
+        completion_prefill_lane_size=args.completion_prefill_lane_size,
     )
     engine = GemmaNativeEngine(
         model,
@@ -182,6 +185,7 @@ def main() -> None:
     ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument("--slots", type=int, default=None)
     ap.add_argument("--chunk", type=int, default=2048)
+    ap.add_argument("--completion-prefill-lane-size", type=int, default=0)
     ap.add_argument("--decode-microbatch-rows", type=int, default=16)
     ap.add_argument("--decode-microbatch-bytes", type=int, default=None)
     ap.add_argument(

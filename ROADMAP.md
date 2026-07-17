@@ -20,6 +20,9 @@ Rationale for every design choice lives in `docs/ANGLE.md` §5 and `docs/RECURRE
 
 - Wire M0 scheduler to M1 runner; overlap scheduling (bounded future queue) from day one — retrofitting it is what scarred SGLang.
 - Whole-step decode CUDA graphs keyed by batch size buckets (uniform batches make this trivially safe).
+- `wkvm.core.mixed_batch.MixedBatchMetadata` defines the dependency-free
+  ragged contract used to combine decode rows with unequal prefill rows; the
+  native runner integration and CPU parity/fallback gates are implemented.
 - Minimal OpenAI-compatible HTTP frontend in its own process; engine speaks token ids only.
 - Exit: Albatross-comparison benchmark — decode tok/s vs batch size, flat VRAM chart.
 

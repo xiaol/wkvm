@@ -10,6 +10,7 @@ prefix caches can report actual cached-token counts.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextlib
 from dataclasses import dataclass
 import gc
@@ -23,6 +24,7 @@ import subprocess
 import sys
 import time
 from typing import Any, Iterable, Sequence
+import uuid
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,6 +44,10 @@ from bench_prompt_utils import (
 
 
 SCHEMA = "wkvm.gemma_multiturn_bench.v1"
+SHARED_HISTORY_TRACE_SCHEMA = "wkvm.gemma_shared_history_trace.v1"
+SHARED_TEACHER_HISTORY_MODE = "shared_teacher_forced"
+SHARED_TEACHER_HISTORY_POLICY = "shared_teacher_forced_token_history"
+TEACHER_FORCED_TOKEN_IDS_ARG = "wkvm_teacher_forced_token_ids"
 PROMPT_TOKEN_SOURCE = "synthetic_lcg"
 
 
@@ -49,6 +55,16 @@ PROMPT_TOKEN_SOURCE = "synthetic_lcg"
 class MultiTurnWorkload:
     initial_prompts: list[list[int]]
     turn_deltas: list[list[list[int]]]
+
+
+@dataclass(frozen=True)
+class SharedHistoryTrace:
+    workload: dict[str, Any]
+    turn_outputs: list[list[list[int]]]
+    output_fingerprints: list[dict[str, Any]]
+    trace_sha256: str
+    source_path: str | None = None
+    source: dict[str, Any] | None = None
 
 
 def atomic_write_json(path: Path, value: Any) -> None:
@@ -259,6 +275,353 @@ def workload_fingerprints(workload: MultiTurnWorkload) -> dict[str, Any]:
             for deltas in workload.turn_deltas
         ],
     }
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _shared_trace_workload(
+    workload: MultiTurnWorkload,
+    *,
+    sessions: int,
+    turns: int,
+    output_tokens_per_turn: int,
+) -> dict[str, Any]:
+    return {
+        "sessions": int(sessions),
+        "turns": int(turns),
+        "output_tokens_per_turn": int(output_tokens_per_turn),
+        "prompt_token_source": PROMPT_TOKEN_SOURCE,
+        "fingerprints": workload_fingerprints(workload),
+    }
+
+
+def _normalize_shared_trace_outputs(
+    turn_outputs: Sequence[Sequence[Sequence[int] | None]],
+    *,
+    sessions: int,
+    turns: int,
+    output_tokens_per_turn: int,
+    vocab_size: int,
+) -> list[list[list[int]]]:
+    if len(turn_outputs) != turns:
+        raise ValueError(
+            f"shared history trace has {len(turn_outputs)} turns, expected {turns}"
+        )
+    normalized: list[list[list[int]]] = []
+    for turn_index, outputs in enumerate(turn_outputs):
+        if len(outputs) != sessions:
+            raise ValueError(
+                f"shared history trace turn {turn_index} has {len(outputs)} rows, "
+                f"expected {sessions}"
+            )
+        turn_rows: list[list[int]] = []
+        for session_index, output in enumerate(outputs):
+            if output is None:
+                raise ValueError(
+                    f"shared history trace turn {turn_index} session "
+                    f"{session_index} has no output"
+                )
+            if len(output) != output_tokens_per_turn:
+                raise ValueError(
+                    f"shared history trace turn {turn_index} session "
+                    f"{session_index} has {len(output)} tokens, expected "
+                    f"{output_tokens_per_turn}"
+                )
+            tokens: list[int] = []
+            for token in output:
+                if isinstance(token, bool) or not isinstance(token, int):
+                    raise ValueError("shared history trace tokens must be integers")
+                token = int(token)
+                if token < 0 or token >= vocab_size:
+                    raise ValueError(
+                        f"shared history trace token {token} is outside "
+                        f"[0, {vocab_size})"
+                    )
+                tokens.append(token)
+            turn_rows.append(tokens)
+        normalized.append(turn_rows)
+    return normalized
+
+
+def build_shared_history_trace(
+    workload: MultiTurnWorkload,
+    turn_outputs: Sequence[Sequence[Sequence[int] | None]],
+    *,
+    sessions: int,
+    turns: int,
+    output_tokens_per_turn: int,
+    vocab_size: int,
+    source_path: str | None = None,
+    source: dict[str, Any] | None = None,
+) -> SharedHistoryTrace:
+    if len(workload.initial_prompts) != sessions:
+        raise ValueError("shared history trace session count does not match workload")
+    if len(workload.turn_deltas) != max(turns - 1, 0):
+        raise ValueError("shared history trace turn count does not match workload")
+    normalized = _normalize_shared_trace_outputs(
+        turn_outputs,
+        sessions=sessions,
+        turns=turns,
+        output_tokens_per_turn=output_tokens_per_turn,
+        vocab_size=vocab_size,
+    )
+    trace_workload = _shared_trace_workload(
+        workload,
+        sessions=sessions,
+        turns=turns,
+        output_tokens_per_turn=output_tokens_per_turn,
+    )
+    contract = {
+        "schema": SHARED_HISTORY_TRACE_SCHEMA,
+        "workload": trace_workload,
+        "turn_outputs": normalized,
+    }
+    request_ids = [session_id(index) for index in range(sessions)]
+    output_fingerprints = [
+        generated_output_fingerprint(
+            zip(request_ids, outputs, strict=True)
+        )
+        for outputs in normalized
+    ]
+    return SharedHistoryTrace(
+        workload=trace_workload,
+        turn_outputs=normalized,
+        output_fingerprints=output_fingerprints,
+        trace_sha256=_canonical_json_sha256(contract),
+        source_path=source_path,
+        source=source,
+    )
+
+
+def shared_history_trace_payload(
+    trace: SharedHistoryTrace,
+    *,
+    source: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "schema": SHARED_HISTORY_TRACE_SCHEMA,
+        "trace_sha256": trace.trace_sha256,
+        "workload": trace.workload,
+        "turn_outputs": trace.turn_outputs,
+        "output_fingerprints": trace.output_fingerprints,
+    }
+    effective_source = trace.source if source is None else source
+    if effective_source is not None:
+        payload["source"] = effective_source
+    return payload
+
+
+def load_shared_history_trace(
+    path: str | Path,
+    workload: MultiTurnWorkload,
+    *,
+    sessions: int,
+    turns: int,
+    output_tokens_per_turn: int,
+    vocab_size: int,
+) -> SharedHistoryTrace:
+    trace_path = Path(path)
+    with trace_path.open("r", encoding="utf-8") as stream:
+        payload = json.load(stream)
+    if not isinstance(payload, dict):
+        raise ValueError("shared history trace must be a JSON object")
+    if payload.get("schema") != SHARED_HISTORY_TRACE_SCHEMA:
+        raise ValueError(
+            f"shared history trace schema must be {SHARED_HISTORY_TRACE_SCHEMA!r}"
+        )
+    expected_workload = _shared_trace_workload(
+        workload,
+        sessions=sessions,
+        turns=turns,
+        output_tokens_per_turn=output_tokens_per_turn,
+    )
+    if payload.get("workload") != expected_workload:
+        raise ValueError("shared history trace workload does not match this run")
+    raw_outputs = payload.get("turn_outputs")
+    if not isinstance(raw_outputs, list):
+        raise ValueError("shared history trace turn_outputs must be a list")
+    source = payload.get("source")
+    if source is not None and not isinstance(source, dict):
+        raise ValueError("shared history trace source must be an object")
+    trace = build_shared_history_trace(
+        workload,
+        raw_outputs,
+        sessions=sessions,
+        turns=turns,
+        output_tokens_per_turn=output_tokens_per_turn,
+        vocab_size=vocab_size,
+        source_path=str(trace_path),
+        source=source,
+    )
+    if payload.get("trace_sha256") != trace.trace_sha256:
+        raise ValueError("shared history trace SHA-256 does not match its contents")
+    if payload.get("output_fingerprints") != trace.output_fingerprints:
+        raise ValueError("shared history trace output fingerprints do not match")
+    return trace
+
+
+def shared_history_trace_metadata(
+    trace: SharedHistoryTrace | None,
+) -> dict[str, Any]:
+    if trace is None:
+        return {
+            "mode": "engine_generated",
+            "shared": False,
+            "teacher_forced": False,
+        }
+    metadata = {
+        "mode": SHARED_TEACHER_HISTORY_MODE,
+        "shared": True,
+        "teacher_forced": True,
+        "schema": SHARED_HISTORY_TRACE_SCHEMA,
+        "trace_sha256": trace.trace_sha256,
+        "turn_count": len(trace.turn_outputs),
+        "output_fingerprints": trace.output_fingerprints,
+        "source_path": trace.source_path,
+    }
+    if isinstance(trace.source, dict):
+        metadata["source_run_id"] = trace.source.get("run_id")
+    return metadata
+
+
+def _teacher_forcing_errors(
+    outputs: Sequence[Sequence[int] | None],
+    expected_outputs: Sequence[Sequence[int]],
+    expected_output_tokens: int,
+) -> list[str | None]:
+    errors = _turn_errors_for_outputs(outputs, expected_output_tokens)
+    for index, (output, expected) in enumerate(
+        zip(outputs, expected_outputs, strict=True)
+    ):
+        observed = list(output or ())
+        target = list(expected)
+        if errors[index] is None and observed != target:
+            mismatch_index = next(
+                token_index
+                for token_index, (observed_token, target_token) in enumerate(
+                    zip(observed, target, strict=True)
+                )
+                if observed_token != target_token
+            )
+            errors[index] = (
+                "engine output diverged from shared teacher trace at output "
+                f"index {mismatch_index}: expected {target[mismatch_index]}, "
+                f"got {observed[mismatch_index]}"
+            )
+    return errors
+
+
+def _teacher_forcing_turn_metadata(
+    trace: SharedHistoryTrace | None,
+    *,
+    turn_index: int,
+    outputs: Sequence[Sequence[int] | None],
+    candidate_outputs: Sequence[Sequence[int]] | None = None,
+    backend: str | None = None,
+) -> dict[str, Any]:
+    if trace is None:
+        return {
+            "enabled": False,
+            "mode": "engine_generated",
+        }
+    expected_outputs = trace.turn_outputs[turn_index]
+    exact_rows = [
+        output is not None and list(output) == list(expected)
+        for output, expected in zip(outputs, expected_outputs, strict=True)
+    ]
+    metadata: dict[str, Any] = {
+        "enabled": True,
+        "mode": SHARED_TEACHER_HISTORY_MODE,
+        "backend": backend,
+        "overhead_contract": _teacher_forcing_overhead_contract(backend),
+        "trace_sha256": trace.trace_sha256,
+        "selected_outputs_match_trace": all(exact_rows),
+        "selected_output_exact_rows": sum(exact_rows),
+        "request_count": len(expected_outputs),
+        "teacher_output_fingerprint": trace.output_fingerprints[turn_index],
+    }
+    if candidate_outputs is not None:
+        request_ids = [session_id(index) for index in range(len(candidate_outputs))]
+        candidate_matches = [
+            list(candidate) == list(expected)
+            for candidate, expected in zip(
+                candidate_outputs,
+                expected_outputs,
+                strict=True,
+            )
+        ]
+        metadata.update(
+            {
+                "candidate_outputs_observed": True,
+                "candidate_output_exact_rows": sum(candidate_matches),
+                "candidate_outputs_match_trace": all(candidate_matches),
+                "candidate_output_fingerprint": generated_output_fingerprint(
+                    zip(request_ids, candidate_outputs, strict=True)
+                ),
+            }
+        )
+    else:
+        metadata["candidate_outputs_observed"] = False
+    return metadata
+
+
+def _teacher_forcing_overhead_contract(
+    backend: str | None,
+) -> dict[str, Any] | None:
+    if backend is None:
+        return None
+    if backend == "post_sample_pending_token_override":
+        return {
+            "timed": True,
+            "full_vocabulary_mask": False,
+            "gpu_logit_elements_mutated_per_row": 0,
+            "mutation": "one_pending_token_scalar_overwrite",
+            "row_mutation_scope": "request_loop",
+        }
+    if backend == "vllm_sequence_logits_processor":
+        return {
+            "timed": True,
+            "full_vocabulary_mask": False,
+            "gpu_logit_elements_mutated_per_row": 1,
+            "mutation": "one_target_positive_infinity_scatter",
+            "row_mutation_scope": "single_batched_scatter",
+        }
+    if backend == "sglang_sequence_logits_processor":
+        return {
+            "timed": True,
+            "full_vocabulary_mask": False,
+            "gpu_logit_elements_mutated_per_row": 1,
+            "mutation": "one_target_dtype_finite_max_scatter",
+            "row_mutation_scope": "single_batched_scatter",
+        }
+    raise ValueError(f"unknown teacher-forcing backend {backend!r}")
+
+
+def _force_pending_wkvm_outputs(
+    requests: dict[str, Any],
+    request_ids: Sequence[str],
+    expected_outputs: Sequence[Sequence[int]],
+    candidate_outputs: list[list[int]],
+) -> None:
+    for request_index, request_id in enumerate(request_ids):
+        output_tokens = requests[request_id].output_token_ids
+        while len(candidate_outputs[request_index]) < len(output_tokens):
+            output_index = len(candidate_outputs[request_index])
+            if output_index >= len(expected_outputs[request_index]):
+                raise RuntimeError("WKVM produced more tokens than the teacher trace")
+            candidate_outputs[request_index].append(
+                int(output_tokens[output_index])
+            )
+            output_tokens[output_index] = int(
+                expected_outputs[request_index][output_index]
+            )
 
 
 def _metric_number(value: Any) -> float | None:
@@ -660,8 +1023,80 @@ def _wkvm_stats_snapshot(engine: Any) -> dict[str, Any]:
         "uses_hf_transformer_forward",
         "uses_hf_model_construction",
         "native_gemma_checkpoint_loader",
+        "prefill_calls",
+        "prefill_model_calls",
+        "batched_prefill_model_calls",
+        "batched_prefill_rows",
+        "max_prefill_batch_rows",
+        "decode_batches",
+        "decode_rows",
+        "decode_model_calls",
+        "batched_decode_model_calls",
+        "fallback_decode_model_calls",
+        "max_decode_batch_rows",
+        "max_decode_model_batch_rows",
+        "decode_microbatch_splits",
+        "decode_microbatch_byte_splits",
+        "decode_batch_fallback_reasons",
+        "decode_timing_merge_s",
+        "decode_timing_model_forward_s",
+        "decode_timing_commit_s",
+        "decode_timing_split_s",
+        "decode_timing_mask_s",
+        "decode_timing_total_s",
+        "decode_timing_graph_input_copy_s",
+        "decode_timing_graph_metadata_copy_s",
+        "decode_timing_graph_replay_s",
+        "persistent_padded_decode_starts",
+        "persistent_padded_decode_reuses",
+        "persistent_padded_decode_rows",
+        "persistent_padded_decode_cuda_graph_captures",
+        "persistent_padded_decode_cuda_graph_replays",
+        "persistent_padded_decode_cuda_graph_skips",
+        "persistent_padded_decode_cuda_graph_skip_reasons",
+        "token_pool_decode_graph_shape_mismatches",
+        "token_pool_decode_graph_shape_mismatch_reasons",
+        "token_pool_decode_graph_metadata_tensor_copies",
+        "token_pool_decode_graph_metadata_tensor_copy_skips",
+        "token_pool_decode_graph_metadata_alias_fastpath_metadata_skips",
+        "token_pool_decode_metadata_batches",
+        "token_pool_decode_metadata_rows",
+        "token_pool_authoritative_prefill_requests",
+        "token_pool_authoritative_prefill_tokens",
+        "token_pool_authoritative_prefill_layer_writes",
+        "token_pool_deferred_prefill_requests",
+        "token_pool_deferred_prefill_tokens",
+        "token_pool_prefill_kv_layer_writes",
+        "token_pool_prefill_kv_tokens_written",
+        "token_pool_final_prefill_full_tail_backfills",
+        "token_pool_final_prefill_full_tail_tokens",
+        "token_pool_decode_covered_layer_type_batches",
+        "token_pool_decode_covered_layer_type_rows",
+        "token_pool_full_attention_row_rebuilds",
+        "token_pool_full_attention_row_reuses",
+        "token_pool_full_attention_row_appends",
+        "token_pool_full_attention_row_invalidations",
+        "token_pool_full_attention_coverage_splits",
+        "token_pool_full_attention_capacity_microbatch",
+        "token_pool_full_attention_capacity_microbatch_groups",
+        "token_pool_full_attention_capacity_microbatch_rows",
+        "token_pool_full_attention_capacity_microbatch_max_rows",
+        "token_pool_route_boundary_batches",
+        "token_pool_route_boundary_flushes",
     )
     snapshot = {key: stats.get(key) for key in keys}
+    mixed_calls = int(stats.get("mixed_batch_model_calls") or 0)
+    snapshot["mixed_batch_model_calls"] = mixed_calls
+    snapshot["mixed_batch_rows"] = int(stats.get("mixed_batch_rows") or 0)
+    snapshot["mixed_batch_opportunities"] = int(
+        stats.get("mixed_batch_opportunities") or 0
+    )
+    snapshot["mixed_batch_fallbacks"] = int(
+        stats.get("mixed_batch_fallbacks") or 0
+    )
+    snapshot["execution_mode"] = (
+        "mixed_ragged" if mixed_calls else "partitioned_prefill_decode"
+    )
     snapshot["state"] = stats.get("state")
     snapshot["token_pool"] = stats.get("token_pool")
     snapshot["gpu_memory"] = stats.get("gpu_memory")
@@ -704,7 +1139,11 @@ def _wkvm_reuse_invariants(
     }
 
 
-def run_wkvm(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[str, Any]:
+def run_wkvm(
+    args: argparse.Namespace,
+    workload: MultiTurnWorkload,
+    shared_history_trace: SharedHistoryTrace | None = None,
+) -> dict[str, Any]:
     import torch
 
     from bench_prompt_utils import SyntheticBenchTokenizer
@@ -741,12 +1180,23 @@ def run_wkvm(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[str,
     turn_rows: list[dict[str, Any]] = []
     turn_prompt_sets: list[list[list[int]]] = []
     turn_output_sets: list[list[list[int]]] = []
+    generated_output_turns: list[list[list[int]]] = []
     before_close: dict[str, Any] | None = None
     after_close: dict[str, Any] | None = None
     fresh_parity: dict[str, Any] | None = None
     closed = False
     try:
         for turn_index in range(args.turns):
+            expected_outputs = (
+                None
+                if shared_history_trace is None
+                else shared_history_trace.turn_outputs[turn_index]
+            )
+            candidate_outputs = (
+                None
+                if expected_outputs is None
+                else [[] for _ in range(args.sessions)]
+            )
             prompts, deltas = _turn_prompts_and_deltas(
                 workload,
                 histories,
@@ -796,6 +1246,14 @@ def run_wkvm(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[str,
             emptied_cache_before_decode = False
             while engine.has_unfinished:
                 engine.step()
+                if expected_outputs is not None:
+                    assert candidate_outputs is not None
+                    _force_pending_wkvm_outputs(
+                        requests,
+                        request_ids,
+                        expected_outputs,
+                        candidate_outputs,
+                    )
                 if (
                     args.wkvm_empty_cache_before_decode
                     and not emptied_cache_before_decode
@@ -813,14 +1271,23 @@ def run_wkvm(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[str,
                 [int(token) for token in requests[request_id].output_token_ids]
                 for request_id in request_ids
             ]
+            generated_output_turns.append([list(output) for output in outputs])
             turn_output_sets.append([list(output) for output in outputs])
             ttfts: list[float | None] = []
             e2es: list[float | None] = []
             reused_prefix_tokens: list[int] = []
             computed_input_tokens: list[int] = []
-            errors = _turn_errors_for_outputs(
-                outputs,
-                args.output_tokens_per_turn,
+            errors = (
+                _turn_errors_for_outputs(
+                    outputs,
+                    args.output_tokens_per_turn,
+                )
+                if expected_outputs is None
+                else _teacher_forcing_errors(
+                    outputs,
+                    expected_outputs,
+                    args.output_tokens_per_turn,
+                )
             )
             for index, request_id in enumerate(request_ids):
                 request = requests[request_id]
@@ -865,6 +1332,17 @@ def run_wkvm(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[str,
             )
             row["reused_prefix_tokens_total"] = sum(reused_prefix_tokens)
             row["computed_input_tokens_total"] = sum(computed_input_tokens)
+            row["teacher_forcing"] = _teacher_forcing_turn_metadata(
+                shared_history_trace,
+                turn_index=turn_index,
+                outputs=outputs,
+                candidate_outputs=candidate_outputs,
+                backend=(
+                    "post_sample_pending_token_override"
+                    if shared_history_trace is not None
+                    else None
+                ),
+            )
             for request_row, reused_tokens, computed_tokens in zip(
                 row["requests"],
                 reused_prefix_tokens,
@@ -1056,6 +1534,10 @@ def run_wkvm(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[str,
         "token_budget": args.token_budget,
         "chunk": args.chunk,
         "prefill_microbatch_rows": args.prefill_microbatch_rows,
+        "continuation_prefill_microbatch_rows": (
+            getattr(args, "continuation_prefill_microbatch_rows", None)
+        ),
+        "enable_mixed_batch": getattr(args, "enable_mixed_batch", False),
         "decode_microbatch_rows": args.decode_microbatch_rows,
         "decode_microbatch_bytes": args.decode_microbatch_bytes,
         "decode_batch_planner": args.decode_batch_planner,
@@ -1086,6 +1568,11 @@ def run_wkvm(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[str,
         "token_pool_max_context_len": args.token_pool_max_context_len,
         "token_pool_capacity": args.token_pool_capacity,
         "token_pool_paged_block_size": args.token_pool_paged_block_size,
+        "token_pool_route_boundary_batch": getattr(
+            args,
+            "token_pool_route_boundary_batch",
+            False,
+        ),
         "sink": args.sink,
         "window": args.window,
         "m_slots": args.m_slots,
@@ -1095,6 +1582,23 @@ def run_wkvm(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[str,
         "empty_cuda_cache_before_decode": args.wkvm_empty_cache_before_decode,
         "request_order_policy": args.request_order_policy,
         "request_order_seed": args.request_order_seed,
+        "history_mode": (
+            SHARED_TEACHER_HISTORY_MODE
+            if shared_history_trace is not None
+            else "engine_generated"
+        ),
+        "teacher_forcing_backend": (
+            "post_sample_pending_token_override"
+            if shared_history_trace is not None
+            else None
+        ),
+        "teacher_forcing_overhead_contract": (
+            _teacher_forcing_overhead_contract(
+                "post_sample_pending_token_override"
+            )
+            if shared_history_trace is not None
+            else None
+        ),
         "device": args.device,
         "dtype": "bfloat16",
     }
@@ -1106,6 +1610,7 @@ def run_wkvm(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[str,
         "engine_metrics_before_close": before_close,
         "engine_metrics_after_close": after_close,
         "fresh_history_parity": fresh_parity,
+        "generated_output_turns": generated_output_turns,
     }
 
 
@@ -1123,7 +1628,11 @@ def _vllm_turn_outputs(raw_outputs: Sequence[Any]) -> list[list[int] | None]:
     return outputs
 
 
-def run_vllm(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[str, Any]:
+def run_vllm(
+    args: argparse.Namespace,
+    workload: MultiTurnWorkload,
+    shared_history_trace: SharedHistoryTrace | None = None,
+) -> dict[str, Any]:
     import vllm
     from vllm import LLM, SamplingParams
 
@@ -1145,6 +1654,8 @@ def run_vllm(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[str,
         "disable_log_stats": False,
         "dtype": "bfloat16",
     }
+    if args.vllm_max_num_batched_tokens is not None:
+        kwargs["max_num_batched_tokens"] = args.vllm_max_num_batched_tokens
     if args.vllm_language_model_only:
         kwargs["language_model_only"] = True
     compilation_config = None
@@ -1157,6 +1668,10 @@ def run_vllm(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[str,
             "max_cudagraph_capture_size": max(capture_sizes),
         }
         kwargs["compilation_config"] = compilation_config
+    if shared_history_trace is not None:
+        kwargs["logits_processors"] = [
+            "experiments.vllm_shared_history_logits:SharedHistoryLogitsProcessor"
+        ]
     try:
         llm = LLM(**kwargs, limit_mm_per_prompt={"image": 0, "audio": 0})
         multimodal_config = {"limit_mm_per_prompt": {"image": 0, "audio": 0}}
@@ -1173,9 +1688,15 @@ def run_vllm(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[str,
     histories = [list(prompt) for prompt in workload.initial_prompts]
     request_ids = [session_id(index) for index in range(args.sessions)]
     turn_rows: list[dict[str, Any]] = []
+    generated_output_turns: list[list[list[int]]] = []
     capacity = vllm_capacity_telemetry(llm, max_model_len=max_model_len)
     try:
         for turn_index in range(args.turns):
+            expected_outputs = (
+                None
+                if shared_history_trace is None
+                else shared_history_trace.turn_outputs[turn_index]
+            )
             prompts, deltas = _turn_prompts_and_deltas(
                 workload,
                 histories,
@@ -1191,9 +1712,30 @@ def run_vllm(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[str,
                 {"prompt_token_ids": prompts[index]}
                 for index in request_order
             ]
+            turn_sampling: Any = sampling
+            if expected_outputs is not None:
+                turn_sampling = [
+                    SamplingParams(
+                        temperature=0.0,
+                        top_p=1.0,
+                        max_tokens=args.output_tokens_per_turn,
+                        ignore_eos=True,
+                        seed=0,
+                        extra_args={
+                            TEACHER_FORCED_TOKEN_IDS_ARG: list(
+                                expected_outputs[index]
+                            )
+                        },
+                    )
+                    for index in request_order
+                ]
             synchronize_cuda()
             started = time.perf_counter()
-            raw_outputs = llm.generate(requests, sampling, use_tqdm=False)
+            raw_outputs = llm.generate(
+                requests,
+                turn_sampling,
+                use_tqdm=False,
+            )
             synchronize_cuda()
             wall_s = time.perf_counter() - started
             if len(raw_outputs) != args.sessions:
@@ -1216,10 +1758,21 @@ def run_vllm(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[str,
                     extract_vllm_cached_tokens(raw_outputs),
                     request_order,
                 )
-                errors = _turn_errors_for_outputs(
-                    outputs,
-                    args.output_tokens_per_turn,
+                errors = (
+                    _turn_errors_for_outputs(
+                        outputs,
+                        args.output_tokens_per_turn,
+                    )
+                    if expected_outputs is None
+                    else _teacher_forcing_errors(
+                        outputs,
+                        expected_outputs,
+                        args.output_tokens_per_turn,
+                    )
                 )
+            generated_output_turns.append(
+                [list(output or ()) for output in outputs]
+            )
             row = summarize_turn(
                 turn_index=turn_index,
                 session_ids=request_ids,
@@ -1242,6 +1795,16 @@ def run_vllm(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[str,
             row["request_order_policy"] = args.request_order_policy
             row["request_order"] = [request_ids[index] for index in request_order]
             row["cached_tokens_source"] = "RequestOutput.num_cached_tokens"
+            row["teacher_forcing"] = _teacher_forcing_turn_metadata(
+                shared_history_trace,
+                turn_index=turn_index,
+                outputs=outputs,
+                backend=(
+                    "vllm_sequence_logits_processor"
+                    if shared_history_trace is not None
+                    else None
+                ),
+            )
             turn_rows.append(row)
             _print_turn("vllm", row)
             _append_outputs(histories, outputs)
@@ -1256,14 +1819,33 @@ def run_vllm(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[str,
         "turns": turn_rows,
         "engine_config": {
             **kwargs,
+            "max_num_batched_tokens": args.vllm_max_num_batched_tokens,
             "compilation_config": compilation_config,
             "prefix_caching": True,
             "request_order_policy": args.request_order_policy,
             "request_order_seed": args.request_order_seed,
+            "history_mode": (
+                SHARED_TEACHER_HISTORY_MODE
+                if shared_history_trace is not None
+                else "engine_generated"
+            ),
+            "teacher_forcing_backend": (
+                "vllm_sequence_logits_processor"
+                if shared_history_trace is not None
+                else None
+            ),
+            "teacher_forcing_overhead_contract": (
+                _teacher_forcing_overhead_contract(
+                    "vllm_sequence_logits_processor"
+                )
+                if shared_history_trace is not None
+                else None
+            ),
             "capacity_telemetry": capacity,
         },
         "engine_version": getattr(vllm, "__version__", "unknown"),
         "launch_environment": {},
+        "generated_output_turns": generated_output_turns,
     }
 
 
@@ -1293,7 +1875,51 @@ def _sglang_output_tokens(output: dict[str, Any]) -> list[int] | None:
     return None
 
 
-def run_sglang(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[str, Any]:
+def _sglang_request_id(output: dict[str, Any]) -> str | None:
+    for container in (output, output.get("meta_info") or {}):
+        if not isinstance(container, dict):
+            continue
+        value = container.get("id") or container.get("rid")
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+async def _sglang_async_generate_many(
+    engine: Any,
+    requests: Sequence[dict[str, Any]],
+) -> list[Any]:
+    return list(
+        await asyncio.gather(
+            *(engine.async_generate(**request) for request in requests),
+            return_exceptions=True,
+        )
+    )
+
+
+def _sglang_generate_many(
+    engine: Any,
+    requests: Sequence[dict[str, Any]],
+) -> list[Any]:
+    loop = getattr(engine, "loop", None)
+    if loop is None or not hasattr(loop, "run_until_complete"):
+        raise RuntimeError("SGLang Engine does not expose its async event loop")
+    return loop.run_until_complete(_sglang_async_generate_many(engine, requests))
+
+
+def run_sglang(
+    args: argparse.Namespace,
+    workload: MultiTurnWorkload,
+    shared_history_trace: SharedHistoryTrace | None = None,
+) -> dict[str, Any]:
+    if shared_history_trace is not None:
+        raise RuntimeError(
+            "SGLang shared-history replay is unsupported because custom-logit "
+            "processor state is not stable across overlap scheduling and "
+            "cache-pressure preemption. Run SGLang with "
+            "--write-shared-history-trace-json as the native trace source, "
+            "then replay that trace with WKVM and vLLM."
+        )
     import sglang as sgl
 
     from incumbent_gemma_bench import (
@@ -1304,6 +1930,10 @@ def run_sglang(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[st
     )
 
     context_length = args.sglang_context_length or args.required_model_len + 16
+    streaming_session_enabled = bool(args.sglang_streaming_session)
+    streaming_session_capacity = (
+        args.sglang_streaming_session_capacity or context_length
+    )
     kwargs: dict[str, Any] = {
         "model_path": args.model_path,
         "mem_fraction_static": args.sglang_mem_fraction,
@@ -1318,6 +1948,11 @@ def run_sglang(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[st
     }
     if args.sglang_attention_backend:
         kwargs["attention_backend"] = args.sglang_attention_backend
+    if args.sglang_chunked_prefill_size is not None:
+        kwargs["chunked_prefill_size"] = args.sglang_chunked_prefill_size
+    if streaming_session_enabled:
+        kwargs["enable_streaming_session"] = True
+    teacher_forcing_processor = None
     model_override = None
     if args.sglang_language_model_only:
         model_override = sglang_language_model_override(args.model_path)
@@ -1331,10 +1966,88 @@ def run_sglang(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[st
     }
     histories = [list(prompt) for prompt in workload.initial_prompts]
     request_ids = [session_id(index) for index in range(args.sessions)]
+    native_session_ids: list[str | None] = [None] * args.sessions
+    native_request_ids: list[str | None] = [None] * args.sessions
     turn_rows: list[dict[str, Any]] = []
+    generated_output_turns: list[list[list[int]]] = []
     capacity = sglang_capacity_telemetry(engine)
+    session_telemetry: dict[str, Any] = {
+        "enabled": streaming_session_enabled,
+        "mode": (
+            "streaming_append_only"
+            if streaming_session_enabled
+            else "radix_cache"
+        ),
+        "streaming": streaming_session_enabled,
+        "history_submission": (
+            "initial_full_prompt_then_token_deltas"
+            if streaming_session_enabled
+            else "cumulative_full_prompt_each_turn"
+        ),
+        "concurrency": (
+            "per_session_async_generate_gather"
+            if streaming_session_enabled
+            else "native_generate_batch"
+        ),
+        "requested_session_count": (
+            args.sessions if streaming_session_enabled else 0
+        ),
+        "capacity_of_str_len_per_session": (
+            streaming_session_capacity if streaming_session_enabled else None
+        ),
+        "capacity_source": (
+            "--sglang-streaming-session-capacity"
+            if args.sglang_streaming_session_capacity is not None
+            else "engine_context_length"
+        )
+        if streaming_session_enabled
+        else None,
+        "opened_session_count": 0,
+        "open_failure_count": 0,
+        "open_failures": [],
+        "generate_request_count": 0,
+        "generate_failure_count": 0,
+        "generate_failures": [],
+        "native_request_id_missing_count": 0,
+        "close_attempt_count": 0,
+        "closed_session_count": 0,
+        "close_failure_count": 0,
+        "close_failures": [],
+    }
     try:
-        for turn_index in range(args.turns):
+        if streaming_session_enabled:
+            for index, request_id in enumerate(request_ids):
+                try:
+                    native_session_id = engine.open_session(
+                        streaming_session_capacity,
+                        session_id=request_id,
+                        streaming=True,
+                    )
+                    if not isinstance(native_session_id, str) or not native_session_id:
+                        raise RuntimeError("SGLang failed to open the session")
+                    native_session_ids[index] = native_session_id
+                    session_telemetry["opened_session_count"] += 1
+                except Exception as exc:
+                    session_telemetry["open_failures"].append(
+                        {
+                            "session_id": request_id,
+                            "type": type(exc).__name__,
+                            "message": str(exc).splitlines()[0],
+                        }
+                    )
+            session_telemetry["open_failure_count"] = len(
+                session_telemetry["open_failures"]
+            )
+        sessions_ready = not streaming_session_enabled or all(
+            native_session_id is not None
+            for native_session_id in native_session_ids
+        )
+        for turn_index in range(args.turns if sessions_ready else 0):
+            expected_outputs = (
+                None
+                if shared_history_trace is None
+                else shared_history_trace.turn_outputs[turn_index]
+            )
             prompts, deltas = _turn_prompts_and_deltas(
                 workload,
                 histories,
@@ -1348,14 +2061,101 @@ def run_sglang(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[st
             )
             synchronize_cuda()
             started = time.perf_counter()
-            raw_output = engine.generate(
-                input_ids=[prompts[index] for index in request_order],
-                sampling_params=sampling,
-            )
+            turn_sampling: Any = sampling
+            if expected_outputs is not None:
+                turn_sampling = [
+                    {
+                        **sampling,
+                        "custom_params": {
+                            TEACHER_FORCED_TOKEN_IDS_ARG: list(
+                                expected_outputs[index]
+                            )
+                        },
+                    }
+                    for index in request_order
+                ]
+            submission_errors: list[str | None] = [None] * args.sessions
+            turn_generate_failures: list[dict[str, Any]] = []
+            if streaming_session_enabled:
+                submitted_inputs = prompts if turn_index == 0 else deltas
+                ordered_sampling = (
+                    turn_sampling
+                    if isinstance(turn_sampling, list)
+                    else [turn_sampling] * args.sessions
+                )
+                generate_requests: list[dict[str, Any]] = []
+                for position, index in enumerate(request_order):
+                    generate_kwargs: dict[str, Any] = {
+                        "input_ids": list(submitted_inputs[index]),
+                        "sampling_params": ordered_sampling[position],
+                        "session_params": {
+                            "id": native_session_ids[index],
+                            "rid": native_request_ids[index],
+                        },
+                    }
+                    if teacher_forcing_processor is not None:
+                        generate_kwargs["custom_logit_processor"] = (
+                            teacher_forcing_processor
+                        )
+                    generate_requests.append(generate_kwargs)
+                session_telemetry["generate_request_count"] += len(
+                    generate_requests
+                )
+                try:
+                    raw_results = _sglang_generate_many(engine, generate_requests)
+                except Exception as exc:
+                    raw_results = [exc] * args.sessions
+                items: list[dict[str, Any]] = []
+                for position, result in enumerate(raw_results):
+                    index = request_order[position]
+                    failure_type = None
+                    failure_message = None
+                    if isinstance(result, BaseException):
+                        failure_type = type(result).__name__
+                        failure_message = str(result).splitlines()[0]
+                    elif not isinstance(result, dict):
+                        failure_type = "TypeError"
+                        failure_message = (
+                            "unexpected SGLang async output type: "
+                            f"{type(result).__name__}"
+                        )
+                    if failure_type is not None:
+                        message = f"{failure_type}: {failure_message}"
+                        submission_errors[position] = message
+                        failure = {
+                            "turn_index": turn_index,
+                            "session_id": request_ids[index],
+                            "type": failure_type,
+                            "message": failure_message,
+                        }
+                        turn_generate_failures.append(failure)
+                        session_telemetry["generate_failures"].append(failure)
+                        items.append({})
+                        continue
+                    items.append(result)
+                    native_request_id = _sglang_request_id(result)
+                    if native_request_id is None:
+                        session_telemetry["native_request_id_missing_count"] += 1
+                    else:
+                        native_request_ids[index] = native_request_id
+                session_telemetry["generate_failure_count"] = len(
+                    session_telemetry["generate_failures"]
+                )
+            else:
+                generate_kwargs = {
+                    "input_ids": [prompts[index] for index in request_order],
+                    "sampling_params": turn_sampling,
+                }
+                if teacher_forcing_processor is not None:
+                    generate_kwargs["custom_logit_processor"] = (
+                        teacher_forcing_processor
+                    )
+                raw_output = engine.generate(**generate_kwargs)
             synchronize_cuda()
             wall_s = time.perf_counter() - started
             try:
-                items = _sglang_items(raw_output, args.sessions)
+                if not streaming_session_enabled:
+                    items = _sglang_items(raw_output, args.sessions)
                 outputs = restore_logical_order(
                     [_sglang_output_tokens(item) for item in items],
                     request_order,
@@ -1367,16 +2167,36 @@ def run_sglang(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[st
                     extract_sglang_cached_tokens(items),
                     request_order,
                 )
-                errors = _turn_errors_for_outputs(
-                    outputs,
-                    args.output_tokens_per_turn,
+                errors = (
+                    _turn_errors_for_outputs(
+                        outputs,
+                        args.output_tokens_per_turn,
+                    )
+                    if expected_outputs is None
+                    else _teacher_forcing_errors(
+                        outputs,
+                        expected_outputs,
+                        args.output_tokens_per_turn,
+                    )
                 )
+                logical_submission_errors = restore_logical_order(
+                    submission_errors,
+                    request_order,
+                )
+                for index, submission_error in enumerate(
+                    logical_submission_errors
+                ):
+                    if submission_error is not None:
+                        errors[index] = submission_error
             except Exception as exc:
                 outputs = [None] * args.sessions
                 ttfts = [None] * args.sessions
                 e2es = [None] * args.sessions
                 cached = [None] * args.sessions
                 errors = [str(exc).splitlines()[0]] * args.sessions
+            generated_output_turns.append(
+                [list(output or ()) for output in outputs]
+            )
             row = summarize_turn(
                 turn_index=turn_index,
                 session_ids=request_ids,
@@ -1395,31 +2215,113 @@ def run_sglang(args: argparse.Namespace, workload: MultiTurnWorkload) -> dict[st
                 cached_tokens=cached,
                 errors=errors,
             )
-            row["reuse_kind"] = "sglang_radix_cache"
+            row["reuse_kind"] = (
+                "sglang_streaming_session_append"
+                if streaming_session_enabled
+                else "sglang_radix_cache"
+            )
             row["request_order_policy"] = args.request_order_policy
             row["request_order"] = [request_ids[index] for index in request_order]
             row["cached_tokens_source"] = "meta_info.cached_tokens"
+            row["history_submission"] = (
+                "initial_full_prompt"
+                if streaming_session_enabled and turn_index == 0
+                else "token_delta"
+                if streaming_session_enabled
+                else "cumulative_full_prompt"
+            )
+            row["submitted_input_tokens"] = (
+                sum(len(prompt) for prompt in prompts)
+                if not streaming_session_enabled or turn_index == 0
+                else sum(len(delta) for delta in deltas)
+            )
+            row["session_generate_failure_count"] = len(
+                turn_generate_failures
+            )
+            row["session_generate_failures"] = turn_generate_failures
+            row["teacher_forcing"] = _teacher_forcing_turn_metadata(
+                shared_history_trace,
+                turn_index=turn_index,
+                outputs=outputs,
+                backend=(
+                    "sglang_sequence_logits_processor"
+                    if shared_history_trace is not None
+                    else None
+                ),
+            )
             turn_rows.append(row)
             _print_turn("sglang", row)
             _append_outputs(histories, outputs)
             if row["error_count"]:
                 break
     finally:
+        if streaming_session_enabled:
+            for index, native_session_id in enumerate(native_session_ids):
+                if native_session_id is None:
+                    continue
+                session_telemetry["close_attempt_count"] += 1
+                try:
+                    engine.close_session(native_session_id)
+                    session_telemetry["closed_session_count"] += 1
+                except Exception as exc:
+                    session_telemetry["close_failures"].append(
+                        {
+                            "session_id": request_ids[index],
+                            "native_session_id": native_session_id,
+                            "type": type(exc).__name__,
+                            "message": str(exc).splitlines()[0],
+                        }
+                    )
+            session_telemetry["close_failure_count"] = len(
+                session_telemetry["close_failures"]
+            )
         with contextlib.suppress(Exception):
             engine.shutdown()
         cleanup_cuda()
+    session_telemetry["all_sessions_opened"] = (
+        session_telemetry["opened_session_count"]
+        == session_telemetry["requested_session_count"]
+    )
+    session_telemetry["all_opened_sessions_closed"] = (
+        session_telemetry["closed_session_count"]
+        == session_telemetry["opened_session_count"]
+    )
     return {
         "turns": turn_rows,
         "engine_config": {
             **kwargs,
+            "chunked_prefill_size": args.sglang_chunked_prefill_size,
+            "enable_streaming_session": streaming_session_enabled,
+            "streaming_session_capacity": (
+                streaming_session_capacity if streaming_session_enabled else None
+            ),
             "disable_radix_cache": False,
             "request_order_policy": args.request_order_policy,
             "request_order_seed": args.request_order_seed,
+            "history_mode": (
+                SHARED_TEACHER_HISTORY_MODE
+                if shared_history_trace is not None
+                else "engine_generated"
+            ),
+            "teacher_forcing_backend": (
+                "sglang_sequence_logits_processor"
+                if shared_history_trace is not None
+                else None
+            ),
+            "teacher_forcing_overhead_contract": (
+                _teacher_forcing_overhead_contract(
+                    "sglang_sequence_logits_processor"
+                )
+                if shared_history_trace is not None
+                else None
+            ),
             "model_override": model_override,
             "capacity_telemetry": capacity,
+            "session_telemetry": session_telemetry,
         },
         "engine_version": getattr(sgl, "__version__", "unknown"),
         "launch_environment": {},
+        "generated_output_turns": generated_output_turns,
     }
 
 
@@ -1439,13 +2341,70 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--synthetic-vocab-size must be >= 16")
     if args.gpu_memory_sample_interval_s <= 0:
         raise ValueError("--gpu-memory-sample-interval-s must be > 0")
+    identity_values = {
+        "campaign_id": args.campaign_id,
+        "repeat_id": args.repeat_id,
+    }
+    supplied_identity = [
+        value is not None for value in identity_values.values()
+    ]
+    if any(supplied_identity) and not all(supplied_identity):
+        raise ValueError(
+            "--campaign-id and --repeat-id must be supplied together"
+        )
+    for name, value in identity_values.items():
+        if value is not None and not str(value).strip():
+            raise ValueError(f"--{name.replace('_', '-')} must not be empty")
+    if args.run_id is None:
+        args.run_id = str(uuid.uuid4())
+    else:
+        try:
+            args.run_id = str(uuid.UUID(str(args.run_id)))
+        except ValueError as exc:
+            raise ValueError("--run-id must be a UUID") from exc
+    if args.memory_ceiling_mib is not None and args.memory_ceiling_mib <= 0:
+        raise ValueError("--memory-ceiling-mib must be > 0")
     if args.slots is not None and args.slots < args.sessions:
         raise ValueError("--slots must be >= --sessions")
+    for name in (
+        "vllm_max_num_batched_tokens",
+        "sglang_streaming_session_capacity",
+    ):
+        value = getattr(args, name)
+        if value is not None and value < 1:
+            raise ValueError(f"--{name.replace('_', '-')} must be >= 1")
+    if (
+        args.sglang_chunked_prefill_size is not None
+        and args.sglang_chunked_prefill_size != -1
+        and args.sglang_chunked_prefill_size < 1
+    ):
+        raise ValueError("--sglang-chunked-prefill-size must be -1 or >= 1")
+    if args.shared_history_trace_json and args.wkvm_verify_fresh_parity:
+        raise ValueError(
+            "--wkvm-verify-fresh-parity is unavailable with a shared "
+            "teacher-forced trace"
+        )
     args.required_model_len = (
         args.initial_context_tokens
         + args.turns * args.output_tokens_per_turn
         + (args.turns - 1) * args.turn_input_tokens
     )
+    if (
+        args.sglang_streaming_session_capacity is not None
+        and not args.sglang_streaming_session
+    ):
+        raise ValueError(
+            "--sglang-streaming-session-capacity requires "
+            "--sglang-streaming-session"
+        )
+    if (
+        args.sglang_streaming_session_capacity is not None
+        and args.sglang_streaming_session_capacity < args.required_model_len
+    ):
+        raise ValueError(
+            "--sglang-streaming-session-capacity must be >= "
+            f"{args.required_model_len}"
+        )
     if args.max_model_len is not None and args.max_model_len < args.required_model_len:
         raise ValueError(
             f"--max-model-len must be >= {args.required_model_len}"
@@ -1466,8 +2425,33 @@ def build_payload(
     gpu_memory: dict[str, Any],
     *,
     fatal_error: dict[str, Any] | None = None,
+    shared_history_trace: SharedHistoryTrace | None = None,
+    emitted_history_trace: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     turns = result.get("turns", [])
+    fingerprints = workload_fingerprints(workload)
+    if shared_history_trace is not None:
+        fingerprints["teacher_forced_turn_outputs"] = (
+            shared_history_trace.output_fingerprints
+        )
+    trace_source = (
+        shared_history_trace.source
+        if shared_history_trace is not None
+        and isinstance(shared_history_trace.source, dict)
+        else {}
+    )
+    artifact_role = (
+        "native_trace_source"
+        if emitted_history_trace is not None
+        else "teacher_forced_replay"
+        if shared_history_trace is not None
+        else "engine_generated"
+    )
+    source_run_id = (
+        args.run_id
+        if artifact_role == "native_trace_source"
+        else trace_source.get("run_id")
+    )
     payload: dict[str, Any] = {
         "schema": SCHEMA,
         "engine": args.engine,
@@ -1475,6 +2459,20 @@ def build_payload(
         "model_path": args.model_path,
         "dtype": "bfloat16",
         "prompt_token_source": PROMPT_TOKEN_SOURCE,
+        "semantic_mode": (
+            "routed_span_approximate"
+            if args.engine == "wkvm"
+            else "full_kv"
+        ),
+        "history_trace": shared_history_trace_metadata(shared_history_trace),
+        "benchmark_identity": {
+            "campaign_id": args.campaign_id,
+            "repeat_id": args.repeat_id,
+            "run_id": args.run_id,
+            "source_run_id": source_run_id,
+            "artifact_role": artifact_role,
+            "memory_ceiling_mib": args.memory_ceiling_mib,
+        },
         "workload": {
             "sessions": args.sessions,
             "turns": args.turns,
@@ -1483,19 +2481,29 @@ def build_payload(
             "output_tokens_per_turn": args.output_tokens_per_turn,
             "required_model_len": args.required_model_len,
             "history_policy": (
-                "parked_state_plus_delta"
-                if args.engine == "wkvm"
-                else "cumulative_full_token_history"
+                SHARED_TEACHER_HISTORY_POLICY
+                if shared_history_trace is not None
+                else (
+                    "parked_state_plus_delta"
+                    if args.engine == "wkvm"
+                    else "cumulative_full_token_history"
+                )
+            ),
+            "history_trace_sha256": (
+                None
+                if shared_history_trace is None
+                else shared_history_trace.trace_sha256
             ),
             "request_order_policy": args.request_order_policy,
             "request_order_seed": args.request_order_seed,
-            "fingerprints": workload_fingerprints(workload),
+            "fingerprints": fingerprints,
         },
         "sampling": {
             "temperature": 0.0,
             "top_p": 1.0,
             "ignore_eos": True,
             "max_output_tokens_per_turn": args.output_tokens_per_turn,
+            "teacher_forced": shared_history_trace is not None,
         },
         "engine_config": result.get("engine_config", {}),
         "gpu_memory": gpu_memory,
@@ -1510,6 +2518,8 @@ def build_payload(
         "turns": turns,
         "summary": summarize_run(turns, args.turns),
     }
+    if emitted_history_trace is not None:
+        payload["emitted_history_trace"] = emitted_history_trace
     for field in (
         "engine_metrics_before_close",
         "engine_metrics_after_close",
@@ -1536,6 +2546,32 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         turn_input_tokens=args.turn_input_tokens,
         vocab_size=args.synthetic_vocab_size,
     )
+    shared_history_trace = (
+        None
+        if not args.shared_history_trace_json
+        else load_shared_history_trace(
+            args.shared_history_trace_json,
+            workload,
+            sessions=args.sessions,
+            turns=args.turns,
+            output_tokens_per_turn=args.output_tokens_per_turn,
+            vocab_size=args.synthetic_vocab_size,
+        )
+    )
+    if shared_history_trace is not None and args.campaign_id is not None:
+        source = shared_history_trace.source
+        if not isinstance(source, dict):
+            raise ValueError(
+                "shared history trace is missing campaign source identity"
+            )
+        if source.get("campaign_id") != args.campaign_id:
+            raise ValueError("shared history trace campaign_id does not match")
+        if source.get("repeat_id") != args.repeat_id:
+            raise ValueError("shared history trace repeat_id does not match")
+        if source.get("memory_ceiling_mib") != args.memory_ceiling_mib:
+            raise ValueError(
+                "shared history trace memory ceiling does not match"
+            )
     runners = {
         "wkvm": run_wkvm,
         "vllm": run_vllm,
@@ -1548,9 +2584,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     result: dict[str, Any] = {"turns": [], "engine_config": {}}
     fatal_error = None
     pending_error: BaseException | None = None
+    emitted_history_trace = None
     with monitor:
         try:
-            result = runners[args.engine](args, workload)
+            result = runners[args.engine](
+                args,
+                workload,
+                shared_history_trace,
+            )
         except BaseException as exc:
             pending_error = exc
             fatal_error = {
@@ -1558,12 +2599,53 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "message": str(exc).splitlines()[0],
                 "phase": "engine_run",
             }
+    if pending_error is None and args.write_shared_history_trace_json:
+        try:
+            trace_path = Path(args.write_shared_history_trace_json)
+            trace_to_write = build_shared_history_trace(
+                workload,
+                result.get("generated_output_turns", []),
+                sessions=args.sessions,
+                turns=args.turns,
+                output_tokens_per_turn=args.output_tokens_per_turn,
+                vocab_size=args.synthetic_vocab_size,
+                source_path=str(trace_path),
+            )
+            atomic_write_json(
+                trace_path,
+                shared_history_trace_payload(
+                    trace_to_write,
+                    source={
+                        "engine": args.engine,
+                        "engine_version": result.get("engine_version"),
+                        "model_path": args.model_path,
+                        "git_commit": git_commit(),
+                        "git_tree_state": git_tree_state(),
+                        "benchmark_artifact": args.json,
+                        "campaign_id": args.campaign_id,
+                        "repeat_id": args.repeat_id,
+                        "run_id": args.run_id,
+                        "memory_ceiling_mib": args.memory_ceiling_mib,
+                    },
+                ),
+            )
+            emitted_history_trace = shared_history_trace_metadata(trace_to_write)
+            print(f"WROTE {trace_path}")
+        except BaseException as exc:
+            pending_error = exc
+            fatal_error = {
+                "type": type(exc).__name__,
+                "message": str(exc).splitlines()[0],
+                "phase": "history_trace_write",
+            }
     payload = build_payload(
         args,
         workload,
         result,
         monitor.result(),
         fatal_error=fatal_error,
+        shared_history_trace=shared_history_trace,
+        emitted_history_trace=emitted_history_trace,
     )
     if args.json:
         atomic_write_json(Path(args.json), payload)
@@ -1588,6 +2670,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gpu-memory-device", default="0")
     parser.add_argument("--gpu-memory-sample-interval-s", type=float, default=0.1)
     parser.add_argument("--json", default=None)
+    parser.add_argument("--campaign-id", default=None)
+    parser.add_argument("--repeat-id", default=None)
+    parser.add_argument("--run-id", default=None)
+    parser.add_argument("--memory-ceiling-mib", type=float, default=None)
+    parser.add_argument(
+        "--shared-history-trace-json",
+        default=None,
+        help=(
+            "Force every engine to select the per-turn tokens in this shared "
+            "trace so all cached prompt histories remain identical. SGLang "
+            "must instead generate the trace natively with "
+            "--write-shared-history-trace-json because its custom processor "
+            "state is not stable across overlap scheduling and preemption."
+        ),
+    )
+    parser.add_argument(
+        "--write-shared-history-trace-json",
+        default=None,
+        help=(
+            "Write this run's selected per-turn token IDs as a reusable shared "
+            "history trace. Default generation behavior is unchanged."
+        ),
+    )
     parser.add_argument("--max-steps", type=int, default=100_000)
     parser.add_argument(
         "--request-order-policy",
@@ -1622,6 +2727,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--token-budget", type=int, default=None)
     parser.add_argument("--chunk", type=int, default=2048)
     parser.add_argument("--prefill-microbatch-rows", type=int, default=2)
+    parser.add_argument(
+        "--continuation-prefill-microbatch-rows",
+        type=int,
+        default=None,
+        help=(
+            "Optional parked-session continuation row cap; 0 is unlimited. "
+            "Long initial chunks retain --prefill-microbatch-rows."
+        ),
+    )
+    parser.add_argument("--enable-mixed-batch", action="store_true")
     parser.add_argument("--decode-microbatch-rows", type=int, default=16)
     parser.add_argument("--decode-microbatch-bytes", type=int, default=None)
     parser.add_argument("--decode-batch-planner", choices=["scheduler", "length_bucketed"], default="scheduler")
@@ -1659,6 +2774,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--enable-token-pool-paged-split-triton", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--token-pool-triton-strict", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--token-pool-sliding-paged-metadata-only", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--token-pool-route-boundary-batch",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Batch the one decode step that reaches a routed-span fold boundary, "
+            "then flush the persistent group for a safe per-row fold."
+        ),
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--attn", choices=["eager", "sdpa"], default="sdpa")
     parser.add_argument("--sink", type=int, default=16)
@@ -1667,6 +2791,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--route-chunk", type=int, default=512)
 
     parser.add_argument("--vllm-gpu-mem-util", type=float, default=0.74)
+    parser.add_argument(
+        "--vllm-max-num-batched-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Explicit vLLM scheduler token budget. The selected value is passed "
+            "to LLM and recorded in engine_config."
+        ),
+    )
     parser.add_argument("--max-model-len", type=int, default=None)
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--vllm-language-model-only", action=argparse.BooleanOptionalAction, default=True)
@@ -1675,6 +2808,34 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sglang-mem-fraction", type=float, default=0.82)
     parser.add_argument("--sglang-context-length", type=int, default=None)
     parser.add_argument("--sglang-max-total-tokens", type=int, default=None)
+    parser.add_argument(
+        "--sglang-chunked-prefill-size",
+        type=int,
+        default=None,
+        help=(
+            "Explicit SGLang chunked-prefill size. The selected value is passed "
+            "to Engine and recorded in engine_config; -1 disables chunking."
+        ),
+    )
+    parser.add_argument(
+        "--sglang-streaming-session",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use SGLang's append-only streaming sessions: open one native "
+            "session per workload row, submit the initial prompt once, then "
+            "submit only per-turn token deltas concurrently."
+        ),
+    )
+    parser.add_argument(
+        "--sglang-streaming-session-capacity",
+        type=int,
+        default=None,
+        help=(
+            "Per-session capacity_of_str_len passed to SGLang. Defaults to "
+            "the selected SGLang context length."
+        ),
+    )
     parser.add_argument("--sglang-attention-backend", default="triton")
     parser.add_argument("--sglang-language-model-only", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--sglang-max-running-requests", type=int, default=None)

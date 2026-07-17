@@ -470,6 +470,234 @@ class NativeSlidingWindowLayer(_NativeGemmaLayer):
         return self.sliding_window
 
 
+@dataclass
+class _PreparedRouteDecision:
+    cut_k: Any
+    cut_v: Any
+    spans: list[tuple[int, int]]
+    n_routed: int
+    features: Any
+    span_means: Any
+    seed_centroids: Any | None
+    seed_count: int
+
+    @property
+    def span_count(self) -> int:
+        return len(self.spans)
+
+    def packet_parts(self) -> list[Any]:
+        parts = [self.features, self.span_means]
+        if self.seed_centroids is not None:
+            parts.append(self.seed_centroids)
+        return parts
+
+
+class _RoutedPacketWorkspace:
+    def __init__(self, max_buffer_bytes: int) -> None:
+        if max_buffer_bytes < 1:
+            raise ValueError("routed packet workspace bytes must be >= 1")
+        self.max_buffer_bytes = int(max_buffer_bytes)
+        self._device_buffer = None
+        self._host_buffer = None
+        self.packet_batches = 0
+        self.packet_rows = 0
+        self.packet_request_rows = 0
+        self.packet_folds = 0
+        self.packet_spans = 0
+        self.packet_bytes = 0
+        self.d2h_copies = 0
+        self.d2h_wait_s = 0.0
+        self.cpu_plan_s = 0.0
+        self.allocations = 0
+        self.reuses = 0
+        self.high_water_bytes = 0
+        self.capacity_fallback_batches = 0
+        self.capacity_fallback_request_rows = 0
+        self.capacity_fallback_packet_rows = 0
+        self.capacity_fallback_bytes = 0
+        self.capacity_fallback_max_required_bytes = 0
+
+    @staticmethod
+    def _required_bytes(rows: int, width: int, *, dtype) -> int:
+        import torch
+
+        return int(rows) * int(width) * int(
+            torch.empty((), dtype=dtype).element_size()
+        )
+
+    def required_buffer_bytes(self, rows: int, width: int) -> int:
+        import torch
+
+        return self._required_bytes(int(rows), int(width), dtype=torch.float32)
+
+    def record_capacity_fallback(
+        self,
+        *,
+        request_rows: int,
+        packet_rows: int,
+        required_bytes: int,
+    ) -> None:
+        self.capacity_fallback_batches += 1
+        self.capacity_fallback_request_rows += int(request_rows)
+        self.capacity_fallback_packet_rows += int(packet_rows)
+        self.capacity_fallback_bytes += int(required_bytes)
+        self.capacity_fallback_max_required_bytes = max(
+            self.capacity_fallback_max_required_bytes,
+            int(required_bytes),
+        )
+
+    def reserve(self, rows: int, width: int, *, device) -> None:
+        import torch
+
+        self._ensure_buffers(
+            int(rows),
+            int(width),
+            dtype=torch.float32,
+            device=device,
+            is_cuda=str(device).startswith("cuda"),
+        )
+
+    def _ensure_buffers(
+        self,
+        rows: int,
+        width: int,
+        *,
+        dtype,
+        device,
+        is_cuda: bool,
+    ) -> None:
+        import torch
+
+        required_bytes = self._required_bytes(rows, width, dtype=dtype)
+        if required_bytes > self.max_buffer_bytes:
+            raise MemoryError(
+                f"routed packet requires {required_bytes} bytes, exceeds "
+                f"workspace cap {self.max_buffer_bytes}"
+            )
+        reusable = (
+            self._device_buffer is not None
+            and self._host_buffer is not None
+            and self._device_buffer.device == torch.device(device)
+            and self._device_buffer.dtype == dtype
+            and int(self._device_buffer.shape[0]) >= rows
+            and int(self._device_buffer.shape[1]) == width
+        )
+        if reusable:
+            self.reuses += 1
+            return
+        self._device_buffer = torch.empty(
+            (rows, width),
+            dtype=dtype,
+            device=device,
+        )
+        self._host_buffer = torch.empty(
+            (rows, width),
+            dtype=dtype,
+            device="cpu",
+            pin_memory=bool(is_cuda),
+        )
+        self.allocations += 1
+
+    def transfer(self, parts: list[Any]):
+        if not parts:
+            raise ValueError("routed packet transfer requires tensor parts")
+        width = int(parts[0].shape[1])
+        if width < 1:
+            raise ValueError("routed packet feature width must be >= 1")
+        if any(part.ndim != 2 or int(part.shape[1]) != width for part in parts):
+            raise ValueError("routed packet parts must share one feature width")
+        reference = parts[0]
+        if any(
+            part.dtype != reference.dtype or part.device != reference.device
+            for part in parts[1:]
+        ):
+            raise ValueError("routed packet parts must share dtype and device")
+        rows = sum(int(part.shape[0]) for part in parts)
+        required_bytes = rows * width * int(reference.element_size())
+        self._ensure_buffers(
+            rows,
+            width,
+            dtype=reference.dtype,
+            device=reference.device,
+            is_cuda=bool(reference.is_cuda),
+        )
+
+        cursor = 0
+        for part in parts:
+            part_rows = int(part.shape[0])
+            self._device_buffer[cursor : cursor + part_rows].copy_(
+                part.detach(),
+                non_blocking=True,
+            )
+            cursor += part_rows
+        wait_start = time.perf_counter()
+        self._host_buffer[:rows].copy_(
+            self._device_buffer[:rows],
+            non_blocking=bool(reference.is_cuda),
+        )
+        if bool(reference.is_cuda):
+            import torch
+
+            torch.cuda.current_stream(reference.device).synchronize()
+            self.d2h_copies += 1
+        self.d2h_wait_s += time.perf_counter() - wait_start
+        self.packet_batches += 1
+        self.packet_rows += rows
+        self.packet_bytes += required_bytes
+        self.high_water_bytes = max(self.high_water_bytes, required_bytes)
+        return self._host_buffer[:rows].numpy()
+
+    def stats(self) -> dict[str, int | float]:
+        device_buffer_bytes = (
+            0
+            if self._device_buffer is None
+            else int(self._device_buffer.numel() * self._device_buffer.element_size())
+        )
+        host_buffer_bytes = (
+            0
+            if self._host_buffer is None
+            else int(self._host_buffer.numel() * self._host_buffer.element_size())
+        )
+        pinned_host_buffer_bytes = (
+            host_buffer_bytes
+            if self._host_buffer is not None and self._host_buffer.is_pinned()
+            else 0
+        )
+        return {
+            "packet_batches": int(self.packet_batches),
+            "packet_rows": int(self.packet_rows),
+            "packet_request_rows": int(self.packet_request_rows),
+            "packet_folds": int(self.packet_folds),
+            "packet_spans": int(self.packet_spans),
+            "packet_bytes": int(self.packet_bytes),
+            "d2h_copies": int(self.d2h_copies),
+            "d2h_wait_s": float(self.d2h_wait_s),
+            "cpu_plan_s": float(self.cpu_plan_s),
+            "workspace_allocations": int(self.allocations),
+            "workspace_reuses": int(self.reuses),
+            "workspace_high_water_bytes": int(self.high_water_bytes),
+            "workspace_payload_high_water_bytes": int(self.high_water_bytes),
+            "workspace_max_bytes": int(self.max_buffer_bytes),
+            "workspace_device_buffer_bytes": device_buffer_bytes,
+            "workspace_host_buffer_bytes": host_buffer_bytes,
+            "workspace_pinned_host_buffer_bytes": pinned_host_buffer_bytes,
+            "workspace_combined_buffer_bytes": (
+                device_buffer_bytes + host_buffer_bytes
+            ),
+            "capacity_fallback_batches": int(self.capacity_fallback_batches),
+            "capacity_fallback_request_rows": int(
+                self.capacity_fallback_request_rows
+            ),
+            "capacity_fallback_packet_rows": int(
+                self.capacity_fallback_packet_rows
+            ),
+            "capacity_fallback_bytes": int(self.capacity_fallback_bytes),
+            "capacity_fallback_max_required_bytes": int(
+                self.capacity_fallback_max_required_bytes
+            ),
+        }
+
+
 class NativeRoutedSpanLayer(_NativeGemmaLayer):
     """wkvm-owned sink/ring/routed-span layer.
 
@@ -557,6 +785,15 @@ class NativeRoutedSpanLayer(_NativeGemmaLayer):
         return ret_k, ret_v
 
     def _update_state(self, key_states, value_states, *, batched_decode: bool) -> None:
+        self._append_state_tokens(key_states, value_states)
+        if batched_decode and self._pend_k.shape[2] >= self.route_chunk:
+            raise NotImplementedError(
+                "batched routed-span decode cannot route new overflow spans"
+            )
+        self._drain_pending_routes()
+        self._materialize()
+
+    def _append_state_tokens(self, key_states, value_states) -> None:
         self.cumulative_length += key_states.shape[-2]
 
         rk = _cat_time(self._ring_k, key_states)
@@ -573,11 +810,9 @@ class NativeRoutedSpanLayer(_NativeGemmaLayer):
             self._pend_v = _cat_time(self._pend_v, rv[:, :, :cut])
             rk, rv = rk[:, :, cut:], rv[:, :, cut:]
         self._ring_k, self._ring_v = rk.contiguous(), rv.contiguous()
+
+    def _drain_pending_routes(self) -> None:
         while self._pend_k.shape[2] >= self.route_chunk:
-            if batched_decode:
-                raise NotImplementedError(
-                    "batched routed-span decode cannot route new overflow spans"
-                )
             n = self._route_fold(
                 self._pend_k[:, :, : self.route_chunk],
                 self._pend_v[:, :, : self.route_chunk],
@@ -586,7 +821,31 @@ class NativeRoutedSpanLayer(_NativeGemmaLayer):
                 break
             self._pend_k = self._pend_k[:, :, n:].contiguous()
             self._pend_v = self._pend_v[:, :, n:].contiguous()
-        self._materialize()
+
+    def _prepare_pending_route_folds(
+        self,
+    ) -> tuple[list[_PreparedRouteDecision], int]:
+        prepared: list[_PreparedRouteDecision] = []
+        consumed = 0
+        simulated_evicted = int(self._evicted)
+        include_seed = self._cent is None
+        pending_width = int(self._pend_k.shape[2])
+        while pending_width - consumed >= self.route_chunk:
+            cut_k = self._pend_k[:, :, consumed : consumed + self.route_chunk]
+            cut_v = self._pend_v[:, :, consumed : consumed + self.route_chunk]
+            decision = self._prepare_route_decision_span(
+                cut_v,
+                cut_k=cut_k,
+                abs_start=self.sink + simulated_evicted,
+                include_seed=include_seed,
+            )
+            if decision.n_routed < 1:
+                break
+            prepared.append(decision)
+            consumed += int(decision.n_routed)
+            simulated_evicted += int(decision.n_routed)
+            include_seed = False
+        return prepared, consumed
 
     def commit_decode_token(self, key_states, value_states) -> bool:
         if (
@@ -837,7 +1096,13 @@ class NativeRoutedSpanLayer(_NativeGemmaLayer):
         return op
 
     def _route_fold(self, cut_k, cut_v) -> int:
-        op = self._decide("route_span", lambda: self._route_decisions_span(cut_v))
+        op = self._decide(
+            "route_span",
+            lambda: self._route_decisions_span(cut_v),
+        )
+        return self._commit_route_fold(cut_k, cut_v, op)
+
+    def _commit_route_fold(self, cut_k, cut_v, op) -> int:
         _, spans, assign, keeps, n_routed = op
         abs_start = self.sink + self._evicted
         self._evicted += n_routed
@@ -881,56 +1146,94 @@ class NativeRoutedSpanLayer(_NativeGemmaLayer):
             self._slot_spans[route_slot] = retained
         return n_routed
 
+    def _prepare_route_decision_span(
+        self,
+        cut_v,
+        *,
+        cut_k=None,
+        abs_start: int,
+        include_seed: bool,
+    ) -> _PreparedRouteDecision:
+        spans, n_routed = self._split_spans(abs_start, cut_v.shape[2])
+        features, span_means = self._span_feature_tensors(cut_v, spans)
+        seed_centroids = None
+        seed_count = 0
+        if include_seed:
+            seed_centroids, seed_count = self._seed_centroids_gpu(features)
+        return _PreparedRouteDecision(
+            cut_k=cut_k,
+            cut_v=cut_v,
+            spans=spans,
+            n_routed=n_routed,
+            features=features,
+            span_means=span_means,
+            seed_centroids=seed_centroids,
+            seed_count=seed_count,
+        )
+
+    def _plan_prepared_route_decision(
+        self,
+        decision: _PreparedRouteDecision,
+        packet_values,
+        *,
+        count_bulk_transfer: bool,
+    ):
+        span_count = decision.span_count
+        features = packet_values[:span_count]
+        span_means = packet_values[span_count : 2 * span_count]
+        if decision.seed_centroids is not None:
+            self._cent = packet_values[2 * span_count :].copy()
+            self._n_active = decision.seed_count
+        elif hasattr(self._cent, "detach"):
+            self._cent = self._cent.detach().cpu().numpy().copy()
+        if self._cent is None:
+            raise RuntimeError("routed span planner has no initialized centroids")
+
+        assign, assign_ambiguous = self._assign_spans_cpu(features)
+        keeps, keeps_ambiguous, keep_syncs = self._span_keeps_cpu(
+            features,
+            decision.spans,
+            assign,
+        )
+        ambiguous = assign_ambiguous or keeps_ambiguous
+        is_cuda = bool(decision.features.is_cuda)
+        if is_cuda and count_bulk_transfer:
+            self._route_decision_bulk_transfers += 1
+        self._route_decision_cpu_plans += 1
+        if ambiguous:
+            self._route_decision_ambiguous_cpu_plans += 1
+        if is_cuda:
+            self._route_decision_scalar_syncs_avoided += (
+                span_count
+                + max(decision.seed_count - 1, 0)
+                + 2 * span_count
+                + keep_syncs
+            )
+
+        self._commit_slot_route_feats(
+            span_means,
+            decision.spans,
+            assign,
+            keeps,
+        )
+        return decision.spans, assign, keeps, decision.n_routed
+
     def _route_decisions_span(self, cut_v):
         """Apply the canonical sequential route policy on CPU."""
 
         import torch
 
-        abs_start = self.sink + self._evicted
-        spans, n_routed = self._split_spans(abs_start, cut_v.shape[2])
-        feats_gpu, span_means_gpu = self._span_feature_tensors(cut_v, spans)
-        seed_gpu = None
-        seed_count = 0
-        if self._cent is None:
-            seed_gpu, seed_count = self._seed_centroids_gpu(feats_gpu)
-
-        packet_parts = [feats_gpu, span_means_gpu]
-        if seed_gpu is not None:
-            packet_parts.append(seed_gpu)
-        packet = torch.cat(packet_parts, dim=0).detach().cpu()
-        packet_values = packet.numpy()
-        span_count = len(spans)
-        feats = packet_values[:span_count]
-        span_means = packet_values[span_count : 2 * span_count]
-        if seed_gpu is not None:
-            self._cent = packet_values[2 * span_count :].copy()
-            self._n_active = seed_count
-        elif hasattr(self._cent, "detach"):
-            self._cent = self._cent.detach().cpu().numpy().copy()
-
-        assign, assign_ambiguous = self._assign_spans_cpu(feats)
-        keeps, keeps_ambiguous, keep_syncs = self._span_keeps_cpu(
-            feats,
-            spans,
-            assign,
+        decision = self._prepare_route_decision_span(
+            cut_v,
+            abs_start=self.sink + self._evicted,
+            include_seed=self._cent is None,
         )
-        ambiguous = assign_ambiguous or keeps_ambiguous
-
-        if bool(feats_gpu.is_cuda):
-            self._route_decision_bulk_transfers += 1
-        self._route_decision_cpu_plans += 1
-        if ambiguous:
-            self._route_decision_ambiguous_cpu_plans += 1
-        if bool(feats_gpu.is_cuda):
-            self._route_decision_scalar_syncs_avoided += (
-                span_count
-                + max(seed_count - 1, 0)
-                + 2 * span_count
-                + keep_syncs
-            )
-
-        self._commit_slot_route_feats(span_means, spans, assign, keeps)
-        return spans, assign, keeps, n_routed
+        packet = torch.cat(decision.packet_parts(), dim=0).detach().cpu()
+        return self._plan_prepared_route_decision(
+            decision,
+            packet.numpy(),
+            count_bulk_transfer=True,
+        )
 
     def _seed_centroids_gpu(self, feats):
         import torch
@@ -1774,6 +2077,7 @@ class NativeGemmaRoutedCache:
         graph_static: bool = False,
         token_pool_covered_layer_types: set[str] | frozenset[str] | None = None,
         release_source_dense_readouts: bool = False,
+        allow_route_boundary: bool = False,
     ) -> tuple["NativeGemmaRoutedCache", dict[str, Any]]:
         """Build a temporary padded cache for ragged decode-only batches."""
 
@@ -1811,6 +2115,7 @@ class NativeGemmaRoutedCache:
                         layer_idx,
                         decode_steps=decode_steps,
                         layer_type=layer_type,
+                        allow_route_boundary=allow_route_boundary,
                     )
                 else:
                     layer, info = _merge_routed_span_layer_padded(
@@ -1821,6 +2126,7 @@ class NativeGemmaRoutedCache:
                         persistent=persistent,
                         graph_static=graph_static,
                         release_source_dense_readouts=release_source_dense_readouts,
+                        allow_route_boundary=allow_route_boundary,
                     )
             elif isinstance(base_layer, NativeSlidingWindowLayer):
                 layer_type = _cache_layer_type(base.hf_config, layer_idx)
@@ -1956,14 +2262,86 @@ class NativeGemmaRoutedCache:
             return 0
         return min(layer.remaining_capacity() for layer in layers)
 
+    def padded_decode_route_boundary_reached(self) -> bool:
+        """Return whether a deferred routed-span fold is due after this step."""
+
+        for layer in self.layers:
+            pending_tail = getattr(layer, "pending_tail", None)
+            route_chunk = getattr(layer, "route_chunk", None)
+            if (
+                pending_tail is not None
+                and route_chunk is not None
+                and int(pending_tail) >= int(route_chunk)
+            ):
+                return True
+        return False
+
+    def padded_decode_route_boundary_pending(self) -> bool:
+        """Return whether the next one-token step reaches a route boundary."""
+
+        for layer in self.layers:
+            pending_tail = getattr(layer, "pending_tail", None)
+            route_chunk = getattr(layer, "route_chunk", None)
+            if (
+                pending_tail is not None
+                and route_chunk is not None
+                and int(pending_tail) + 1 == int(route_chunk)
+            ):
+                return True
+        return False
+
 
 class _NativeGemmaPrefillBatchLayer:
-    def __init__(self, layers: list[_NativeGemmaLayer], row_widths: list[int]) -> None:
+    def __init__(
+        self,
+        layers: list[_NativeGemmaLayer],
+        row_widths: list[int],
+        *,
+        query_lengths: list[int] | None = None,
+        token_pool_decode_rows: set[int] | frozenset[int] | None = None,
+        routed_packet_workspace: _RoutedPacketWorkspace | None = None,
+    ) -> None:
         if not layers or len(layers) != len(row_widths):
             raise ValueError("prefill batch layer rows do not match widths")
         self.layers = layers
         self.row_widths = [int(width) for width in row_widths]
+        if query_lengths is None:
+            # Preserve the direct helper's historical API.  Its callers pass
+            # the post-update cache width, so recover each query width from
+            # the layer's currently materialized dense tail.
+            inferred_lengths: list[int] = []
+            for layer, row_width in zip(layers, self.row_widths):
+                current_keys = getattr(layer, "keys", None)
+                current_width = (
+                    0 if current_keys is None else int(current_keys.shape[-2])
+                )
+                inferred_lengths.append(max(int(row_width) - current_width, 1))
+            query_lengths = inferred_lengths
+        self.query_lengths = [
+            int(length)
+            for length in (
+                query_lengths
+            )
+        ]
+        if len(self.query_lengths) != len(self.layers) or any(
+            length < 1 for length in self.query_lengths
+        ):
+            raise ValueError("prefill batch query lengths must match rows and be positive")
+        self.token_pool_decode_rows = frozenset(
+            int(row) for row in (token_pool_decode_rows or ())
+        )
+        if any(
+            row < 0 or row >= len(self.layers)
+            for row in self.token_pool_decode_rows
+        ):
+            raise ValueError("token-pool decode row is out of range")
+        if any(
+            self.query_lengths[row] != 1
+            for row in self.token_pool_decode_rows
+        ):
+            raise ValueError("token-pool decode rows must have query length one")
         self.is_sliding = bool(layers[0].is_sliding)
+        self.routed_packet_workspace = routed_packet_workspace
         self._last_update_mode = "none"
 
     def update(self, key_states, value_states, *args, **kwargs):
@@ -1983,12 +2361,19 @@ class _NativeGemmaPrefillBatchLayer:
         key_rows = []
         value_rows = []
         for row, layer in enumerate(self.layers):
-            row_keys, row_values = layer.update(
-                key_states[row : row + 1],
-                value_states[row : row + 1],
-                *args,
-                **kwargs,
-            )
+            query_length = self.query_lengths[row]
+            if int(key_states.shape[2]) < query_length:
+                raise ValueError("prefill batch key width is shorter than a row query")
+            if row in self.token_pool_decode_rows:
+                row_keys = key_states[row : row + 1, :, :query_length, :]
+                row_values = value_states[row : row + 1, :, :query_length, :]
+            else:
+                row_keys, row_values = layer.update(
+                    key_states[row : row + 1, :, :query_length, :],
+                    value_states[row : row + 1, :, :query_length, :],
+                    *args,
+                    **kwargs,
+                )
             expected_width = self.row_widths[row]
             if int(row_keys.shape[2]) != expected_width:
                 raise DistinctCacheBatchError(
@@ -2004,7 +2389,12 @@ class _NativeGemmaPrefillBatchLayer:
         return torch.cat(key_rows, dim=0), torch.cat(value_rows, dim=0)
 
     def _update_homogeneous(self, key_states, value_states):
-        if key_states.ndim != 4 or len(set(self.row_widths)) != 1:
+        if (
+            self.token_pool_decode_rows
+            or key_states.ndim != 4
+            or len(set(self.row_widths)) != 1
+            or len(set(self.query_lengths)) != 1
+        ):
             return None
         if all(type(layer) is NativeSlidingWindowLayer for layer in self.layers):
             return self._update_homogeneous_sliding(key_states, value_states)
@@ -2018,6 +2408,8 @@ class _NativeGemmaPrefillBatchLayer:
             return None
 
         query_length = int(key_states.shape[2])
+        if query_length != self.query_lengths[0]:
+            return None
         expected_width = self.row_widths[0]
         if not initialized:
             if expected_width != query_length:
@@ -2064,13 +2456,56 @@ class _NativeGemmaPrefillBatchLayer:
     def _update_homogeneous_sliding(self, key_states, value_states):
         layers = self.layers
         first = layers[0]
+        authoritative_prefills = [
+            layer._token_pool_authoritative_prefill for layer in layers
+        ]
+        has_authoritative_prefill = any(
+            reservation is not None for reservation in authoritative_prefills
+        )
         if (
             first.sliding_window <= 1
             or any(layer.sliding_window != first.sliding_window for layer in layers[1:])
             or any(layer._dense_storage_released for layer in layers)
-            or any(layer._token_pool_authoritative_prefill is not None for layer in layers)
+            or (
+                has_authoritative_prefill
+                and any(
+                    reservation is None for reservation in authoritative_prefills
+                )
+            )
+            or (
+                has_authoritative_prefill
+                and any(layer.layer_id is None for layer in layers)
+            )
         ):
             return None
+
+        query_length = int(key_states.shape[2])
+        if has_authoritative_prefill:
+            if len({id(reservation) for reservation in authoritative_prefills}) != len(
+                authoritative_prefills
+            ):
+                raise DistinctCacheBatchError(
+                    "authoritative prefill batch reservations must be distinct"
+                )
+            for layer, reservation in zip(layers, authoritative_prefills):
+                snapshot = layer._token_pool_authoritative_prefill_snapshot
+                layer_id = int(layer.layer_id)
+                if (
+                    not bool(reservation.active)
+                    or snapshot is None
+                    or snapshot[0] is not reservation
+                    or int(layer.cumulative_length) != int(reservation.previous_length)
+                    or int(reservation.new_length) - int(reservation.previous_length)
+                    != query_length
+                    or int(reservation.kept_tokens) < 1
+                    or int(reservation.kept_tokens) > query_length
+                    or layer_id not in reservation.expected_layer_ids
+                    or layer_id in reservation.written_layer_ids
+                    or layer_id in reservation.pending_layer_kv
+                ):
+                    raise DistinctCacheBatchError(
+                        "sliding layer does not match authoritative prefill reservation"
+                    )
 
         readout = self._homogeneous_readout(key_states, value_states)
         if readout is None:
@@ -2079,7 +2514,15 @@ class _NativeGemmaPrefillBatchLayer:
         keep = int(first.sliding_window) - 1
         cached_keys = full_keys[:, :, -keep:, :].contiguous()
         cached_values = full_values[:, :, -keep:, :].contiguous()
-        query_length = int(key_states.shape[2])
+        if has_authoritative_prefill:
+            for row, (layer, reservation) in enumerate(
+                zip(layers, authoritative_prefills)
+            ):
+                reservation.write_layer_kv(
+                    layer.layer_id,
+                    key_states[row : row + 1],
+                    value_states[row : row + 1],
+                )
         for row, layer in enumerate(layers):
             if not was_initialized:
                 layer.dtype = key_states.dtype
@@ -2098,6 +2541,15 @@ class _NativeGemmaPrefillBatchLayer:
         if readout is None:
             return None
         full_keys, full_values, was_initialized = readout
+        workspace = self.routed_packet_workspace
+        if workspace is not None and all(layer.is_leader for layer in layers):
+            used_packets = self._update_homogeneous_routed_packets(
+                key_states,
+                value_states,
+                was_initialized=was_initialized,
+            )
+            if used_packets:
+                return full_keys, full_values
         for row, layer in enumerate(layers):
             row_keys = key_states[row : row + 1]
             row_values = value_states[row : row + 1]
@@ -2109,6 +2561,126 @@ class _NativeGemmaPrefillBatchLayer:
                 batched_decode=False,
             )
         return full_keys, full_values
+
+    def _update_homogeneous_routed_packets(
+        self,
+        key_states,
+        value_states,
+        *,
+        was_initialized: bool,
+    ) -> bool:
+        workspace = self.routed_packet_workspace
+        if workspace is None:
+            raise RuntimeError("routed packet workspace is not configured")
+        packet_rows, feature_width = self._routed_packet_shape(value_states)
+        if packet_rows:
+            required_bytes = workspace.required_buffer_bytes(
+                packet_rows,
+                feature_width,
+            )
+            if required_bytes > workspace.max_buffer_bytes:
+                workspace.record_capacity_fallback(
+                    request_rows=len(self.layers),
+                    packet_rows=packet_rows,
+                    required_bytes=required_bytes,
+                )
+                return False
+            workspace.reserve(
+                packet_rows,
+                feature_width,
+                device=value_states.device,
+            )
+        prepared_by_layer: list[
+            tuple[NativeRoutedSpanLayer, list[_PreparedRouteDecision], int]
+        ] = []
+        packet_parts: list[Any] = []
+        participating_rows = 0
+        for row, layer in enumerate(self.layers):
+            row_keys = key_states[row : row + 1]
+            row_values = value_states[row : row + 1]
+            if not was_initialized:
+                layer.lazy_initialization(row_keys, row_values)
+            layer._append_state_tokens(row_keys, row_values)
+            prepared, consumed = layer._prepare_pending_route_folds()
+            if prepared:
+                participating_rows += 1
+            prepared_by_layer.append((layer, prepared, consumed))
+            for decision in prepared:
+                packet_parts.extend(decision.packet_parts())
+
+        if packet_parts:
+            packet_values = workspace.transfer(packet_parts)
+            workspace.packet_request_rows += participating_rows
+            workspace.packet_folds += sum(
+                len(prepared) for _layer, prepared, _consumed in prepared_by_layer
+            )
+            workspace.packet_spans += sum(
+                decision.span_count
+                for _layer, prepared, _consumed in prepared_by_layer
+                for decision in prepared
+            )
+            packet_cursor = 0
+            plan_start = time.perf_counter()
+            first_transfer_layer = True
+            for layer, prepared, _consumed in prepared_by_layer:
+                for decision in prepared:
+                    packet_rows = sum(
+                        int(part.shape[0]) for part in decision.packet_parts()
+                    )
+                    plan = layer._plan_prepared_route_decision(
+                        decision,
+                        packet_values[packet_cursor : packet_cursor + packet_rows],
+                        count_bulk_transfer=False,
+                    )
+                    if first_transfer_layer and bool(decision.features.is_cuda):
+                        layer._route_decision_bulk_transfers += 1
+                        first_transfer_layer = False
+                    op = layer._decide("route_span", lambda plan=plan: plan)
+                    layer._commit_route_fold(decision.cut_k, decision.cut_v, op)
+                    packet_cursor += packet_rows
+            workspace.cpu_plan_s += time.perf_counter() - plan_start
+
+        for layer, _prepared, consumed in prepared_by_layer:
+            if consumed:
+                layer._pend_k = layer._pend_k[:, :, consumed:].contiguous()
+                layer._pend_v = layer._pend_v[:, :, consumed:].contiguous()
+            layer._materialize()
+        return True
+
+    def _routed_packet_shape(self, value_states) -> tuple[int, int]:
+        query_length = int(value_states.shape[2])
+        feature_width = int(value_states.shape[1]) * int(value_states.shape[3])
+        packet_rows = 0
+        for layer in self.layers:
+            if layer.is_initialized:
+                sink_width = int(layer._sink_k.shape[2])
+                ring_width = int(layer._ring_k.shape[2])
+                pending_width = int(layer._pend_k.shape[2])
+            else:
+                sink_width = 0
+                ring_width = 0
+                pending_width = 0
+            sink_deficit = max(layer.sink - sink_width, 0)
+            ring_after_append = ring_width + query_length
+            ring_after_sink = max(ring_after_append - sink_deficit, 0)
+            pending_width += max(ring_after_sink - layer.window, 0)
+            consumed = 0
+            simulated_evicted = int(layer._evicted)
+            include_seed = layer._cent is None
+            while pending_width - consumed >= layer.route_chunk:
+                spans, n_routed = layer._split_spans(
+                    layer.sink + simulated_evicted,
+                    layer.route_chunk,
+                )
+                if n_routed < 1:
+                    break
+                packet_rows += 2 * len(spans)
+                if include_seed:
+                    packet_rows += layer.m_slots
+                consumed += int(n_routed)
+                simulated_evicted += int(n_routed)
+                include_seed = False
+        return packet_rows, feature_width
 
     def get_seq_length(self) -> int:
         return max(int(layer.get_seq_length()) for layer in self.layers)
@@ -2127,16 +2699,50 @@ class _NativeGemmaPrefillBatchCache:
         self,
         caches: list[NativeGemmaRoutedCache],
         *,
-        query_length: int,
+        query_length: int | None = None,
+        query_lengths: list[int] | None = None,
         start_positions: list[int],
         device,
         boolean_attention_mask: bool,
         mask_dtype,
+        token_pool_decode_rows: set[int] | frozenset[int] | None = None,
+        routed_packet_workspace: _RoutedPacketWorkspace | None = None,
     ) -> None:
         if len(caches) < 2:
             raise ValueError("prefill batch cache requires at least two rows")
         if len(caches) != len(start_positions):
             raise ValueError("prefill batch start positions do not match rows")
+        if query_lengths is None:
+            if query_length is None:
+                raise ValueError("prefill batch query length is required")
+            query_lengths = [int(query_length)] * len(caches)
+        else:
+            query_lengths = [int(length) for length in query_lengths]
+            if any(length < 1 for length in query_lengths):
+                raise ValueError("prefill batch query lengths must be positive")
+            if query_length is not None and any(
+                length != int(query_length) for length in query_lengths
+            ):
+                raise ValueError(
+                    "query_length conflicts with per-row prefill query lengths"
+                )
+        if len(query_lengths) != len(caches):
+            raise ValueError("prefill batch query lengths do not match rows")
+        self.query_lengths = query_lengths
+        self.max_query_length = max(query_lengths)
+        self.token_pool_decode_rows = frozenset(
+            int(row) for row in (token_pool_decode_rows or ())
+        )
+        if any(
+            row < 0 or row >= len(caches)
+            for row in self.token_pool_decode_rows
+        ):
+            raise ValueError("token-pool decode row is out of range")
+        if any(
+            query_lengths[row] != 1
+            for row in self.token_pool_decode_rows
+        ):
+            raise ValueError("token-pool decode rows must have query length one")
         base = caches[0]
         if any(cache.hf_config is not base.hf_config for cache in caches[1:]):
             raise DistinctCacheBatchError("prefill cache hf_config objects differ")
@@ -2167,10 +2773,16 @@ class _NativeGemmaPrefillBatchCache:
             representatives.setdefault(layer_type, layer_idx)
 
         for layer_type, layer_idx in representatives.items():
-            sizes = [
-                cache.layers[layer_idx].get_mask_sizes(int(query_length))
-                for cache in caches
-            ]
+            sizes = []
+            for row, cache in enumerate(caches):
+                if row in self.token_pool_decode_rows:
+                    sizes.append((int(query_lengths[row]), int(start_positions[row])))
+                else:
+                    sizes.append(
+                        cache.layers[layer_idx].get_mask_sizes(
+                            int(query_lengths[row])
+                        )
+                    )
             self._row_widths_by_type[layer_type] = [int(size[0]) for size in sizes]
             self._kv_offsets_by_type[layer_type] = [int(size[1]) for size in sizes]
 
@@ -2192,6 +2804,9 @@ class _NativeGemmaPrefillBatchCache:
                 _NativeGemmaPrefillBatchLayer(
                     source_layers,
                     self._row_widths_by_type[layer_type],
+                    query_lengths=query_lengths,
+                    token_pool_decode_rows=self.token_pool_decode_rows,
+                    routed_packet_workspace=routed_packet_workspace,
                 )
             )
 
@@ -2200,7 +2815,8 @@ class _NativeGemmaPrefillBatchCache:
                 row_widths=self._row_widths_by_type[layer_type],
                 kv_offsets=self._kv_offsets_by_type[layer_type],
                 start_positions=start_positions,
-                query_length=int(query_length),
+                query_lengths=query_lengths,
+                max_query_length=self.max_query_length,
                 sliding_window=(
                     int(getattr(self.hf_config, "sliding_window", 0) or 0)
                     if layer_type == "sliding_attention"
@@ -2219,7 +2835,8 @@ class _NativeGemmaPrefillBatchCache:
         row_widths: list[int],
         kv_offsets: list[int],
         start_positions: list[int],
-        query_length: int,
+        query_lengths: list[int],
+        max_query_length: int,
         sliding_window: int | None,
         device,
         boolean_attention_mask: bool,
@@ -2235,13 +2852,18 @@ class _NativeGemmaPrefillBatchCache:
             dtype=torch.long,
             device=device,
         ).reshape(batch, 1, 1)
-        query_position = torch.arange(
-            query_length,
+        query_index = torch.arange(
+            max_query_length,
             dtype=torch.long,
             device=device,
-        ).reshape(1, query_length, 1)
-        query_position = query_position + torch.as_tensor(
+        ).reshape(1, max_query_length, 1)
+        query_position = query_index + torch.as_tensor(
             start_positions,
+            dtype=torch.long,
+            device=device,
+        ).reshape(batch, 1, 1)
+        query_valid = query_index < torch.as_tensor(
+            query_lengths,
             dtype=torch.long,
             device=device,
         ).reshape(batch, 1, 1)
@@ -2253,6 +2875,10 @@ class _NativeGemmaPrefillBatchCache:
         valid = valid & (key_position <= query_position)
         if sliding_window is not None:
             valid = valid & (key_position > query_position - int(sliding_window))
+        # Keep padded query rows numerically defined; their logits are never
+        # gathered by the mixed runner.  Allowing key zero avoids an all-masked
+        # softmax row while preserving the valid rows' causal mask exactly.
+        valid = valid & (query_valid | (key_index == 0))
         valid = valid.unsqueeze(1)
         if boolean_attention_mask:
             return valid
@@ -2341,11 +2967,15 @@ class GemmaRoutedSpanRunner:
     decode_workspace: PaddedDecodeWorkspace | None = None
     persistent_padded_decode_cuda_graph: bool = False
     persistent_padded_decode_graph_warmup_iters: int = 3
+    allow_padded_route_boundary: bool = False
     use_native_gemma_forward: bool = False
     native_gemma_attention_backend: str = "manual"
     native_gemma_projection_backend: str = "separate"
     native_gemma_weight_backend: str = "hf_live"
     native_gemma_release_hf_decoder_layers: bool = False
+    native_gemma_kv_sharing_fast_prefill: bool = False
+    batched_routed_packets: bool = False
+    routed_packet_workspace_bytes: int = 64 * 1024 * 1024
     collect_cuda_memory_phase_metrics: bool = False
 
     def __post_init__(self) -> None:
@@ -2353,6 +2983,8 @@ class GemmaRoutedSpanRunner:
             raise ValueError("prefill_chunk must be >= 1")
         if self.persistent_padded_decode_graph_warmup_iters < 0:
             raise ValueError("persistent_padded_decode_graph_warmup_iters must be >= 0")
+        if self.routed_packet_workspace_bytes < 1:
+            raise ValueError("routed_packet_workspace_bytes must be >= 1")
         if self.native_gemma_attention_backend not in {
             "manual",
             "manual_gqa",
@@ -2396,7 +3028,26 @@ class GemmaRoutedSpanRunner:
                     self.native_gemma_release_hf_decoder_layers
                 ),
             )
+        if self.native_gemma_kv_sharing_fast_prefill:
+            if not self.use_native_gemma_forward:
+                raise ValueError(
+                    "native_gemma_kv_sharing_fast_prefill requires "
+                    "use_native_gemma_forward"
+                )
+            text_prefix = getattr(self.model, "text_prefix", None)
+            if not bool(
+                getattr(text_prefix, "kv_sharing_fast_prefill_eligible", False)
+            ):
+                raise ValueError(
+                    "native_gemma_kv_sharing_fast_prefill requires a full "
+                    "Gemma4 stack with an eligible KV-shared tail"
+                )
         self.device = self._model_device()
+        self._routed_packet_workspace = (
+            _RoutedPacketWorkspace(self.routed_packet_workspace_bytes)
+            if self.batched_routed_packets
+            else None
+        )
         self._token_pool_decode_graph_cache: OrderedDict[tuple[Any, ...], Any] = (
             OrderedDict()
         )
@@ -2514,12 +3165,14 @@ class GemmaRoutedSpanRunner:
             cache.set_span_break_mask(break_mask)
         logits = None
         for start in range(0, len(token_ids), self.prefill_chunk):
+            end = min(start + self.prefill_chunk, len(token_ids))
             logits = self.prefill_chunk_step(
                 cache,
-                token_ids[start : start + self.prefill_chunk],
+                token_ids[start:end],
                 slots,
                 start_pos=start,
                 break_mask=break_mask,
+                compute_logits=end == len(token_ids),
             )
         if logits is None:
             raise AssertionError("prefill produced no logits")
@@ -2533,6 +3186,7 @@ class GemmaRoutedSpanRunner:
         *,
         start_pos: int,
         break_mask: list[bool] | None = None,
+        compute_logits: bool = True,
     ):
         import torch
 
@@ -2556,6 +3210,14 @@ class GemmaRoutedSpanRunner:
                 past_key_values=cache,
                 use_cache=True,
                 logits_to_keep=1,
+                wkvm_kv_sharing_fast_prefill=(
+                    self.native_gemma_kv_sharing_fast_prefill
+                ),
+                **(
+                    {"wkvm_compute_logits": bool(compute_logits)}
+                    if self.native_gemma_kv_sharing_fast_prefill
+                    else {}
+                ),
             )
         self.bank.ingest_positions(
             slots,
@@ -2572,6 +3234,7 @@ class GemmaRoutedSpanRunner:
         *,
         start_positions: list[int],
         break_masks: list[list[bool] | None] | None = None,
+        compute_logits: bool = True,
     ):
         import torch
 
@@ -2604,6 +3267,7 @@ class GemmaRoutedSpanRunner:
                 getattr(self.model, "wkvm_no_hf_transformer_forward", False)
             ),
             mask_dtype=self._model_dtype(),
+            routed_packet_workspace=self._routed_packet_workspace,
         )
         ids = torch.tensor(token_id_rows, dtype=torch.long, device=self.device)
         pos = torch.arange(
@@ -2624,6 +3288,14 @@ class GemmaRoutedSpanRunner:
                 past_key_values=batch_cache,
                 use_cache=True,
                 logits_to_keep=1,
+                wkvm_kv_sharing_fast_prefill=(
+                    self.native_gemma_kv_sharing_fast_prefill
+                ),
+                **(
+                    {"wkvm_compute_logits": bool(compute_logits)}
+                    if self.native_gemma_kv_sharing_fast_prefill
+                    else {}
+                ),
             )
         for slots, start_pos, break_mask in zip(
             slots_by_row,
@@ -2636,6 +3308,179 @@ class GemmaRoutedSpanRunner:
                 break_mask,
             )
         return out.logits
+
+    def mixed_batch_step(
+        self,
+        caches: list[NativeGemmaRoutedCache],
+        token_ids: list[int] | tuple[int, ...],
+        slots_by_row: list[dict[str, int]],
+        *,
+        metadata,
+        start_positions: list[int],
+        break_masks: list[list[bool] | None] | None = None,
+        token_pool_decode=None,
+    ):
+        """Execute one opt-in ragged prefill/decode model call.
+
+        The query dimension is padded only at the *input* boundary to the
+        largest row width.  ``_NativeGemmaPrefillBatchLayer`` slices each row
+        back to its true query length before mutating its cache, and the
+        attention mask excludes the padding.  This keeps q=1 decode rows and
+        q>1 prefill rows in one native forward while preserving per-row cache
+        lengths.  When a mixed token-pool context is supplied, q=1 rows use
+        token-pool attention and per-layer write slots while the remaining
+        rows retain the dense prefill path.
+        """
+        import torch
+
+        if not bool(getattr(self.model, "wkvm_no_hf_transformer_forward", False)):
+            raise DistinctCacheBatchError(
+                "ragged mixed batch requires the native Gemma forward bridge"
+            )
+        row_count = int(getattr(metadata, "row_count", 0))
+        q_lens = tuple(int(value) for value in getattr(metadata, "q_lens", ()))
+        if row_count < 2:
+            raise ValueError("ragged mixed batch requires at least two rows")
+        if len(caches) != row_count or len(slots_by_row) != row_count:
+            raise ValueError("mixed batch cache, slot, and metadata rows differ")
+        if len(start_positions) != row_count:
+            raise ValueError("mixed batch start positions do not match rows")
+        if len(q_lens) != row_count or any(length < 1 for length in q_lens):
+            raise ValueError("mixed batch q_lens must be positive and row-aligned")
+        token_pool_decode_rows = frozenset()
+        if token_pool_decode is not None:
+            context_q_lens = tuple(
+                int(value) for value in getattr(token_pool_decode, "q_lens", ())
+            )
+            if context_q_lens != q_lens:
+                raise ValueError("mixed token-pool q_lens do not match metadata")
+            token_pool_decode_rows = frozenset(
+                int(value)
+                for value in getattr(token_pool_decode, "decode_row_indices", ())
+            )
+            if not token_pool_decode_rows:
+                raise ValueError("mixed token-pool context has no decode rows")
+            if any(
+                row < 0 or row >= row_count
+                for row in token_pool_decode_rows
+            ):
+                raise ValueError("mixed token-pool decode row is out of range")
+            if any(q_lens[row] != 1 for row in token_pool_decode_rows):
+                raise ValueError("mixed token-pool decode rows must have q_len one")
+        flat_tokens = tuple(int(token) for token in token_ids)
+        expected_tokens = sum(q_lens)
+        if len(flat_tokens) != expected_tokens:
+            raise ValueError("mixed batch token count does not match q_lens")
+        if tuple(int(value) for value in getattr(metadata, "positions", ())) and (
+            len(getattr(metadata, "positions", ())) != expected_tokens
+        ):
+            raise ValueError("mixed batch positions do not match q_lens")
+        if break_masks is None:
+            break_masks = [None] * row_count
+        if len(break_masks) != row_count:
+            raise ValueError("mixed batch break-mask rows do not match caches")
+        for cache, break_mask in zip(caches, break_masks):
+            if break_mask is not None:
+                cache.set_span_break_mask(break_mask)
+
+        token_rows: list[tuple[int, ...]] = []
+        cursor = 0
+        for q_len in q_lens:
+            token_rows.append(flat_tokens[cursor : cursor + q_len])
+            cursor += q_len
+        max_query_length = max(q_lens)
+        # Dummy values are masked for every padded query position and are never
+        # written to a request cache.  Repeating the row's final token keeps
+        # embedding lookup valid for native models that do not accept padding
+        # ids outside their vocabulary.
+        padded_ids = [
+            list(row) + [row[-1]] * (max_query_length - len(row))
+            for row in token_rows
+        ]
+        padded_positions = []
+        metadata_positions = tuple(int(value) for value in getattr(metadata, "positions", ()))
+        cursor = 0
+        for row, q_len, start in zip(token_rows, q_lens, start_positions):
+            row_positions = metadata_positions[cursor : cursor + q_len]
+            if len(row_positions) != q_len:
+                row_positions = tuple(range(int(start), int(start) + q_len))
+            padded_positions.append(
+                list(row_positions)
+                + [row_positions[-1]] * (max_query_length - q_len)
+            )
+            cursor += q_len
+
+        batch_cache = _NativeGemmaPrefillBatchCache(
+            caches,
+            query_lengths=list(q_lens),
+            start_positions=[int(start) for start in start_positions],
+            device=self.device,
+            boolean_attention_mask=bool(
+                getattr(self.model, "wkvm_no_hf_transformer_forward", False)
+            ),
+            mask_dtype=self._model_dtype(),
+            token_pool_decode_rows=token_pool_decode_rows,
+            routed_packet_workspace=self._routed_packet_workspace,
+        )
+        ids = torch.as_tensor(padded_ids, dtype=torch.long, device=self.device)
+        positions = torch.as_tensor(
+            padded_positions,
+            dtype=torch.long,
+            device=self.device,
+        )
+        logits_indices = torch.as_tensor(
+            [q_len - 1 for q_len in q_lens],
+            dtype=torch.long,
+            device=self.device,
+        )
+        native_forward_kwargs = self._native_forward_extra_kwargs(
+            token_pool_decode=token_pool_decode,
+        )
+        with torch.inference_mode():
+            out = self.model(
+                input_ids=ids,
+                position_ids=positions,
+                attention_mask=batch_cache.attention_mask,
+                past_key_values=batch_cache,
+                use_cache=True,
+                logits_to_keep=1,
+                wkvm_logits_indices=logits_indices,
+                **native_forward_kwargs,
+            )
+        for slots, start_pos, q_len, break_mask in zip(
+            slots_by_row,
+            start_positions,
+            q_lens,
+            break_masks,
+        ):
+            self.bank.ingest_positions(
+                slots,
+                list(range(int(start_pos), int(start_pos) + int(q_len))),
+                break_mask,
+            )
+        self.last_mixed_batch_info = {
+            "merge": (
+                "ragged_mixed_token_pool"
+                if token_pool_decode is not None
+                else "ragged_mixed"
+            ),
+            "rows": row_count,
+            "q_lens": q_lens,
+            "token_pool_decode_rows": len(token_pool_decode_rows),
+            "query_padding_tokens": sum(max_query_length - q_len for q_len in q_lens),
+        }
+        return out.logits
+
+    def routed_packet_stats(self) -> dict[str, int | float | bool]:
+        if self._routed_packet_workspace is None:
+            return {
+                "enabled": False,
+                "workspace_max_bytes": int(self.routed_packet_workspace_bytes),
+            }
+        return {
+            "enabled": True,
+            **self._routed_packet_workspace.stats(),
+        }
 
     def decode_step(
         self,
@@ -2717,6 +3562,7 @@ class GemmaRoutedSpanRunner:
                     decode_steps=1,
                     workspace=self.decode_workspace,
                     token_pool_covered_layer_types=token_pool_covered_layer_types,
+                    allow_route_boundary=self.allow_padded_route_boundary,
                 )
                 commit_padded = True
             except DistinctCacheBatchError as padded_exc:
@@ -2878,11 +3724,18 @@ class GemmaRoutedSpanRunner:
             required_layer_types
             and required_layer_types.issubset(token_pool_covered_layer_types)
         )
+        token_pool_graphable = (
+            token_pool_decode is None
+            or TokenPoolDecodeBackendState.graph_decode_context_is_graphable(
+                token_pool_decode
+            )
+        )
         use_cuda_graph = bool(
             self._can_cuda_graph_decode()
-            and fully_token_pool_covered
-            and TokenPoolDecodeBackendState.graph_decode_context_is_graphable(
-                token_pool_decode
+            and token_pool_graphable
+            and (
+                token_pool_decode is None
+                or fully_token_pool_covered
             )
         )
         merged_cache, info = NativeGemmaRoutedCache.merge_padded_decode(
@@ -2893,6 +3746,7 @@ class GemmaRoutedSpanRunner:
             graph_static=use_cuda_graph,
             token_pool_covered_layer_types=token_pool_covered_layer_types,
             release_source_dense_readouts=True,
+            allow_route_boundary=self.allow_padded_route_boundary,
         )
         released_source_readouts = sum(
             int(layer_info.get("released_source_dense_readouts", 0) or 0)
@@ -2932,7 +3786,18 @@ class GemmaRoutedSpanRunner:
                         merged_cache,
                         len(last_tokens),
                         device=self.device,
-                        warmup_iters=self.persistent_padded_decode_graph_warmup_iters,
+                        warmup_iters=(
+                            0
+                            if (
+                                self.allow_padded_route_boundary
+                                and getattr(
+                                    merged_cache,
+                                    "padded_decode_route_boundary_pending",
+                                    lambda: False,
+                                )()
+                            )
+                            else self.persistent_padded_decode_graph_warmup_iters
+                        ),
                         token_pool_decode=native_forward_kwargs.get(
                             "wkvm_token_pool_decode"
                         ),
@@ -3560,6 +4425,8 @@ class _TokenPoolCoveredDecodeLayer(_NativeGemmaLayer):
         dtype,
         device,
         reserved_decode_steps: int = 1,
+        pending_tail: int | None = None,
+        route_chunk: int | None = None,
     ) -> None:
         super().__init__()
         self.cumulative_length = int(cumulative_length)
@@ -3571,6 +4438,8 @@ class _TokenPoolCoveredDecodeLayer(_NativeGemmaLayer):
         self.is_initialized = True
         self._reserved_decode_steps = max(1, int(reserved_decode_steps))
         self._consumed_decode_steps = 0
+        self.pending_tail = None if pending_tail is None else int(pending_tail)
+        self.route_chunk = None if route_chunk is None else int(route_chunk)
 
     def update(self, key_states, value_states, *args, **kwargs):
         raise DistinctCacheBatchError(
@@ -3594,6 +4463,8 @@ class _TokenPoolCoveredDecodeLayer(_NativeGemmaLayer):
             return
         self._consumed_decode_steps += steps
         self.cumulative_length += steps
+        if self.pending_tail is not None:
+            self.pending_tail += steps
 
 
 class _PaddedDecodeLayer(_NativeGemmaLayer):
@@ -3609,6 +4480,7 @@ class _PaddedDecodeLayer(_NativeGemmaLayer):
         is_sliding: bool,
         pending_tail: int | None = None,
         route_chunk: int | None = None,
+        allow_route_boundary: bool = False,
     ) -> None:
         super().__init__()
         self.keys = keys
@@ -3620,20 +4492,25 @@ class _PaddedDecodeLayer(_NativeGemmaLayer):
         self.is_sliding = bool(is_sliding)
         self.pending_tail = None if pending_tail is None else int(pending_tail)
         self.route_chunk = None if route_chunk is None else int(route_chunk)
+        self.allow_route_boundary = bool(allow_route_boundary)
         self.dtype = keys.dtype
         self.device = keys.device
         self.is_initialized = True
         self._last_key_states = None
         self._last_value_states = None
 
+    def _would_cross_route_boundary(self, steps: int) -> bool:
+        if self.pending_tail is None or self.route_chunk is None:
+            return False
+        total = int(self.pending_tail) + int(steps)
+        if total < int(self.route_chunk):
+            return False
+        return total > int(self.route_chunk) or not self.allow_route_boundary
+
     def update(self, key_states, value_states, *args, **kwargs):
         if key_states.shape[-2] != 1:
             raise NotImplementedError("padded native Gemma cache is decode-only")
-        if (
-            self.pending_tail is not None
-            and self.route_chunk is not None
-            and self.pending_tail + key_states.shape[-2] >= self.route_chunk
-        ):
+        if self._would_cross_route_boundary(key_states.shape[-2]):
             raise NotImplementedError("padded decode would cross routed-span fold boundary")
         self._last_key_states = key_states.detach()
         self._last_value_states = value_states.detach()
@@ -3682,6 +4559,7 @@ class _PersistentPaddedDecodeLayer(_PaddedDecodeLayer):
         is_sliding: bool,
         pending_tail: int | None = None,
         route_chunk: int | None = None,
+        allow_route_boundary: bool = False,
         static_width: bool = False,
     ) -> None:
         super().__init__(
@@ -3692,6 +4570,7 @@ class _PersistentPaddedDecodeLayer(_PaddedDecodeLayer):
             is_sliding=is_sliding,
             pending_tail=pending_tail,
             route_chunk=route_chunk,
+            allow_route_boundary=allow_route_boundary,
         )
         self._initial_write_width = int(initial_write_width)
         self._write_width = int(initial_write_width)
@@ -3714,11 +4593,7 @@ class _PersistentPaddedDecodeLayer(_PaddedDecodeLayer):
     def update(self, key_states, value_states, *args, **kwargs):
         if key_states.shape[-2] != 1:
             raise NotImplementedError("persistent padded Gemma cache is decode-only")
-        if (
-            self.pending_tail is not None
-            and self.route_chunk is not None
-            and self.pending_tail + key_states.shape[-2] >= self.route_chunk
-        ):
+        if self._would_cross_route_boundary(key_states.shape[-2]):
             raise NotImplementedError("persistent padded decode would cross routed-span fold boundary")
         self._last_key_states = key_states.detach()
         self._last_value_states = value_states.detach()
@@ -3846,11 +4721,7 @@ class _PersistentPaddedDecodeLayer(_PaddedDecodeLayer):
             raise DistinctCacheBatchError("dynamic persistent padded layer has no static replay bookkeeping")
         if steps < 1:
             raise ValueError("steps must be >= 1")
-        if (
-            self.pending_tail is not None
-            and self.route_chunk is not None
-            and self.pending_tail + steps >= self.route_chunk
-        ):
+        if self._would_cross_route_boundary(steps):
             raise NotImplementedError("static padded decode replay would cross routed-span fold boundary")
         end = self._write_width + int(steps)
         if end > self.keys.shape[2]:
@@ -4346,6 +5217,7 @@ def _merge_token_pool_covered_routed_layer(
     *,
     decode_steps: int = 1,
     layer_type: str,
+    allow_route_boundary: bool = False,
 ) -> tuple[_TokenPoolCoveredDecodeLayer, dict[str, Any]]:
     base = layers[0]
     if not base.is_initialized:
@@ -4368,7 +5240,10 @@ def _merge_token_pool_covered_routed_layer(
     lengths = [0 if layer.keys is None else int(layer.keys.shape[2]) for layer in layers]
     pending_tail = max(int(layer._pend_k.shape[2]) for layer in layers)
     route_chunk = int(base.route_chunk)
-    if pending_tail + int(decode_steps) >= route_chunk:
+    decode_total = pending_tail + int(decode_steps)
+    if decode_total > route_chunk or (
+        decode_total == route_chunk and not allow_route_boundary
+    ):
         raise DistinctCacheBatchError(
             f"layer {layer_idx}: pending tail {pending_tail} + "
             f"decode {int(decode_steps)} reaches route_chunk {route_chunk}"
@@ -4381,6 +5256,8 @@ def _merge_token_pool_covered_routed_layer(
         dtype=dtype,
         device=device,
         reserved_decode_steps=decode_steps,
+        pending_tail=pending_tail,
+        route_chunk=route_chunk,
     )
     return (
         layer,
@@ -4513,6 +5390,7 @@ def _merge_routed_span_layer_padded(
     persistent: bool = False,
     graph_static: bool = False,
     release_source_dense_readouts: bool = False,
+    allow_route_boundary: bool = False,
 ) -> tuple[_PaddedDecodeLayer, dict[str, Any]]:
     base = layers[0]
     if not base.is_initialized:
@@ -4526,7 +5404,10 @@ def _merge_routed_span_layer_padded(
     if any(layer.route_chunk != route_chunk for layer in layers):
         raise DistinctCacheBatchError(f"layer {layer_idx}: route_chunk differs")
     pending_tail = max(int(layer._pend_k.shape[2]) for layer in layers)
-    if pending_tail + decode_steps >= route_chunk:
+    decode_total = pending_tail + int(decode_steps)
+    if decode_total > route_chunk or (
+        decode_total == route_chunk and not allow_route_boundary
+    ):
         raise DistinctCacheBatchError(
             f"layer {layer_idx}: pending tail {pending_tail} + "
             f"decode {decode_steps} reaches route_chunk {route_chunk}"
@@ -4553,6 +5434,7 @@ def _merge_routed_span_layer_padded(
             is_sliding=False,
             pending_tail=pending_tail,
             route_chunk=route_chunk,
+            allow_route_boundary=allow_route_boundary,
             static_width=graph_static,
         )
     else:
@@ -4572,6 +5454,7 @@ def _merge_routed_span_layer_padded(
             is_sliding=False,
             pending_tail=pending_tail,
             route_chunk=route_chunk,
+            allow_route_boundary=allow_route_boundary,
         )
     return (
         layer,

@@ -2,6 +2,33 @@
 
 *Measured on one machine: RTX 4090 24GB (Ada, sm_89), local checkpoints, 2026-07-03. Engine-architecture claims verified against main-branch source (see ANGLE.md for the full audit). Measured sections are filled from runs in `/run/media/.../wkvm_bench/` and `experiments/results/`; anything not measured here is marked as such.*
 
+> **Scope update:** the historical 10x-class rows below remain specialized
+> steady-state PoC decode. The strict short-session A800 gate remains FAIL at
+> 0.790x versus vLLM and 1.400x versus SGLang. A separate one-repeat RTX 4090
+> long-lived provider-HTTP cohort now passes the complete-session gate at
+> 11.151x versus vLLM and 26.079x versus SGLang. It is exploratory because the
+> tree was dirty, the GPU was not headless, and WKVM `routed_span_approximate`
+> semantics differ from incumbent `full_kv` semantics.
+
+## Latest provider-HTTP complete-session result
+
+Gemma-4-E4B-it, BF16, B16, 48 synchronized turns, 36,864 initial tokens,
+32 new input tokens per continuation, 64 output tokens per request, and a
+24,200 MiB whole-device ceiling:
+
+| Engine | Semantic mode | Full wall | Full output tok/s | Peak whole GPU |
+|---|---|---:|---:|---:|
+| WKVM | `routed_span_approximate` | **180.415 s** | **272.439** | 23,856 MiB |
+| vLLM 0.24.0 | `full_kv` | 2,011.890 s | 24.431 | 23,200 MiB |
+| SGLang 0.5.14 | `full_kv` | 4,705.123 s | 10.446 | 23,597 MiB |
+
+The full-session ratios are **11.151x** and **26.079x**. All engines complete
+768/768 requests with zero errors and share one exact 48-turn source/replay
+trace. Turn zero is tied between WKVM and vLLM; the 10x result comes from
+amortizing that one-time prompt over 47 resident-state continuations. See the
+[`full report`](../experiments/results/gemma_4090_48turn_10x_20260717.md) for
+launch settings, continuation results, trace identity, and claim limits.
+
 ## 1. What each engine is
 
 | | wkvm | vLLM | SGLang | Albatross |

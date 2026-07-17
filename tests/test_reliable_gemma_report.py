@@ -161,6 +161,8 @@ class ReliableGemmaReportTest(unittest.TestCase):
             "cohort_prefill_wall_s": cohort_wall,
             "cohort_input_tok_s": prompt_total / cohort_wall,
             "gpu_memory": memory,
+            "peak_engine_delta_gib": (peak_used - baseline) / 1024.0,
+            "green": True,
         }
         if engine == "wkvm-native":
             row.update(
@@ -334,6 +336,11 @@ class ReliableGemmaReportTest(unittest.TestCase):
 
         self.assertEqual(summary["status"], "pass")
         self.assertEqual(summary["minimum_samples_per_engine_batch"], 3)
+        self.assertFalse(
+            summary["ten_x_e2e_claim_gate"][
+                "any_batch_passes_all_incumbents"
+            ]
+        )
         self.assertEqual(len(summary["groups"]), 3)
         wkvm = next(group for group in summary["groups"] if group["engine"] == "wkvm-native")
         sglang = next(group for group in summary["groups"] if group["engine"] == "sglang")
@@ -363,6 +370,7 @@ class ReliableGemmaReportTest(unittest.TestCase):
         self.assertIn("full_kv", markdown)
         self.assertIn("excluded (separate_run_subtraction)", markdown)
         self.assertIn("Every ratio is `wkvm-native / incumbent`", markdown)
+        self.assertIn("## 10x E2E Claim Gate", markdown)
         self.assertIn("`**/__pycache__/**`", markdown)
         self.assertIn("`.cache/**`", markdown)
         for path in paths:
@@ -503,6 +511,27 @@ class ReliableGemmaReportTest(unittest.TestCase):
                 paths = self.cohort()
                 self.rewrite(paths[-1], lambda data: mutation(data["rows"][0]["gpu_memory"]))
                 with self.assertRaisesRegex(ReliableReportError, "gpu_memory"):
+                    build_summary(paths)
+                for path in paths:
+                    path.unlink(missing_ok=True)
+
+    def test_rejects_rows_that_fail_configured_memory_gate(self) -> None:
+        def exceed_gate(data: dict) -> None:
+            row = data["rows"][0]
+            memory = row["gpu_memory"]
+            delta_mib = 74 * 1024
+            memory["peak_delta_mib"] = delta_mib
+            memory["peak_used_mib"] = memory["baseline_used_mib"] + delta_mib
+            row["peak_engine_delta_gib"] = 74.0
+
+        for mutation in (
+            lambda data: data["rows"][0].update({"green": False}),
+            exceed_gate,
+        ):
+            with self.subTest(mutation=mutation):
+                paths = self.cohort()
+                self.rewrite(paths[-1], mutation)
+                with self.assertRaisesRegex(ReliableReportError, "failed memory gate"):
                     build_summary(paths)
                 for path in paths:
                     path.unlink(missing_ok=True)
@@ -830,6 +859,38 @@ class ReliableGemmaReportTest(unittest.TestCase):
         self.assertEqual(comparison["numerator_engine"], "wkvm-native")
         self.assertEqual(comparison["ratio_definition"], "numerator_over_denominator")
         self.assertAlmostEqual(comparison["median_e2e_output_ratio"], 2.0)
+        self.assertAlmostEqual(
+            comparison["conservative_e2e_output_ratio"],
+            4.0 / 3.0,
+        )
+
+    def test_ten_x_gate_requires_worst_repeat_win_against_both_incumbents(self) -> None:
+        paths = self.cohort()
+        for path in paths:
+            if path.name.startswith("wkvm-native"):
+                continue
+
+            def slow_incumbent(data: dict) -> None:
+                row = data["rows"][0]
+                row["batch_wall_s"] *= 20
+                row["e2e_output_tok_s"] = (
+                    sum(row["output_token_counts"]) / row["batch_wall_s"]
+                )
+
+            self.rewrite(path, slow_incumbent)
+
+        summary = build_summary(paths)
+        gate = summary["ten_x_e2e_claim_gate"]
+
+        self.assertTrue(gate["any_batch_passes_all_incumbents"])
+        self.assertTrue(gate["batches"][0]["passes_all_incumbents"])
+        self.assertTrue(
+            all(
+                comparison["ten_x_e2e_claim_pass"]
+                for comparison in summary["comparisons"]
+            )
+        )
+        self.assertIn("**PASS**", render_markdown(summary))
 
     def test_parser_requires_both_output_artifacts(self) -> None:
         parser = build_arg_parser()

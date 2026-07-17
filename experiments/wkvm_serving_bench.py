@@ -72,6 +72,15 @@ PROTECTED_OPENAI_REQUEST_FIELDS = frozenset(
 PROVENANCE_SCHEMA = "wkvm.serving_bench.provenance.v2"
 GPU_MEMORY_SCHEMA = "wkvm.whole_gpu_memory.v1"
 PROVENANCE_PACKAGES = ("wkvm", "torch", "transformers", "vllm", "sglang")
+GPU_RUNTIME_FIELDS = (
+    "gpu_utilization_percent",
+    "memory_utilization_percent",
+    "sm_clock_mhz",
+    "memory_clock_mhz",
+    "power_draw_w",
+    "power_limit_w",
+    "temperature_gpu_c",
+)
 
 
 def atomic_write_json(path: Path, obj: Any) -> None:
@@ -151,8 +160,34 @@ def installed_package_versions() -> dict[str, str | None]:
     return versions
 
 
+def _optional_nvidia_number(raw: str) -> float | None:
+    value = raw.strip()
+    if value.lower() in {"", "n/a", "[n/a]", "not supported"}:
+        return None
+    try:
+        number = float(value)
+    except ValueError:
+        return None
+    return number if math.isfinite(number) else None
+
+
 def query_nvidia_gpu(device: str) -> dict[str, Any]:
-    fields = ("index", "uuid", "name", "driver_version", "memory.total", "memory.used")
+    fields = (
+        "index",
+        "uuid",
+        "name",
+        "driver_version",
+        "memory.total",
+        "memory.used",
+        "pstate",
+        "temperature.gpu",
+        "utilization.gpu",
+        "utilization.memory",
+        "clocks.current.sm",
+        "clocks.current.memory",
+        "power.draw",
+        "power.limit",
+    )
     output = subprocess.check_output(
         [
             "nvidia-smi",
@@ -172,6 +207,15 @@ def query_nvidia_gpu(device: str) -> dict[str, Any]:
     values = [value.strip() for value in rows[0].split(",")]
     if len(values) != len(fields):
         raise RuntimeError(f"unexpected nvidia-smi output for device {device!r}")
+    telemetry_values = {
+        "temperature_gpu_c": values[7],
+        "gpu_utilization_percent": values[8],
+        "memory_utilization_percent": values[9],
+        "sm_clock_mhz": values[10],
+        "memory_clock_mhz": values[11],
+        "power_draw_w": values[12],
+        "power_limit_w": values[13],
+    }
     return {
         "index": int(values[0]),
         "uuid": values[1],
@@ -179,6 +223,46 @@ def query_nvidia_gpu(device: str) -> dict[str, Any]:
         "driver_version": values[3],
         "memory_total_mib": int(values[4]),
         "memory_used_mib": int(values[5]),
+        "pstate": values[6] or None,
+        **{
+            field: _optional_nvidia_number(raw)
+            for field, raw in telemetry_values.items()
+        },
+    }
+
+
+def _empty_metric_stats() -> dict[str, float | int | None]:
+    return {"count": 0, "sum": 0.0, "min": None, "max": None}
+
+
+def _update_metric_stats(
+    stats: dict[str, float | int | None],
+    value: Any,
+) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return
+    number = float(value)
+    if not math.isfinite(number):
+        return
+    count = int(stats["count"] or 0)
+    total = float(stats["sum"] or 0.0)
+    minimum = stats["min"]
+    maximum = stats["max"]
+    stats["count"] = count + 1
+    stats["sum"] = total + number
+    stats["min"] = number if minimum is None else min(float(minimum), number)
+    stats["max"] = number if maximum is None else max(float(maximum), number)
+
+
+def _metric_stats_result(
+    stats: dict[str, float | int | None],
+) -> dict[str, float | int | None]:
+    count = int(stats["count"] or 0)
+    return {
+        "count": count,
+        "min": stats["min"],
+        "mean": None if count == 0 else float(stats["sum"] or 0.0) / count,
+        "max": stats["max"],
     }
 
 
@@ -196,6 +280,15 @@ class WholeGpuMemoryMonitor:
         self.query_error_count = 0
         self.first_error: str | None = None
         self.gpu: dict[str, Any] | None = None
+        self.active_sample_count = 0
+        self.pstates: set[str] = set()
+        self.active_pstates: set[str] = set()
+        self.runtime_stats = {
+            field: _empty_metric_stats() for field in GPU_RUNTIME_FIELDS
+        }
+        self.active_runtime_stats = {
+            field: _empty_metric_stats() for field in GPU_RUNTIME_FIELDS
+        }
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
@@ -210,6 +303,27 @@ class WholeGpuMemoryMonitor:
         used_mib = int(sample["memory_used_mib"])
         self.sample_count += 1
         self.gpu = sample
+        pstate = sample.get("pstate")
+        if isinstance(pstate, str) and pstate:
+            self.pstates.add(pstate)
+        for field in GPU_RUNTIME_FIELDS:
+            _update_metric_stats(self.runtime_stats[field], sample.get(field))
+        utilization = sample.get("gpu_utilization_percent")
+        active = (
+            isinstance(utilization, (int, float))
+            and not isinstance(utilization, bool)
+            and math.isfinite(float(utilization))
+            and float(utilization) > 0
+        )
+        if active:
+            self.active_sample_count += 1
+            if isinstance(pstate, str) and pstate:
+                self.active_pstates.add(pstate)
+            for field in GPU_RUNTIME_FIELDS:
+                _update_metric_stats(
+                    self.active_runtime_stats[field],
+                    sample.get(field),
+                )
         if self.baseline_used_mib is None:
             self.baseline_used_mib = used_mib
         self.peak_used_mib = (
@@ -254,6 +368,23 @@ class WholeGpuMemoryMonitor:
             "peak_delta_mib": peak_delta_mib,
             "query_error_count": self.query_error_count,
             "error": self.first_error,
+            "gpu_runtime_telemetry": {
+                "source": "same_nvidia_smi_samples_as_memory_monitor",
+                "sample_count": self.sample_count,
+                "active_sample_count": self.active_sample_count,
+                "pstates": sorted(self.pstates),
+                "active_pstates": sorted(self.active_pstates),
+                "metrics": {
+                    field: _metric_stats_result(self.runtime_stats[field])
+                    for field in GPU_RUNTIME_FIELDS
+                },
+                "active_metrics": {
+                    field: _metric_stats_result(
+                        self.active_runtime_stats[field]
+                    )
+                    for field in GPU_RUNTIME_FIELDS
+                },
+            },
         }
 
 

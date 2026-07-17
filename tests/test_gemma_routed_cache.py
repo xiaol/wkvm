@@ -1910,5 +1910,197 @@ class TestGemmaRoutedCache(unittest.TestCase):
                 token_pool_covered_layer_types={"full_attention"},
             )
 
+    def test_padded_decode_allows_exact_route_boundary_when_opted_in(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+
+        hf_cfg = SimpleNamespace(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention",),
+            sliding_window=8,
+        )
+        cfg = gemma4_e4b_routed_span_config(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention",),
+            sink_tokens=1,
+            ring_tokens=1,
+            pending_tokens=2,
+            routed_slots=2,
+            reps_per_slot=1,
+            span_budget_tokens=2,
+            max_span_tokens=2,
+        )
+        caches = [NativeGemmaRoutedCache(hf_cfg, cfg) for _ in range(2)]
+        for row, cache in enumerate(caches):
+            key = torch.full((1, 1, 3, 2), float(row + 1))
+            value = torch.full((1, 1, 3, 2), float(row + 11))
+            cache.update(key, value, layer_idx=0)
+
+        merged, info = NativeGemmaRoutedCache.merge_padded_decode(
+            caches,
+            decode_steps=1,
+            allow_route_boundary=True,
+        )
+        self.assertEqual(info["merge"], "padded_valid_mask_concat")
+        merged.update(
+            torch.full((2, 1, 1, 2), 7.0),
+            torch.full((2, 1, 1, 2), 17.0),
+            layer_idx=0,
+        )
+        merged.commit_padded_decode_into(caches)
+        for cache in caches:
+            layer = cache.layers[0]
+            self.assertLess(int(layer._pend_k.shape[2]), layer.route_chunk)
+
+    def test_padded_route_boundary_commit_matches_single_row_fold(self) -> None:
+        try:
+            import numpy as np
+            import torch
+        except ImportError:
+            self.skipTest("torch/numpy unavailable")
+
+        from wkvm.runner.gemma_runner import NativeGemmaRoutedCache
+
+        hf_cfg = SimpleNamespace(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention",),
+            sliding_window=8,
+        )
+        cfg = gemma4_e4b_routed_span_config(
+            num_hidden_layers=1,
+            num_kv_shared_layers=0,
+            layer_types=("full_attention",),
+            num_kv_heads=1,
+            head_dim=2,
+            sink_tokens=1,
+            ring_tokens=1,
+            pending_tokens=2,
+            routed_slots=2,
+            reps_per_slot=1,
+            span_budget_tokens=2,
+            max_span_tokens=2,
+        )
+
+        def tensor(start: int, length: int):
+            return torch.arange(
+                start,
+                start + length * 2,
+                dtype=torch.float32,
+            ).reshape(1, 1, length, 2)
+
+        def make_caches():
+            caches = [NativeGemmaRoutedCache(hf_cfg, cfg) for _ in range(2)]
+            for row, cache in enumerate(caches):
+                cache.update(
+                    tensor(10 + row * 100, 3),
+                    tensor(1000 + row * 100, 3),
+                    layer_idx=0,
+                )
+            return caches
+
+        reference_caches = make_caches()
+        batched_caches = make_caches()
+        decode_keys = torch.cat([tensor(500, 1), tensor(600, 1)], dim=0)
+        decode_values = torch.cat([tensor(1500, 1), tensor(1600, 1)], dim=0)
+
+        for row, cache in enumerate(reference_caches):
+            cache.update(
+                decode_keys[row : row + 1],
+                decode_values[row : row + 1],
+                layer_idx=0,
+            )
+
+        merged, _ = NativeGemmaRoutedCache.merge_padded_decode(
+            batched_caches,
+            decode_steps=1,
+            allow_route_boundary=True,
+        )
+        merged.update(decode_keys, decode_values, layer_idx=0)
+        self.assertTrue(merged.padded_decode_route_boundary_reached())
+        merged.commit_padded_decode_into(batched_caches)
+
+        tensor_attrs = (
+            "keys",
+            "values",
+            "_sink_k",
+            "_sink_v",
+            "_ring_k",
+            "_ring_v",
+            "_pend_k",
+            "_pend_v",
+            "_slot_mk",
+            "_slot_mv",
+        )
+        scalar_attrs = (
+            "cumulative_length",
+            "_evicted",
+            "_n_active",
+            "_slot_cnt",
+            "_slot_span_tokens",
+            "_bank_span_tokens",
+            "_active_span_slots",
+            "_op_cursor",
+            "_gcnt",
+        )
+        for batched_cache, reference_cache in zip(
+            batched_caches,
+            reference_caches,
+        ):
+            batched_layer = batched_cache.layers[0]
+            reference_layer = reference_cache.layers[0]
+            for attr in scalar_attrs:
+                self.assertEqual(
+                    getattr(batched_layer, attr),
+                    getattr(reference_layer, attr),
+                    attr,
+                )
+            for attr in tensor_attrs:
+                self.assertTrue(
+                    torch.equal(
+                        getattr(batched_layer, attr),
+                        getattr(reference_layer, attr),
+                    ),
+                    attr,
+                )
+            self.assertTrue(np.array_equal(batched_layer._cent, reference_layer._cent))
+            self.assertTrue(np.array_equal(batched_layer._gmean, reference_layer._gmean))
+            for batched_spans, reference_spans in zip(
+                batched_layer._slot_spans,
+                reference_layer._slot_spans,
+            ):
+                self.assertEqual(len(batched_spans), len(reference_spans))
+                for batched_span, reference_span in zip(
+                    batched_spans,
+                    reference_spans,
+                ):
+                    self.assertEqual(batched_span["pos"], reference_span["pos"])
+                    self.assertTrue(
+                        torch.equal(batched_span["k"], reference_span["k"])
+                    )
+                    self.assertTrue(
+                        torch.equal(batched_span["v"], reference_span["v"])
+                    )
+            for batched_features, reference_features in zip(
+                batched_layer._slot_route_feats,
+                reference_layer._slot_route_feats,
+            ):
+                self.assertEqual(len(batched_features), len(reference_features))
+                self.assertTrue(
+                    all(
+                        np.array_equal(batched, reference)
+                        for batched, reference in zip(
+                            batched_features,
+                            reference_features,
+                        )
+                    )
+                )
+
 if __name__ == "__main__":
     unittest.main()

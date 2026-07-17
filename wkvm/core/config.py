@@ -68,6 +68,7 @@ class SchedulerConfig:
     # Cap a single request's tokens within one step so one long prefill cannot
     # starve running decodes (vLLM's long_prefill_token_threshold, simplified).
     max_tokens_per_request_per_step: int = 4096
+    completion_prefill_lane_size: int = 0
 
     def __post_init__(self) -> None:
         if self.max_tokens_per_step < 1:
@@ -76,6 +77,23 @@ class SchedulerConfig:
             raise ValueError("max_running_requests must be >= 1")
         if self.max_tokens_per_request_per_step < 1:
             raise ValueError("max_tokens_per_request_per_step must be >= 1")
+        if self.completion_prefill_lane_size < 0:
+            raise ValueError("completion_prefill_lane_size must be >= 0")
+        if self.completion_prefill_lane_size > self.max_running_requests:
+            raise ValueError(
+                "completion_prefill_lane_size must not exceed max_running_requests"
+            )
+        if self.completion_prefill_lane_size:
+            required_budget = (
+                self.max_running_requests
+                + self.completion_prefill_lane_size
+                * self.max_tokens_per_request_per_step
+            )
+            if self.max_tokens_per_step < required_budget:
+                raise ValueError(
+                    "completion-prefill scheduling requires max_tokens_per_step "
+                    f">= {required_budget}"
+                )
 
 
 def rwkv7_state_spec(

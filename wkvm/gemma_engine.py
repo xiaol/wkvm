@@ -18,6 +18,7 @@ from typing import Any, Literal
 
 from wkvm.core.arena import StateArena
 from wkvm.core.config import SchedulerConfig
+from wkvm.core.mixed_batch import MixedBatchMetadata, MixedBatchRow
 from wkvm.core.request import Request, RequestStatus
 from wkvm.core.scheduler import Scheduler, SchedulerOutput
 from wkvm.models.gemma import GemmaRoutedSpanConfig
@@ -44,6 +45,7 @@ from wkvm.runner.gemma_token_pool import (
     TokenPoolDecodeGraphSignatureTracker,
     TokenPoolFullAttentionRow,
     TokenPoolLayerPlan,
+    TokenPoolMixedBatchContext,
     TokenPoolPreparedDecodeBatch,
     TokenSlotAllocator,
 )
@@ -80,6 +82,14 @@ def _token_pool_full_attention_paged_metadata_requested() -> bool:
 
 def _token_pool_graph_signature_recording_requested() -> bool:
     return _env_flag("WKVM_TOKEN_POOL_RECORD_GRAPH_SIGNATURES")
+
+
+def _token_pool_capacity_microbatch_requested() -> bool:
+    return _env_flag("WKVM_TOKEN_POOL_FULL_ATTENTION_CAPACITY_MICROBATCH")
+
+
+def _token_pool_route_boundary_batch_requested() -> bool:
+    return _env_flag("WKVM_TOKEN_POOL_ROUTE_BOUNDARY_BATCH")
 
 
 def _sample_argmax_token_ids(logits: Any, *, rows: int | None = None) -> list[int]:
@@ -144,6 +154,10 @@ class GemmaEngineMetrics:
     decode_model_calls: int = 0
     batched_decode_model_calls: int = 0
     fallback_decode_model_calls: int = 0
+    mixed_batch_model_calls: int = 0
+    mixed_batch_rows: int = 0
+    mixed_batch_opportunities: int = 0
+    mixed_batch_fallbacks: int = 0
     max_decode_batch_rows: int = 0
     max_decode_model_batch_rows: int = 0
     max_decode_model_batch_bytes: int = 0
@@ -226,6 +240,11 @@ class GemmaEngineMetrics:
     token_pool_full_attention_row_appends: int = 0
     token_pool_full_attention_row_invalidations: int = 0
     token_pool_full_attention_coverage_splits: int = 0
+    token_pool_full_attention_capacity_microbatch_groups: int = 0
+    token_pool_full_attention_capacity_microbatch_rows: int = 0
+    token_pool_full_attention_capacity_microbatch_max_rows: int = 0
+    token_pool_route_boundary_batches: int = 0
+    token_pool_route_boundary_flushes: int = 0
     token_pool_slot_high_watermark: int = 0
     max_waiting: int = 0
     max_running: int = 0
@@ -282,6 +301,10 @@ class GemmaEngineMetrics:
             "decode_model_calls": self.decode_model_calls,
             "batched_decode_model_calls": self.batched_decode_model_calls,
             "fallback_decode_model_calls": self.fallback_decode_model_calls,
+            "mixed_batch_model_calls": self.mixed_batch_model_calls,
+            "mixed_batch_rows": self.mixed_batch_rows,
+            "mixed_batch_opportunities": self.mixed_batch_opportunities,
+            "mixed_batch_fallbacks": self.mixed_batch_fallbacks,
             "max_decode_batch_rows": self.max_decode_batch_rows,
             "max_decode_model_batch_rows": self.max_decode_model_batch_rows,
             "max_decode_model_batch_bytes": self.max_decode_model_batch_bytes,
@@ -416,6 +439,17 @@ class GemmaEngineMetrics:
             "token_pool_full_attention_coverage_splits": (
                 self.token_pool_full_attention_coverage_splits
             ),
+            "token_pool_full_attention_capacity_microbatch_groups": (
+                self.token_pool_full_attention_capacity_microbatch_groups
+            ),
+            "token_pool_full_attention_capacity_microbatch_rows": (
+                self.token_pool_full_attention_capacity_microbatch_rows
+            ),
+            "token_pool_full_attention_capacity_microbatch_max_rows": (
+                self.token_pool_full_attention_capacity_microbatch_max_rows
+            ),
+            "token_pool_route_boundary_batches": self.token_pool_route_boundary_batches,
+            "token_pool_route_boundary_flushes": self.token_pool_route_boundary_flushes,
             "token_pool_slot_high_watermark": self.token_pool_slot_high_watermark,
             "max_waiting": self.max_waiting,
             "max_running": self.max_running,
@@ -547,6 +581,7 @@ class GemmaNativeEngine:
         stop_token_ids: frozenset[int] = frozenset(),
         prefill_chunk: int = 2048,
         prefill_microbatch_rows: int | None = 1,
+        continuation_prefill_microbatch_rows: int | None = None,
         decode_microbatch_rows: int | None = 16,
         decode_microbatch_bytes: int | None = None,
         decode_batch_planner: Literal["scheduler", "length_bucketed"] = "scheduler",
@@ -575,6 +610,9 @@ class GemmaNativeEngine:
         ] = "separate",
         native_gemma_weight_backend: Literal["hf_live", "owned", "owned_cpu"] = "hf_live",
         native_gemma_release_hf_decoder_layers: bool = False,
+        native_gemma_kv_sharing_fast_prefill: bool = False,
+        batched_routed_packets: bool = False,
+        routed_packet_workspace_bytes: int = 64 * 1024 * 1024,
         enable_token_pool_metadata: bool | None = None,
         enable_token_pool_attention: bool = False,
         token_pool_max_context_len: int | None = None,
@@ -582,11 +620,19 @@ class GemmaNativeEngine:
         token_pool_paged_block_size: int | None = None,
         collect_cuda_memory_phase_metrics: bool = False,
         finished_trace_limit: int | None = 4096,
+        enable_mixed_batch: bool = False,
     ) -> None:
         if prefill_microbatch_rows == 0:
             prefill_microbatch_rows = None
         if prefill_microbatch_rows is not None and prefill_microbatch_rows < 1:
             raise ValueError("prefill_microbatch_rows must be >= 1, 0, or None")
+        if (
+            continuation_prefill_microbatch_rows is not None
+            and continuation_prefill_microbatch_rows < 0
+        ):
+            raise ValueError(
+                "continuation_prefill_microbatch_rows must be >= 1, 0, or None"
+            )
         if decode_microbatch_rows == 0:
             decode_microbatch_rows = None
         if decode_microbatch_rows is not None and decode_microbatch_rows < 1:
@@ -605,6 +651,8 @@ class GemmaNativeEngine:
             raise ValueError("decode_workspace_width_bucket must be >= 1")
         if finished_trace_limit is not None and finished_trace_limit < 1:
             raise ValueError("finished_trace_limit must be >= 1 or None")
+        if routed_packet_workspace_bytes < 1:
+            raise ValueError("routed_packet_workspace_bytes must be >= 1")
         if persistent_padded_decode_steps < 1:
             raise ValueError("persistent_padded_decode_steps must be >= 1")
         if persistent_padded_decode_graph_warmup_iters < 0:
@@ -664,6 +712,7 @@ class GemmaNativeEngine:
             raise ValueError("enable_token_pool_attention requires token-pool metadata")
         self.model = model
         self.config = config
+        self.enable_mixed_batch = bool(enable_mixed_batch)
         self.bank = GemmaRoutedStateBank(config, num_slots=num_slots)
         self.arena = StateArena(config.state_spec(), num_slots=num_slots)
         self.scheduler = Scheduler(
@@ -691,6 +740,9 @@ class GemmaNativeEngine:
             persistent_padded_decode_graph_warmup_iters=(
                 persistent_padded_decode_graph_warmup_iters
             ),
+            allow_padded_route_boundary=(
+                _token_pool_route_boundary_batch_requested()
+            ),
             use_native_gemma_forward=use_native_gemma_forward,
             native_gemma_attention_backend=native_gemma_attention_backend,
             native_gemma_projection_backend=native_gemma_projection_backend,
@@ -698,10 +750,18 @@ class GemmaNativeEngine:
             native_gemma_release_hf_decoder_layers=(
                 native_gemma_release_hf_decoder_layers
             ),
+            native_gemma_kv_sharing_fast_prefill=(
+                native_gemma_kv_sharing_fast_prefill
+            ),
+            batched_routed_packets=batched_routed_packets,
+            routed_packet_workspace_bytes=routed_packet_workspace_bytes,
             collect_cuda_memory_phase_metrics=collect_cuda_memory_phase_metrics,
         )
         self.stop_token_ids = stop_token_ids
         self.prefill_microbatch_rows = prefill_microbatch_rows
+        self.continuation_prefill_microbatch_rows = (
+            continuation_prefill_microbatch_rows
+        )
         self.decode_microbatch_rows = decode_microbatch_rows
         self.decode_microbatch_bytes = decode_microbatch_bytes
         self.decode_batch_planner = decode_batch_planner
@@ -735,6 +795,11 @@ class GemmaNativeEngine:
         self.native_gemma_release_hf_decoder_layers = bool(
             native_gemma_release_hf_decoder_layers
         )
+        self.native_gemma_kv_sharing_fast_prefill = bool(
+            native_gemma_kv_sharing_fast_prefill
+        )
+        self.batched_routed_packets = bool(batched_routed_packets)
+        self.routed_packet_workspace_bytes = int(routed_packet_workspace_bytes)
         self.collect_cuda_memory_phase_metrics = bool(
             collect_cuda_memory_phase_metrics
         )
@@ -763,6 +828,7 @@ class GemmaNativeEngine:
         self._caches: dict[str, NativeGemmaRoutedCache] = {}
         self._persistent_exact_decode_groups: dict[tuple[str, ...], NativeGemmaRoutedCache] = {}
         self._persistent_padded_decode_groups: dict[tuple[str, ...], NativeGemmaRoutedCache] = {}
+        self._capacity_decode_group_keys: set[tuple[str, ...]] = set()
         self._token_pool_decode_graph_gc_pending = False
         self._token_pool_decode_graph_signature_fallback = (
             TokenPoolDecodeGraphSignatureTracker()
@@ -1036,6 +1102,7 @@ class GemmaNativeEngine:
     def fail_unfinished(self, error: str) -> list[Request]:
         self._persistent_exact_decode_groups.clear()
         self._persistent_padded_decode_groups.clear()
+        self._capacity_decode_group_keys.clear()
         self._token_pool_clear_graph_decode_signatures()
         self._token_pool_clear_full_attention_rows(list(self._token_pool_full_attention_rows))
         failed: list[Request] = []
@@ -1105,6 +1172,17 @@ class GemmaNativeEngine:
 
     def stats(self) -> dict[str, Any]:
         gpu_memory = self._gpu_memory_stats()
+        runner_model = getattr(self.runner, "model", None)
+        text_prefix = getattr(runner_model, "text_prefix", None)
+        routed_packet_stats = getattr(self.runner, "routed_packet_stats", None)
+        routed_packets = (
+            routed_packet_stats()
+            if routed_packet_stats is not None
+            else {
+                "enabled": self.batched_routed_packets,
+                "workspace_max_bytes": self.routed_packet_workspace_bytes,
+            }
+        )
         return {
             **self.metrics.as_dict(),
             "queue_depth": len(self.scheduler.waiting),
@@ -1120,6 +1198,22 @@ class GemmaNativeEngine:
             "active_cache_bytes": self._active_cache_bytes(),
             "state_bytes_per_request": self.config.state_spec().bytes_per_request,
             "prefill_microbatch_rows": self.prefill_microbatch_rows,
+            "continuation_prefill_microbatch_rows": (
+                self.continuation_prefill_microbatch_rows
+            ),
+            "enable_mixed_batch": self.enable_mixed_batch,
+            "completion_prefill_lane_size": (
+                self.scheduler.config.completion_prefill_lane_size
+            ),
+            "completion_prefill_lane_starts": (
+                self.scheduler.completion_prefill_lane_starts
+            ),
+            "completion_prefill_lane_completions": (
+                self.scheduler.completion_prefill_lane_completions
+            ),
+            "completion_prefill_lane_cancellations": (
+                self.scheduler.completion_prefill_lane_cancellations
+            ),
             "decode_microbatch_rows": self.decode_microbatch_rows,
             "decode_microbatch_bytes": self.decode_microbatch_bytes,
             "decode_batch_planner": self.decode_batch_planner,
@@ -1139,6 +1233,12 @@ class GemmaNativeEngine:
             "token_pool_decode_graph_signature_recording": (
                 self.record_token_pool_decode_graph_signatures
             ),
+            "token_pool_full_attention_capacity_microbatch": (
+                _token_pool_capacity_microbatch_requested()
+            ),
+            "token_pool_route_boundary_batch": (
+                _token_pool_route_boundary_batch_requested()
+            ),
             "cuda_phase_metrics_enabled": self.collect_cuda_memory_phase_metrics,
             "use_native_gemma_forward": self.use_native_gemma_forward,
             "native_gemma_attention_backend": self.native_gemma_attention_backend,
@@ -1147,6 +1247,63 @@ class GemmaNativeEngine:
             "native_gemma_release_hf_decoder_layers": (
                 self.native_gemma_release_hf_decoder_layers
             ),
+            "native_gemma_kv_sharing_fast_prefill": (
+                self.native_gemma_kv_sharing_fast_prefill
+            ),
+            "kv_sharing_fast_prefill": {
+                "eligible": bool(
+                    getattr(
+                        text_prefix,
+                        "kv_sharing_fast_prefill_eligible",
+                        False,
+                    )
+                ),
+                "split_layer": getattr(
+                    text_prefix,
+                    "kv_sharing_fast_prefill_split_layer",
+                    None,
+                ),
+                "calls": int(
+                    getattr(
+                        text_prefix,
+                        "kv_sharing_fast_prefill_calls",
+                        0,
+                    )
+                ),
+                "owner_tokens": int(
+                    getattr(
+                        text_prefix,
+                        "kv_sharing_fast_prefill_owner_tokens",
+                        0,
+                    )
+                ),
+                "tail_tokens": int(
+                    getattr(
+                        text_prefix,
+                        "kv_sharing_fast_prefill_tail_tokens",
+                        0,
+                    )
+                ),
+                "fallbacks": int(
+                    getattr(
+                        text_prefix,
+                        "kv_sharing_fast_prefill_fallbacks",
+                        0,
+                    )
+                ),
+                "owner_only_calls": int(
+                    getattr(text_prefix, "kv_sharing_owner_only_calls", 0)
+                ),
+                "owner_only_tokens": int(
+                    getattr(text_prefix, "kv_sharing_owner_only_tokens", 0)
+                ),
+                "owner_only_fallbacks": int(
+                    getattr(text_prefix, "kv_sharing_owner_only_fallbacks", 0)
+                ),
+            },
+            "batched_routed_packets": self.batched_routed_packets,
+            "routed_packet_workspace_bytes": self.routed_packet_workspace_bytes,
+            "routed_packets": routed_packets,
             "native_gemma_released_hf_decoder_layers": (
                 self.native_gemma_released_hf_decoder_layers
             ),
@@ -1190,10 +1347,295 @@ class GemmaNativeEngine:
                     "GemmaNativeEngine does not support multi-token decode steps"
                 )
 
+        if decode_reqs and prefill_work:
+            self.metrics.mixed_batch_opportunities += 1
+        if decode_reqs and prefill_work and self.enable_mixed_batch:
+            mixed_work = [
+                *prefill_work,
+                *[(req, 1, False) for req in decode_reqs],
+            ]
+            if self._mixed_batch_is_eligible(mixed_work):
+                mixed_sampled = self._execute_mixed_batch(mixed_work)
+                if mixed_sampled is not None:
+                    return mixed_sampled
+            self.metrics.mixed_batch_fallbacks += 1
+
         if decode_reqs:
             sampled.update(self._execute_decode_batch(decode_reqs))
         if prefill_work:
             sampled.update(self._execute_prefill_work(prefill_work))
+        return sampled
+
+    def _mixed_batch_is_eligible(
+        self,
+        work: list[tuple[Request, int, bool]],
+    ) -> bool:
+        """Return whether the opt-in native ragged call is safe to attempt.
+
+        Token-pool mixed execution requires the real KV pool.  Metadata-only
+        mode keeps the established partitioned path because it has no decode
+        attention call to combine with dense prefill rows.
+        """
+        mixed_step = getattr(self.runner, "mixed_batch_step", None)
+        if not callable(mixed_step):
+            return False
+        if self.enable_token_pool_metadata and (
+            not self.enable_token_pool_attention
+            or self._token_kv_pool is None
+            or self._token_pool_decode_backend is None
+        ):
+            return False
+        if not bool(getattr(self.runner.model, "wkvm_no_hf_transformer_forward", False)):
+            return False
+        if not any(req.num_computed_tokens < req.num_prompt_tokens for req, _n, _i in work):
+            return False
+        if not any(req.num_computed_tokens >= req.num_prompt_tokens for req, _n, _i in work):
+            return False
+        for req, n, initial in work:
+            if int(n) < 1:
+                return False
+            if initial and req.num_computed_tokens != 0:
+                return False
+            if req.num_computed_tokens < req.num_prompt_tokens:
+                if req.num_computed_tokens + int(n) > req.num_prompt_tokens:
+                    return False
+            elif int(n) != 1:
+                return False
+        return True
+
+    def _execute_mixed_batch(
+        self,
+        work: list[tuple[Request, int, bool]],
+    ) -> dict[str, list[int]] | None:
+        """Run one native ragged model call for decode and prefill rows.
+
+        This path is deliberately opt-in.  With token-pool attention enabled,
+        q=1 rows use decode metadata while prefill rows retain their dense
+        cache update inside the same native model call.
+        """
+        if len(work) < 2:
+            raise ValueError("mixed batch requires at least two rows")
+        mixed_step = getattr(self.runner, "mixed_batch_step", None)
+        if not callable(mixed_step):
+            raise DistinctCacheBatchError("runner does not provide mixed_batch_step")
+
+        # Persistent decode groups hold merged cache objects and must not be
+        # reused after a mixed call mutates their source rows.
+        touched = {req.req_id for req, _n, _initial in work}
+        self._flush_exact_decode_groups_touching(touched)
+        self._flush_padded_decode_groups_touching(touched)
+
+        rows: list[MixedBatchRow] = []
+        caches: list[NativeGemmaRoutedCache] = []
+        token_rows: list[list[int]] = []
+        slots_by_row: list[dict[str, int]] = []
+        start_positions: list[int] = []
+        break_masks: list[list[bool] | None] = []
+        prefill_rows: list[
+            tuple[
+                Request,
+                int,
+                Any,
+                bool,
+                TokenPoolAuthoritativePrefillReservation | None,
+            ]
+        ] = []
+        prepared_decode: Any = ()
+        decode_committed = False
+        token_pool_mixed_context: TokenPoolMixedBatchContext | None = None
+        built_cache_req_ids: list[str] = []
+        try:
+            for req, n, initial in work:
+                n = int(n)
+                if initial:
+                    cache = self.runner.build_cache(req.slots)
+                    self._caches[req.req_id] = cache
+                    built_cache_req_ids.append(req.req_id)
+                    self.metrics.cache_builds += 1
+                else:
+                    try:
+                        cache = self._caches[req.req_id]
+                    except KeyError as exc:
+                        raise DistinctCacheBatchError(
+                            f"mixed row {req.req_id}: cache is not resident"
+                        ) from exc
+                prefix_len = int(req.num_computed_tokens)
+                if prefix_len < req.num_prompt_tokens and not initial:
+                    self._restore_session_sliding_tail_for_prefill(req, cache)
+                rows.append(
+                    MixedBatchRow(
+                        req_id=req.req_id,
+                        prefix_len=prefix_len,
+                        q_len=n,
+                        prompt_len=req.num_prompt_tokens,
+                        target_len=req.num_tokens,
+                        position_start=prefix_len,
+                        initial=bool(initial),
+                    )
+                )
+                caches.append(cache)
+                token_rows.append(self._feed_tokens(req, n))
+                slots_by_row.append(req.slots)
+                start_positions.append(prefix_len)
+                break_masks.append(self._break_masks.get(req.req_id))
+                if prefix_len < req.num_prompt_tokens:
+                    trace = self._traces.get(req.req_id)
+                    if trace is not None and trace.prefill_start is None:
+                        trace.prefill_start = time.perf_counter()
+                    final_prefill = prefix_len + n >= req.num_prompt_tokens
+                    authoritative_prefill = (
+                        self._token_pool_prepare_authoritative_prefill(
+                            req,
+                            n,
+                            cache=cache,
+                            initial=initial,
+                            final_prefill=final_prefill,
+                        )
+                    )
+                    prefill_rows.append(
+                        (
+                            req,
+                            n,
+                            cache,
+                            final_prefill,
+                            authoritative_prefill,
+                        )
+                    )
+
+            metadata = MixedBatchMetadata.from_rows(rows)
+            flat_tokens = MixedBatchMetadata.flatten_token_rows(
+                token_rows,
+                metadata.q_lens,
+            )
+            if self.enable_token_pool_attention:
+                decode_requests = [
+                    work[row_index][0]
+                    for row_index in metadata.decode_row_indices
+                ]
+                prepared_decode = self._token_pool_prepare_decode_model_batch(
+                    decode_requests
+                )
+                token_pool_decode = self._token_pool_decode_context(prepared_decode)
+                layer_plan = self._token_pool_layer_plan()
+                pool_layer_ids = set(
+                    getattr(self._token_kv_pool, "layer_specs", {})
+                )
+                required_layer_types = {
+                    str(layer_type)
+                    for layer_id, layer_type in layer_plan.layer_type_by_layer_id.items()
+                    if int(layer_id) in pool_layer_ids
+                }
+                covered_layer_types = (
+                    frozenset()
+                    if token_pool_decode is None
+                    else token_pool_decode.covered_decode_layer_types()
+                )
+                if (
+                    token_pool_decode is None
+                    or not required_layer_types
+                    or not required_layer_types.issubset(covered_layer_types)
+                ):
+                    self._token_pool_discard_decode_reservations(prepared_decode)
+                    prepared_decode = ()
+                    for _req, _n, cache, _final, reservation in prefill_rows:
+                        self._token_pool_discard_authoritative_prefill(
+                            reservation,
+                            cache=cache,
+                        )
+                    for req_id in built_cache_req_ids:
+                        self._caches.pop(req_id, None)
+                    self.metrics.cache_builds -= len(built_cache_req_ids)
+                    return None
+                token_pool_mixed_context = TokenPoolMixedBatchContext(
+                    decode_context=token_pool_decode,
+                    q_lens=metadata.q_lens,
+                    decode_row_indices=metadata.decode_row_indices,
+                    prefill_row_indices=metadata.prefill_row_indices,
+                )
+
+            mixed_kwargs: dict[str, Any] = {}
+            if token_pool_mixed_context is not None:
+                mixed_kwargs["token_pool_decode"] = token_pool_mixed_context
+            logits = mixed_step(
+                caches,
+                flat_tokens,
+                slots_by_row,
+                metadata=metadata,
+                start_positions=start_positions,
+                break_masks=break_masks,
+                **mixed_kwargs,
+            )
+            for req, n, cache, final_prefill, authoritative_prefill in prefill_rows:
+                self._token_pool_commit_prefill_tokens(
+                    req,
+                    n,
+                    cache=cache,
+                    final_prefill=final_prefill,
+                    authoritative_prefill=authoritative_prefill,
+                    defer_kv=not final_prefill,
+                )
+            if prepared_decode:
+                self._token_pool_commit_decode_reservations(prepared_decode)
+                decode_committed = True
+        except Exception:
+            if prepared_decode and not decode_committed:
+                self._token_pool_discard_decode_reservations(prepared_decode)
+            for _req, _n, cache, _final, reservation in prefill_rows:
+                self._token_pool_discard_authoritative_prefill(
+                    reservation,
+                    cache=cache,
+                )
+            for req_id in built_cache_req_ids:
+                self._caches.pop(req_id, None)
+            self.metrics.cache_builds -= len(built_cache_req_ids)
+            raise
+
+        now = time.perf_counter()
+        for req, n, cache, final_prefill, _reservation in prefill_rows:
+            self._record_session_prefill(req, n)
+            if final_prefill:
+                self._token_pool_release_prefill_sliding_storage(cache)
+                trace = self._traces.get(req.req_id)
+                if trace is not None:
+                    trace.prefill_end = now
+                    trace.first_token_time = now
+
+        self.metrics.mixed_batch_model_calls += 1
+        self.metrics.mixed_batch_rows += len(work)
+        self.metrics.prefill_calls += len(prefill_rows)
+        if prefill_rows:
+            self.metrics.batched_prefill_model_calls += 1
+            self.metrics.batched_prefill_rows += len(prefill_rows)
+        decode_row_count = len(metadata.decode_row_indices)
+        self.metrics.decode_batches += 1
+        self.metrics.decode_rows += decode_row_count
+        self.metrics.max_decode_batch_rows = max(
+            self.metrics.max_decode_batch_rows,
+            decode_row_count,
+        )
+        self.metrics.decode_model_calls += 1
+        if decode_row_count > 1:
+            self.metrics.batched_decode_model_calls += 1
+        self.metrics.max_decode_model_batch_rows = max(
+            self.metrics.max_decode_model_batch_rows,
+            decode_row_count,
+        )
+        self.metrics.prefill_model_calls += 1 if prefill_rows else 0
+        self.metrics.max_prefill_batch_rows = max(
+            self.metrics.max_prefill_batch_rows,
+            len(prefill_rows),
+        )
+        self._record_cuda_memory_phase("mixed_batch")
+        self._record_cache_bytes()
+
+        sampled: dict[str, list[int]] = {}
+        token_ids: list[int] | None = None
+        for row, (req, n, _initial) in enumerate(work):
+            if not self._closes_gap(req, n):
+                continue
+            if token_ids is None:
+                token_ids = _sample_argmax_token_ids(logits, rows=len(work))
+            sampled[req.req_id] = [token_ids[row]]
         return sampled
 
     def _execute_prefill_work(
@@ -1215,8 +1657,11 @@ class GemmaNativeEngine:
                 self.metrics.token_pool_decode_graph_prefill_cache_evictions += evicted
             self._token_pool_decode_graph_gc_pending = False
         batch_step = getattr(self.runner, "prefill_batch_step", None)
-        row_limit = self.prefill_microbatch_rows
-        if batch_step is None or row_limit == 1:
+        base_row_limit = self.prefill_microbatch_rows
+        if batch_step is None or (
+            base_row_limit == 1
+            and self.continuation_prefill_microbatch_rows in (None, 1)
+        ):
             sampled: dict[str, list[int]] = {}
             for req, n, initial in work:
                 sampled.update(
@@ -1229,7 +1674,17 @@ class GemmaNativeEngine:
             by_width.setdefault(int(item[1]), []).append(item)
         sampled: dict[str, list[int]] = {}
         for items in by_width.values():
-            limit = len(items) if row_limit is None else int(row_limit)
+            continuation_group = all(
+                int(self._session_turn_indices.get(req.req_id, 0)) > 0
+                for req, _n, _initial in items
+            )
+            row_limit = (
+                self.continuation_prefill_microbatch_rows
+                if continuation_group
+                and self.continuation_prefill_microbatch_rows is not None
+                else base_row_limit
+            )
+            limit = len(items) if row_limit in (None, 0) else int(row_limit)
             for start in range(0, len(items), limit):
                 batch = items[start : start + limit]
                 if len(batch) == 1:
@@ -1294,6 +1749,7 @@ class GemmaNativeEngine:
                 [item[0].slots for item in prepared],
                 start_positions=[item[0].num_computed_tokens for item in prepared],
                 break_masks=[self._break_masks.get(item[0].req_id) for item in prepared],
+                compute_logits=any(item[3] for item in prepared),
             )
             self._record_cuda_memory_phase("prefill_forward")
             for req, n, cache, final_prefill, authoritative_prefill in prepared:
@@ -1387,6 +1843,7 @@ class GemmaNativeEngine:
                 req.slots,
                 start_pos=req.num_computed_tokens,
                 break_mask=self._break_masks.get(req.req_id),
+                compute_logits=final_prefill,
             )
             self._record_cuda_memory_phase("prefill_forward")
             self._token_pool_commit_prefill_tokens(
@@ -1449,6 +1906,12 @@ class GemmaNativeEngine:
             for batch in batches
             if len(batch) > 1 or self._single_row_persistent_padded_enabled()
         }
+        current_ids = {req.req_id for req in reqs}
+        allowed_group_keys.update(
+            key
+            for key in self._capacity_decode_group_keys
+            if set(key).issubset(current_ids)
+        )
         self._flush_exact_decode_groups_except(allowed_group_keys)
         self._flush_padded_decode_groups_except(allowed_group_keys)
         if len(batches) > 1:
@@ -1599,6 +2062,29 @@ class GemmaNativeEngine:
         self.metrics.decode_microbatch_splits += 1
         self.metrics.token_pool_full_attention_coverage_splits += 1
         sampled: dict[str, list[int]] = {}
+        if _token_pool_capacity_microbatch_requested():
+            midpoint = max(1, len(reqs) // 2)
+            capacity_groups = (reqs[:midpoint], reqs[midpoint:])
+            for group in capacity_groups:
+                if not group:
+                    continue
+                group_key = tuple(req.req_id for req in group)
+                self.metrics.token_pool_full_attention_capacity_microbatch_groups += 1
+                self.metrics.token_pool_full_attention_capacity_microbatch_rows += len(
+                    group
+                )
+                self.metrics.token_pool_full_attention_capacity_microbatch_max_rows = max(
+                    self.metrics.token_pool_full_attention_capacity_microbatch_max_rows,
+                    len(group),
+                )
+                try:
+                    sampled.update(self._execute_decode_model_batch(group))
+                except Exception:
+                    self._flush_padded_decode_group(group_key)
+                    raise
+                if group_key in self._persistent_padded_decode_groups:
+                    self._capacity_decode_group_keys.add(group_key)
+            return sampled
         for req in reqs:
             sampled.update(self._execute_decode_model_batch([req]))
         return sampled
@@ -1847,6 +2333,17 @@ class GemmaNativeEngine:
             if post_step_remaining_capacity is None
             else max(0, int(post_step_remaining_capacity))
         )
+        route_boundary_reached = bool(
+            getattr(
+                merged_cache,
+                "padded_decode_route_boundary_reached",
+                lambda: False,
+            )()
+        )
+        if route_boundary_reached:
+            self.metrics.token_pool_route_boundary_batches += 1
+            self.metrics.token_pool_route_boundary_flushes += 1
+            should_flush = True
         if should_flush or remaining_capacity < 1:
             self._flush_padded_decode_group(key)
         return sampled
@@ -1863,7 +2360,16 @@ class GemmaNativeEngine:
             return 0
         route_margin = self._persistent_padded_route_margin(reqs)
         if route_margin is not None:
-            reserve = min(reserve, route_margin)
+            if route_margin < 1:
+                allow_boundary = bool(
+                    getattr(self.runner, "allow_padded_route_boundary", False)
+                )
+                if route_margin == 0 and allow_boundary:
+                    reserve = min(reserve, 1)
+                else:
+                    reserve = 0
+            else:
+                reserve = min(reserve, route_margin)
         return max(0, reserve)
 
     def _persistent_padded_route_margin(self, reqs: list[Request]) -> int | None:
@@ -2210,6 +2716,7 @@ class GemmaNativeEngine:
     def _discard_padded_decode_groups_touching(self, req_ids: set[str]) -> None:
         for key in list(self._persistent_padded_decode_groups):
             if any(req_id in req_ids for req_id in key):
+                self._capacity_decode_group_keys.discard(key)
                 self._persistent_padded_decode_groups.pop(key, None)
                 self._token_pool_discard_graph_decode_signature(key)
         self._token_pool_invalidate_full_attention_rows(req_ids)
@@ -2231,6 +2738,7 @@ class GemmaNativeEngine:
         self._record_cuda_memory_phase("persistent_exact_decode_split")
 
     def _flush_padded_decode_group(self, key: tuple[str, ...]) -> None:
+        self._capacity_decode_group_keys.discard(key)
         merged_cache = self._persistent_padded_decode_groups.pop(key, None)
         self._token_pool_discard_graph_decode_signature(key)
         if merged_cache is None:

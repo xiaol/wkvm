@@ -36,6 +36,14 @@ Every ratio is `wkvm-native / incumbent` (numerator / denominator). Cross-semant
 | 64 | wkvm-native / vllm | 0.868x | 0.793x | 4.467x |
 | 64 | wkvm-native / sglang | excluded (incomparable_methods:same_run_max_request_ttft,separate_run_batch_wall) | 1.404x | excluded (separate_run_subtraction) |
 
+## 10x E2E Claim Gate
+
+This observed-run gate passes only when minimum WKVM E2E output throughput divided by maximum incumbent throughput is at least 10.000x for both vLLM and SGLang at the same B. It is deliberately stricter than a median ratio and is not a statistical confidence interval.
+
+| B | Conservative WKVM / vLLM | Conservative WKVM / SGLang | All incumbents |
+|---:|---:|---:|---|
+| 64 | 0.790x | 1.400x | **FAIL** |
+
 ## Artifacts
 
 - `experiments/results/gemma_a800_reliable_20260716/artifacts/sglang-r1.json`
@@ -81,3 +89,4 @@ Every ratio is `wkvm-native / incumbent` (numerator / denominator). Cross-semant
 - whole-device memory includes every process on the selected GPU
 - SGLang separate max_tokens=1 prefill is excluded from cohort-input ratios
 - SGLang separate-run subtraction is excluded from decode ratios
+- the 10x gate applies to E2E output throughput and uses the worst observed repeated-run envelope

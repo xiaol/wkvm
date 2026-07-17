@@ -2,6 +2,67 @@ import unittest
 
 
 class TestGemmaTokenPool(unittest.TestCase):
+    def test_mixed_context_maps_q_lens_and_per_layer_write_slots(self) -> None:
+        import torch
+
+        from wkvm.runner.gemma_token_pool import (
+            TokenKVLayerSpec,
+            TokenKVPool,
+            TokenPoolDecodeContext,
+            TokenPoolMixedBatchContext,
+            build_decode_metadata_from_token_slot_rows,
+            resolve_token_pool_attention_call,
+        )
+
+        pool = TokenKVPool(
+            capacity=3,
+            layer_specs=[
+                TokenKVLayerSpec(
+                    layer_id=0,
+                    num_kv_heads=1,
+                    head_dim=2,
+                    dtype=torch.float32,
+                )
+            ],
+            dtype=torch.float32,
+        )
+        slots = pool.alloc_slots(3)
+        metadata = build_decode_metadata_from_token_slot_rows(
+            [[int(value) for value in slots.tolist()]],
+            req_slots=[0],
+            logical_seq_lens=[3],
+            out_cache_loc=slots[-1:],
+        )
+        context = TokenPoolMixedBatchContext(
+            decode_context=TokenPoolDecodeContext(
+                metadata_by_layer_type={"sliding_attention": metadata},
+                kv_pool=pool,
+                covered_layer_types=frozenset({"sliding_attention"}),
+            ),
+            q_lens=(1, 3),
+            decode_row_indices=(0,),
+            prefill_row_indices=(1,),
+        )
+
+        attention_call = resolve_token_pool_attention_call(
+            context,
+            0,
+            "sliding_attention",
+            attention_mask_present=True,
+            query_seq_len=3,
+        )
+
+        self.assertEqual(context.q_lens, (1, 3))
+        self.assertEqual(context.decode_row_indices, (0,))
+        self.assertTrue(
+            torch.equal(
+                context.write_slots_for_layer(0, "sliding_attention"),
+                metadata.out_cache_loc_long,
+            )
+        )
+        self.assertTrue(attention_call.mixed_attention_enabled)
+        self.assertFalse(attention_call.decode_attention_enabled)
+
     def test_decode_reservation_is_token_pool_owned_state(self) -> None:
         from wkvm.runner.gemma_token_pool import (
             TokenPoolDecodeReservation,
@@ -1305,6 +1366,31 @@ class TestGemmaTokenPool(unittest.TestCase):
         self.assertEqual(reused.materialized_slot_ids, [])
         self.assertEqual(reused.full_token_slot, 4)
         self.assertEqual(reused.row_chunks.chunks[0].tolist(), [1, 2, 3, 4])
+
+        refilled = manager.prepare_decode_row(
+            "persist",
+            materialized_width=4,
+            decode_token_slot=reservation_slot_ids[0],
+            decode_token_slot_tensor=reservation_slots[:1],
+            persistent_rows=True,
+            build_paged_rows=False,
+            append_reserve_slots=2,
+            device="cpu",
+        )
+        refilled_pointer = refilled.row_chunks.chunks[0].data_ptr()
+        cached = manager.prepare_decode_row(
+            "persist",
+            materialized_width=5,
+            decode_token_slot=reservation_slot_ids[0],
+            decode_token_slot_tensor=reservation_slots[:1],
+            persistent_rows=True,
+            build_paged_rows=False,
+            append_reserve_slots=2,
+            device="cpu",
+        )
+
+        self.assertEqual(cached.row_chunks.chunks[0].data_ptr(), refilled_pointer)
+        self.assertEqual(cached.row_chunks.chunks[0].tolist(), [1, 2, 3, 4, 5, 6])
 
         manager.clear(["persist"])
         self.assertEqual(allocator.allocated_count, 1)

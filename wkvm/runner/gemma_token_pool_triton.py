@@ -1,4 +1,4 @@
-"""Triton decode kernels for native Gemma token-pool attention."""
+"""Triton decode and dense GQA prefill kernels for native Gemma attention."""
 
 from __future__ import annotations
 
@@ -1275,6 +1275,145 @@ def _dense_padded_gqa_decode_grouped_kernel(
         + d_offsets[None, :] * o_stride_d,
         out,
         mask=valid_g[:, None] & (d_offsets[None, :] < head_dim),
+    )
+
+
+@triton.jit
+def _dense_gqa_prefill_kernel(
+    query,
+    keys,
+    values,
+    attention_mask,
+    output,
+    q_stride_b: tl.constexpr,
+    q_stride_h: tl.constexpr,
+    q_stride_t: tl.constexpr,
+    q_stride_d: tl.constexpr,
+    k_stride_b: tl.constexpr,
+    k_stride_h: tl.constexpr,
+    k_stride_t: tl.constexpr,
+    k_stride_d: tl.constexpr,
+    v_stride_b: tl.constexpr,
+    v_stride_h: tl.constexpr,
+    v_stride_t: tl.constexpr,
+    v_stride_d: tl.constexpr,
+    m_stride_b: tl.constexpr,
+    m_stride_q: tl.constexpr,
+    m_stride_t: tl.constexpr,
+    o_stride_b: tl.constexpr,
+    o_stride_t: tl.constexpr,
+    o_stride_h: tl.constexpr,
+    o_stride_d: tl.constexpr,
+    scaling: tl.constexpr,
+    groups: tl.constexpr,
+    query_length: tl.constexpr,
+    key_length: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_m: tl.constexpr,
+    block_d: tl.constexpr,
+    block_n: tl.constexpr,
+    has_mask: tl.constexpr,
+    mask_is_bool: tl.constexpr,
+    input_precision: tl.constexpr,
+    native_dot: tl.constexpr,
+):
+    row = tl.program_id(0)
+    query_head = tl.program_id(1)
+    query_block = tl.program_id(2)
+    query_offsets = query_block * block_m + tl.arange(0, block_m)
+    d_offsets = tl.arange(0, block_d)
+    n_offsets = tl.arange(0, block_n)
+    valid_m = query_offsets < query_length
+    kv_head = query_head // groups
+
+    q = tl.load(
+        query
+        + row * q_stride_b
+        + query_head * q_stride_h
+        + query_offsets[:, None] * q_stride_t
+        + d_offsets[None, :] * q_stride_d,
+        mask=valid_m[:, None] & (d_offsets[None, :] < head_dim),
+        other=0.0,
+    )
+    if not native_dot:
+        q = q.to(tl.float32)
+
+    m_i = tl.zeros((block_m,), tl.float32)
+    l_i = tl.zeros((block_m,), tl.float32)
+    acc = tl.zeros((block_m, block_d), tl.float32)
+
+    offset = 0
+    while offset < key_length:
+        valid_n = n_offsets + offset < key_length
+        k = tl.load(
+            keys
+            + row * k_stride_b
+            + kv_head * k_stride_h
+            + (offset + n_offsets)[:, None] * k_stride_t
+            + d_offsets[None, :] * k_stride_d,
+            mask=valid_n[:, None] & (d_offsets[None, :] < head_dim),
+            other=0.0,
+        )
+        if not native_dot:
+            k = k.to(tl.float32)
+        scores = tl.dot(q, tl.trans(k), input_precision=input_precision).to(tl.float32)
+        scores *= scaling
+        if has_mask:
+            mask_values = tl.load(
+                attention_mask
+                + row * m_stride_b
+                + query_offsets[:, None] * m_stride_q
+                + (offset + n_offsets)[None, :] * m_stride_t,
+                mask=valid_m[:, None] & valid_n[None, :],
+                other=False if mask_is_bool else -float("inf"),
+            )
+            if mask_is_bool:
+                scores = tl.where(mask_values, scores, -float("inf"))
+            else:
+                scores += mask_values.to(tl.float32)
+        scores = tl.where(valid_m[:, None] & valid_n[None, :], scores, -float("inf"))
+
+        block_max = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, block_max)
+        probabilities = tl.exp(scores - m_new[:, None])
+        alpha = tl.exp(m_i - m_new)
+        v = tl.load(
+            values
+            + row * v_stride_b
+            + kv_head * v_stride_h
+            + (offset + n_offsets)[:, None] * v_stride_t
+            + d_offsets[None, :] * v_stride_d,
+            mask=valid_n[:, None] & (d_offsets[None, :] < head_dim),
+            other=0.0,
+        )
+        if not native_dot:
+            v = v.to(tl.float32)
+            probability_values = probabilities
+        else:
+            probability_values = probabilities.to(v.dtype)
+        acc = acc * alpha[:, None] + tl.dot(
+            probability_values,
+            v,
+            input_precision=input_precision,
+        ).to(tl.float32)
+        l_i = l_i * alpha + tl.sum(probabilities, axis=1)
+        m_i = m_new
+        offset += block_n
+
+    safe_l = tl.where(l_i > 0, l_i, 1.0)
+    result = tl.where(
+        l_i[:, None] > 0,
+        acc / safe_l[:, None],
+        0.0,
+    )
+    tl.store(
+        output
+        + row * o_stride_b
+        + query_offsets[:, None] * o_stride_t
+        + query_head * o_stride_h
+        + d_offsets[None, :] * o_stride_d,
+        result,
+        mask=valid_m[:, None] & (d_offsets[None, :] < head_dim),
     )
 
 
@@ -2736,6 +2875,148 @@ def dense_padded_gqa_decode(
         bn,
         bg,
         bool(has_mask),
+        precision,
+        native_dot,
+        num_warps=num_warps,
+    )
+    return output
+
+
+def dense_gqa_prefill(
+    query_states,
+    key_states,
+    value_states,
+    attention_mask=None,
+    *,
+    num_key_value_groups: int,
+    scaling: float,
+    block_n: int | None = None,
+    input_precision: str | None = None,
+    dot_dtype: str | None = None,
+    output=None,
+):
+    """Grouped-query prefill attention without expanding K/V heads."""
+
+    import torch
+
+    if query_states.ndim != 4 or int(query_states.shape[2]) < 2:
+        raise ValueError("dense GQA prefill requires [B, Hq, Q, D] queries with Q >= 2")
+    if key_states.ndim != 4 or value_states.ndim != 4:
+        raise ValueError("dense GQA prefill K/V tensors must have shape [B, Hkv, T, D]")
+    if not query_states.is_cuda:
+        raise RuntimeError("dense GQA prefill requires CUDA tensors")
+    if key_states.device != query_states.device or value_states.device != query_states.device:
+        raise ValueError("dense GQA prefill K/V tensors must be on the query device")
+
+    batch = int(query_states.shape[0])
+    query_heads = int(query_states.shape[1])
+    query_length = int(query_states.shape[2])
+    key_length = int(key_states.shape[2])
+    head_dim = int(query_states.shape[3])
+    groups = int(num_key_value_groups)
+    if groups < 1 or query_heads % groups:
+        raise ValueError("invalid grouped-query head layout")
+    if int(key_states.shape[0]) != batch or int(value_states.shape[0]) != batch:
+        raise ValueError("dense GQA prefill K/V batch does not match query batch")
+    if int(key_states.shape[1]) * groups != query_heads:
+        raise ValueError("dense GQA prefill K/V head count does not match query heads")
+    if tuple(value_states.shape[:3]) != tuple(key_states.shape[:3]):
+        raise ValueError("dense GQA prefill key/value shapes differ")
+    if int(key_states.shape[3]) != head_dim or int(value_states.shape[3]) != head_dim:
+        raise ValueError("dense GQA prefill K/V head_dim does not match query head_dim")
+    if key_length < 1:
+        raise ValueError("dense GQA prefill key_length must be >= 1")
+
+    has_mask = attention_mask is not None
+    mask_is_bool = False
+    if has_mask:
+        if attention_mask.device != query_states.device:
+            raise ValueError("dense GQA prefill mask must be on the query device")
+        if attention_mask.ndim != 4:
+            raise ValueError("dense GQA prefill mask must have shape [B, 1, Q, T]")
+        if int(attention_mask.shape[0]) != batch or int(attention_mask.shape[-1]) != key_length:
+            raise ValueError("dense GQA prefill mask shape does not match K/V")
+        if int(attention_mask.shape[1]) != 1 or int(attention_mask.shape[2]) not in {
+            1,
+            query_length,
+        }:
+            raise ValueError("dense GQA prefill mask head/query dimensions are invalid")
+        mask_is_bool = attention_mask.dtype == torch.bool
+    else:
+        attention_mask = key_states
+
+    output_shape = (batch, query_length, query_heads, head_dim)
+    if output is None:
+        output = torch.empty(
+            output_shape,
+            dtype=query_states.dtype,
+            device=query_states.device,
+        )
+    elif tuple(output.shape) != output_shape:
+        raise ValueError("dense GQA prefill output buffer has the wrong shape")
+    elif output.dtype != query_states.dtype or output.device != query_states.device:
+        raise ValueError("dense GQA prefill output buffer must match query dtype/device")
+
+    native_dot = _resolve_native_dot(query_states.dtype, dot_dtype)
+    block_d = _block_d(head_dim)
+    block_m = int(
+        os.environ.get(
+            "WKVM_DENSE_GQA_PREFILL_BLOCK_M",
+            16 if head_dim >= 256 else 32,
+        )
+    )
+    if block_m < 1 or block_m & (block_m - 1):
+        raise ValueError("dense GQA prefill block_m must be a positive power of two")
+    block_n = _resolve_block_n(
+        head_dim,
+        block_n,
+        env_names=("WKVM_DENSE_GQA_PREFILL_BLOCK_N", "WKVM_DENSE_TRITON_BLOCK_N"),
+    )
+    precision = _resolve_input_precision(query_states.dtype, input_precision)
+    num_warps = _resolve_num_warps(
+        block_d,
+        env_names=("WKVM_DENSE_GQA_PREFILL_NUM_WARPS", "WKVM_DENSE_TRITON_NUM_WARPS"),
+    )
+    mask_query_stride = (
+        0 if not has_mask or int(attention_mask.shape[2]) == 1 else attention_mask.stride(2)
+    )
+    _dense_gqa_prefill_kernel[
+        (batch, query_heads, triton.cdiv(query_length, block_m))
+    ](
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        output,
+        query_states.stride(0),
+        query_states.stride(1),
+        query_states.stride(2),
+        query_states.stride(3),
+        key_states.stride(0),
+        key_states.stride(1),
+        key_states.stride(2),
+        key_states.stride(3),
+        value_states.stride(0),
+        value_states.stride(1),
+        value_states.stride(2),
+        value_states.stride(3),
+        attention_mask.stride(0),
+        mask_query_stride,
+        attention_mask.stride(3),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        output.stride(3),
+        float(scaling),
+        groups,
+        query_length,
+        key_length,
+        head_dim,
+        block_m,
+        block_d,
+        block_n,
+        bool(has_mask),
+        bool(mask_is_bool),
         precision,
         native_dot,
         num_warps=num_warps,

@@ -41,9 +41,10 @@ Use an otherwise idle GPU. The runner treats more than 1 GiB of pre-existing
 device usage as non-comparable. Keep benchmark JSON outside the repository so
 artifact creation cannot change source identity.
 
-For a 24 GiB 4090, use `--mem-cap-gib 20 --headroom-gib 4`. A B16 run is the
-first green high-concurrency target; B24/B32 are capacity probes and may exceed
-the headroom gate.
+For a 24 GiB 4090, use `--mem-cap-gib 24 --headroom-gib 4`, which makes the
+green engine-delta ceiling 20 GiB. A B16 run is the first green
+high-concurrency target; B24/B32 are capacity probes and may exceed the
+headroom gate.
 
 ## Phase 1: Four Controlled Probes
 
@@ -110,7 +111,7 @@ done
 
 Only run this phase after selecting a Phase 1 candidate. Repeat the baseline
 and candidate at B16, ctx=16K, out=32, with `slots=16`, token-pool capacity
-`65536`, and the same `mem-cap-gib=20/headroom-gib=4` gate. Use three repeats
+`65536`, and the same `mem-cap-gib=24/headroom-gib=4` gate. Use three repeats
 for a throughput claim.
 
 Then run one exploratory capacity ladder at B24 and B32, increasing slots and
@@ -148,6 +149,122 @@ gate passes:
 
 Do not spend VRAM first on `prefill_microbatch_rows=16`, `chunk=4096`, or a
 larger token pool. Existing A/Bs added memory and became slower.
+
+## Phase 3 Implementation Status
+
+All four Phase 3 paths are implemented as explicit opt-ins. The production
+profile remains unchanged until repeated evidence passes the semantic, memory,
+and throughput gates.
+
+| Change | Opt-in | Validation signal |
+|---|---|---|
+| Persistent packed projections | `--native-gemma-projection-backend qkv_gate_up_packed` | Packed weights are reused and refreshed after source-weight mutation |
+| Batched routed packets | `--batched-routed-packets --prefill-microbatch-rows N` | `routed_packets.packet_batches > 0`; oversized packets fall back to canonical serial routing |
+| Completion-biased lanes | `--completion-prefill-lane-size N` | Lane starts, completions, and cancellations are reported per run |
+| Native GQA prefill | `--native-gemma-attention-backend triton_dense_gqa` | Multi-token K/V heads remain unexpanded; eval-with-grad falls back to an autograd-safe path |
+
+`--routed-packet-workspace-bytes` bounds each routed packet staging buffer.
+The benchmark rejects a batched-packet profile that cannot actually batch
+prompt rows; acceptance also requires a positive packet count and zero errors.
+
+### Repeated Phase 3 runner
+
+`scripts/run_wkvm_phase3_4090.sh` runs seven isolated profiles in interleaved
+order for at least three repeats:
+
+| Family | Profiles | Shape |
+|---|---|---|
+| Prefill | baseline, packed, routed packets, native GQA, combined | B8, ctx=16K, out=1 |
+| Scheduling | baseline, completion lane 8 | B16, ctx=16K, out=32 |
+
+Every profile is a fresh process. Native GQA therefore includes Triton compile
+cost in every cold repeat; do not substitute a JIT-warm run for only that
+profile. The runner rejects a dirty worktree, a GPU baseline above 1 GiB, an
+output directory inside the checkout, fewer than three repeats, missing
+artifacts, or source changes between runs.
+
+```bash
+export GPU_DEVICE=0
+export MODEL_PATH=/path/to/gemma-4-E4B-it
+export PYTHON=/path/to/wkvm-venv/bin/python
+export OUT_DIR=/path/outside/wkvm/phase3_$(date +%Y%m%d_%H%M%S)
+bash scripts/run_wkvm_phase3_4090.sh
+```
+
+For command and profile inspection without CUDA:
+
+```bash
+DRY_RUN=1 MODEL_PATH=/path/to/gemma-4-E4B-it \
+  PYTHON=/path/to/python bash scripts/run_wkvm_phase3_4090.sh
+```
+
+The runner finishes with `experiments/phase3_gemma_report.py`. Its report only
+passes when all profiles share one clean source identity, model manifest, GPU,
+prompt fingerprint, and exact family output fingerprint; every row must be
+complete and green, packet/lane telemetry must prove the feature ran, and no
+routed-packet capacity fallback may occur. It reports median/min/max metrics,
+the isolated 5% prefill candidate gate, interaction results, and the completion
+lane's p50/p95/max TTFT tradeoff.
+
+### Exploratory smoke only
+
+One full-checkpoint B2, ctx=256, out=2 smoke produced the same generated-token
+fingerprint for every isolated profile. It is useful for catching regressions,
+not for selecting a production default:
+
+| Profile | Prefill tok/s | Change | Peak reserved | Readout |
+|---|---:|---:|---:|---|
+| Baseline | 965.415 | baseline | 14.086 GiB | `separate` + `sdpa_single_gqa` |
+| Persistent packed | 970.195 | +0.50% | 18.617 GiB | Small gain, +4.531 GiB reserved |
+| Batched routed packets | 1,002.114 | +3.80% | 14.086 GiB | One D2H packet covered six folds |
+| Tiled native GQA | 992.479 | +2.80% | 14.086 GiB | Repeat after Triton compilation |
+| All three compute opt-ins | 964.057 | -0.14% | 18.617 GiB | Isolated gains were not additive |
+
+A separate B4, ctx=256 scheduling smoke reduced first-lane TTFT by about 6.5%
+and batch wall by 1.7%, but increased p95 TTFT by about 9.0% for the delayed
+lane. That is the expected latency/fairness tradeoff and must be evaluated on a
+longer arrival trace before enabling the policy by default.
+
+These measurements selected one exploratory run per profile; native GQA also
+has separate cold-JIT and JIT-warm artifacts. They used a dirty worktree, short
+prompts, and a desktop GPU baseline above the 1 GiB publication ceiling. They
+do not establish a public speed ratio.
+
+## Public 10x Claim Gate
+
+Do not publish the blanket statement "WKVM is 10x vLLM and SGLang." A valid
+result must name the GPU, model, context, output length, offered concurrency,
+metric, engine versions, and the routed-span semantic difference. The legacy
+12.5x number in `docs/COMPARISON.md` is a specialized steady-state PoC decode
+result with replicated caches; it is not current native-engine E2E or serving
+evidence.
+
+For a scoped E2E claim, all of the following must hold:
+
+1. Benchmark a committed, clean source tree on an otherwise idle GPU with at
+   most 1 GiB pre-load use.
+2. Run current WKVM, vLLM, and SGLang sequentially on the same physical GPU,
+   checkpoint, prompts, B/ctx/out shape, dtype, greedy policy, and memory gate.
+3. Collect at least three distinct cold artifacts per engine and batch size;
+   keep launch configuration and source/model identities unchanged.
+4. Require complete requests, exact token accounting, stable per-engine output
+   fingerprints, and no semantic or memory-gate regression.
+5. Generate the strict report and require the conservative E2E ratio—minimum
+   WKVM throughput divided by maximum incumbent throughput—to be at least
+   10.000x against both incumbents at the same B.
+
+```bash
+python experiments/reliable_gemma_report.py "$OUT_DIR"/*.json \
+  --markdown "$OUT_DIR/report.md" \
+  --summary-json "$OUT_DIR/summary.json"
+jq '.ten_x_e2e_claim_gate' "$OUT_DIR/summary.json"
+```
+
+Only `any_batch_passes_all_incumbents=true` supports wording such as: "On one
+RTX 4090, for Gemma-4-E4B-it at B=N, ctx=N, out=N, WKVM routed-span approximate
+mode delivered at least 10x observed E2E output throughput versus vLLM X and
+SGLang Y across three cold runs." It still does not support a same-semantics or
+general engine-wide 10x claim.
 
 ## Commit and Push Discipline
 

@@ -7,7 +7,7 @@ MODEL_PATH="${MODEL_PATH:-$ROOT/../models/gemma-4-E4B-it}"
 PYTHON="${PYTHON:-$ROOT/../.venv-wkvm/bin/python}"
 OUT_DIR="${OUT_DIR:-$ROOT/../results/4090/wkvm_vram_speed_$(date +%Y%m%d_%H%M%S)}"
 REPEATS="${REPEATS:-3}"
-MEM_CAP_GIB="${MEM_CAP_GIB:-20}"
+MEM_CAP_GIB="${MEM_CAP_GIB:-24}"
 HEADROOM_GIB="${HEADROOM_GIB:-4}"
 BASELINE_MAX_MIB="${BASELINE_MAX_MIB:-1024}"
 ALLOW_BUSY_GPU="${ALLOW_BUSY_GPU:-0}"
@@ -102,7 +102,6 @@ run_probe() {
     --gpu-memory-device "$GPU_DEVICE"
     --gpu-memory-sample-interval-s 0.1
     --require-native-no-hf
-    --no-warmup
     --stop-on-failure
     --json "$output"
   )

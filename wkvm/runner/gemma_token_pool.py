@@ -523,6 +523,7 @@ class TokenPoolFullAttentionRow:
     borrowed_slots: list[int] = field(default_factory=list)
     borrowed_append_slots_remaining: int | None = None
     page_aligned: bool = False
+    row_slots_tensor: Any | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -756,6 +757,32 @@ class TokenPoolFullAttentionRowManager:
             reused_existing_row=True,
         )
 
+    @staticmethod
+    def active_row_slots_tensor(
+        row: TokenPoolFullAttentionRow,
+        *,
+        device: Any,
+    ) -> Any:
+        import torch
+
+        total_slots = len(row.row_slots) + len(row.append_slots)
+        slot_tensor = row.row_slots_tensor
+        tensor_device = getattr(slot_tensor, "device", None)
+        if (
+            slot_tensor is None
+            or int(slot_tensor.numel()) != total_slots
+            or getattr(slot_tensor, "dtype", None) != torch.int32
+            or tensor_device is None
+            or torch.device(tensor_device) != torch.device(device)
+        ):
+            slot_tensor = torch.as_tensor(
+                [*row.row_slots, *row.append_slots],
+                dtype=torch.int32,
+                device=device,
+            )
+            row.row_slots_tensor = slot_tensor
+        return slot_tensor[: len(row.row_slots)]
+
     def start_persistent_row(
         self,
         req_id: str,
@@ -879,6 +906,10 @@ class TokenPoolFullAttentionRowManager:
                 )
                 if append is not None:
                     empty_slots = torch.empty(0, dtype=torch.int32, device=device)
+                    active_row_slots = self.active_row_slots_tensor(
+                        append.row,
+                        device=device,
+                    )
                     paged_row = (
                         list(append.row.row_slots)
                         if build_paged_rows and append.row.page_aligned
@@ -886,13 +917,7 @@ class TokenPoolFullAttentionRowManager:
                     )
                     return TokenPoolFullAttentionPreparedDecodeRow(
                         row_chunks=TokenSlotRowChunks(
-                            (
-                                torch.as_tensor(
-                                    append.row.row_slots,
-                                    dtype=torch.int32,
-                                    device=device,
-                                ),
-                            ),
+                            (active_row_slots,),
                             trusted=True,
                         ),
                         full_token_slot=append.full_token_slot,
@@ -1542,6 +1567,86 @@ class TokenPoolAttentionLayerKVBinding:
     should_update_dense_cache: bool
 
 
+@dataclass(frozen=True)
+class TokenPoolMixedAttentionCall:
+    """One layer's token-pool decode call inside a ragged mixed batch."""
+
+    decode_call: TokenPoolAttentionCall
+    q_lens: tuple[int, ...]
+    decode_row_indices: tuple[int, ...]
+    prefill_row_indices: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        row_count = len(self.q_lens)
+        if row_count < 2:
+            raise ValueError("token-pool mixed attention requires at least two rows")
+        if any(int(q_len) < 1 for q_len in self.q_lens):
+            raise ValueError("token-pool mixed q_lens must be positive")
+        decode_rows = tuple(int(row) for row in self.decode_row_indices)
+        prefill_rows = tuple(int(row) for row in self.prefill_row_indices)
+        if any(row < 0 or row >= row_count for row in decode_rows + prefill_rows):
+            raise ValueError("token-pool mixed row index is out of range")
+        if len(set(decode_rows)) != len(decode_rows):
+            raise ValueError("token-pool mixed decode rows must be unique")
+        if len(set(prefill_rows)) != len(prefill_rows):
+            raise ValueError("token-pool mixed prefill rows must be unique")
+        if set(decode_rows).intersection(prefill_rows):
+            raise ValueError("token-pool mixed row partitions must be disjoint")
+        if set(decode_rows).union(prefill_rows) != set(range(row_count)):
+            raise ValueError("token-pool mixed row partitions must cover every row")
+        if not decode_rows or not prefill_rows:
+            raise ValueError("token-pool mixed attention requires both row kinds")
+        if any(int(self.q_lens[row]) != 1 for row in decode_rows):
+            raise ValueError("token-pool mixed decode rows must have q_len == 1")
+        object.__setattr__(self, "q_lens", tuple(int(value) for value in self.q_lens))
+        object.__setattr__(self, "decode_row_indices", decode_rows)
+        object.__setattr__(self, "prefill_row_indices", prefill_rows)
+
+    @property
+    def decode_attention_enabled(self) -> bool:
+        # The whole rectangular query is not a decode call.  Native attention
+        # dispatch detects ``mixed_attention_enabled`` and launches only the
+        # selected q=1 rows through ``decode_call``.
+        return False
+
+    @property
+    def mixed_attention_enabled(self) -> bool:
+        return bool(self.decode_call.decode_attention_enabled)
+
+    def bind_layer_kv(
+        self,
+        key_states: Any,
+        value_states: Any,
+        *,
+        has_past_key_values: bool,
+        is_kv_shared_layer: bool = False,
+    ) -> "TokenPoolAttentionLayerKVBinding":
+        decode_call = self.decode_call
+        if self.mixed_attention_enabled and not bool(is_kv_shared_layer):
+            if key_states is None or value_states is None:
+                raise RuntimeError("token-pool mixed decode requires current layer KV")
+            import torch
+
+            rows = torch.as_tensor(
+                self.decode_row_indices,
+                dtype=torch.long,
+                device=key_states.device,
+            )
+            decode_call = decode_call.with_current_kv(
+                key_states.index_select(0, rows)[:, :, :1, :],
+                value_states.index_select(0, rows)[:, :, :1, :],
+            )
+        return TokenPoolAttentionLayerKVBinding(
+            attention_call=replace(self, decode_call=decode_call),
+            should_update_dense_cache=(
+                bool(has_past_key_values) and not bool(is_kv_shared_layer)
+            ),
+        )
+
+    def backend_decode_call(self) -> TokenPoolAttentionCall:
+        return self.decode_call
+
+
 def token_pool_attention_plan_kwargs(token_pool_plan: Any) -> dict[str, Any]:
     attention_kwargs = getattr(token_pool_plan, "attention_kwargs", None)
     if attention_kwargs is not None:
@@ -2071,6 +2176,124 @@ class TokenPoolDecodeContext:
             paged_metadata=paged_metadata,
             kv_pool=token_kv_pool,
             attention_workspace=self.attention_workspace,
+        )
+
+
+@dataclass(frozen=True)
+class TokenPoolMixedBatchContext:
+    """Decode metadata plus scheduler-row mapping for one mixed model call."""
+
+    decode_context: TokenPoolDecodeContext
+    q_lens: tuple[int, ...]
+    decode_row_indices: tuple[int, ...]
+    prefill_row_indices: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        # Reuse the layer-call validator so the public context and every layer
+        # resolve the exact same row partition.
+        TokenPoolMixedAttentionCall(
+            decode_call=TokenPoolAttentionCall(),
+            q_lens=self.q_lens,
+            decode_row_indices=self.decode_row_indices,
+            prefill_row_indices=self.prefill_row_indices,
+        )
+        object.__setattr__(
+            self,
+            "q_lens",
+            tuple(int(value) for value in self.q_lens),
+        )
+        object.__setattr__(
+            self,
+            "decode_row_indices",
+            tuple(int(value) for value in self.decode_row_indices),
+        )
+        object.__setattr__(
+            self,
+            "prefill_row_indices",
+            tuple(int(value) for value in self.prefill_row_indices),
+        )
+        decode_rows = len(self.decode_row_indices)
+        seen_metadata: set[int] = set()
+        for group_name in (
+            "metadata_by_layer_type",
+            "metadata_by_layer_id",
+            "paged_metadata_by_layer_type",
+            "paged_metadata_by_layer_id",
+        ):
+            group = getattr(self.decode_context, group_name, None) or {}
+            for metadata in group.values():
+                if metadata is None or id(metadata) in seen_metadata:
+                    continue
+                seen_metadata.add(id(metadata))
+                req_pool_indices = getattr(metadata, "req_pool_indices", None)
+                if req_pool_indices is None:
+                    continue
+                if int(req_pool_indices.numel()) != decode_rows:
+                    raise ValueError(
+                        "token-pool mixed metadata rows must match decode rows"
+                    )
+
+    @property
+    def kv_pool(self) -> Any | None:
+        return self.decode_context.kv_pool
+
+    @property
+    def attention_workspace(self) -> Any | None:
+        return self.decode_context.attention_workspace
+
+    @property
+    def covered_layer_types(self) -> frozenset[str]:
+        return self.decode_context.covered_decode_layer_types()
+
+    def covered_decode_layer_types(self) -> frozenset[str]:
+        return self.decode_context.covered_decode_layer_types()
+
+    def metadata_for_layer(
+        self,
+        layer_idx: int | None,
+        layer_type: str | None,
+    ) -> DecodeBatchMetadata | None:
+        return self.decode_context.metadata_for_layer(layer_idx, layer_type)
+
+    def paged_metadata_for_layer(
+        self,
+        layer_idx: int | None,
+        layer_type: str | None,
+    ) -> PagedDecodeBatchMetadata | None:
+        return self.decode_context.paged_metadata_for_layer(layer_idx, layer_type)
+
+    def write_slots_for_layer(
+        self,
+        layer_idx: int | None,
+        layer_type: str | None,
+    ) -> Any | None:
+        binding = self.decode_context.attention_binding_for_layer(
+            layer_idx,
+            layer_type,
+            attention_mask_present=False,
+        )
+        return binding.out_cache_loc_for_write()
+
+    def attention_call_for_layer(
+        self,
+        layer_idx: int | None,
+        layer_type: str | None,
+        *,
+        attention_mask_present: bool = False,
+        query_seq_len: int | None = None,
+    ) -> TokenPoolMixedAttentionCall:
+        del attention_mask_present, query_seq_len
+        decode_call = self.decode_context.attention_call_for_layer(
+            layer_idx,
+            layer_type,
+            attention_mask_present=False,
+            query_seq_len=1,
+        )
+        return TokenPoolMixedAttentionCall(
+            decode_call=decode_call,
+            q_lens=self.q_lens,
+            decode_row_indices=self.decode_row_indices,
+            prefill_row_indices=self.prefill_row_indices,
         )
 
 

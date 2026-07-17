@@ -307,6 +307,7 @@ TOKEN_POOL_TRITON_BENCH_ENV_NAMES = (
     "WKVM_ENABLE_TOKEN_POOL_PAGED_SPLIT_TRITON",
     "WKVM_TOKEN_POOL_TRITON_STRICT",
     "WKVM_TOKEN_POOL_SLIDING_PAGED_METADATA_ONLY",
+    "WKVM_TOKEN_POOL_ROUTE_BOUNDARY_BATCH",
 )
 
 
@@ -322,6 +323,10 @@ def apply_token_pool_triton_bench_env(args) -> dict[str, str | None]:
         (
             "token_pool_sliding_paged_metadata_only",
             "WKVM_TOKEN_POOL_SLIDING_PAGED_METADATA_ONLY",
+        ),
+        (
+            "token_pool_route_boundary_batch",
+            "WKVM_TOKEN_POOL_ROUTE_BOUNDARY_BATCH",
         ),
     )
     for attr, env_name in flag_to_env:
@@ -571,6 +576,56 @@ def benchmark_fatal_error(exc: BaseException, *, phase: str) -> dict[str, Any]:
     }
 
 
+def validate_routed_packet_benchmark_args(args) -> None:
+    if not bool(getattr(args, "batched_routed_packets", False)):
+        return
+    prefill_rows = getattr(args, "prefill_microbatch_rows", 1)
+    if prefill_rows == 1:
+        raise ValueError(
+            "--batched-routed-packets requires --prefill-microbatch-rows 0 or >= 2"
+        )
+
+
+def routed_packet_evidence_summary(
+    rows: list[dict[str, Any]],
+    *,
+    required: bool,
+) -> dict[str, Any]:
+    stats_rows = [
+        row["routed_packets"]
+        for row in rows
+        if isinstance(row.get("routed_packets"), dict)
+    ]
+    packet_batches = sum(
+        int(stats.get("packet_batches", 0) or 0) for stats in stats_rows
+    )
+    capacity_fallback_batches = sum(
+        int(stats.get("capacity_fallback_batches", 0) or 0)
+        for stats in stats_rows
+    )
+    rows_with_packets = sum(
+        int(stats.get("packet_batches", 0) or 0) > 0 for stats in stats_rows
+    )
+    successful_rows = sum(
+        row.get("error") is None
+        and int(row.get("error_count", 0) or 0) == 0
+        and row.get("success_count") == row.get("B")
+        for row in rows
+    )
+    all_rows_successful = bool(rows) and successful_rows == len(rows)
+    return {
+        "required": bool(required),
+        "passed": not required or (packet_batches > 0 and all_rows_successful),
+        "packet_batches": packet_batches,
+        "capacity_fallback_batches": capacity_fallback_batches,
+        "rows_with_packet_stats": len(stats_rows),
+        "rows_with_packets": rows_with_packets,
+        "row_count": len(rows),
+        "successful_rows": successful_rows,
+        "all_rows_successful": all_rows_successful,
+    }
+
+
 def prompt_token_source(args) -> str:
     return "synthetic" if getattr(args, "synthetic_prompts", False) else "hf_tokenizer"
 
@@ -623,6 +678,10 @@ def build_benchmark_payload(
     source_identity_after = source_worktree_identity(ROOT)
     hf_boundary = hf_boundary_summary(rows, args)
     output_fingerprints = generated_output_fingerprint_summary(rows)
+    routed_packet_evidence = routed_packet_evidence_summary(
+        rows,
+        required=bool(getattr(args, "batched_routed_packets", False)),
+    )
     native_no_hf_requirement = native_no_hf_requirement_report(
         rows,
         required=args.require_native_no_hf,
@@ -683,7 +742,19 @@ def build_benchmark_payload(
         "native_gemma_release_hf_decoder_layers": (
             args.native_gemma_release_hf_decoder_layers
         ),
+        "batched_routed_packets": getattr(args, "batched_routed_packets", False),
+        "routed_packet_evidence": routed_packet_evidence,
+        "completion_prefill_lane_size": getattr(
+            args,
+            "completion_prefill_lane_size",
+            0,
+        ),
         "token_pool_attention_enabled": args.enable_token_pool_attention,
+        "token_pool_route_boundary_batch": getattr(
+            args,
+            "token_pool_route_boundary_batch",
+            False,
+        ),
         "token_pool_triton_env": token_pool_triton_env,
         "cuda_phase_metrics_enabled": args.cuda_phase_metrics,
         "git_commit": commit,
@@ -704,6 +775,17 @@ def build_benchmark_payload(
             "route_chunk": args.route_chunk,
             "chunk": args.chunk,
             "prefill_microbatch_rows": getattr(args, "prefill_microbatch_rows", 1),
+            "continuation_prefill_microbatch_rows": getattr(
+                args,
+                "continuation_prefill_microbatch_rows",
+                None,
+            ),
+            "enable_mixed_batch": getattr(args, "enable_mixed_batch", False),
+            "completion_prefill_lane_size": getattr(
+                args,
+                "completion_prefill_lane_size",
+                0,
+            ),
             "decode_microbatch_rows": args.decode_microbatch_rows,
             "decode_microbatch_bytes": args.decode_microbatch_bytes,
             "decode_batch_planner": args.decode_batch_planner,
@@ -730,6 +812,12 @@ def build_benchmark_payload(
             "native_gemma_release_hf_decoder_layers": (
                 args.native_gemma_release_hf_decoder_layers
             ),
+            "batched_routed_packets": getattr(args, "batched_routed_packets", False),
+            "routed_packet_workspace_bytes": getattr(
+                args,
+                "routed_packet_workspace_bytes",
+                64 * 1024 * 1024,
+            ),
             "enable_token_pool_metadata": args.enable_token_pool_metadata,
             "enable_token_pool_attention": args.enable_token_pool_attention,
             "token_pool_max_context_len": args.token_pool_max_context_len,
@@ -743,6 +831,11 @@ def build_benchmark_payload(
             "token_pool_triton_strict": args.token_pool_triton_strict,
             "token_pool_sliding_paged_metadata_only": (
                 args.token_pool_sliding_paged_metadata_only
+            ),
+            "token_pool_route_boundary_batch": getattr(
+                args,
+                "token_pool_route_boundary_batch",
+                False,
             ),
             "token_pool_triton_env": token_pool_triton_env,
             "synthetic_prompts": getattr(args, "synthetic_prompts", False),
@@ -762,6 +855,8 @@ def build_benchmark_payload(
                 (r.get("agg_decode_tok_s") or 0.0 for r in rows if r.get("green")),
                 default=0.0,
             ),
+            "routed_packet_evidence_passed": routed_packet_evidence["passed"],
+            "routed_packet_batches": routed_packet_evidence["packet_batches"],
         },
         "rows": rows,
     }
@@ -821,6 +916,11 @@ def make_engine(model, cfg, prompts: list[list[int]], args) -> GemmaNativeEngine
         slots=slots,
         token_budget=args.token_budget,
         chunk=args.chunk,
+        completion_prefill_lane_size=getattr(
+            args,
+            "completion_prefill_lane_size",
+            0,
+        ),
     )
     return GemmaNativeEngine(
         model,
@@ -829,6 +929,12 @@ def make_engine(model, cfg, prompts: list[list[int]], args) -> GemmaNativeEngine
         scheduler_config=sched_cfg,
         prefill_chunk=args.chunk,
         prefill_microbatch_rows=getattr(args, "prefill_microbatch_rows", 1),
+        continuation_prefill_microbatch_rows=getattr(
+            args,
+            "continuation_prefill_microbatch_rows",
+            None,
+        ),
+        enable_mixed_batch=getattr(args, "enable_mixed_batch", False),
         decode_microbatch_rows=args.decode_microbatch_rows,
         decode_microbatch_bytes=args.decode_microbatch_bytes,
         decode_batch_planner=args.decode_batch_planner,
@@ -865,6 +971,12 @@ def make_engine(model, cfg, prompts: list[list[int]], args) -> GemmaNativeEngine
             args,
             "native_gemma_release_hf_decoder_layers",
             False,
+        ),
+        batched_routed_packets=getattr(args, "batched_routed_packets", False),
+        routed_packet_workspace_bytes=getattr(
+            args,
+            "routed_packet_workspace_bytes",
+            64 * 1024 * 1024,
         ),
         enable_token_pool_metadata=getattr(args, "enable_token_pool_metadata", None),
         enable_token_pool_attention=getattr(args, "enable_token_pool_attention", False),
@@ -959,6 +1071,11 @@ def run_row(model, tok, cfg, B: int, args, usable_gib: float | None) -> dict[str
             decode_s = max(finish_times) - min(decode_starts)
         peak_reserved = cuda_peak_reserved_gib()
         engine_stats = engine.stats()
+        routed_packet_stats = engine_stats["routed_packets"]
+        routed_packet_evidence_passed = (
+            not bool(getattr(args, "batched_routed_packets", False))
+            or int(routed_packet_stats.get("packet_batches", 0) or 0) > 0
+        )
         trace_summary = summarize_request_traces(traces.values())
         request_traces = {
             req.req_id: traces[req.req_id].as_dict()
@@ -1027,6 +1144,23 @@ def run_row(model, tok, cfg, B: int, args, usable_gib: float | None) -> dict[str
                 "native_gemma_release_hf_decoder_layers": engine_stats[
                     "native_gemma_release_hf_decoder_layers"
                 ],
+                "batched_routed_packets": engine_stats[
+                    "batched_routed_packets"
+                ],
+                "routed_packets": routed_packet_stats,
+                "routed_packet_evidence_passed": routed_packet_evidence_passed,
+                "completion_prefill_lane_size": engine_stats[
+                    "completion_prefill_lane_size"
+                ],
+                "completion_prefill_lane_starts": engine_stats[
+                    "completion_prefill_lane_starts"
+                ],
+                "completion_prefill_lane_completions": engine_stats[
+                    "completion_prefill_lane_completions"
+                ],
+                "completion_prefill_lane_cancellations": engine_stats[
+                    "completion_prefill_lane_cancellations"
+                ],
                 "native_gemma_released_hf_decoder_layers": engine_stats[
                     "native_gemma_released_hf_decoder_layers"
                 ],
@@ -1080,6 +1214,12 @@ def run_row(model, tok, cfg, B: int, args, usable_gib: float | None) -> dict[str
                 "token_pool_full_attention_row_invalidations": (
                     engine.metrics.token_pool_full_attention_row_invalidations
                 ),
+                "token_pool_route_boundary_batches": (
+                    engine.metrics.token_pool_route_boundary_batches
+                ),
+                "token_pool_route_boundary_flushes": (
+                    engine.metrics.token_pool_route_boundary_flushes
+                ),
                 "token_pool_slot_high_watermark": (
                     engine.metrics.token_pool_slot_high_watermark
                 ),
@@ -1090,6 +1230,10 @@ def run_row(model, tok, cfg, B: int, args, usable_gib: float | None) -> dict[str
                 ),
                 "batched_prefill_rows": engine.metrics.batched_prefill_rows,
                 "max_prefill_batch_rows": engine.metrics.max_prefill_batch_rows,
+                "mixed_batch_model_calls": engine.metrics.mixed_batch_model_calls,
+                "mixed_batch_rows": engine.metrics.mixed_batch_rows,
+                "mixed_batch_opportunities": engine.metrics.mixed_batch_opportunities,
+                "mixed_batch_fallbacks": engine.metrics.mixed_batch_fallbacks,
                 "steps": engine.metrics.steps,
                 "max_waiting": engine.metrics.max_waiting,
                 "max_running": engine.metrics.max_running,
@@ -1239,6 +1383,10 @@ def run_row(model, tok, cfg, B: int, args, usable_gib: float | None) -> dict[str
                 ),
             }
         )
+        if not routed_packet_evidence_passed:
+            row["green"] = False
+            row["error_count"] = max(int(row["error_count"]), 1)
+            row["error"] = "batched routed packet benchmark produced zero packet batches"
         if row["success_count"] == B and row["error_count"] == 0:
             row.update(
                 generated_output_fingerprint_row_fields(
@@ -1282,6 +1430,7 @@ def run_row(model, tok, cfg, B: int, args, usable_gib: float | None) -> dict[str
 def run(args) -> dict[str, Any]:
     import torch
 
+    validate_routed_packet_benchmark_args(args)
     token_pool_triton_env = apply_token_pool_triton_bench_env(args)
     path = resolve_model_path(args.model_path)
     source_identity_before = source_worktree_identity(ROOT)
@@ -1412,6 +1561,12 @@ def run(args) -> dict[str, Any]:
     emit_benchmark_payload(args, payload)
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    routed_packet_evidence = payload["routed_packet_evidence"]
+    if routed_packet_evidence["required"] and not routed_packet_evidence["passed"]:
+        raise RuntimeError(
+            "batched routed packet benchmark requires positive packet batches "
+            "and zero row errors"
+        )
     native_no_hf_requirement = payload["native_no_hf_requirement"]
     if args.require_native_no_hf and not native_no_hf_requirement["passed"]:
         raise RuntimeError(
@@ -1461,6 +1616,24 @@ def main() -> None:
         default=1,
         help="Equal-width prompt rows per native model call; 1 disables batching, 0 is unlimited.",
     )
+    ap.add_argument(
+        "--continuation-prefill-microbatch-rows",
+        type=int,
+        default=None,
+        help=(
+            "Optional parked-session continuation row cap; 0 is unlimited. "
+            "Long initial chunks continue to use --prefill-microbatch-rows."
+        ),
+    )
+    ap.add_argument(
+        "--enable-mixed-batch",
+        action="store_true",
+        help=(
+            "Opt into one native ragged prefill/decode call, including hybrid "
+            "token-pool q=1 decode rows when token-pool attention is enabled."
+        ),
+    )
+    ap.add_argument("--completion-prefill-lane-size", type=int, default=0)
     ap.add_argument("--decode-microbatch-rows", type=int, default=16)
     ap.add_argument("--decode-microbatch-bytes", type=int, default=None)
     ap.add_argument("--decode-workspace-bytes", type=int, default=None)
@@ -1549,6 +1722,12 @@ def main() -> None:
             "--native-gemma-weight-backend owned or owned_cpu."
         ),
     )
+    ap.add_argument("--batched-routed-packets", action="store_true")
+    ap.add_argument(
+        "--routed-packet-workspace-bytes",
+        type=int,
+        default=64 * 1024 * 1024,
+    )
     ap.add_argument(
         "--enable-token-pool-metadata",
         action="store_true",
@@ -1606,6 +1785,15 @@ def main() -> None:
         ),
     )
     ap.add_argument(
+        "--token-pool-route-boundary-batch",
+        action="store_true",
+        help=(
+            "Set WKVM_TOKEN_POOL_ROUTE_BOUNDARY_BATCH=1 to batch the single "
+            "decode step that reaches a routed-span fold boundary, then flush "
+            "the persistent group for a safe per-row fold."
+        ),
+    )
+    ap.add_argument(
         "--decode-batch-planner",
         choices=["scheduler", "length_bucketed"],
         default="scheduler",
@@ -1630,6 +1818,10 @@ def main() -> None:
     )
     ap.add_argument("--stop-on-failure", action="store_true")
     args = ap.parse_args()
+    try:
+        validate_routed_packet_benchmark_args(args)
+    except ValueError as exc:
+        ap.error(str(exc))
     run(args)
 
 

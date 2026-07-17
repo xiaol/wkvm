@@ -1,8 +1,10 @@
 """Native Gemma token-id and opt-in OpenAI chat HTTP endpoint.
 
-The canonical wkvm endpoint is token-id `/v1/stream`. `/v1/completions` exposes
-the same engine through the OpenAI completions streaming shape used by vLLM and
-SGLang benchmarks, limited to single-prompt greedy token-id requests.
+The canonical wkvm endpoint is token-id `/v1/stream`, including explicit
+stateful sessions that accept an initial prompt or later token deltas.
+`/v1/completions` exposes the same engine through the OpenAI completions
+streaming shape used by vLLM and SGLang benchmarks, limited to single-prompt
+greedy token-id requests.
 `--enable-openai-chat` adds tokenizer-backed `/v1/chat/completions` support.
 """
 
@@ -34,6 +36,9 @@ class _ChatTurn:
     max_new_tokens: int
     break_mask: list[bool] | None
     deadline: float | None
+    session_kind: str
+    input_mode: str
+    forced_output_token_ids: list[int] | None = None
     request: Any | None = None
     engine_req_id: str | None = None
     state: str = "pending"
@@ -43,6 +48,10 @@ class _ChatTurn:
     metrics: dict[str, Any] | None = None
     cancel_requested: bool = False
     cuda_cache_emptied: bool = False
+    session_reused: bool = False
+    candidate_output_token_ids: list[int] = field(default_factory=list)
+    teacher_forcing_overwrite_s: float = 0.0
+    teacher_forcing_overwrites: int = 0
 
     @property
     def finished(self) -> bool:
@@ -53,6 +62,7 @@ class _ChatTurn:
 class _ChatSession:
     session_id: str
     engine_req_id: str
+    session_kind: str
     request: Any
     active_turn: _ChatTurn | None
     last_access: float
@@ -70,6 +80,7 @@ class BoundedGemmaService:
         chat_session_ttl_s: float | None = 1800.0,
         max_chat_sessions: int | None = None,
         cuda_empty_cache: Callable[[], None] | None = None,
+        enable_token_session_teacher_forcing: bool = False,
     ) -> None:
         if max_queue < 1:
             raise ValueError("max_queue must be >= 1")
@@ -100,6 +111,9 @@ class BoundedGemmaService:
         self.max_chat_sessions = max_chat_sessions
         self.cuda_empty_cache = cuda_empty_cache
         self.cuda_empty_cache_calls = 0
+        self.enable_token_session_teacher_forcing = bool(
+            enable_token_session_teacher_forcing
+        )
         self.lock = threading.RLock()
         self.cv = threading.Condition(self.lock)
         self.engine_lock = threading.RLock()
@@ -354,6 +368,9 @@ class BoundedGemmaService:
         req_id: str,
         break_mask: list[bool] | None = None,
         timeout_s: float | None = None,
+        _session_kind: str = "chat",
+        _input_mode: str = "full_prompt",
+        _forced_output_ids: list[int] | None = None,
     ) -> Iterator[dict[str, Any]]:
         started = time.perf_counter()
         effective_timeout = self.request_timeout_s if timeout_s is None else float(timeout_s)
@@ -370,6 +387,9 @@ class BoundedGemmaService:
                 max_tokens=max_tokens,
                 break_mask=break_mask,
                 deadline=deadline,
+                session_kind=_session_kind,
+                input_mode=_input_mode,
+                forced_output_ids=_forced_output_ids,
             )
 
         emitted = 0
@@ -432,6 +452,45 @@ class BoundedGemmaService:
             if not turn.finished:
                 self._cancel_chat_turn(turn)
 
+    def stream_token_session(
+        self,
+        *,
+        session_id: str,
+        max_tokens: int,
+        req_id: str,
+        prompt_ids: list[int] | None = None,
+        delta_ids: list[int] | None = None,
+        forced_output_ids: list[int] | None = None,
+        break_mask: list[bool] | None = None,
+        timeout_s: float | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        if (prompt_ids is None) == (delta_ids is None):
+            raise ValueError(
+                "stateful token request requires exactly one of prompt_ids or delta_ids"
+            )
+        input_mode = "initial_prompt" if prompt_ids is not None else "continuation_delta"
+        input_ids = prompt_ids if prompt_ids is not None else delta_ids
+        assert input_ids is not None
+        if forced_output_ids is not None:
+            if not self.enable_token_session_teacher_forcing:
+                raise ValueError("token-session teacher forcing is disabled")
+            forced_output_ids = [int(token_id) for token_id in forced_output_ids]
+            if len(forced_output_ids) != int(max_tokens):
+                raise ValueError(
+                    "forced_output_ids length must equal max_tokens for this turn"
+                )
+        return self.stream_chat(
+            prompt_ids=input_ids,
+            max_tokens=max_tokens,
+            session_id=session_id,
+            req_id=req_id,
+            break_mask=break_mask,
+            timeout_s=timeout_s,
+            _session_kind="token",
+            _input_mode=input_mode,
+            _forced_output_ids=forced_output_ids,
+        )
+
     def status(self, req_id: str) -> dict[str, Any]:
         with self.cv:
             request = self._requests.get(req_id)
@@ -479,6 +538,10 @@ class BoundedGemmaService:
                 running = len(self.engine.scheduler.running)
                 free_state_slots = self.engine.arena.num_free_slots()
                 chat_sessions = len(self._chat_sessions)
+                token_sessions = sum(
+                    session.session_kind == "token"
+                    for session in self._chat_sessions.values()
+                )
             return {
                 "ok": ready,
                 "queue_depth": pending + waiting,
@@ -486,6 +549,7 @@ class BoundedGemmaService:
                 "running": running,
                 "free_state_slots": free_state_slots,
                 "chat_sessions": chat_sessions,
+                "token_sessions": token_sessions,
                 "timed_out_requests": self.total_timed_out,
                 "worker_alive": worker_alive,
                 "last_error": self.last_error,
@@ -499,6 +563,10 @@ class BoundedGemmaService:
             with self.engine_lock:
                 engine_stats = self.engine.stats()
                 chat_sessions = len(self._chat_sessions)
+                token_sessions = sum(
+                    session.session_kind == "token"
+                    for session in self._chat_sessions.values()
+                )
             return {
                 "server": {
                     "ready": ready,
@@ -514,6 +582,10 @@ class BoundedGemmaService:
                     "chat_session_ttl_s": self.chat_session_ttl_s,
                     "max_chat_sessions": self.max_chat_sessions,
                     "chat_sessions": chat_sessions,
+                    "token_sessions": token_sessions,
+                    "token_session_teacher_forcing_enabled": (
+                        self.enable_token_session_teacher_forcing
+                    ),
                     "empty_cuda_cache_before_decode": self.cuda_empty_cache is not None,
                     "cuda_empty_cache_calls": self.cuda_empty_cache_calls,
                     "pending_queue_depth": pending,
@@ -629,6 +701,7 @@ class BoundedGemmaService:
                             self.total_errors += 1
                     if self.engine.has_unfinished:
                         completed = self.engine.step() or []
+                        self._force_token_session_outputs_locked()
                         self._maybe_empty_cuda_cache_before_decode_locked()
                         finalized_chat.extend(
                             self._completed_chat_turns_locked(completed)
@@ -653,6 +726,71 @@ class BoundedGemmaService:
                     self._trim_completed_locked()
                     self.cv.notify_all()
 
+    def _force_token_session_outputs_locked(self) -> None:
+        for session in self._chat_sessions.values():
+            turn = session.active_turn
+            if turn is None or turn.forced_output_token_ids is None:
+                continue
+            output_tokens = session.request.output_token_ids
+            while len(turn.candidate_output_token_ids) < len(output_tokens):
+                output_index = len(turn.candidate_output_token_ids)
+                if output_index >= len(turn.forced_output_token_ids):
+                    raise RuntimeError(
+                        f"token session {turn.session_id} produced more tokens "
+                        "than forced_output_ids"
+                    )
+                turn.candidate_output_token_ids.append(
+                    int(output_tokens[output_index])
+                )
+                overwrite_started = time.perf_counter()
+                output_tokens[output_index] = int(
+                    turn.forced_output_token_ids[output_index]
+                )
+                turn.teacher_forcing_overwrite_s += (
+                    time.perf_counter() - overwrite_started
+                )
+                turn.teacher_forcing_overwrites += 1
+
+    @staticmethod
+    def _stateful_turn_metrics(
+        turn: _ChatTurn,
+        engine_metrics: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        metrics = {} if engine_metrics is None else dict(engine_metrics)
+        metrics.update(
+            {
+                "http_session_id": turn.session_id,
+                "session_kind": turn.session_kind,
+                "session_input_mode": turn.input_mode,
+                "session_input_tokens": len(turn.prompt_token_ids),
+                "session_reused": turn.session_reused,
+            }
+        )
+        forced = turn.forced_output_token_ids
+        if forced is None:
+            metrics["teacher_forcing"] = {"enabled": False}
+        else:
+            selected = list(turn.output_token_ids)
+            candidates = list(turn.candidate_output_token_ids)
+            metrics["teacher_forcing"] = {
+                "enabled": True,
+                "backend": "post_sample_pending_token_override",
+                "overhead_contract": {
+                    "timed": True,
+                    "full_vocabulary_mask": False,
+                    "gpu_logit_elements_mutated_per_row": 0,
+                    "mutation": "one_pending_token_scalar_overwrite",
+                    "row_mutation_scope": "request_loop",
+                },
+                "forced_output_ids": list(forced),
+                "candidate_output_ids": candidates,
+                "selected_outputs_match_forced": selected == forced,
+                "candidate_outputs_match_forced": candidates == forced,
+                "scalar_overwrite_count": turn.teacher_forcing_overwrites,
+                "scalar_overwrite_s": round(turn.teacher_forcing_overwrite_s, 9),
+            }
+        return metrics
+
     def _maybe_empty_cuda_cache_before_decode_locked(self) -> None:
         if self.cuda_empty_cache is None:
             return
@@ -674,6 +812,9 @@ class BoundedGemmaService:
 
     @staticmethod
     def _chat_turn_tokens(turn: _ChatTurn) -> list[int]:
+        if turn.forced_output_token_ids is not None:
+            safe_count = len(turn.candidate_output_token_ids)
+            return list(turn.forced_output_token_ids[:safe_count])
         if turn.finished:
             return list(turn.output_token_ids)
         if turn.request is None or turn.state != "running":
@@ -689,6 +830,9 @@ class BoundedGemmaService:
         max_tokens: int,
         break_mask: list[bool] | None,
         deadline: float | None,
+        session_kind: str = "chat",
+        input_mode: str = "full_prompt",
+        forced_output_ids: list[int] | None = None,
     ) -> _ChatTurn:
         if self.closed:
             self.total_errors += 1
@@ -700,14 +844,59 @@ class BoundedGemmaService:
         session_id = str(session_id).strip()
         if not session_id:
             raise ValueError("session_id must not be empty")
+        if session_kind not in {"chat", "token"}:
+            raise ValueError(f"unsupported session kind {session_kind!r}")
+        allowed_input_modes = (
+            {"full_prompt"}
+            if session_kind == "chat"
+            else {"initial_prompt", "continuation_delta"}
+        )
+        if input_mode not in allowed_input_modes:
+            raise ValueError(
+                f"unsupported {session_kind} session input mode {input_mode!r}"
+            )
+        if forced_output_ids is not None:
+            if session_kind != "token":
+                raise ValueError("teacher forcing is only available for token sessions")
+            if not self.enable_token_session_teacher_forcing:
+                raise ValueError("token-session teacher forcing is disabled")
+            forced_output_ids = [int(token_id) for token_id in forced_output_ids]
+            if len(forced_output_ids) != int(max_tokens):
+                raise ValueError(
+                    "forced_output_ids length must equal max_tokens for this turn"
+                )
         if session_id in self._chat_active_turns:
-            raise SessionBusy(f"chat session {session_id} already has an active turn")
+            raise SessionBusy(f"session {session_id} already has an active turn")
         prompt_ids = [int(token_id) for token_id in prompt_ids]
         if not prompt_ids:
-            raise ValueError("chat prompt must not be empty")
+            raise ValueError("session input token ids must not be empty")
         if max_tokens < 1:
             raise ValueError("max_tokens must be >= 1")
         with self.engine_lock:
+            session = self._chat_sessions.get(session_id)
+            if session is not None and session.session_kind != session_kind:
+                raise ValueError(
+                    f"session {session_id} belongs to the {session.session_kind} API"
+                )
+            if session_kind == "token":
+                if input_mode == "initial_prompt" and session is not None:
+                    raise ValueError(
+                        f"token session {session_id} already exists; send delta_ids"
+                    )
+                if input_mode == "continuation_delta":
+                    if session is None:
+                        raise ValueError(
+                            f"unknown token session {session_id}; send prompt_ids first"
+                        )
+                    parked = getattr(self.engine.scheduler, "parked", {})
+                    if (
+                        session.request.status.name != "PARKED"
+                        or parked.get(session.engine_req_id) is not session.request
+                    ):
+                        raise SessionBusy(
+                            f"token session {session_id} is not parked for continuation"
+                        )
+                    session.last_access = time.monotonic()
             queued = (
                 len(self._pending)
                 + len(self._pending_chat)
@@ -723,6 +912,9 @@ class BoundedGemmaService:
             max_new_tokens=int(max_tokens),
             break_mask=None if break_mask is None else list(break_mask),
             deadline=deadline,
+            session_kind=session_kind,
+            input_mode=input_mode,
+            forced_output_token_ids=forced_output_ids,
         )
         self.total_requests += 1
         self._pending_chat.append(turn)
@@ -730,12 +922,59 @@ class BoundedGemmaService:
         self.cv.notify_all()
         return turn
 
+    def _resume_chat_session_locked(
+        self,
+        session: _ChatSession,
+        turn: _ChatTurn,
+        continuation: list[int],
+    ) -> bool:
+        scheduler = self.engine.scheduler
+        max_running = getattr(
+            getattr(scheduler, "config", None),
+            "max_running_requests",
+            None,
+        )
+        if max_running is not None and len(scheduler.running) >= max_running:
+            return False
+        self.engine.continue_session_requests(
+            {session.engine_req_id: continuation},
+            max_new_tokens=turn.max_new_tokens,
+            break_masks={session.engine_req_id: turn.break_mask},
+        )
+        session.active_turn = turn
+        session.last_access = time.monotonic()
+        turn.request = session.request
+        turn.engine_req_id = session.engine_req_id
+        turn.state = "running"
+        turn.session_reused = True
+        return True
+
     def _start_chat_turn_locked(self, turn: _ChatTurn) -> bool:
         from wkvm.core.request import Request
 
         session = self._chat_sessions.get(turn.session_id)
+        if session is not None and session.session_kind != turn.session_kind:
+            raise ValueError(
+                f"session {turn.session_id} belongs to the {session.session_kind} API"
+            )
         if session is not None and session.active_turn is not None:
             return False
+        if turn.session_kind == "token" and turn.input_mode == "continuation_delta":
+            if session is None:
+                raise ValueError(f"unknown token session {turn.session_id}")
+            if session.request.status.name != "PARKED":
+                raise SessionBusy(
+                    f"token session {turn.session_id} is not parked for continuation"
+                )
+            return self._resume_chat_session_locked(
+                session,
+                turn,
+                list(turn.prompt_token_ids),
+            )
+        if turn.session_kind == "token" and session is not None:
+            raise ValueError(
+                f"token session {turn.session_id} already exists; send delta_ids"
+            )
         if session is not None and session.request.status.name != "PARKED":
             self._drop_chat_session_locked(session)
             session = None
@@ -749,26 +988,8 @@ class BoundedGemmaService:
                 and turn.prompt_token_ids[: len(retained)] == retained
             )
             if exact_prefix:
-                scheduler = self.engine.scheduler
-                max_running = getattr(
-                    getattr(scheduler, "config", None),
-                    "max_running_requests",
-                    None,
-                )
-                if max_running is not None and len(scheduler.running) >= max_running:
-                    return False
                 continuation = turn.prompt_token_ids[len(retained) :]
-                self.engine.continue_session_requests(
-                    {session.engine_req_id: continuation},
-                    max_new_tokens=turn.max_new_tokens,
-                    break_masks={session.engine_req_id: turn.break_mask},
-                )
-                session.active_turn = turn
-                session.last_access = time.monotonic()
-                turn.request = session.request
-                turn.engine_req_id = session.engine_req_id
-                turn.state = "running"
-                return True
+                return self._resume_chat_session_locked(session, turn, continuation)
             self._retire_chat_session_locked(session)
 
         if not self._make_chat_session_room_locked():
@@ -784,6 +1005,7 @@ class BoundedGemmaService:
         session = _ChatSession(
             session_id=turn.session_id,
             engine_req_id=engine_req_id,
+            session_kind=turn.session_kind,
             request=request,
             active_turn=turn,
             last_access=time.monotonic(),
@@ -804,16 +1026,25 @@ class BoundedGemmaService:
             turn = session.active_turn
             turn.output_token_ids = list(request.output_token_ids)
             trace = self.engine.finished_traces.get(request.req_id)
+            engine_metrics = None
             if trace is not None:
                 turn.error = trace.error
                 turn.finish_reason = trace.finish_reason
-                turn.metrics = trace.as_dict()
+                engine_metrics = trace.as_dict()
             else:
                 terminal_status = request.parked_finish_status or request.status
                 turn.finish_reason = terminal_status.name.removeprefix("FINISHED_").lower()
+            forced = turn.forced_output_token_ids
+            forcing_mismatch = forced is not None and turn.output_token_ids != forced
+            if forcing_mismatch:
+                turn.error = "selected outputs did not match forced_output_ids"
+                turn.finish_reason = "error"
+            turn.metrics = self._stateful_turn_metrics(turn, engine_metrics)
             session.active_turn = None
             session.last_access = time.monotonic()
-            if request.status.name != "PARKED":
+            if forcing_mismatch:
+                self._retire_chat_session_locked(session)
+            elif request.status.name != "PARKED":
                 self._drop_chat_session_locked(session)
             finalized.append(turn)
         return finalized
@@ -832,6 +1063,7 @@ class BoundedGemmaService:
             self._drop_chat_session_locked(session)
         turn.error = error
         turn.finish_reason = "error"
+        turn.metrics = self._stateful_turn_metrics(turn, turn.metrics)
 
     def _make_chat_session_room_locked(self) -> bool:
         while True:
@@ -846,6 +1078,7 @@ class BoundedGemmaService:
                 session
                 for session in self._chat_sessions.values()
                 if session.active_turn is None and session.request.status.name == "PARKED"
+                and session.session_id not in self._chat_active_turns
             ]
             if not candidates:
                 return False
@@ -861,6 +1094,7 @@ class BoundedGemmaService:
             for session in self._chat_sessions.values()
             if session.active_turn is None
             and session.request.status.name == "PARKED"
+            and session.session_id not in self._chat_active_turns
             and now - session.last_access >= self.chat_session_ttl_s
         ]
         for session in expired:
@@ -918,6 +1152,7 @@ class BoundedGemmaService:
                         self.engine.abort_request(engine_req_id)
                         self._drop_chat_session_locked(session)
                         turn.finish_reason = "aborted"
+        turn.metrics = self._stateful_turn_metrics(turn, turn.metrics)
         if turn.finish_reason is None:
             turn.finish_reason = "aborted"
         with self.cv:
@@ -1117,6 +1352,15 @@ def _bool_field(body: dict[str, Any], name: str, default: bool) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"{name} must be a boolean")
     return value
+
+
+def _token_id_list_field(body: dict[str, Any], name: str) -> list[int]:
+    value = body.get(name)
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{name} must be a non-empty token-id list")
+    if not all(type(token_id) is int and token_id >= 0 for token_id in value):
+        raise ValueError(f"{name} must be a token-id list")
+    return list(value)
 
 
 def _openai_completion_request(
@@ -1516,6 +1760,73 @@ class _RequestBodyError(Exception):
         self.status = status
 
 
+class _TokenSSEWriter:
+    def __init__(self, wfile, *, flush_tokens: int = 1) -> None:
+        flush_tokens = int(flush_tokens)
+        if flush_tokens < 1:
+            raise ValueError("flush_tokens must be >= 1")
+        self.wfile = wfile
+        self.flush_tokens = flush_tokens
+        self.pending_payloads: list[bytes] = []
+        self.pending_token_events = 0
+        self.first_token_flushed = False
+
+    def send(self, event: dict[str, Any]) -> None:
+        self.pending_payloads.append(
+            (
+                f"event: {event['type']}\n"
+                f"data: {json.dumps(event)}\n\n"
+            ).encode()
+        )
+        if event.get("type") != "token":
+            self.flush()
+            return
+        if not self.first_token_flushed:
+            self.first_token_flushed = True
+            self.flush()
+            return
+        self.pending_token_events += 1
+        if self.pending_token_events >= self.flush_tokens:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.pending_payloads:
+            return
+        payload = (
+            self.pending_payloads[0]
+            if len(self.pending_payloads) == 1
+            else b"".join(self.pending_payloads)
+        )
+        self.wfile.write(payload)
+        self.wfile.flush()
+        self.pending_payloads.clear()
+        self.pending_token_events = 0
+
+
+def _write_token_sse_stream(
+    wfile,
+    stream_iter: Iterator[dict[str, Any]],
+    first_event: dict[str, Any],
+    *,
+    flush_tokens: int,
+) -> None:
+    writer = _TokenSSEWriter(wfile, flush_tokens=flush_tokens)
+    try:
+        try:
+            event = first_event
+            while True:
+                writer.send(event)
+                event = next(stream_iter)
+        except StopIteration:
+            writer.flush()
+        except TimeoutError as exc:
+            writer.send({"type": "error", "error": str(exc)})
+    except (BrokenPipeError, ConnectionResetError):
+        close_stream = getattr(stream_iter, "close", None)
+        if close_stream is not None:
+            close_stream()
+
+
 def build_app(
     service: BoundedGemmaService,
     *,
@@ -1524,12 +1835,16 @@ def build_app(
     ignore_eos: bool | None = None,
     max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES,
     request_read_timeout_s: float = DEFAULT_REQUEST_READ_TIMEOUT_S,
+    stream_flush_tokens: int = 1,
 ):
     if max_request_body_bytes < 1:
         raise ValueError("max_request_body_bytes must be >= 1")
     request_read_timeout_s = float(request_read_timeout_s)
     if not math.isfinite(request_read_timeout_s) or request_read_timeout_s <= 0:
         raise ValueError("request_read_timeout_s must be finite and > 0")
+    stream_flush_tokens = int(stream_flush_tokens)
+    if stream_flush_tokens < 1:
+        raise ValueError("stream_flush_tokens must be >= 1")
     model_id = str(model_id).strip()
     if not model_id:
         raise ValueError("model_id must not be empty")
@@ -1684,7 +1999,6 @@ def build_app(
                         ),
                     )
                 elif path == "/v1/stream":
-                    prompt_ids = list(body["prompt_ids"])
                     max_tokens = int(body.get("max_tokens", 32))
                     timeout_s = body.get("timeout_s")
                     if timeout_s is not None:
@@ -1693,40 +2007,76 @@ def build_app(
                     if break_mask is not None:
                         break_mask = [bool(x) for x in break_mask]
                     req_id = body.get("req_id") or f"gemma-stream-{time.time_ns()}"
-                    stream_iter = service.stream(
-                        prompt_ids=prompt_ids,
-                        max_tokens=max_tokens,
-                        req_id=req_id,
-                        break_mask=break_mask,
-                        timeout_s=timeout_s,
-                    )
+                    session_id = body.get("session_id")
+                    delta_fields = [
+                        name
+                        for name in ("delta_ids", "continuation_ids")
+                        if name in body
+                    ]
+                    if len(delta_fields) > 1:
+                        raise ValueError(
+                            "provide only one of delta_ids or continuation_ids"
+                        )
+                    if session_id is None:
+                        if delta_fields:
+                            raise ValueError(
+                                "continuation token ids require an explicit session_id"
+                            )
+                        if "forced_output_ids" in body:
+                            raise ValueError(
+                                "forced_output_ids require a stateful token session"
+                            )
+                        stream_iter = service.stream(
+                            prompt_ids=list(body["prompt_ids"]),
+                            max_tokens=max_tokens,
+                            req_id=req_id,
+                            break_mask=break_mask,
+                            timeout_s=timeout_s,
+                        )
+                    else:
+                        has_prompt = "prompt_ids" in body
+                        if int(has_prompt) + len(delta_fields) != 1:
+                            raise ValueError(
+                                "stateful token request requires exactly one of "
+                                "prompt_ids, delta_ids, or continuation_ids"
+                            )
+                        prompt_ids = (
+                            _token_id_list_field(body, "prompt_ids")
+                            if has_prompt
+                            else None
+                        )
+                        delta_ids = (
+                            _token_id_list_field(body, delta_fields[0])
+                            if delta_fields
+                            else None
+                        )
+                        forced_output_ids = (
+                            _token_id_list_field(body, "forced_output_ids")
+                            if "forced_output_ids" in body
+                            else None
+                        )
+                        stream_iter = service.stream_token_session(
+                            session_id=str(session_id),
+                            prompt_ids=prompt_ids,
+                            delta_ids=delta_ids,
+                            forced_output_ids=forced_output_ids,
+                            max_tokens=max_tokens,
+                            req_id=str(req_id),
+                            break_mask=break_mask,
+                            timeout_s=timeout_s,
+                        )
                     first_event = next(stream_iter)
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
                     self.send_header("Cache-Control", "no-cache")
                     self.send_header("Connection", "close")
                     self.end_headers()
-                    try:
-                        event = first_event
-                        while True:
-                            payload = (
-                                f"event: {event['type']}\n"
-                                f"data: {json.dumps(event)}\n\n"
-                            ).encode()
-                            self.wfile.write(payload)
-                            self.wfile.flush()
-                            event = next(stream_iter)
-                    except StopIteration:
-                        pass
-                    except (BrokenPipeError, ConnectionResetError):
-                        service.cancel(str(req_id))
-                    except TimeoutError as exc:
-                        payload = (
-                            "event: error\n"
-                            f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n"
-                        ).encode()
-                        self.wfile.write(payload)
-                        self.wfile.flush()
+                    _write_token_sse_stream(
+                        self.wfile,
+                        stream_iter,
+                        first_event,
+                        flush_tokens=stream_flush_tokens,
+                    )
                 elif path == "/v1/submit":
                     prompt_ids = list(body["prompt_ids"])
                     max_tokens = int(body.get("max_tokens", 32))
@@ -2033,6 +2383,18 @@ def build_app(
     return Handler
 
 
+class _GemmaThreadingHTTPServer(ThreadingHTTPServer):
+    def __init__(
+        self,
+        server_address,
+        request_handler_class,
+        *,
+        request_queue_size: int,
+    ) -> None:
+        self.request_queue_size = int(request_queue_size)
+        super().__init__(server_address, request_handler_class)
+
+
 def serve(
     service: BoundedGemmaService,
     *,
@@ -2043,8 +2405,9 @@ def serve(
     ignore_eos: bool | None = None,
     max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES,
     request_read_timeout_s: float = DEFAULT_REQUEST_READ_TIMEOUT_S,
+    stream_flush_tokens: int = 1,
 ):
-    server = ThreadingHTTPServer(
+    server = _GemmaThreadingHTTPServer(
         (host, port),
         build_app(
             service,
@@ -2053,6 +2416,11 @@ def serve(
             ignore_eos=ignore_eos,
             max_request_body_bytes=max_request_body_bytes,
             request_read_timeout_s=request_read_timeout_s,
+            stream_flush_tokens=stream_flush_tokens,
+        ),
+        request_queue_size=max(
+            int(service.max_queue),
+            int(ThreadingHTTPServer.request_queue_size),
         ),
     )
     return server
@@ -2118,7 +2486,13 @@ def validate_native_gemma_loader_args(args) -> None:
 
 def engine_kwargs_from_args(args) -> dict[str, Any]:
     return {
+        "prefill_chunk": getattr(args, "prefill_chunk", 2048),
         "prefill_microbatch_rows": getattr(args, "prefill_microbatch_rows", 1),
+        "continuation_prefill_microbatch_rows": getattr(
+            args,
+            "continuation_prefill_microbatch_rows",
+            None,
+        ),
         "decode_microbatch_rows": args.decode_microbatch_rows,
         "decode_microbatch_bytes": args.decode_microbatch_bytes,
         "decode_batch_planner": args.decode_batch_planner,
@@ -2148,6 +2522,17 @@ def engine_kwargs_from_args(args) -> dict[str, Any]:
         "native_gemma_release_hf_decoder_layers": (
             args.native_gemma_release_hf_decoder_layers
         ),
+        "native_gemma_kv_sharing_fast_prefill": getattr(
+            args,
+            "native_gemma_kv_sharing_fast_prefill",
+            False,
+        ),
+        "batched_routed_packets": getattr(args, "batched_routed_packets", False),
+        "routed_packet_workspace_bytes": getattr(
+            args,
+            "routed_packet_workspace_bytes",
+            64 * 1024 * 1024,
+        ),
         "enable_token_pool_metadata": getattr(
             args,
             "enable_token_pool_metadata",
@@ -2171,6 +2556,25 @@ def engine_kwargs_from_args(args) -> dict[str, Any]:
         ),
         "finished_trace_limit": args.max_completed_requests,
     }
+
+
+def scheduler_config_from_args(args):
+    from wkvm.core.config import SchedulerConfig
+
+    prefill_chunk = int(getattr(args, "prefill_chunk", 2048))
+    completion_prefill_lane_size = int(
+        getattr(args, "completion_prefill_lane_size", 0)
+    )
+    slots = int(args.slots)
+    return SchedulerConfig(
+        max_tokens_per_step=max(
+            prefill_chunk * slots,
+            slots + completion_prefill_lane_size * prefill_chunk,
+        ),
+        max_running_requests=slots,
+        max_tokens_per_request_per_step=prefill_chunk,
+        completion_prefill_lane_size=completion_prefill_lane_size,
+    )
 
 
 def _chat_stop_token_ids(full_config, tokenizer, *, ignore_eos: bool) -> frozenset[int]:
@@ -2209,6 +2613,15 @@ def main() -> None:
         default=DEFAULT_REQUEST_READ_TIMEOUT_S,
         help="Maximum wall-clock seconds to receive one HTTP request body (default: 30).",
     )
+    ap.add_argument(
+        "--stream-flush-tokens",
+        type=int,
+        default=1,
+        help=(
+            "Token events per /v1/stream socket write after the first token; "
+            "queued, first-token, finish, and error events flush immediately."
+        ),
+    )
     ap.add_argument("--max-completed-requests", type=int, default=4096)
     ap.add_argument(
         "--enable-openai-chat",
@@ -2229,6 +2642,14 @@ def main() -> None:
     ap.add_argument("--chat-session-ttl-s", type=float, default=1800.0)
     ap.add_argument("--max-chat-sessions", type=int, default=None)
     ap.add_argument(
+        "--enable-token-session-teacher-forcing",
+        action="store_true",
+        help=(
+            "Allow stateful /v1/stream requests to replace each sampled pending "
+            "token with forced_output_ids for fixed-trace benchmark replay."
+        ),
+    )
+    ap.add_argument(
         "--batch-wait-s",
         type=float,
         default=0.01,
@@ -2243,11 +2664,24 @@ def main() -> None:
         ),
     )
     ap.add_argument(
+        "--prefill-chunk",
+        type=int,
+        default=2048,
+        help="Maximum prompt tokens consumed per request in one scheduler step.",
+    )
+    ap.add_argument(
         "--prefill-microbatch-rows",
         type=int,
         default=1,
         help="Equal-width prompt rows per model call; 0 is unlimited.",
     )
+    ap.add_argument(
+        "--continuation-prefill-microbatch-rows",
+        type=int,
+        default=None,
+        help="Continuation prompt rows per model call; 0 is unlimited.",
+    )
+    ap.add_argument("--completion-prefill-lane-size", type=int, default=0)
     ap.add_argument("--decode-microbatch-rows", type=int, default=16)
     ap.add_argument("--decode-microbatch-bytes", type=int, default=None)
     ap.add_argument("--decode-workspace-bytes", type=int, default=None)
@@ -2357,6 +2791,21 @@ def main() -> None:
         ),
     )
     ap.add_argument(
+        "--native-gemma-kv-sharing-fast-prefill",
+        action="store_true",
+        help=(
+            "For Gemma4 KV-sharing models, run the KV-owning prefix layers on "
+            "all prompt tokens and the KV-shared tail only at requested logit "
+            "positions. Prompt-token logits outside those positions are not valid."
+        ),
+    )
+    ap.add_argument("--batched-routed-packets", action="store_true")
+    ap.add_argument(
+        "--routed-packet-workspace-bytes",
+        type=int,
+        default=64 * 1024 * 1024,
+    )
+    ap.add_argument(
         "--decode-batch-planner",
         choices=["scheduler", "length_bucketed"],
         default="scheduler",
@@ -2381,6 +2830,13 @@ def main() -> None:
         ap.error("--chat-session-ttl-s must be finite and > 0")
     if args.max_chat_sessions is not None and args.max_chat_sessions < 1:
         ap.error("--max-chat-sessions must be >= 1")
+    if args.prefill_chunk < 1:
+        ap.error("--prefill-chunk must be >= 1")
+    if (
+        args.continuation_prefill_microbatch_rows is not None
+        and args.continuation_prefill_microbatch_rows < 0
+    ):
+        ap.error("--continuation-prefill-microbatch-rows must be >= 0 or omitted")
     if not math.isfinite(args.batch_wait_s) or args.batch_wait_s < 0:
         ap.error("--batch-wait-s must be finite and >= 0")
     if (
@@ -2388,6 +2844,8 @@ def main() -> None:
         or args.request_read_timeout_s <= 0
     ):
         ap.error("--request-read-timeout-s must be finite and > 0")
+    if args.stream_flush_tokens < 1:
+        ap.error("--stream-flush-tokens must be >= 1")
     for option, value in (
         ("--token-pool-max-context-len", args.token_pool_max_context_len),
         ("--token-pool-capacity", args.token_pool_capacity),
@@ -2410,7 +2868,6 @@ def main() -> None:
             f"{exc}"
         )
 
-    from wkvm.core.config import SchedulerConfig
     from wkvm.gemma_engine import GemmaNativeEngine
     from wkvm.models.gemma import gemma4_e4b_routed_span_config
 
@@ -2470,11 +2927,7 @@ def main() -> None:
         cfg,
         num_slots=args.slots,
         stop_token_ids=stop_token_ids,
-        scheduler_config=SchedulerConfig(
-            max_tokens_per_step=8192 * args.slots,
-            max_running_requests=args.slots,
-            max_tokens_per_request_per_step=8192,
-        ),
+        scheduler_config=scheduler_config_from_args(args),
         **engine_kwargs_from_args(args),
     )
     service = BoundedGemmaService(
@@ -2490,6 +2943,9 @@ def main() -> None:
             if args.empty_cuda_cache_before_decode
             else None
         ),
+        enable_token_session_teacher_forcing=(
+            args.enable_token_session_teacher_forcing
+        ),
     )
     server = serve(
         service,
@@ -2499,6 +2955,7 @@ def main() -> None:
         ignore_eos=(tokenizer is None or args.ignore_eos),
         max_request_body_bytes=args.max_request_body_bytes,
         request_read_timeout_s=args.request_read_timeout_s,
+        stream_flush_tokens=args.stream_flush_tokens,
     )
     stats = engine.stats()
     print(
