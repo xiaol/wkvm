@@ -67,10 +67,12 @@ class Test10xHttp4090Runner(unittest.TestCase):
                 "SGLANG_CUDA_GRAPH_BACKEND_PREFILL": "disabled",
                 "SGLANG_MAX_RUNNING_REQUESTS": "16",
                 "SGLANG_PY": sys.executable,
+                "STRICT_PUBLICATION": "0",
                 "VLLM_COMPILE_MODE": "0",
                 "VLLM_CUDAGRAPH_MODE": "",
                 "VLLM_KV_SHARING_FAST_PREFILL": "1",
                 "VLLM_MAX_NUM_BATCHED_TOKENS": "4096",
+                "VLLM_GPU_MEMORY_UTILIZATION": "0.82",
                 "VLLM_PY": sys.executable,
                 "TURNS": "8",
                 "TURN_INPUT_TOKENS": "32",
@@ -332,6 +334,7 @@ class Test10xHttp4090Runner(unittest.TestCase):
                     "VLLM_CUDAGRAPH_MODE": "piecewise",
                     "VLLM_KV_SHARING_FAST_PREFILL": "0",
                     "VLLM_MAX_NUM_BATCHED_TOKENS": "8192",
+                    "VLLM_GPU_MEMORY_UTILIZATION": "0.90",
                     "WKVM_NATIVE_GEMMA_KV_SHARING_FAST_PREFILL": "0",
                 },
             )
@@ -363,6 +366,7 @@ class Test10xHttp4090Runner(unittest.TestCase):
         self.assertIn("--no-kv-sharing-fast-prefill", vllm_server)
         self.assertNotIn("--kv-sharing-fast-prefill", vllm_server)
         self.assertEqual(option_value(vllm_server, "--max-num-batched-tokens"), "8192")
+        self.assertEqual(option_value(vllm_server, "--gpu-memory-utilization"), "0.90")
         self.assertEqual(
             json.loads(option_value(vllm_server, "--compilation-config")),
             {
@@ -394,6 +398,7 @@ class Test10xHttp4090Runner(unittest.TestCase):
         )
         self.assertIs(recorded_configs["vllm"]["kv_sharing_fast_prefill"], False)
         self.assertEqual(recorded_configs["vllm"]["max_num_batched_tokens"], 8192)
+        self.assertEqual(recorded_configs["vllm"]["gpu_memory_utilization"], 0.90)
 
         disabled_lines = disabled_default.stdout.splitlines()
         disabled_vllm = next(
@@ -447,6 +452,7 @@ class Test10xHttp4090Runner(unittest.TestCase):
             "continuation",
         )
         self.assertNotIn("--allow-fail", report_command)
+        self.assertNotIn("--strict-publication", report_command)
         self.assertIn("kind\trepeat\tpath", result.stdout)
 
     def test_dry_run_parameterizes_long_lived_workload_and_server_limits(self) -> None:
@@ -457,12 +463,14 @@ class Test10xHttp4090Runner(unittest.TestCase):
             result = self.dry_run(
                 out_dir=base / "results",
                 model_path=model,
+                repeats=3,
                 extra_env={
                     "TURNS": "48",
                     "INITIAL_CONTEXT_TOKENS": "36864",
                     "TURN_INPUT_TOKENS": "32",
                     "OUTPUT_TOKENS_PER_TURN": "64",
                     "REPORT_CLAIM_SCOPE": "full-session",
+                    "STRICT_PUBLICATION": "1",
                 },
             )
 
@@ -485,6 +493,16 @@ class Test10xHttp4090Runner(unittest.TestCase):
                     option_value(arguments, "--target-server-config-json")
                 )
 
+        report_index = next(
+            index for index, line in enumerate(lines) if line.startswith("report artifacts=")
+        )
+        report_command = shlex.split(lines[report_index + 1])
+        self.assertIn("artifacts=9", lines[report_index])
+        self.assertEqual(option_value(report_command, "--min-repeats"), "3")
+        self.assertEqual(option_value(report_command, "--claim-scope"), "full-session")
+        self.assertIn("--strict-publication", report_command)
+        self.assertNotIn("--allow-fail", report_command)
+
         for arguments in client_commands.values():
             self.assertEqual(option_value(arguments, "--turns"), "48")
             self.assertEqual(
@@ -500,7 +518,7 @@ class Test10xHttp4090Runner(unittest.TestCase):
             client_commands["sglang"],
             "--write-shared-history-trace-json",
         )
-        self.assertTrue(trace.endswith(f"/traces/{tag}-r1.trace.json"), trace)
+        self.assertTrue(trace.endswith(f"/traces/{tag}-r3.trace.json"), trace)
         self.assertEqual(
             option_value(client_commands["wkvm"], "--shared-history-trace-json"),
             trace,
@@ -516,7 +534,7 @@ class Test10xHttp4090Runner(unittest.TestCase):
         ):
             artifact = option_value(client_commands[engine], "--json")
             self.assertTrue(
-                artifact.endswith(f"/artifacts/{role}-{tag}-r1.json"),
+                artifact.endswith(f"/artifacts/{role}-{tag}-r3.json"),
                 artifact,
             )
 
@@ -617,6 +635,16 @@ class Test10xHttp4090Runner(unittest.TestCase):
                 model_path=model,
                 extra_env={"REPORT_CLAIM_SCOPE": "all"},
             )
+            invalid_strict = self.dry_run(
+                out_dir=base / "results-h",
+                model_path=model,
+                extra_env={"STRICT_PUBLICATION": "yes"},
+            )
+            invalid_vllm_utilization = self.dry_run(
+                out_dir=base / "results-i",
+                model_path=model,
+                extra_env={"VLLM_GPU_MEMORY_UTILIZATION": "0"},
+            )
 
         self.assertNotEqual(invalid_repeats.returncode, 0)
         self.assertIn("REPEATS must be an integer >= 1", invalid_repeats.stderr)
@@ -643,6 +671,13 @@ class Test10xHttp4090Runner(unittest.TestCase):
         self.assertIn(
             "REPORT_CLAIM_SCOPE must be continuation or full-session",
             invalid_scope.stderr,
+        )
+        self.assertNotEqual(invalid_strict.returncode, 0)
+        self.assertIn("STRICT_PUBLICATION must be 0 or 1", invalid_strict.stderr)
+        self.assertNotEqual(invalid_vllm_utilization.returncode, 0)
+        self.assertIn(
+            "VLLM_GPU_MEMORY_UTILIZATION must be a number greater than 0 and at most 1",
+            invalid_vllm_utilization.stderr,
         )
 
 

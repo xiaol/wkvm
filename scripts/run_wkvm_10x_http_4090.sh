@@ -17,6 +17,7 @@ OUTPUT_TOKENS_PER_TURN="${OUTPUT_TOKENS_PER_TURN:-64}"
 REPORT_CLAIM_SCOPE="${REPORT_CLAIM_SCOPE:-continuation}"
 DRY_RUN="${DRY_RUN:-0}"
 ALLOW_FAIL="${ALLOW_FAIL:-0}"
+STRICT_PUBLICATION="${STRICT_PUBLICATION:-0}"
 CAMPAIGN_ID="${CAMPAIGN_ID:-}"
 MEMORY_CEILING_MIB="${MEMORY_CEILING_MIB:-24200}"
 MAX_IDLE_BASELINE_MIB="${MAX_IDLE_BASELINE_MIB:-1024}"
@@ -37,6 +38,7 @@ VLLM_KV_SHARING_FAST_PREFILL="${VLLM_KV_SHARING_FAST_PREFILL:-1}"
 VLLM_CUDAGRAPH_MODE="${VLLM_CUDAGRAPH_MODE:-}"
 VLLM_COMPILE_MODE="${VLLM_COMPILE_MODE:-0}"
 VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-4096}"
+VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.82}"
 BENCHMARK="${BENCHMARK:-$ROOT/experiments/gemma_multiturn_http_bench.py}"
 REPORT="${REPORT:-$ROOT/experiments/multiturn_http_10x_report.py}"
 GPU_LOCK_FILE="${GPU_LOCK_FILE:-${TMPDIR:-/tmp}/wkvm-10x-http-gpu-${GPU_DEVICE//[^[:alnum:]_.-]/_}.lock}"
@@ -91,6 +93,16 @@ validate_boolean() {
   local value="$2"
   if [[ "$value" != "0" && "$value" != "1" ]]; then
     printf '%s must be 0 or 1: %s\n' "$name" "$value" >&2
+    exit 1
+  fi
+}
+
+validate_fraction() {
+  local name="$1"
+  local value="$2"
+  if ! awk -v value="$value" 'BEGIN { exit !(value > 0 && value <= 1) }'; then
+    printf '%s must be a number greater than 0 and at most 1: %s\n' \
+      "$name" "$value" >&2
     exit 1
   fi
 }
@@ -356,6 +368,7 @@ print_path_manifest() {
   printf '# turn_input_tokens=%s\n' "$TURN_INPUT_TOKENS"
   printf '# output_tokens_per_turn=%s\n' "$OUTPUT_TOKENS_PER_TURN"
   printf '# report_claim_scope=%s\n' "$REPORT_CLAIM_SCOPE"
+  printf '# strict_publication=%s\n' "$STRICT_PUBLICATION"
   printf '# required_model_len=%s\n' "$REQUIRED_MODEL_LEN"
   printf '# incumbent_context_length=%s\n' "$INCUMBENT_CONTEXT_LENGTH"
   printf '# wkvm_token_pool_max_context_len=%s\n' \
@@ -392,6 +405,7 @@ validate_positive_integer SERVER_STOP_TIMEOUT_S "$SERVER_STOP_TIMEOUT_S"
 validate_positive_integer GPU_CLEAR_TIMEOUT_S "$GPU_CLEAR_TIMEOUT_S"
 validate_positive_integer SGLANG_MAX_RUNNING_REQUESTS "$SGLANG_MAX_RUNNING_REQUESTS"
 validate_positive_integer VLLM_MAX_NUM_BATCHED_TOKENS "$VLLM_MAX_NUM_BATCHED_TOKENS"
+validate_fraction VLLM_GPU_MEMORY_UTILIZATION "$VLLM_GPU_MEMORY_UTILIZATION"
 validate_boolean WKVM_NATIVE_GEMMA_KV_SHARING_FAST_PREFILL \
   "$WKVM_NATIVE_GEMMA_KV_SHARING_FAST_PREFILL"
 validate_boolean VLLM_KV_SHARING_FAST_PREFILL \
@@ -459,6 +473,7 @@ if [[ "$ALLOW_FAIL" != "0" && "$ALLOW_FAIL" != "1" ]]; then
   printf '%s\n' 'ALLOW_FAIL must be 0 or 1' >&2
   exit 1
 fi
+validate_boolean STRICT_PUBLICATION "$STRICT_PUBLICATION"
 case "$REPORT_CLAIM_SCOPE" in
   continuation|full-session) ;;
   *)
@@ -514,8 +529,9 @@ printf -v VLLM_COMPILATION_CONFIG \
   '{"mode":%s,"cudagraph_mode":"%s","cudagraph_capture_sizes":[1,2,4,8,16],"max_cudagraph_capture_size":16}' \
   "$VLLM_COMPILE_MODE" "$VLLM_CUDAGRAPH_MODE"
 printf -v VLLM_CONFIG \
-  '{"compilation_config":%s,"enable_prefix_caching":true,"gpu_memory_utilization":0.82,"kv_sharing_fast_prefill":%s,"language_model_only":true,"max_model_len":%s,"max_num_batched_tokens":%s,"max_num_seqs":16,"prefix_caching":true}' \
-  "$VLLM_COMPILATION_CONFIG" "$vllm_fast_prefill_json" \
+  '{"compilation_config":%s,"enable_prefix_caching":true,"gpu_memory_utilization":%s,"kv_sharing_fast_prefill":%s,"language_model_only":true,"max_model_len":%s,"max_num_batched_tokens":%s,"max_num_seqs":16,"prefix_caching":true}' \
+  "$VLLM_COMPILATION_CONFIG" "$VLLM_GPU_MEMORY_UTILIZATION" \
+  "$vllm_fast_prefill_json" \
   "$INCUMBENT_CONTEXT_LENGTH" "$VLLM_MAX_NUM_BATCHED_TOKENS"
 
 for python_path in "$WKVM_PY" "$VLLM_PY" "$SGLANG_PY"; do
@@ -798,7 +814,7 @@ for ((repeat = 1; repeat <= REPEATS; repeat++)); do
     --dtype bfloat16
     --max-model-len "$INCUMBENT_CONTEXT_LENGTH"
     --max-num-seqs 16
-    --gpu-memory-utilization 0.82
+    --gpu-memory-utilization "$VLLM_GPU_MEMORY_UTILIZATION"
     --max-num-batched-tokens "$VLLM_MAX_NUM_BATCHED_TOKENS"
     --enable-prefix-caching
     "$vllm_fast_prefill_arg"
@@ -852,6 +868,9 @@ report_command=(
   --markdown "$MARKDOWN"
   --summary-json "$SUMMARY_JSON"
 )
+if [[ "$STRICT_PUBLICATION" == "1" ]]; then
+  report_command+=(--strict-publication)
+fi
 if [[ "$ALLOW_FAIL" == "1" ]]; then
   report_command+=(--allow-fail)
 fi
