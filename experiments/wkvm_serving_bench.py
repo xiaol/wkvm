@@ -13,8 +13,10 @@ sustained multi-wave measurements instead of a single request cohort.
 from __future__ import annotations
 
 import argparse
+import ast
 import concurrent.futures
 import contextlib
+import hashlib
 from importlib import metadata as importlib_metadata
 import json
 import math
@@ -26,6 +28,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
@@ -81,6 +84,18 @@ GPU_RUNTIME_FIELDS = (
     "power_limit_w",
     "temperature_gpu_c",
 )
+TARGET_SERVER_LAUNCH_SCHEMA = "wkvm.target_server_launch_argv.v1"
+RUNTIME_CONFIG_PROOF_SCHEMA = "wkvm.target_server_runtime_config_proof.v1"
+_PLACEMENT_OPTIONS = {
+    "gpu": frozenset({"--base-gpu-id", "--device", "--gpu", "--gpu-id"}),
+    "host": frozenset({"--bind", "--host", "--hostname"}),
+    "port": frozenset({"--port"}),
+}
+_PLACEMENT_PLACEHOLDERS = {
+    "gpu": "<GPU_SELECTOR>",
+    "host": "<HOST>",
+    "port": "<PORT>",
+}
 
 
 def atomic_write_json(path: Path, obj: Any) -> None:
@@ -115,6 +130,882 @@ def parse_json_object(raw: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise argparse.ArgumentTypeError("must decode to a JSON object")
     return value
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _launch_target(base_url: str | None) -> tuple[str | None, int | None]:
+    if not isinstance(base_url, str) or not base_url.strip():
+        return None, None
+    try:
+        parsed = urllib.parse.urlsplit(base_url)
+        return parsed.hostname, parsed.port
+    except ValueError:
+        return None, None
+
+
+def build_target_server_launch_record(
+    launch_command: str | None,
+    *,
+    base_url: str | None,
+    gpu_selector: str | None,
+) -> dict[str, Any] | None:
+    """Bind a placement-normalized argv profile to the recorded command."""
+
+    if not isinstance(launch_command, str) or not launch_command.strip():
+        return None
+    host, port = _launch_target(base_url)
+    expected = {
+        "gpu": None if gpu_selector is None else str(gpu_selector),
+        "host": host,
+        "port": None if port is None else str(port),
+    }
+    try:
+        argv = shlex.split(launch_command, posix=True)
+    except ValueError as exc:
+        return {
+            "schema": TARGET_SERVER_LAUNCH_SCHEMA,
+            "error": f"launch command is not valid shell argv: {exc}",
+        }
+    if not argv:
+        return {
+            "schema": TARGET_SERVER_LAUNCH_SCHEMA,
+            "error": "launch command contains no argv tokens",
+        }
+
+    canonical = list(argv)
+    placements: list[dict[str, Any]] = []
+    normalized_indices: set[int] = set()
+
+    def normalize(index: int, role: str, source: str) -> None:
+        if index in normalized_indices:
+            return
+        value = argv[index]
+        if value != expected[role]:
+            return
+        canonical[index] = _PLACEMENT_PLACEHOLDERS[role]
+        placements.append(
+            {"argv_index": index, "role": role, "source": source, "value": value}
+        )
+        normalized_indices.add(index)
+
+    for index, token in enumerate(argv):
+        if token.startswith("CUDA_VISIBLE_DEVICES="):
+            value = token.partition("=")[2]
+            if value == expected["gpu"]:
+                canonical[index] = "CUDA_VISIBLE_DEVICES=<GPU_SELECTOR>"
+                placements.append(
+                    {
+                        "argv_index": index,
+                        "role": "gpu",
+                        "source": "environment_assignment",
+                        "value": value,
+                    }
+                )
+                normalized_indices.add(index)
+            continue
+        option, separator, inline_value = token.partition("=")
+        for role, allowed_options in _PLACEMENT_OPTIONS.items():
+            if option not in allowed_options:
+                continue
+            if separator:
+                if inline_value == expected[role]:
+                    canonical[index] = f"{option}={_PLACEMENT_PLACEHOLDERS[role]}"
+                    placements.append(
+                        {
+                            "argv_index": index,
+                            "role": role,
+                            "source": "inline_option",
+                            "option": option,
+                            "value": inline_value,
+                        }
+                    )
+                    normalized_indices.add(index)
+            elif index + 1 < len(argv):
+                normalize(index + 1, role, f"option:{option}")
+
+    # Some launchers, notably ``python -c`` SGLang wrappers, carry host and
+    # port as positional argv. Only a unique exact token match is accepted.
+    for role in ("host", "port"):
+        if expected[role] is None or any(row["role"] == role for row in placements):
+            continue
+        matches = [
+            index
+            for index, token in enumerate(argv)
+            if index not in normalized_indices and token == expected[role]
+        ]
+        if len(matches) == 1:
+            normalize(matches[0], role, "unique_positional_target_match")
+
+    placements.sort(key=lambda row: int(row["argv_index"]))
+    missing_roles = [
+        role
+        for role, value in expected.items()
+        if value is not None and not any(row["role"] == role for row in placements)
+    ]
+    return {
+        "schema": TARGET_SERVER_LAUNCH_SCHEMA,
+        "argv": argv,
+        "argv_sha256": _canonical_json_sha256(argv),
+        "canonical_argv": canonical,
+        "canonical_argv_sha256": _canonical_json_sha256(canonical),
+        "placements": placements,
+        "target": expected,
+        "missing_placement_roles": missing_roles,
+        "error": None,
+    }
+
+
+def validate_target_server_launch_record(
+    launch_command: Any,
+    launch_record: Any,
+    *,
+    base_url: str | None,
+    gpu_selector: str | None,
+) -> tuple[bool, dict[str, Any] | None]:
+    expected = build_target_server_launch_record(
+        launch_command if isinstance(launch_command, str) else None,
+        base_url=base_url,
+        gpu_selector=gpu_selector,
+    )
+    if expected is None or not isinstance(launch_record, dict):
+        return False, expected
+    required_roles = {"gpu", "host", "port"}
+    observed_roles = {
+        row.get("role")
+        for row in expected.get("placements", ())
+        if isinstance(row, dict)
+    }
+    valid = (
+        expected.get("error") is None
+        and not expected.get("missing_placement_roles")
+        and required_roles.issubset(observed_roles)
+        and launch_record == expected
+    )
+    return valid, expected
+
+
+def _command_option_value(argv: list[str], option: str) -> Any:
+    matches: list[str | bool] = []
+    for index, token in enumerate(argv):
+        if token == option:
+            if index + 1 < len(argv) and not argv[index + 1].startswith("--"):
+                matches.append(argv[index + 1])
+            else:
+                matches.append(True)
+        elif token.startswith(option + "="):
+            matches.append(token.partition("=")[2])
+    return matches[0] if len(matches) == 1 else None
+
+
+def _python_c_server_args(argv: list[str]) -> dict[str, Any]:
+    try:
+        flag_index = argv.index("-c")
+        source = argv[flag_index + 1]
+    except (ValueError, IndexError):
+        return {}
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {}
+    names: dict[str, ast.AST] = {}
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            names[node.targets[0].id] = node.value
+
+    def resolve(node: ast.AST) -> Any:
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.Name) and node.id in names:
+            return resolve(names[node.id])
+        if isinstance(node, ast.Subscript):
+            target = node.value
+            if (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "sys"
+                and target.attr == "argv"
+            ):
+                position = resolve(node.slice)
+                token_index = flag_index + 1 + position if isinstance(position, int) else -1
+                return argv[token_index] if 0 <= token_index < len(argv) else None
+        if isinstance(node, ast.Call) and len(node.args) == 1:
+            function_name = (
+                node.func.id
+                if isinstance(node.func, ast.Name)
+                else node.func.attr
+                if isinstance(node.func, ast.Attribute)
+                else None
+            )
+            raw = resolve(node.args[0])
+            try:
+                if function_name == "int":
+                    return int(raw)
+                if function_name == "float":
+                    return float(raw)
+                if function_name == "str":
+                    return str(raw)
+            except (TypeError, ValueError):
+                return None
+        try:
+            return ast.literal_eval(node)
+        except (ValueError, TypeError):
+            return None
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = (
+            node.func.id
+            if isinstance(node.func, ast.Name)
+            else node.func.attr
+            if isinstance(node.func, ast.Attribute)
+            else None
+        )
+        if name == "ServerArgs":
+            return {
+                keyword.arg: resolve(keyword.value)
+                for keyword in node.keywords
+                if keyword.arg is not None
+            }
+    return {}
+
+
+def _coerce_launch_value(value: Any, requested: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    if isinstance(requested, bool):
+        lowered = value.lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    if isinstance(requested, int) and not isinstance(requested, bool):
+        try:
+            return int(value)
+        except ValueError:
+            return value
+    if isinstance(requested, float):
+        try:
+            return float(value)
+        except ValueError:
+            return value
+    if isinstance(requested, (dict, list)):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    return value
+
+
+def build_target_server_model_binding(
+    launch_command: Any,
+    requested_config: Any,
+    *,
+    served_model: Any,
+) -> dict[str, Any]:
+    requested = requested_config if isinstance(requested_config, dict) else {}
+    model_identity = requested.get("model_identity")
+    identity = model_identity if isinstance(model_identity, dict) else {}
+    if isinstance(launch_command, str):
+        try:
+            argv = shlex.split(launch_command, posix=True)
+        except ValueError:
+            argv = []
+    else:
+        argv = []
+    server_args = _python_c_server_args(argv)
+
+    command_model_path = _command_option_value(argv, "--model")
+    if command_model_path is None:
+        command_model_path = server_args.get("model_path")
+    command_served_model = _command_option_value(argv, "--served-model-name")
+    if command_served_model is None:
+        command_served_model = server_args.get("served_model_name")
+
+    fields: dict[str, dict[str, Any]] = {}
+    for field, requested_value in requested.items():
+        if field == "model_identity":
+            continue
+        effective = server_args.get(field)
+        source = "python_c.ServerArgs"
+        if field not in server_args:
+            effective = _command_option_value(
+                argv, "--" + field.replace("_", "-")
+            )
+            source = "command_option"
+        if effective is None:
+            continue
+        effective = _coerce_launch_value(effective, requested_value)
+        fields[field] = {
+            "requested": requested_value,
+            "launch_value": effective,
+            "source": source,
+            "match": _runtime_values_match(
+                requested_value, effective, field=field
+            ),
+        }
+
+    requested_path = identity.get("path")
+    requested_served_model = identity.get("served_name")
+    manifest_sha256 = identity.get("manifest_sha256")
+    model_path_match = (
+        isinstance(requested_path, str)
+        and isinstance(command_model_path, str)
+        and requested_path == command_model_path
+    )
+    served_model_match = (
+        isinstance(requested_served_model, str)
+        and isinstance(command_served_model, str)
+        and requested_served_model == command_served_model
+        and served_model == requested_served_model
+    )
+    manifest_valid = (
+        isinstance(manifest_sha256, str)
+        and len(manifest_sha256) == 64
+        and all(character in "0123456789abcdefABCDEF" for character in manifest_sha256)
+    )
+    config_fields_match = all(field["match"] is True for field in fields.values())
+    return {
+        "requested_model_path": requested_path,
+        "command_model_path": command_model_path,
+        "model_path_match": model_path_match,
+        "requested_served_model": requested_served_model,
+        "command_served_model": command_served_model,
+        "payload_served_model": served_model,
+        "served_model_match": served_model_match,
+        "manifest_sha256": (
+            manifest_sha256.lower() if manifest_valid else manifest_sha256
+        ),
+        "manifest_valid": manifest_valid,
+        "config_fields": fields,
+        "config_fields_match": config_fields_match,
+        "binding_sha256": (
+            _canonical_json_sha256(
+                {
+                    "argv": argv,
+                    "manifest_sha256": manifest_sha256,
+                    "model_path": requested_path,
+                    "served_model": requested_served_model,
+                }
+            )
+            if argv and manifest_valid
+            else None
+        ),
+        "passed": (
+            model_path_match
+            and served_model_match
+            and manifest_valid
+            and config_fields_match
+        ),
+    }
+
+
+def _nested_value(value: Any, *path: str) -> Any:
+    current = value
+    for part in path:
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def _normalized_runtime_value(value: Any, *, field: str) -> Any:
+    if field == "dtype" and isinstance(value, str):
+        value = value.lower().removeprefix("torch.")
+        return "bfloat16" if value == "bf16" else value
+    if "cudagraph" in field:
+        graph_modes = {
+            0: "NONE",
+            1: "PIECEWISE",
+            2: "FULL",
+            (2, 0): "FULL_DECODE_ONLY",
+            (2, 1): "FULL_AND_PIECEWISE",
+        }
+        if isinstance(value, list):
+            value = tuple(value)
+        if value in graph_modes:
+            return graph_modes[value]
+        if isinstance(value, str):
+            return value.rsplit(".", 1)[-1].upper()
+    return value
+
+
+def _runtime_values_match(requested: Any, effective: Any, *, field: str) -> bool:
+    left = _normalized_runtime_value(requested, field=field)
+    right = _normalized_runtime_value(effective, field=field)
+    if (
+        isinstance(left, (int, float))
+        and not isinstance(left, bool)
+        and isinstance(right, (int, float))
+        and not isinstance(right, bool)
+    ):
+        return math.isclose(float(left), float(right), rel_tol=1e-9, abs_tol=1e-9)
+    return left == right
+
+
+def _sglang_effective_value(metrics: dict[str, Any], field: str) -> tuple[Any, str | None]:
+    states = metrics.get("internal_states")
+    state_values = [
+        state[field]
+        for state in states
+        if isinstance(state, dict) and field in state
+    ] if isinstance(states, list) else []
+    if state_values and all(value == state_values[0] for value in state_values):
+        return state_values[0], f"internal_states[].{field}"
+    if field in metrics:
+        return metrics[field], field
+    return None, None
+
+
+def _proof_field(
+    requested: Any,
+    effective: Any,
+    *,
+    field: str,
+    source: str | None,
+) -> dict[str, Any]:
+    return {
+        "requested": requested,
+        "effective": effective,
+        "effective_source": source,
+        "match": source is not None
+        and _runtime_values_match(requested, effective, field=field),
+    }
+
+
+def build_runtime_config_proof(
+    engine: str,
+    requested_config: Any,
+    server_metrics: Any,
+    *,
+    workload: Any = None,
+) -> dict[str, Any]:
+    """Compare publication-relevant requested settings with effective state."""
+
+    requested = requested_config if isinstance(requested_config, dict) else {}
+    metrics = server_metrics if isinstance(server_metrics, dict) else {}
+    workload_dict = workload if isinstance(workload, dict) else {}
+    fields: dict[str, dict[str, Any]] = {}
+    required_checks: dict[str, bool] = {}
+    effective_feature_state: dict[str, Any] = {}
+    capacity: dict[str, Any] = {
+        "requested_limit": None,
+        "claimed_effective": requested.get("effective_token_capacity"),
+        "effective": None,
+        "effective_source": None,
+    }
+    effective_model_path = None
+    effective_model_path_source = None
+
+    if engine == "vllm":
+        config = metrics.get("vllm_config") if isinstance(metrics.get("vllm_config"), dict) else {}
+        vllm_env = metrics.get("vllm_env") if isinstance(metrics.get("vllm_env"), dict) else {}
+        mapping = {
+            "dtype": ("model_config", "dtype"),
+            "max_model_len": ("model_config", "max_model_len"),
+            "gpu_memory_utilization": ("cache_config", "gpu_memory_utilization"),
+            "enable_prefix_caching": ("cache_config", "enable_prefix_caching"),
+            "kv_sharing_fast_prefill": ("cache_config", "kv_sharing_fast_prefill"),
+            "max_num_batched_tokens": ("scheduler_config", "max_num_batched_tokens"),
+            "max_num_seqs": ("scheduler_config", "max_num_seqs"),
+            "enable_chunked_prefill": ("scheduler_config", "enable_chunked_prefill"),
+        }
+        for field, path in mapping.items():
+            if field in requested:
+                fields[field] = _proof_field(
+                    requested[field],
+                    _nested_value(config, *path),
+                    field=field,
+                    source="vllm_config." + ".".join(path),
+                )
+        requested_compilation = requested.get("compilation_config")
+        if isinstance(requested_compilation, dict):
+            for field in ("mode", "cudagraph_mode", "cudagraph_capture_sizes"):
+                if field in requested_compilation:
+                    effective = _nested_value(config, "compilation_config", field)
+                    fields[f"compilation_config.{field}"] = _proof_field(
+                        requested_compilation[field],
+                        effective,
+                        field=field,
+                        source=f"vllm_config.compilation_config.{field}",
+                    )
+        runner_raw = vllm_env.get("VLLM_USE_V2_MODEL_RUNNER")
+        if isinstance(runner_raw, str):
+            if runner_raw.lower() in {"1", "true", "yes", "on"}:
+                runner_raw = True
+            elif runner_raw.lower() in {"0", "false", "no", "off"}:
+                runner_raw = False
+        runner_generation = (
+            "v2" if runner_raw is True else "v1" if runner_raw is False else None
+        )
+        requested_runner = requested.get("model_runner_generation")
+        if requested_runner is not None:
+            fields["model_runner_generation"] = _proof_field(
+                requested_runner,
+                runner_generation,
+                field="model_runner_generation",
+                source="vllm_env.VLLM_USE_V2_MODEL_RUNNER",
+            )
+        effective_model_path = _nested_value(config, "model_config", "model")
+        effective_model_path_source = "vllm_config.model_config.model"
+        capacity.update(
+            {
+                "effective": _nested_value(config, "cache_config", "kv_cache_size_tokens"),
+                "effective_source": "vllm_config.cache_config.kv_cache_size_tokens",
+                "max_concurrency": _nested_value(
+                    config, "cache_config", "kv_cache_max_concurrency"
+                ),
+            }
+        )
+        graph_mode = _nested_value(config, "compilation_config", "cudagraph_mode")
+        normalized_graph_mode = _normalized_runtime_value(
+            graph_mode, field="cudagraph_mode"
+        )
+        required_checks = {
+            "prefix_caching_enabled": _nested_value(
+                config, "cache_config", "enable_prefix_caching"
+            ) is True,
+            "runner_generation_profile": (
+                _nested_value(config, "cache_config", "kv_sharing_fast_prefill")
+                is True
+                if requested_runner == "v1"
+                else runner_generation == "v2"
+                if requested_runner == "v2"
+                else False
+            ),
+            "chunked_prefill_enabled": _nested_value(
+                config, "scheduler_config", "enable_chunked_prefill"
+            ) is True,
+            "decode_cuda_graph_enabled": (
+                normalized_graph_mode
+                in {"PIECEWISE", "FULL", "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE"}
+            ),
+            "model_runner_generation_explicit": (
+                requested_runner in {"v1", "v2"}
+                and runner_generation in {"v1", "v2"}
+                and requested_runner == runner_generation
+            ),
+            "capacity_reported": (
+                isinstance(capacity["effective"], (int, float))
+                and not isinstance(capacity["effective"], bool)
+                and float(capacity["effective"]) > 0
+                and isinstance(capacity.get("max_concurrency"), (int, float))
+                and float(capacity["max_concurrency"]) > 0
+            ),
+        }
+        effective_feature_state = {
+            "model_runner_generation": runner_generation,
+            "kv_sharing_fast_prefill": _nested_value(
+                config, "cache_config", "kv_sharing_fast_prefill"
+            ),
+            "compilation_mode": _nested_value(
+                config, "compilation_config", "mode"
+            ),
+            "cudagraph_mode": graph_mode,
+        }
+    elif engine == "sglang":
+        mapping = (
+            "attention_backend",
+            "chunked_prefill_size",
+            "context_length",
+            "cuda_graph_backend_decode",
+            "cuda_graph_backend_prefill",
+            "dtype",
+            "max_running_requests",
+            "max_total_tokens",
+            "mem_fraction_static",
+        )
+        for field in mapping:
+            if field not in requested:
+                continue
+            effective, source = _sglang_effective_value(metrics, field)
+            if field == "max_running_requests":
+                normalized, normalized_source = _sglang_effective_value(
+                    metrics, "effective_max_running_requests_per_dp"
+                )
+                if normalized_source is not None:
+                    effective, source = normalized, normalized_source
+            fields[field] = _proof_field(
+                requested[field], effective, field=field, source=source
+            )
+        effective_model_path, effective_model_path_source = _sglang_effective_value(
+            metrics, "model_path"
+        )
+        effective_capacity = metrics.get("max_total_num_tokens")
+        capacity_source = "max_total_num_tokens"
+        if not isinstance(effective_capacity, (int, float)):
+            states = metrics.get("internal_states")
+            capacities = []
+            if isinstance(states, list):
+                for state in states:
+                    value = _nested_value(state, "memory_usage", "token_capacity")
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        capacities.append(value)
+            if capacities:
+                effective_capacity = sum(capacities)
+                capacity_source = "internal_states[].memory_usage.token_capacity"
+        capacity.update(
+            {
+                "requested_limit": requested.get("max_total_tokens"),
+                "effective": effective_capacity,
+                "effective_source": capacity_source,
+            }
+        )
+        chunked, _ = _sglang_effective_value(metrics, "chunked_prefill_size")
+        decode_backend, _ = _sglang_effective_value(
+            metrics, "cuda_graph_backend_decode"
+        )
+        disable_graph, _ = _sglang_effective_value(metrics, "disable_cuda_graph")
+        disable_decode, _ = _sglang_effective_value(
+            metrics, "disable_decode_cuda_graph"
+        )
+        disable_radix, _ = _sglang_effective_value(metrics, "disable_radix_cache")
+        disable_overlap, _ = _sglang_effective_value(
+            metrics, "disable_overlap_schedule"
+        )
+        disable_chunked_prefix, _ = _sglang_effective_value(
+            metrics, "disable_chunked_prefix_cache"
+        )
+        enable_torch_compile, _ = _sglang_effective_value(
+            metrics, "enable_torch_compile"
+        )
+        enable_tbo, _ = _sglang_effective_value(
+            metrics, "enable_two_batch_overlap"
+        )
+        max_running, _ = _sglang_effective_value(
+            metrics, "effective_max_running_requests_per_dp"
+        )
+        sessions = workload_dict.get("sessions")
+        required_checks = {
+            "radix_cache_enabled": disable_radix is False,
+            "overlap_schedule_enabled": disable_overlap is False,
+            "chunked_prefill_enabled": (
+                isinstance(chunked, int) and not isinstance(chunked, bool) and chunked > 0
+            ),
+            "decode_cuda_graph_enabled": (
+                disable_graph is False
+                and disable_decode is False
+                and isinstance(decode_backend, str)
+                and decode_backend.lower() != "disabled"
+            ),
+            "max_running_capacity": (
+                isinstance(max_running, int)
+                and not isinstance(max_running, bool)
+                and isinstance(sessions, int)
+                and not isinstance(sessions, bool)
+                and max_running >= sessions
+            ),
+            "capacity_reported": (
+                isinstance(effective_capacity, (int, float))
+                and not isinstance(effective_capacity, bool)
+                and float(effective_capacity) > 0
+            ),
+        }
+        effective_feature_state = {
+            "disable_radix_cache": disable_radix,
+            "disable_chunked_prefix_cache": disable_chunked_prefix,
+            "disable_overlap_schedule": disable_overlap,
+            "disable_cuda_graph": disable_graph,
+            "disable_decode_cuda_graph": disable_decode,
+            "cuda_graph_backend_decode": decode_backend,
+            "enable_torch_compile": enable_torch_compile,
+            "enable_two_batch_overlap": enable_tbo,
+            "disclosure": (
+                "torch compile and two-batch overlap are reported as observed; "
+                "they are not required profile settings"
+            ),
+        }
+    elif engine == "wkvm":
+        engine_metrics = metrics.get("engine") if isinstance(metrics.get("engine"), dict) else {}
+        server = metrics.get("server") if isinstance(metrics.get("server"), dict) else {}
+        mapping = {
+            "batch_wait_s": (server, "batch_wait_s", "server.batch_wait_s"),
+            "continuation_prefill_microbatch_rows": (
+                engine_metrics,
+                "continuation_prefill_microbatch_rows",
+                "engine.continuation_prefill_microbatch_rows",
+            ),
+            "native_gemma_attention_backend": (
+                engine_metrics,
+                "native_gemma_attention_backend",
+                "engine.native_gemma_attention_backend",
+            ),
+            "native_gemma_kv_sharing_fast_prefill": (
+                engine_metrics,
+                "native_gemma_kv_sharing_fast_prefill",
+                "engine.native_gemma_kv_sharing_fast_prefill",
+            ),
+            "native_gemma_projection_backend": (
+                engine_metrics,
+                "native_gemma_projection_backend",
+                "engine.native_gemma_projection_backend",
+            ),
+            "persistent_padded_decode_steps": (
+                engine_metrics,
+                "persistent_padded_decode_steps",
+                "engine.persistent_padded_decode_steps",
+            ),
+            "prefill_microbatch_rows": (
+                engine_metrics,
+                "prefill_microbatch_rows",
+                "engine.prefill_microbatch_rows",
+            ),
+            "slots": (server, "max_chat_sessions", "server.max_chat_sessions"),
+            "max_queue": (server, "max_queue", "server.max_queue"),
+        }
+        token_pool = engine_metrics.get("token_pool") if isinstance(engine_metrics.get("token_pool"), dict) else {}
+        token_mapping = {
+            "token_pool_capacity": "token_slot_capacity",
+            "token_pool_max_context_len": "max_context_len",
+            "token_pool_paged_block_size": "paged_block_size",
+        }
+        for field, (container, key, source) in mapping.items():
+            if field in requested:
+                fields[field] = _proof_field(
+                    requested[field], container.get(key), field=field, source=source
+                )
+        for field, key in token_mapping.items():
+            if field in requested:
+                fields[field] = _proof_field(
+                    requested[field],
+                    token_pool.get(key),
+                    field=field,
+                    source=f"engine.token_pool.{key}",
+                )
+        capacity.update(
+            {
+                "claimed_effective": requested.get("token_pool_capacity"),
+                "effective": token_pool.get("token_slot_capacity"),
+                "effective_source": "engine.token_pool.token_slot_capacity",
+                "max_context_len": token_pool.get("max_context_len"),
+                "resident_state_slots": engine_metrics.get(
+                    "max_resident_state_slots"
+                ),
+            }
+        )
+        sessions = workload_dict.get("sessions")
+        required_len = workload_dict.get("required_model_len")
+        required_checks = {
+            "token_pool_attention_enabled": (
+                token_pool.get("enabled") is True
+                and token_pool.get("attention_enabled") is True
+                and engine_metrics.get("token_pool_attention_enabled") is True
+            ),
+            "kv_sharing_fast_prefill_enabled": engine_metrics.get(
+                "native_gemma_kv_sharing_fast_prefill"
+            ) is True,
+            "persistent_padded_decode_enabled": engine_metrics.get(
+                "persistent_padded_decode"
+            ) is True,
+            "resident_state_capacity": (
+                isinstance(sessions, int)
+                and isinstance(capacity["resident_state_slots"], int)
+                and capacity["resident_state_slots"] >= sessions
+            ),
+            "context_capacity": (
+                isinstance(required_len, int)
+                and isinstance(capacity["max_context_len"], int)
+                and capacity["max_context_len"] >= required_len
+            ),
+        }
+        effective_feature_state = {
+            "token_pool_attention_enabled": engine_metrics.get(
+                "token_pool_attention_enabled"
+            ),
+            "native_gemma_kv_sharing_fast_prefill": engine_metrics.get(
+                "native_gemma_kv_sharing_fast_prefill"
+            ),
+            "persistent_padded_decode": engine_metrics.get(
+                "persistent_padded_decode"
+            ),
+            "persistent_padded_decode_cuda_graph": engine_metrics.get(
+                "persistent_padded_decode_cuda_graph"
+            ),
+        }
+    else:
+        required_checks = {"known_engine": False}
+
+    model_identity = requested.get("model_identity")
+    requested_model_path = (
+        model_identity.get("path") if isinstance(model_identity, dict) else None
+    )
+    model_path_match = (
+        isinstance(requested_model_path, str)
+        and isinstance(effective_model_path, str)
+        and requested_model_path == effective_model_path
+    )
+    if engine == "wkvm":
+        # WKVM's current metrics endpoint does not repeat the checkpoint path;
+        # launch/config binding remains the authoritative model-path proof.
+        model_path_match = effective_model_path is None
+
+    claimed_capacity = capacity.get("claimed_effective")
+    effective_capacity = capacity.get("effective")
+    capacity_claim_valid = (
+        isinstance(effective_capacity, (int, float))
+        and not isinstance(effective_capacity, bool)
+        and float(effective_capacity) > 0
+        and (
+            claimed_capacity is None
+            or _runtime_values_match(
+                claimed_capacity, effective_capacity, field="effective_token_capacity"
+            )
+        )
+    )
+    requested_effective_match = bool(fields) and all(
+        field["match"] is True for field in fields.values()
+    )
+    optimized_settings_passed = bool(required_checks) and all(
+        required_checks.values()
+    )
+    metrics_available = bool(metrics)
+    proof = {
+        "schema": RUNTIME_CONFIG_PROOF_SCHEMA,
+        "engine": engine,
+        "requested_config_sha256": (
+            _canonical_json_sha256(requested) if requested else None
+        ),
+        "server_metrics_sha256": (
+            _canonical_json_sha256(metrics) if metrics else None
+        ),
+        "fields": fields,
+        "required_optimization_checks": required_checks,
+        "effective_feature_state": effective_feature_state,
+        "requested_effective_match": requested_effective_match,
+        "optimized_settings_passed": optimized_settings_passed,
+        "capacity": capacity,
+        "capacity_claim_valid": capacity_claim_valid,
+        "model_path": {
+            "requested": requested_model_path,
+            "effective": effective_model_path,
+            "effective_source": effective_model_path_source,
+            "match": model_path_match,
+            "verified_by": (
+                "launch_config_binding" if engine == "wkvm" else "server_metrics"
+            ),
+        },
+        "metrics_available": metrics_available,
+    }
+    proof["passed"] = (
+        metrics_available
+        and requested_effective_match
+        and optimized_settings_passed
+        and capacity_claim_valid
+        and model_path_match
+    )
+    return proof
 
 
 def percentile(values: list[float], pct: float) -> float | None:
@@ -416,9 +1307,30 @@ def build_provenance(
         if isinstance(raw_launch_command, str) and raw_launch_command.strip()
         else None
     )
+    raw_launch_profile = getattr(args, "target_server_launch_profile", None)
+    target_server_launch_profile = (
+        raw_launch_profile
+        if isinstance(raw_launch_profile, str) and raw_launch_profile.strip()
+        else None
+    )
     target_server_config = getattr(args, "target_server_config", None)
     if target_server_config is not None and not isinstance(target_server_config, dict):
         raise ValueError("target_server_config must be a JSON object")
+    base_url = getattr(args, "base_url", getattr(args, "url", None))
+    launch_record = build_target_server_launch_record(
+        target_server_launch_command,
+        base_url=base_url,
+        gpu_selector=(None if monitor_device is None else str(monitor_device)),
+    )
+    model_binding = build_target_server_model_binding(
+        target_server_launch_command,
+        target_server_config,
+        served_model=getattr(
+            args,
+            "model",
+            getattr(args, "served_model", None),
+        ),
+    )
     return {
         "schema": PROVENANCE_SCHEMA,
         "benchmark": {
@@ -449,12 +1361,25 @@ def build_provenance(
                 if target_server_launch_command is not None
                 else "unreported"
             ),
+            "launch_profile": target_server_launch_profile,
+            "launch_profile_source": (
+                "operator_supplied_untrusted"
+                if target_server_launch_profile is not None
+                else "unreported"
+            ),
+            "launch_argv": launch_record,
+            "launch_argv_source": (
+                "derived_from_launch_command"
+                if launch_record is not None
+                else "unreported"
+            ),
             "config": target_server_config,
             "config_source": (
                 "operator_supplied"
                 if target_server_config is not None
                 else "unreported"
             ),
+            "model_binding": model_binding,
         },
         "gpu": gpu,
         "gpu_probe_error": gpu_probe_error,

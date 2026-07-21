@@ -28,6 +28,11 @@ from experiments.multiturn_http_10x_report import (
     main,
     render_markdown,
 )
+from experiments.wkvm_serving_bench import (
+    build_runtime_config_proof,
+    build_target_server_launch_record,
+    build_target_server_model_binding,
+)
 
 
 def _trace_sha(repeat_index: int, suffix: int = 0) -> str:
@@ -243,11 +248,180 @@ def _artifact_payload(
     }
     engine_ports = {"wkvm": 8000, "vllm": 8001, "sglang": 8002}
     engine_version = engine_versions[engine]
-    target_server_config = {
-        "dtype": "bfloat16",
-        "port": engine_ports[engine],
-        "served_model": "mock-gemma",
+    model_path = "/models/mock-gemma"
+    model_identity = {
+        "manifest_sha256": "e" * 64,
+        "path": model_path,
+        "served_name": "mock-gemma",
     }
+    required_model_len = workload_payload["required_model_len"]
+    if engine == "wkvm":
+        target_server_config = {
+            "batch_wait_s": 0.01,
+            "continuation_prefill_microbatch_rows": sessions,
+            "dtype": "bfloat16",
+            "max_queue": sessions * 2,
+            "model_identity": model_identity,
+            "native_gemma_attention_backend": "triton_dense_gqa",
+            "native_gemma_kv_sharing_fast_prefill": True,
+            "native_gemma_projection_backend": "separate",
+            "persistent_padded_decode_steps": output_tokens,
+            "prefill_microbatch_rows": 2,
+            "slots": sessions,
+            "token_pool_capacity": 4096,
+            "token_pool_max_context_len": required_model_len,
+            "token_pool_paged_block_size": 16,
+        }
+        launch_command = (
+            "setsid env CUDA_VISIBLE_DEVICES=0 python -m wkvm.gemma_server "
+            f"--model {model_path} --served-model-name mock-gemma "
+            f"--host 127.0.0.1 --port {engine_ports[engine]} "
+            f"--batch-wait-s 0.01 --continuation-prefill-microbatch-rows {sessions} "
+            f"--max-queue {sessions * 2} --native-gemma-attention-backend "
+            "triton_dense_gqa --native-gemma-kv-sharing-fast-prefill "
+            "--native-gemma-projection-backend separate "
+            f"--persistent-padded-decode-steps {output_tokens} "
+            f"--prefill-microbatch-rows 2 --slots {sessions} "
+            f"--token-pool-capacity 4096 --token-pool-max-context-len {required_model_len} "
+            "--token-pool-paged-block-size 16"
+        )
+        server_metrics = {
+            "engine": {
+                "continuation_prefill_microbatch_rows": sessions,
+                "max_resident_state_slots": sessions,
+                "native_gemma_attention_backend": "triton_dense_gqa",
+                "native_gemma_kv_sharing_fast_prefill": True,
+                "native_gemma_projection_backend": "separate",
+                "persistent_padded_decode": True,
+                "persistent_padded_decode_steps": output_tokens,
+                "prefill_microbatch_rows": 2,
+                "token_pool_attention_enabled": True,
+                "token_pool": {
+                    "enabled": True,
+                    "attention_enabled": True,
+                    "token_slot_capacity": 4096,
+                    "max_context_len": required_model_len,
+                    "paged_block_size": 16,
+                },
+            },
+            "server": {
+                "batch_wait_s": 0.01,
+                "max_chat_sessions": sessions,
+                "max_queue": sessions * 2,
+            },
+        }
+    elif engine == "vllm":
+        compilation = {
+            "mode": 3,
+            "cudagraph_mode": "FULL_AND_PIECEWISE",
+            "cudagraph_capture_sizes": [1, 2],
+        }
+        target_server_config = {
+            "compilation_config": compilation,
+            "dtype": "bfloat16",
+            "enable_chunked_prefill": True,
+            "enable_prefix_caching": True,
+            "gpu_memory_utilization": 0.92,
+            "kv_sharing_fast_prefill": True,
+            "max_model_len": required_model_len,
+            "max_num_batched_tokens": 1024,
+            "max_num_seqs": sessions,
+            "model_identity": model_identity,
+            "model_runner_generation": "v1",
+        }
+        compilation_json = json.dumps(compilation, separators=(",", ":"))
+        launch_command = (
+            "setsid env CUDA_VISIBLE_DEVICES=0 VLLM_USE_V2_MODEL_RUNNER=0 "
+            f"python -m vllm.entrypoints.openai.api_server --model {model_path} "
+            f"--served-model-name mock-gemma --host 127.0.0.1 --port {engine_ports[engine]} "
+            f"--dtype bfloat16 --max-model-len {required_model_len} "
+            f"--max-num-seqs {sessions} --gpu-memory-utilization 0.92 "
+            "--max-num-batched-tokens 1024 --enable-chunked-prefill "
+            "--enable-prefix-caching --kv-sharing-fast-prefill "
+            f"--compilation-config '{compilation_json}'"
+        )
+        server_metrics = {
+            "vllm_config": {
+                "model_config": {"model": model_path, "dtype": "bfloat16", "max_model_len": required_model_len},
+                "cache_config": {
+                    "gpu_memory_utilization": 0.92,
+                    "enable_prefix_caching": True,
+                    "kv_sharing_fast_prefill": True,
+                    "kv_cache_size_tokens": 4096,
+                    "kv_cache_max_concurrency": 2.0,
+                },
+                "scheduler_config": {
+                    "max_num_batched_tokens": 1024,
+                    "max_num_seqs": sessions,
+                    "enable_chunked_prefill": True,
+                },
+                "compilation_config": compilation,
+            },
+            "vllm_env": {"VLLM_USE_V2_MODEL_RUNNER": False},
+        }
+    else:
+        target_server_config = {
+            "attention_backend": "triton",
+            "chunked_prefill_size": 1024,
+            "context_length": required_model_len,
+            "cuda_graph_backend_decode": "full",
+            "cuda_graph_backend_prefill": "disabled",
+            "dtype": "bfloat16",
+            "max_running_requests": sessions,
+            "max_total_tokens": 4096,
+            "mem_fraction_static": 0.92,
+            "model_identity": model_identity,
+        }
+        launch_command = (
+            "setsid env CUDA_VISIBLE_DEVICES=0 sglang serve "
+            f"--model {model_path} --served-model-name mock-gemma "
+            f"--host 127.0.0.1 --port {engine_ports[engine]} --dtype bfloat16 "
+            f"--attention-backend triton --chunked-prefill-size 1024 "
+            f"--context-length {required_model_len} --cuda-graph-backend-decode full "
+            "--cuda-graph-backend-prefill disabled "
+            f"--max-running-requests {sessions} --max-total-tokens 4096 "
+            "--mem-fraction-static 0.92"
+        )
+        server_metrics = {
+            "attention_backend": "triton",
+            "chunked_prefill_size": 1024,
+            "context_length": required_model_len,
+            "cuda_graph_backend_decode": "full",
+            "cuda_graph_backend_prefill": "disabled",
+            "disable_cuda_graph": False,
+            "disable_decode_cuda_graph": False,
+            "disable_overlap_schedule": False,
+            "disable_radix_cache": False,
+            "disable_chunked_prefix_cache": False,
+            "enable_torch_compile": False,
+            "enable_two_batch_overlap": False,
+            "dtype": "bfloat16",
+            "max_running_requests": sessions,
+            "max_total_tokens": 4096,
+            "max_total_num_tokens": 4096,
+            "mem_fraction_static": 0.92,
+            "model_path": model_path,
+            "internal_states": [
+                {"effective_max_running_requests_per_dp": sessions}
+            ],
+        }
+    base_url = f"http://127.0.0.1:{engine_ports[engine]}"
+    launch_record = build_target_server_launch_record(
+        launch_command,
+        base_url=base_url,
+        gpu_selector="0",
+    )
+    model_binding = build_target_server_model_binding(
+        launch_command,
+        target_server_config,
+        served_model="mock-gemma",
+    )
+    runtime_config_proof = build_runtime_config_proof(
+        engine,
+        target_server_config,
+        server_metrics,
+        workload=workload_payload,
+    )
     payload = {
         "schema": BENCH_SCHEMA,
         "engine": engine,
@@ -256,6 +430,10 @@ def _artifact_payload(
             "routed_span_approximate" if engine == "wkvm" else "full_kv"
         ),
         "model": "mock-gemma",
+        "api": {
+            "base_url": base_url,
+            "endpoint": "/v1/completions",
+        },
         "git_commit": "c" * 40,
         "provenance": {
             "engine": {
@@ -264,12 +442,15 @@ def _artifact_payload(
                 "version_source": "frozen_campaign",
             },
             "target_server": {
-                "launch_command": (
-                    f"{engine} serve mock-gemma --port {engine_ports[engine]}"
-                ),
+                "launch_command": launch_command,
                 "launch_command_source": "operator_supplied",
+                "launch_profile": "legacy-untrusted-profile",
+                "launch_profile_source": "operator_supplied_untrusted",
+                "launch_argv": launch_record,
+                "launch_argv_source": "derived_from_launch_command",
                 "config": target_server_config,
                 "config_source": "operator_supplied",
+                "model_binding": model_binding,
             },
         },
         "prompt_token_source": "synthetic_lcg",
@@ -283,10 +464,14 @@ def _artifact_payload(
         "workload": workload_payload,
         "turns": rows,
         "summary": summarize_run(rows, turns),
+        "server_metrics_after_run": server_metrics,
+        "server_metrics_error": None,
+        "runtime_config_proof": runtime_config_proof,
         "gpu_memory": {
             "schema": "wkvm.whole_gpu_memory.v1",
             "scope": "whole_device",
             "source": "nvidia-smi",
+            "device_selector": "0",
             "baseline_used_mib": 512,
             "peak_used_mib": peak_used_mib,
             "peak_delta_mib": peak_used_mib - 512,
@@ -312,6 +497,26 @@ def _artifact_payload(
     if emitted_history_trace is not None:
         payload["emitted_history_trace"] = emitted_history_trace
     return payload
+
+
+def _refresh_publication_proof(payload: dict) -> None:
+    target = payload["provenance"]["target_server"]
+    target["launch_argv"] = build_target_server_launch_record(
+        target["launch_command"],
+        base_url=payload["api"]["base_url"],
+        gpu_selector=payload["gpu_memory"]["device_selector"],
+    )
+    target["model_binding"] = build_target_server_model_binding(
+        target["launch_command"],
+        target["config"],
+        served_model=payload["model"],
+    )
+    payload["runtime_config_proof"] = build_runtime_config_proof(
+        payload["engine"],
+        target["config"],
+        payload["server_metrics_after_run"],
+        workload=payload["workload"],
+    )
 
 
 def _write_campaign(
@@ -372,6 +577,55 @@ class MultiTurnHttp10xReportTests(unittest.TestCase):
         self.assertTrue(report["passed"])
         self.assertTrue(report["publication_passed"])
         self.assertTrue(all(report["publication_checks"].values()))
+        self.assertEqual(report["model_manifest_sha256"], "e" * 64)
+        self.assertTrue(
+            report["publication_checks"]["same_model_manifest_sha256"]
+        )
+        self.assertEqual(
+            {item["model_manifest_sha256"] for item in report["artifacts"]},
+            {"e" * 64},
+        )
+        self.assertIn(
+            f"Model manifest SHA-256: `{'e' * 64}`.",
+            render_markdown(report),
+        )
+
+    def test_strict_publication_rejects_missing_or_cross_engine_model_manifest(
+        self,
+    ) -> None:
+        for mutation in ("missing", "different"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
+                paths = _write_campaign(Path(tmp), repeats=3)
+                for path in paths:
+                    payload = json.loads(path.read_text())
+                    if payload["engine"] != "vllm":
+                        continue
+                    model_identity = payload["provenance"]["target_server"][
+                        "config"
+                    ]["model_identity"]
+                    if mutation == "missing":
+                        model_identity.pop("manifest_sha256")
+                    else:
+                        model_identity["manifest_sha256"] = "d" * 64
+                    atomic_write_json(path, payload)
+                report = build_report(
+                    load_records(paths),
+                    min_repeats=3,
+                    whole_device_memory_ceiling_mib=24_200,
+                    strict=True,
+                )
+
+            self.assertFalse(report["passed"])
+            self.assertFalse(report["publication_passed"])
+            self.assertFalse(
+                report["publication_checks"]["same_model_manifest_sha256"]
+            )
+            self.assertTrue(report["publication_checks"]["stable_engine_configs"])
+            self.assertIsNone(report["model_manifest_sha256"])
+            self.assertIn(
+                "Model manifest SHA-256: unverified (missing or inconsistent).",
+                render_markdown(report),
+            )
 
     def test_strict_publication_requires_three_repeats_and_exact_matrix(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -407,6 +661,155 @@ class MultiTurnHttp10xReportTests(unittest.TestCase):
         self.assertFalse(report["passed"])
         self.assertFalse(report["publication_checks"]["clean_worktree"])
         self.assertFalse(report["publication_checks"]["same_gpu"])
+
+    def test_homogeneous_pool_accepts_one_paired_gpu_per_repeat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = _write_campaign(Path(tmp), repeats=3)
+            for repeat_index in range(1, 4):
+                for engine in ("wkvm", "vllm", "sglang"):
+                    path = Path(tmp) / f"{engine}-{repeat_index}.json"
+                    payload = json.loads(path.read_text())
+                    payload["gpu_memory"]["device_uuid"] = f"GPU-pool-{repeat_index}"
+                    atomic_write_json(path, payload)
+            report = build_report(
+                load_records(paths),
+                min_repeats=3,
+                whole_device_memory_ceiling_mib=24_200,
+                gpu_policy="homogeneous-pool",
+                strict=True,
+            )
+
+        self.assertTrue(report["passed"])
+        self.assertTrue(report["publication_checks"]["same_gpu"])
+        self.assertTrue(report["publication_checks"]["paired_repeat_gpu"])
+        self.assertTrue(report["publication_checks"]["homogeneous_gpu_pool"])
+        self.assertEqual(
+            report["gpu_policy_details"]["repeat_gpu_uuids"]["r2"],
+            ["GPU-pool-2"],
+        )
+
+    def test_homogeneous_pool_rejects_cross_engine_gpu_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = _write_campaign(Path(tmp), repeats=3)
+            for path in paths:
+                payload = json.loads(path.read_text())
+                repeat_index = int(payload["benchmark_identity"]["repeat_id"][1:])
+                payload["gpu_memory"]["device_uuid"] = f"GPU-pool-{repeat_index}"
+                atomic_write_json(path, payload)
+            mismatch = Path(tmp) / "vllm-2.json"
+            payload = json.loads(mismatch.read_text())
+            payload["gpu_memory"]["device_uuid"] = "GPU-wrong"
+            atomic_write_json(mismatch, payload)
+            report = build_report(
+                load_records(paths),
+                min_repeats=3,
+                whole_device_memory_ceiling_mib=24_200,
+                gpu_policy="homogeneous-pool",
+                strict=True,
+            )
+
+        self.assertFalse(report["passed"])
+        self.assertFalse(report["publication_checks"]["same_gpu"])
+        self.assertFalse(report["publication_checks"]["paired_repeat_gpu"])
+
+    def test_homogeneous_pool_rejects_hardware_or_driver_drift(self) -> None:
+        for field, value in (
+            ("gpu_name", "Different GPU"),
+            ("memory_total_mib", 48_000),
+            ("driver_version", "999.0"),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                paths = _write_campaign(Path(tmp), repeats=3)
+                for path in paths:
+                    payload = json.loads(path.read_text())
+                    repeat_index = int(
+                        payload["benchmark_identity"]["repeat_id"][1:]
+                    )
+                    payload["gpu_memory"]["device_uuid"] = (
+                        f"GPU-pool-{repeat_index}"
+                    )
+                    atomic_write_json(path, payload)
+                drift = Path(tmp) / "wkvm-3.json"
+                payload = json.loads(drift.read_text())
+                payload["gpu_memory"][field] = value
+                atomic_write_json(drift, payload)
+                report = build_report(
+                    load_records(paths),
+                    min_repeats=3,
+                    whole_device_memory_ceiling_mib=24_200,
+                    gpu_policy="homogeneous-pool",
+                    strict=True,
+                )
+
+            self.assertFalse(report["publication_checks"]["same_gpu"])
+            self.assertFalse(
+                report["publication_checks"]["homogeneous_gpu_pool"]
+            )
+
+    def test_pool_launch_identity_derives_from_argv_and_ignores_claimed_profile(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = _write_campaign(Path(tmp), repeats=3)
+            for path in paths:
+                payload = json.loads(path.read_text())
+                repeat_index = int(payload["benchmark_identity"]["repeat_id"][1:])
+                payload["gpu_memory"]["device_uuid"] = f"GPU-pool-{repeat_index}"
+                payload["gpu_memory"]["device_selector"] = str(repeat_index)
+                target = payload["provenance"]["target_server"]
+                target["launch_command"] = target["launch_command"].replace(
+                    "CUDA_VISIBLE_DEVICES=0",
+                    f"CUDA_VISIBLE_DEVICES={repeat_index}",
+                )
+                old_port = payload["api"]["base_url"].rsplit(":", 1)[1]
+                new_port = str(9000 + repeat_index)
+                target["launch_command"] = target["launch_command"].replace(
+                    f"--port {old_port}", f"--port {new_port}"
+                )
+                payload["api"]["base_url"] = f"http://127.0.0.1:{new_port}"
+                _refresh_publication_proof(payload)
+                atomic_write_json(path, payload)
+            passing = build_report(
+                load_records(paths),
+                min_repeats=3,
+                whole_device_memory_ceiling_mib=24_200,
+                gpu_policy="homogeneous-pool",
+                strict=True,
+            )
+            drift = Path(tmp) / "vllm-3.json"
+            payload = json.loads(drift.read_text())
+            payload["provenance"]["target_server"]["launch_profile"] += (
+                " --different-engine-setting"
+            )
+            atomic_write_json(drift, payload)
+            untrusted_profile = build_report(
+                load_records(paths),
+                min_repeats=3,
+                whole_device_memory_ceiling_mib=24_200,
+                gpu_policy="homogeneous-pool",
+                strict=True,
+            )
+            payload["provenance"]["target_server"]["launch_command"] = payload[
+                "provenance"
+            ]["target_server"]["launch_command"].replace(
+                "--dtype bfloat16", "--dtype float16"
+            )
+            atomic_write_json(drift, payload)
+            failing = build_report(
+                load_records(paths),
+                min_repeats=3,
+                whole_device_memory_ceiling_mib=24_200,
+                gpu_policy="homogeneous-pool",
+                strict=True,
+            )
+
+        self.assertTrue(passing["publication_checks"]["stable_engine_launches"])
+        self.assertTrue(
+            untrusted_profile["publication_checks"]["stable_engine_launches"]
+        )
+        self.assertTrue(untrusted_profile["passed"])
+        self.assertFalse(failing["publication_checks"]["stable_engine_launches"])
+        self.assertFalse(failing["publication_checks"]["launch_argv_binding"])
 
     def test_strict_publication_rejects_commit_model_and_driver_drift(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

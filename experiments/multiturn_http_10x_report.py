@@ -20,6 +20,11 @@ if str(EXPERIMENTS) not in sys.path:
     sys.path.insert(0, str(EXPERIMENTS))
 
 from gemma_multiturn_bench import atomic_write_json, percentile
+from wkvm_serving_bench import (
+    build_runtime_config_proof,
+    build_target_server_model_binding,
+    validate_target_server_launch_record,
+)
 
 
 SCHEMA = "wkvm.multiturn_http_10x_report.v1"
@@ -30,6 +35,7 @@ WHOLE_GPU_MEMORY_SCHEMA = "wkvm.whole_gpu_memory.v1"
 ENGINES = ("wkvm", "vllm", "sglang")
 INCUMBENTS = ("vllm", "sglang")
 CLAIM_SCOPES = ("continuation", "full-session")
+GPU_POLICIES = ("same-device", "homogeneous-pool")
 PUBLICATION_MIN_REPEATS = 3
 THRESHOLD = 10.0
 SLOW_REPEAT_FRACTION = 0.80
@@ -120,7 +126,7 @@ def _engine_version_identity(payload: dict[str, Any]) -> tuple[str, str] | None:
 
 def _target_server_provenance(
     payload: dict[str, Any],
-) -> tuple[str, str] | None:
+) -> dict[str, Any] | None:
     provenance = payload.get("provenance")
     target_server = (
         provenance.get("target_server") if isinstance(provenance, dict) else None
@@ -138,15 +144,99 @@ def _target_server_provenance(
         or config_source in {None, "unreported"}
     ):
         return None
+    api = payload.get("api") if isinstance(payload.get("api"), dict) else {}
+    gpu_memory = (
+        payload.get("gpu_memory")
+        if isinstance(payload.get("gpu_memory"), dict)
+        else {}
+    )
+    launch_record_valid, derived_launch_record = validate_target_server_launch_record(
+        launch_command,
+        target_server.get("launch_argv"),
+        base_url=_normalized_text(api.get("base_url")),
+        gpu_selector=_normalized_text(gpu_memory.get("device_selector")),
+    )
+    derived_model_binding = build_target_server_model_binding(
+        launch_command,
+        config,
+        served_model=payload.get("model"),
+    )
+    recorded_model_binding = target_server.get("model_binding")
+    model_binding_valid = (
+        isinstance(recorded_model_binding, dict)
+        and recorded_model_binding == derived_model_binding
+        and derived_model_binding.get("passed") is True
+    )
+    derived_runtime_proof = build_runtime_config_proof(
+        str(payload.get("engine") or ""),
+        config,
+        payload.get("server_metrics_after_run"),
+        workload=payload.get("workload"),
+    )
+    recorded_runtime_proof = payload.get("runtime_config_proof")
+    runtime_config_valid = (
+        isinstance(recorded_runtime_proof, dict)
+        and recorded_runtime_proof == derived_runtime_proof
+        and derived_runtime_proof.get("passed") is True
+    )
     try:
-        return (
-            _payload_sha256(
+        return {
+            "launch_signature": _payload_sha256(
                 {"launch_command": launch_command, "source": launch_source}
             ),
-            _payload_sha256({"config": config, "source": config_source}),
-        )
+            "launch_profile_signature": (
+                derived_launch_record.get("canonical_argv_sha256")
+                if launch_record_valid and isinstance(derived_launch_record, dict)
+                else None
+            ),
+            "launch_argv_valid": launch_record_valid,
+            "config_signature": _payload_sha256(
+                {"config": config, "source": config_source}
+            ),
+            "model_binding_valid": model_binding_valid,
+            "model_binding": derived_model_binding,
+            "runtime_config_valid": runtime_config_valid,
+            "runtime_config_proof": derived_runtime_proof,
+            "runtime_config_signature": (
+                _payload_sha256(
+                    {
+                        "engine": derived_runtime_proof.get("engine"),
+                        "fields": derived_runtime_proof.get("fields"),
+                        "required_optimization_checks": derived_runtime_proof.get(
+                            "required_optimization_checks"
+                        ),
+                        "effective_feature_state": derived_runtime_proof.get(
+                            "effective_feature_state"
+                        ),
+                        "capacity": derived_runtime_proof.get("capacity"),
+                        "model_path": derived_runtime_proof.get("model_path"),
+                    }
+                )
+                if runtime_config_valid
+                else None
+            ),
+        }
     except (TypeError, ValueError):
         return None
+
+
+def _model_manifest_sha256(payload: dict[str, Any]) -> str | None:
+    provenance = payload.get("provenance")
+    target_server = (
+        provenance.get("target_server") if isinstance(provenance, dict) else None
+    )
+    config = (
+        target_server.get("config") if isinstance(target_server, dict) else None
+    )
+    model_identity = config.get("model_identity") if isinstance(config, dict) else None
+    manifest_sha256 = (
+        model_identity.get("manifest_sha256")
+        if isinstance(model_identity, dict)
+        else None
+    )
+    if not _valid_sha256(manifest_sha256):
+        return None
+    return str(manifest_sha256).lower()
 
 
 def _median(values: Sequence[float]) -> float | None:
@@ -742,15 +832,46 @@ def artifact_record(path: str | Path, payload: dict[str, Any]) -> dict[str, Any]
         "artifact_role": artifact_role,
         "semantic_mode": _normalized_text(payload.get("semantic_mode")),
         "model_identity": _normalized_text(payload.get("model")),
+        "model_manifest_sha256": _model_manifest_sha256(payload),
         "git_commit": _normalized_text(payload.get("git_commit")),
         "engine_version_identity": _engine_version_identity(payload),
         "target_server_launch_signature": (
-            target_server_provenance[0]
+            target_server_provenance["launch_signature"]
+            if target_server_provenance is not None
+            else None
+        ),
+        "target_server_launch_profile_signature": (
+            target_server_provenance["launch_profile_signature"]
             if target_server_provenance is not None
             else None
         ),
         "target_server_config_signature": (
-            target_server_provenance[1]
+            target_server_provenance["config_signature"]
+            if target_server_provenance is not None
+            else None
+        ),
+        "target_server_launch_argv_valid": (
+            target_server_provenance["launch_argv_valid"]
+            if target_server_provenance is not None
+            else False
+        ),
+        "target_server_model_binding_valid": (
+            target_server_provenance["model_binding_valid"]
+            if target_server_provenance is not None
+            else False
+        ),
+        "runtime_config_valid": (
+            target_server_provenance["runtime_config_valid"]
+            if target_server_provenance is not None
+            else False
+        ),
+        "runtime_config_signature": (
+            target_server_provenance["runtime_config_signature"]
+            if target_server_provenance is not None
+            else None
+        ),
+        "runtime_config_proof": (
+            target_server_provenance["runtime_config_proof"]
             if target_server_provenance is not None
             else None
         ),
@@ -869,6 +990,7 @@ def _build_repeat_groups(
         ]
         source_replay_contract = (
             len(source_records) == 1
+            and source_records[0].get("engine") in INCUMBENTS
             and len(replay_records) == len(ENGINES) - 1
             and len(group_records) == len(ENGINES)
         )
@@ -1121,11 +1243,70 @@ def _publication_artifact_checks(record: dict[str, Any]) -> dict[str, bool]:
     }
 
 
+def _gpu_policy_details(
+    records: Sequence[dict[str, Any]],
+    *,
+    gpu_policy: str,
+) -> dict[str, Any]:
+    gpu_rows = [
+        (
+            record.get("gpu_uuid"),
+            record.get("gpu_name"),
+            record.get("gpu_memory_total_mib"),
+            record.get("gpu_driver_version"),
+        )
+        for record in records
+    ]
+    identities_complete = bool(gpu_rows) and all(all(row) for row in gpu_rows)
+    same_physical_gpu = identities_complete and len(set(gpu_rows)) == 1
+    homogeneous_gpu_pool = identities_complete and all(
+        len({row[index] for row in gpu_rows}) == 1 for index in (1, 2, 3)
+    )
+    repeat_groups: dict[str, list[dict[str, Any]]] = {}
+    repeat_identity_complete = bool(records) and all(
+        record.get("repeat_id") is not None for record in records
+    )
+    if repeat_identity_complete:
+        for record in records:
+            repeat_groups.setdefault(str(record["repeat_id"]), []).append(record)
+    paired_repeat_gpu = repeat_identity_complete and bool(repeat_groups) and all(
+        len(group) == len(ENGINES)
+        and sorted(record.get("engine") for record in group) == sorted(ENGINES)
+        and None not in {record.get("gpu_uuid") for record in group}
+        and len({record.get("gpu_uuid") for record in group}) == 1
+        for group in repeat_groups.values()
+    )
+    policy_contract = (
+        same_physical_gpu
+        if gpu_policy == "same-device"
+        else homogeneous_gpu_pool and paired_repeat_gpu
+    )
+    return {
+        "policy": gpu_policy,
+        "identity_complete": identities_complete,
+        "same_physical_gpu": same_physical_gpu,
+        "homogeneous_gpu_pool": homogeneous_gpu_pool,
+        "paired_repeat_gpu": paired_repeat_gpu,
+        "contract_passed": policy_contract,
+        "repeat_gpu_uuids": {
+            repeat_id: sorted(
+                {
+                    str(record["gpu_uuid"])
+                    for record in group
+                    if record.get("gpu_uuid") is not None
+                }
+            )
+            for repeat_id, group in sorted(repeat_groups.items())
+        },
+    }
+
+
 def _publication_campaign_checks(
     records: Sequence[dict[str, Any]],
     *,
     min_repeats: int,
     memory_ceiling_mib: float | None,
+    gpu_policy: str,
 ) -> dict[str, bool]:
     identities_complete = bool(records) and all(
         record.get(field) is not None
@@ -1171,14 +1352,7 @@ def _publication_campaign_checks(
     trace_output_binding = bool(artifact_checks) and all(
         checks["trace_output_binding"] for checks in artifact_checks
     )
-    gpu_values = {
-        (record.get("gpu_uuid"), record.get("gpu_name")) for record in records
-    }
-    same_gpu = (
-        bool(gpu_values)
-        and all(uuid and name for uuid, name in gpu_values)
-        and len(gpu_values) == 1
-    )
+    gpu_policy_details = _gpu_policy_details(records, gpu_policy=gpu_policy)
     driver_values = {record.get("gpu_driver_version") for record in records}
     driver_identity = bool(records) and None not in driver_values
     same_driver = driver_identity and len(driver_values) == 1
@@ -1193,6 +1367,14 @@ def _publication_campaign_checks(
         bool(records)
         and None not in model_identities
         and len(model_identities) == 1
+    )
+    model_manifest_values = {
+        record.get("model_manifest_sha256") for record in records
+    }
+    same_model_manifest_sha256 = (
+        bool(records)
+        and None not in model_manifest_values
+        and len(model_manifest_values) == 1
     )
 
     def stable_per_engine(field: str) -> bool:
@@ -1211,26 +1393,62 @@ def _publication_campaign_checks(
         and record.get("target_server_config_signature") is not None
         for record in records
     )
+    launch_argv_binding = bool(records) and all(
+        record.get("target_server_launch_argv_valid") is True for record in records
+    )
+    model_launch_config_binding = bool(records) and all(
+        record.get("target_server_model_binding_valid") is True
+        for record in records
+    )
+    effective_runtime_config = bool(records) and all(
+        record.get("runtime_config_valid") is True for record in records
+    )
     stable_engine_versions = stable_per_engine("engine_version_identity")
-    stable_engine_launches = stable_per_engine("target_server_launch_signature")
+    stable_engine_launch_commands = stable_per_engine(
+        "target_server_launch_signature"
+    )
+    stable_engine_launch_profiles = stable_per_engine(
+        "target_server_launch_profile_signature"
+    )
+    stable_engine_launches = (
+        stable_engine_launch_commands
+        if gpu_policy == "same-device"
+        else stable_engine_launch_profiles
+    )
     stable_engine_configs = stable_per_engine("target_server_config_signature")
+    stable_effective_runtime_configs = stable_per_engine(
+        "runtime_config_signature"
+    )
     same_trace = True
     same_outputs = True
     trace_role_contract = exact_repeat_matrix
     if trace_role_contract:
         for group in repeat_groups.values():
-            by_engine = {record.get("engine"): record for record in group}
-            source = by_engine.get("sglang")
-            replays = [by_engine.get(engine) for engine in ("wkvm", "vllm")]
+            sources = [
+                record
+                for record in group
+                if record.get("artifact_role") == SOURCE_ROLE
+            ]
+            replays = [
+                record
+                for record in group
+                if record.get("artifact_role") in REPLAY_ROLES
+            ]
             if (
-                source is None
-                or source.get("artifact_role") != SOURCE_ROLE
-                or source.get("trace_sha256") is None
+                len(sources) != 1
+                or sources[0].get("engine") not in INCUMBENTS
+                or len(replays) != len(ENGINES) - 1
+                or {record.get("engine") for record in (*sources, *replays)}
+                != set(ENGINES)
                 or any(
-                    replay is None
-                    or replay.get("artifact_role") != "http_teacher_forced_replay"
+                    replay.get("artifact_role") not in REPLAY_ROLES
                     for replay in replays
                 )
+                or any(
+                    replay.get("artifact_role") == SOURCE_ROLE for replay in replays
+                )
+                or sources[0].get("trace_sha256") is None
+                or any(replay.get("trace_sha256") is None for replay in replays)
             ):
                 trace_role_contract = False
                 break
@@ -1272,15 +1490,26 @@ def _publication_campaign_checks(
         "minimum_repeats": min_repeats >= PUBLICATION_MIN_REPEATS,
         "exact_repeat_matrix": exact_repeat_matrix,
         "clean_worktree": clean_worktree,
-        "same_gpu": same_gpu,
+        # Keep the historical key policy-aware so publication_passed remains
+        # the conjunction of all reported publication checks.
+        "same_gpu": bool(gpu_policy_details["contract_passed"]),
+        "paired_repeat_gpu": bool(gpu_policy_details["paired_repeat_gpu"]),
+        "homogeneous_gpu_pool": bool(
+            gpu_policy_details["homogeneous_gpu_pool"]
+        ),
         "driver_identity": driver_identity,
         "same_driver": same_driver,
         "same_git_commit": same_git_commit,
         "stable_model_identity": stable_model_identity,
+        "same_model_manifest_sha256": same_model_manifest_sha256,
         "stable_engine_versions": stable_engine_versions,
         "target_server_provenance": target_server_provenance,
+        "launch_argv_binding": launch_argv_binding,
+        "model_launch_config_binding": model_launch_config_binding,
+        "effective_runtime_config": effective_runtime_config,
         "stable_engine_launches": stable_engine_launches,
         "stable_engine_configs": stable_engine_configs,
+        "stable_effective_runtime_configs": stable_effective_runtime_configs,
         "idle_gpu_baseline": idle_gpu_baseline,
         "memory_delta": memory_delta,
         "memory_ceiling_configured": memory_ceiling_mib is not None,
@@ -1299,6 +1528,7 @@ def build_report(
     min_repeats: int = 3,
     whole_device_memory_ceiling_mib: float | None = None,
     claim_scope: str = "continuation",
+    gpu_policy: str = "same-device",
     strict: bool = False,
 ) -> dict[str, Any]:
     if min_repeats < 1:
@@ -1312,6 +1542,8 @@ def build_report(
         raise ValueError(
             f"claim_scope must be one of {', '.join(CLAIM_SCOPES)}"
         )
+    if gpu_policy not in GPU_POLICIES:
+        raise ValueError(f"gpu_policy must be one of {', '.join(GPU_POLICIES)}")
     rate_field = (
         "continuation_rate"
         if claim_scope == "continuation"
@@ -1433,11 +1665,24 @@ def build_report(
         record_list,
         min_repeats=min_repeats,
         memory_ceiling_mib=whole_device_memory_ceiling_mib,
+        gpu_policy=gpu_policy,
+    )
+    gpu_policy_details = _gpu_policy_details(
+        record_list,
+        gpu_policy=gpu_policy,
     )
     workload_signatures = {record.get("workload_signature") for record in record_list}
     artifact_paths = [record.get("path") for record in record_list]
     artifact_hashes = [record.get("payload_sha256") for record in record_list]
     run_ids = [record.get("run_id") for record in record_list]
+    model_manifest_values = {
+        record.get("model_manifest_sha256") for record in record_list
+    }
+    model_manifest_sha256 = (
+        next(iter(model_manifest_values))
+        if None not in model_manifest_values and len(model_manifest_values) == 1
+        else None
+    )
     memory_ceiling_configured = whole_device_memory_ceiling_mib is not None
     within_memory_ceiling = (
         True
@@ -1567,6 +1812,8 @@ def build_report(
     return {
         "schema": SCHEMA,
         "strict": bool(strict),
+        "gpu_policy": gpu_policy,
+        "gpu_policy_details": gpu_policy_details,
         "claim_scope": claim_scope_id,
         "claim_scope_short": claim_scope,
         "claim_rate_field": rate_field,
@@ -1574,6 +1821,7 @@ def build_report(
         "minimum_repeats": min_repeats,
         "whole_device_memory_ceiling_mib": whole_device_memory_ceiling_mib,
         "memory_ceiling_configured": memory_ceiling_configured,
+        "model_manifest_sha256": model_manifest_sha256,
         "workload": workload,
         "semantic_comparison": {
             "engines": semantic_modes,
@@ -1634,10 +1882,17 @@ def build_report(
                     "artifact_role",
                     "semantic_mode",
                     "model_identity",
+                    "model_manifest_sha256",
                     "git_commit",
                     "engine_version_identity",
                     "target_server_launch_signature",
+                    "target_server_launch_profile_signature",
                     "target_server_config_signature",
+                    "target_server_launch_argv_valid",
+                    "target_server_model_binding_valid",
+                    "runtime_config_valid",
+                    "runtime_config_signature",
+                    "runtime_config_proof",
                     "trace_sha256",
                     "continuation_rate",
                     "continuation_wall_s",
@@ -1682,9 +1937,15 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"# Provider-HTTP 10x {scope_short} gate",
         "",
         f"Gate mode: `{'strict publication' if report.get('strict') else 'exploratory'}`.",
+        f"GPU policy: `{report.get('gpu_policy', 'same-device')}`.",
         f"Scope: `{report['claim_scope']}`.",
         f"Required repeats: `{report['minimum_repeats']}`.",
         f"Whole-device memory ceiling: `{report['whole_device_memory_ceiling_mib']}` MiB.",
+        (
+            f"Model manifest SHA-256: `{report['model_manifest_sha256']}`."
+            if report.get("model_manifest_sha256") is not None
+            else "Model manifest SHA-256: unverified (missing or inconsistent)."
+        ),
         f"Semantic modes: {semantic_summary}.",
         (
             "Semantic modes are identical."
@@ -1806,6 +2067,15 @@ def build_parser() -> argparse.ArgumentParser:
         choices=CLAIM_SCOPES,
         default="continuation",
     )
+    parser.add_argument(
+        "--gpu-policy",
+        choices=GPU_POLICIES,
+        default="same-device",
+        help=(
+            "require one physical GPU for the whole campaign, or one paired "
+            "GPU per repeat from a homogeneous pool"
+        ),
+    )
     parser.add_argument("--markdown", type=Path, default=None)
     parser.add_argument("--summary-json", type=Path, default=None)
     parser.add_argument(
@@ -1837,6 +2107,7 @@ def main(argv: list[str] | None = None) -> int:
             args.whole_device_memory_ceiling_mib
         ),
         claim_scope=args.claim_scope,
+        gpu_policy=args.gpu_policy,
         strict=args.strict,
     )
     markdown = render_markdown(report)

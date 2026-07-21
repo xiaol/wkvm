@@ -108,10 +108,22 @@ There is no honest workload-independent “WKVM is 10x faster” claim. The
 current evidence supports a scoped long-lived-session claim and also contains
 workloads where vLLM remains faster.
 
+> **Outdated benchmark:** The 2026-07-14 Open WebUI B32 x 8 comparison predates
+> the current serving and benchmark code. It is retained only as historical
+> context and is excluded from current performance claims until it is rerun
+> from the current commit with optimized vLLM and SGLang configurations.
+
+> **A800 status:** A single exploratory B32, 98,304-token, 12-turn scout
+> measured 12.107x versus vLLM (346.300 s versus 4,192.690 s), but it is not a
+> publication-grade 10x claim yet. It used a dirty worktree, did not freeze the
+> final incumbent optimization profiles, and has no matching SGLang T12 result.
+> The claim remains pending a clean, repeated campaign on homogeneous A800s.
+
 | measured workload | WKVM result | vs vLLM | vs SGLang | outcome |
 |---|---:|---:|---:|---|
 | RTX 4090 provider HTTP, B16, 48 turns, 36,864-token initial context | 180.415s complete wall | **11.151x faster** | **26.079x faster** | scoped exploratory pass |
-| Real Open WebUI 0.10.2, offered B32, 8 turns | 53.963 output tok/s | 0.586x; vLLM is 70.6% faster | 0.998x; effectively tied | accounting pass, strict reuse fail |
+| **PROVISIONAL:** A800 provider HTTP scout, B32, 12 turns, 98,304-token initial context | 346.300s complete wall | **12.107x faster** | not matched | clean repeated campaign pending |
+| **OUTDATED:** Real Open WebUI 0.10.2, offered B32, 8 turns | 53.963 output tok/s | 0.586x; vLLM is 70.6% faster | 0.998x; effectively tied | historical only; rerun required |
 | Repeated A800 strict short-session gate, B64/ctx16K/out32 | worst-repeat envelope | 0.790x | 1.400x | overall gate fail |
 
 The B16 x 48-turn result completed all 2,304 requests from a 36,864-token
@@ -122,16 +134,19 @@ claim is: **on that predeclared long-lived workload, WKVM measured 11.151x vLLM
 and 26.079x SGLang end to end**. It does not establish a universal engine
 ranking or quality equivalence.
 
-The real Open WebUI run completed 256/256 requests for every engine. WKVM
+The outdated Open WebUI run completed 256/256 requests for every engine. WKVM
 retained 32 states, but only 125/224 continuations exactly matched parked token
-history; 99 normalized histories were safely restarted. High concurrency
-increases residency and batching opportunity, but it does not by itself remove
-WKVM's decode-kernel and microbatch bottlenecks.
+history; 99 normalized histories were safely restarted. Those measurements
+describe the old code path and must not be used as current WKVM, vLLM, or
+SGLang performance evidence. High concurrency increases residency and batching
+opportunity, but it does not by itself remove WKVM's decode-kernel and
+microbatch bottlenecks.
 
 Evidence and methodology:
 
 - [48-turn RTX 4090 E2E report](experiments/results/gemma_4090_48turn_10x_20260717.md)
-- [Real Open WebUI B32 x 8 report](experiments/results/open_webui_b32_t8_compare_20260714.md)
+- [A800 10x methodology and pending gate](docs/10X_E2E_PLAN.md)
+- [Outdated historical Open WebUI B32 x 8 report](experiments/results/open_webui_b32_t8_compare_20260714.md)
 - [Repeated A800 comparison](experiments/results/gemma_a800_reliable_20260716/report.md)
 - [Controlled B16 evidence audit](experiments/results/gemma_b16_evidence_audit_20260713.md)
 - [10x E2E scope and optimization plan](docs/10X_E2E_PLAN.md)

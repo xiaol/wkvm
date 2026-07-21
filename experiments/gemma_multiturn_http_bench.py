@@ -67,6 +67,7 @@ from gemma_multiturn_bench import (
 )
 from wkvm_serving_bench import (
     WholeGpuMemoryMonitor,
+    build_runtime_config_proof,
     build_provenance,
     collect_gpu_provenance,
     parse_json_object,
@@ -1520,6 +1521,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     payload["server_metrics_after_run"] = server_metrics
     payload["server_metrics_error"] = server_metrics_error
+    payload["runtime_config_proof"] = build_runtime_config_proof(
+        args.engine,
+        args.target_server_config,
+        server_metrics,
+        workload=payload.get("workload"),
+    )
     if args.json:
         atomic_write_json(Path(args.json), payload)
         print(f"WROTE {args.json}")
@@ -1616,6 +1623,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--engine-version", default=None)
     parser.add_argument("--engine-version-source", default="operator_supplied")
     parser.add_argument("--target-server-launch-command", default=None)
+    parser.add_argument(
+        "--target-server-launch-profile",
+        default=None,
+        help=(
+            "Canonical target-server launch template with placement-only GPU "
+            "and network values replaced by stable placeholders."
+        ),
+    )
     parser.add_argument(
         "--target-server-config-json",
         dest="target_server_config",
