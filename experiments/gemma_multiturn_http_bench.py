@@ -1044,7 +1044,7 @@ def _server_session_reuse_summary(
 
 def fetch_server_metrics(url: str, timeout_s: float) -> tuple[dict[str, Any] | None, str | None]:
     try:
-        with urllib.request.urlopen(url, timeout=min(timeout_s, 10.0)) as response:
+        with urllib.request.urlopen(url, timeout=min(timeout_s, 60.0)) as response:
             payload = json.loads(response.read())
         if not isinstance(payload, dict):
             raise ValueError("server metrics response must be a JSON object")

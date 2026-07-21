@@ -30,6 +30,7 @@ WHOLE_GPU_MEMORY_SCHEMA = "wkvm.whole_gpu_memory.v1"
 ENGINES = ("wkvm", "vllm", "sglang")
 INCUMBENTS = ("vllm", "sglang")
 CLAIM_SCOPES = ("continuation", "full-session")
+PUBLICATION_MIN_REPEATS = 3
 THRESHOLD = 10.0
 SLOW_REPEAT_FRACTION = 0.80
 LOW_CLOCK_PEER_FRACTION = 0.95
@@ -60,6 +61,16 @@ def _valid_sha256(value: Any) -> bool:
     return True
 
 
+def _valid_git_commit(value: Any) -> bool:
+    if not isinstance(value, str) or len(value) not in {40, 64}:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
+
+
 def _number(value: Any, *, positive: bool = False) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -82,6 +93,60 @@ def _normalized_text(value: Any) -> str | None:
         return None
     result = str(value).strip()
     return result or None
+
+
+def _engine_version_identity(payload: dict[str, Any]) -> tuple[str, str] | None:
+    engine = _normalized_text(payload.get("engine"))
+    version = _normalized_text(payload.get("engine_version"))
+    provenance = payload.get("provenance")
+    engine_provenance = (
+        provenance.get("engine") if isinstance(provenance, dict) else None
+    )
+    if not isinstance(engine_provenance, dict):
+        return None
+    provenance_label = _normalized_text(engine_provenance.get("label"))
+    provenance_version = _normalized_text(engine_provenance.get("version"))
+    version_source = _normalized_text(engine_provenance.get("version_source"))
+    if (
+        engine is None
+        or version is None
+        or provenance_label != engine
+        or provenance_version != version
+        or version_source in {None, "unreported"}
+    ):
+        return None
+    return version, version_source
+
+
+def _target_server_provenance(
+    payload: dict[str, Any],
+) -> tuple[str, str] | None:
+    provenance = payload.get("provenance")
+    target_server = (
+        provenance.get("target_server") if isinstance(provenance, dict) else None
+    )
+    if not isinstance(target_server, dict):
+        return None
+    launch_command = _normalized_text(target_server.get("launch_command"))
+    launch_source = _normalized_text(target_server.get("launch_command_source"))
+    config = target_server.get("config")
+    config_source = _normalized_text(target_server.get("config_source"))
+    if (
+        launch_command is None
+        or launch_source in {None, "unreported"}
+        or not isinstance(config, dict)
+        or config_source in {None, "unreported"}
+    ):
+        return None
+    try:
+        return (
+            _payload_sha256(
+                {"launch_command": launch_command, "source": launch_source}
+            ),
+            _payload_sha256({"config": config, "source": config_source}),
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 def _median(values: Sequence[float]) -> float | None:
@@ -166,6 +231,81 @@ def _trace_sha256(payload: dict[str, Any]) -> tuple[str | None, bool]:
             values.append(str(value))
     unique = set(values)
     return (next(iter(unique)), True) if len(unique) == 1 else (None, not unique)
+
+
+def _trace_metadata_for_role(
+    payload: dict[str, Any],
+    artifact_role: str | None,
+) -> dict[str, Any] | None:
+    fields = (
+        ("emitted_history_trace",)
+        if artifact_role == SOURCE_ROLE
+        else ("history_trace",)
+    )
+    for field in fields:
+        metadata = payload.get(field)
+        if isinstance(metadata, dict):
+            return metadata
+    return None
+
+
+def _trace_output_signature(
+    metadata: dict[str, Any] | None,
+    *,
+    sessions: int | None,
+    turns: int | None,
+    output_tokens: int | None,
+) -> tuple[str, ...] | None:
+    if metadata is None or sessions is None or turns is None or output_tokens is None:
+        return None
+    fingerprints = metadata.get("output_fingerprints")
+    if not isinstance(fingerprints, list) or len(fingerprints) != turns:
+        return None
+    hashes: list[str] = []
+    for fingerprint in fingerprints:
+        digest = _fingerprint_hash(
+            fingerprint,
+            sessions=sessions,
+            output_tokens=output_tokens,
+        )
+        if digest is None:
+            return None
+        hashes.append(digest)
+    return tuple(hashes)
+
+
+def _trace_metadata_contract(
+    payload: dict[str, Any],
+    *,
+    artifact_role: str | None,
+    workload: dict[str, Any],
+    output_signature: tuple[str, ...] | None,
+) -> tuple[bool, tuple[str, ...] | None]:
+    metadata = _trace_metadata_for_role(payload, artifact_role)
+    sessions = _integer(workload.get("sessions"), minimum=1)
+    turns = _integer(workload.get("turns"), minimum=2)
+    output_tokens = _integer(
+        workload.get("output_tokens_per_turn"),
+        minimum=1,
+    )
+    metadata_signature = _trace_output_signature(
+        metadata,
+        sessions=sessions,
+        turns=turns,
+        output_tokens=output_tokens,
+    )
+    valid = (
+        metadata is not None
+        and metadata.get("schema") == TRACE_SCHEMA
+        and metadata.get("shared") is True
+        and metadata.get("teacher_forced") is True
+        and metadata.get("turn_count") == turns
+        and _valid_sha256(metadata.get("trace_sha256"))
+        and metadata_signature is not None
+        and output_signature is not None
+        and metadata_signature == output_signature
+    )
+    return valid, metadata_signature
 
 
 def _tree_state(payload: dict[str, Any]) -> dict[str, Any]:
@@ -572,6 +712,14 @@ def artifact_record(path: str | Path, payload: dict[str, Any]) -> dict[str, Any]
     artifact_role = _normalized_text(identity.get("artifact_role"))
     if artifact_role not in {SOURCE_ROLE, *REPLAY_ROLES}:
         errors.append("invalid_artifact_role")
+    trace_metadata_valid, trace_output_signature = _trace_metadata_contract(
+        payload,
+        artifact_role=artifact_role,
+        workload=payload.get("workload")
+        if isinstance(payload.get("workload"), dict)
+        else {},
+        output_signature=measurement["output_signature"],
+    )
     gpu_memory = payload.get("gpu_memory")
     if not isinstance(gpu_memory, dict):
         gpu_memory = {}
@@ -583,6 +731,7 @@ def artifact_record(path: str | Path, payload: dict[str, Any]) -> dict[str, Any]
     )
     runtime_telemetry = _runtime_telemetry(gpu_memory)
     tree_state = _tree_state(payload)
+    target_server_provenance = _target_server_provenance(payload)
     return {
         "path": str(artifact_path),
         "payload_sha256": _payload_sha256(payload),
@@ -592,9 +741,28 @@ def artifact_record(path: str | Path, payload: dict[str, Any]) -> dict[str, Any]
         "run_id": run_id,
         "artifact_role": artifact_role,
         "semantic_mode": _normalized_text(payload.get("semantic_mode")),
+        "model_identity": _normalized_text(payload.get("model")),
+        "git_commit": _normalized_text(payload.get("git_commit")),
+        "engine_version_identity": _engine_version_identity(payload),
+        "target_server_launch_signature": (
+            target_server_provenance[0]
+            if target_server_provenance is not None
+            else None
+        ),
+        "target_server_config_signature": (
+            target_server_provenance[1]
+            if target_server_provenance is not None
+            else None
+        ),
         "workload": payload.get("workload"),
         "workload_signature": workload_signature,
         "trace_sha256": trace_sha256,
+        "trace_metadata_valid": trace_metadata_valid,
+        "trace_output_signature": trace_output_signature,
+        "trace_output_binding": (
+            trace_metadata_valid
+            and trace_output_signature == measurement["output_signature"]
+        ),
         "output_signature": measurement["output_signature"],
         "success_complete": measurement["success_complete"],
         "exact_output_ids": measurement["exact_output_ids"],
@@ -619,8 +787,19 @@ def artifact_record(path: str | Path, payload: dict[str, Any]) -> dict[str, Any]
         "exact_output_id_requests": measurement["exact_output_id_requests"],
         "memory_scope_valid": memory_scope_valid,
         "peak_used_mib": peak_used_mib,
+        "baseline_used_mib": _number(gpu_memory.get("baseline_used_mib")),
+        "peak_delta_mib": _number(gpu_memory.get("peak_delta_mib")),
+        "memory_schema": gpu_memory.get("schema"),
+        "memory_scope": gpu_memory.get("scope"),
+        "memory_source": gpu_memory.get("source"),
+        "memory_error": gpu_memory.get("error"),
+        "memory_query_error_count": _integer(
+            gpu_memory.get("query_error_count")
+        ),
         "gpu_name": gpu_memory.get("gpu_name"),
         "gpu_uuid": gpu_memory.get("device_uuid"),
+        "gpu_memory_total_mib": _number(gpu_memory.get("memory_total_mib")),
+        "gpu_driver_version": _normalized_text(gpu_memory.get("driver_version")),
         "runtime_telemetry": runtime_telemetry,
         "tree_state": tree_state,
         "errors": sorted(set(errors)),
@@ -673,7 +852,7 @@ def _build_repeat_groups(
         output_linked = None not in output_values and len(output_values) == 1
         linkage_method = (
             "shared_trace_sha256"
-            if trace_linked
+            if trace_linked and output_linked
             else "per_turn_output_fingerprints"
             if output_linked
             else None
@@ -900,12 +1079,227 @@ def _build_stability_diagnostics(
     return engine_stability, repeat_diagnostics
 
 
+def _publication_artifact_checks(record: dict[str, Any]) -> dict[str, bool]:
+    tree = record.get("tree_state")
+    clean_tree = (
+        isinstance(tree, dict)
+        and tree.get("clean") is True
+        and tree.get("tracked_clean") is True
+        and tree.get("classification") == "clean"
+    )
+    gpu_identity = bool(record.get("gpu_uuid")) and bool(record.get("gpu_name"))
+    baseline = _number(record.get("baseline_used_mib"))
+    idle_gpu_baseline = (
+        baseline is not None
+        and baseline <= 1024.0
+        and record.get("memory_error") in (None, "")
+        and int(record.get("memory_query_error_count") or 0) == 0
+    )
+    peak = _number(record.get("peak_used_mib"))
+    delta = _number(record.get("peak_delta_mib"))
+    memory_total = _number(record.get("gpu_memory_total_mib"))
+    memory_delta = (
+        record.get("memory_schema") == WHOLE_GPU_MEMORY_SCHEMA
+        and record.get("memory_scope") == "whole_device"
+        and record.get("memory_source") == "nvidia-smi"
+        and peak is not None
+        and delta is not None
+        and baseline is not None
+        and memory_total is not None
+        and peak <= memory_total
+        and math.isclose(delta, peak - baseline, rel_tol=0.0, abs_tol=1.0)
+        and record.get("memory_error") in (None, "")
+        and int(record.get("memory_query_error_count") or 0) == 0
+    )
+    return {
+        "clean_worktree": clean_tree,
+        "gpu_identity": gpu_identity,
+        "idle_gpu_baseline": idle_gpu_baseline,
+        "memory_delta": memory_delta,
+        "trace_metadata": record.get("trace_metadata_valid") is True,
+        "trace_output_binding": record.get("trace_output_binding") is True,
+    }
+
+
+def _publication_campaign_checks(
+    records: Sequence[dict[str, Any]],
+    *,
+    min_repeats: int,
+    memory_ceiling_mib: float | None,
+) -> dict[str, bool]:
+    identities_complete = bool(records) and all(
+        record.get(field) is not None
+        for record in records
+        for field in ("campaign_id", "repeat_id", "run_id")
+    )
+    campaign_ids = {record.get("campaign_id") for record in records}
+    same_campaign = identities_complete and len(campaign_ids) == 1
+    repeat_groups: dict[str, list[dict[str, Any]]] = {}
+    if identities_complete:
+        for record in records:
+            repeat_groups.setdefault(str(record["repeat_id"]), []).append(record)
+    exact_repeat_matrix = (
+        identities_complete
+        and min_repeats >= PUBLICATION_MIN_REPEATS
+        and len(records) == min_repeats * len(ENGINES)
+        and len(repeat_groups) == min_repeats
+        and all(
+            len(group) == len(ENGINES)
+            and sorted(record.get("engine") for record in group)
+            == sorted(ENGINES)
+            for group in repeat_groups.values()
+        )
+    )
+    unique_artifacts = (
+        len({record.get("path") for record in records}) == len(records)
+        and len({record.get("payload_sha256") for record in records}) == len(records)
+        and len({record.get("run_id") for record in records}) == len(records)
+    )
+    artifact_checks = [_publication_artifact_checks(record) for record in records]
+    clean_worktree = bool(artifact_checks) and all(
+        checks["clean_worktree"] for checks in artifact_checks
+    )
+    idle_gpu_baseline = bool(artifact_checks) and all(
+        checks["idle_gpu_baseline"] for checks in artifact_checks
+    )
+    memory_delta = bool(artifact_checks) and all(
+        checks["memory_delta"] for checks in artifact_checks
+    )
+    trace_metadata = bool(artifact_checks) and all(
+        checks["trace_metadata"] for checks in artifact_checks
+    )
+    trace_output_binding = bool(artifact_checks) and all(
+        checks["trace_output_binding"] for checks in artifact_checks
+    )
+    gpu_values = {
+        (record.get("gpu_uuid"), record.get("gpu_name")) for record in records
+    }
+    same_gpu = (
+        bool(gpu_values)
+        and all(uuid and name for uuid, name in gpu_values)
+        and len(gpu_values) == 1
+    )
+    driver_values = {record.get("gpu_driver_version") for record in records}
+    driver_identity = bool(records) and None not in driver_values
+    same_driver = driver_identity and len(driver_values) == 1
+    commits = {record.get("git_commit") for record in records}
+    same_git_commit = (
+        bool(records)
+        and all(_valid_git_commit(commit) for commit in commits)
+        and len(commits) == 1
+    )
+    model_identities = {record.get("model_identity") for record in records}
+    stable_model_identity = (
+        bool(records)
+        and None not in model_identities
+        and len(model_identities) == 1
+    )
+
+    def stable_per_engine(field: str) -> bool:
+        return all(
+            bool(engine_records)
+            and None not in {record.get(field) for record in engine_records}
+            and len({record.get(field) for record in engine_records}) == 1
+            for engine in ENGINES
+            for engine_records in (
+                [record for record in records if record.get("engine") == engine],
+            )
+        )
+
+    target_server_provenance = bool(records) and all(
+        record.get("target_server_launch_signature") is not None
+        and record.get("target_server_config_signature") is not None
+        for record in records
+    )
+    stable_engine_versions = stable_per_engine("engine_version_identity")
+    stable_engine_launches = stable_per_engine("target_server_launch_signature")
+    stable_engine_configs = stable_per_engine("target_server_config_signature")
+    same_trace = True
+    same_outputs = True
+    trace_role_contract = exact_repeat_matrix
+    if trace_role_contract:
+        for group in repeat_groups.values():
+            by_engine = {record.get("engine"): record for record in group}
+            source = by_engine.get("sglang")
+            replays = [by_engine.get(engine) for engine in ("wkvm", "vllm")]
+            if (
+                source is None
+                or source.get("artifact_role") != SOURCE_ROLE
+                or source.get("trace_sha256") is None
+                or any(
+                    replay is None
+                    or replay.get("artifact_role") != "http_teacher_forced_replay"
+                    for replay in replays
+                )
+            ):
+                trace_role_contract = False
+                break
+            group_trace_values = {
+                record.get("trace_sha256") for record in group
+            }
+            group_output_values = {
+                record.get("output_signature") for record in group
+            }
+            if len(group_trace_values) != 1:
+                same_trace = False
+            if len(group_output_values) != 1:
+                same_outputs = False
+            if not all(
+                record.get("trace_output_binding") is True for record in group
+            ):
+                trace_role_contract = False
+            if not same_trace or not same_outputs:
+                trace_role_contract = False
+                break
+    else:
+        same_trace = False
+        same_outputs = False
+
+    within_memory_ceiling = (
+        memory_ceiling_mib is not None
+        and bool(records)
+        and all(
+            record.get("memory_scope_valid") is True
+            and record.get("peak_used_mib") is not None
+            and float(record["peak_used_mib"]) <= float(memory_ceiling_mib)
+            for record in records
+        )
+    )
+    return {
+        "benchmark_identity": identities_complete,
+        "unique_artifacts": unique_artifacts,
+        "same_campaign": same_campaign,
+        "minimum_repeats": min_repeats >= PUBLICATION_MIN_REPEATS,
+        "exact_repeat_matrix": exact_repeat_matrix,
+        "clean_worktree": clean_worktree,
+        "same_gpu": same_gpu,
+        "driver_identity": driver_identity,
+        "same_driver": same_driver,
+        "same_git_commit": same_git_commit,
+        "stable_model_identity": stable_model_identity,
+        "stable_engine_versions": stable_engine_versions,
+        "target_server_provenance": target_server_provenance,
+        "stable_engine_launches": stable_engine_launches,
+        "stable_engine_configs": stable_engine_configs,
+        "idle_gpu_baseline": idle_gpu_baseline,
+        "memory_delta": memory_delta,
+        "memory_ceiling_configured": memory_ceiling_mib is not None,
+        "within_memory_ceiling": within_memory_ceiling,
+        "trace_metadata": trace_metadata,
+        "trace_output_binding": trace_output_binding,
+        "same_trace": same_trace,
+        "same_output_fingerprints": same_outputs,
+        "trace_role_contract": trace_role_contract,
+    }
+
+
 def build_report(
     records: Iterable[dict[str, Any]],
     *,
     min_repeats: int = 3,
     whole_device_memory_ceiling_mib: float | None = None,
     claim_scope: str = "continuation",
+    strict: bool = False,
 ) -> dict[str, Any]:
     if min_repeats < 1:
         raise ValueError("min_repeats must be >= 1")
@@ -1035,6 +1429,11 @@ def build_report(
 
     repeat_groups = _build_repeat_groups(record_list)
     complete_repeat_groups = [group for group in repeat_groups if group["complete"]]
+    publication_checks = _publication_campaign_checks(
+        record_list,
+        min_repeats=min_repeats,
+        memory_ceiling_mib=whole_device_memory_ceiling_mib,
+    )
     workload_signatures = {record.get("workload_signature") for record in record_list}
     artifact_paths = [record.get("path") for record in record_list]
     artifact_hashes = [record.get("payload_sha256") for record in record_list]
@@ -1163,8 +1562,11 @@ def build_report(
         ),
         {},
     )
+    core_passed = all(checks.values())
+    publication_passed = all(publication_checks.values())
     return {
         "schema": SCHEMA,
+        "strict": bool(strict),
         "claim_scope": claim_scope_id,
         "claim_scope_short": claim_scope,
         "claim_rate_field": rate_field,
@@ -1216,6 +1618,8 @@ def build_report(
         "repeat_groups": repeat_groups,
         "complete_repeat_count": len(complete_repeat_groups),
         "checks": checks,
+        "publication_checks": publication_checks,
+        "publication_passed": publication_passed,
         "dirty_tree_artifacts": dirty_tree_artifacts,
         "caveats": caveats,
         "artifacts": [
@@ -1229,6 +1633,11 @@ def build_report(
                     "run_id",
                     "artifact_role",
                     "semantic_mode",
+                    "model_identity",
+                    "git_commit",
+                    "engine_version_identity",
+                    "target_server_launch_signature",
+                    "target_server_config_signature",
                     "trace_sha256",
                     "continuation_rate",
                     "continuation_wall_s",
@@ -1241,13 +1650,19 @@ def build_report(
                     "observed_output_id_requests",
                     "exact_output_id_requests",
                     "peak_used_mib",
+                    "baseline_used_mib",
+                    "peak_delta_mib",
+                    "gpu_name",
+                    "gpu_uuid",
+                    "gpu_driver_version",
                     "runtime_telemetry",
                     "errors",
                 )
             }
             for record in record_list
         ],
-        "passed": all(checks.values()),
+        "core_passed": core_passed,
+        "passed": core_passed and (publication_passed if strict else True),
     }
 
 
@@ -1266,6 +1681,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     lines = [
         f"# Provider-HTTP 10x {scope_short} gate",
         "",
+        f"Gate mode: `{'strict publication' if report.get('strict') else 'exploratory'}`.",
         f"Scope: `{report['claim_scope']}`.",
         f"Required repeats: `{report['minimum_repeats']}`.",
         f"Whole-device memory ceiling: `{report['whole_device_memory_ceiling_mib']}` MiB.",
@@ -1352,6 +1768,9 @@ def render_markdown(report: dict[str, Any]) -> str:
     lines.extend(["", "## Checks", ""])
     for name, passed in report["checks"].items():
         lines.append(f"- `{name}`: {'PASS' if passed else 'FAIL'}")
+    lines.extend(["", "## Publication checks", ""])
+    for name, passed in report.get("publication_checks", {}).items():
+        lines.append(f"- `{name}`: {'PASS' if passed else 'FAIL'}")
     lines.extend(["", "## Dirty-tree caveats", ""])
     if report["dirty_tree_artifacts"]:
         for item in report["dirty_tree_artifacts"]:
@@ -1399,6 +1818,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="write reports and return success even when the gate fails",
     )
+    parser.add_argument(
+        "--strict",
+        "--strict-publication",
+        dest="strict",
+        action="store_true",
+        help="require the publication provenance and repeat-matrix checks",
+    )
     return parser
 
 
@@ -1411,6 +1837,7 @@ def main(argv: list[str] | None = None) -> int:
             args.whole_device_memory_ceiling_mib
         ),
         claim_scope=args.claim_scope,
+        strict=args.strict,
     )
     markdown = render_markdown(report)
     if args.summary_json is not None:

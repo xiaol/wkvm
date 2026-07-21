@@ -157,8 +157,21 @@ class Test10xHttp4090Runner(unittest.TestCase):
 
         wkvm_server = server_commands[("wkvm", 1)]
         self.assertIn("PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True", wkvm_server)
+        for environment_flag in (
+            "WKVM_ENABLE_TOKEN_POOL_TRITON=1",
+            "WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON=1",
+            "WKVM_ENABLE_TOKEN_POOL_PAGED_SPLIT_TRITON=1",
+            "WKVM_TOKEN_POOL_TRITON_STRICT=1",
+            "WKVM_TOKEN_POOL_SLIDING_PAGED_METADATA_ONLY=1",
+            "WKVM_TOKEN_POOL_ROUTE_BOUNDARY_BATCH=1",
+        ):
+            self.assertIn(environment_flag, wkvm_server)
         self.assertEqual(option_value(wkvm_server, "--max-queue"), "64")
         self.assertEqual(option_value(wkvm_server, "--slots"), "16")
+        self.assertEqual(
+            option_value(wkvm_server, "--max-completed-requests"),
+            "144",
+        )
         self.assertEqual(option_value(wkvm_server, "--batch-wait-s"), "0.01")
         self.assertEqual(option_value(wkvm_server, "--stream-flush-tokens"), "1")
         self.assertEqual(

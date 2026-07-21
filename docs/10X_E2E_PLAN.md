@@ -730,6 +730,16 @@ fits below the common ceiling. The frozen HTTP runner now selects this mode by
 default when vLLM fast prefill is enabled, records the configuration in every
 artifact, and keeps WKVM owner-only fast prefill enabled by default.
 
+The WKVM HTTP launch must also export the token-pool backend policy explicitly:
+`WKVM_ENABLE_TOKEN_POOL_TRITON=1`, `WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON=1`,
+`WKVM_ENABLE_TOKEN_POOL_PAGED_SPLIT_TRITON=1`,
+`WKVM_TOKEN_POOL_TRITON_STRICT=1`,
+`WKVM_TOKEN_POOL_SLIDING_PAGED_METADATA_ONLY=1`, and
+`WKVM_TOKEN_POOL_ROUTE_BOUNDARY_BATCH=1`. These controls are environment-based;
+the July 17 exploratory launch did not record them in its command, so its
+low-level dispatch mix is not publication provenance. The runner now exports
+them and the regression test asserts their presence.
+
 ### Route from here
 
 High concurrency is now doing exactly what the architecture promises: WKVM

@@ -479,6 +479,7 @@ WKVM_TOKEN_POOL_MAX_CONTEXT_LEN=$((ALIGNED_REQUIRED_MODEL_LEN + 32))
 SGLANG_MAX_TOTAL_TOKENS=$((
   SESSIONS * (ALIGNED_REQUIRED_MODEL_LEN + 400)
 ))
+WKVM_MAX_COMPLETED_REQUESTS=$((SESSIONS * TURNS + SESSIONS))
 if [[ "$TURNS" == "8" && "$INITIAL_CONTEXT_TOKENS" == "36864" && \
       "$TURN_INPUT_TOKENS" == "32" && "$OUTPUT_TOKENS_PER_TURN" == "64" ]]; then
   WORKLOAD_TAG=b16_ctx36864_t8_o64
@@ -704,6 +705,12 @@ for ((repeat = 1; repeat <= REPEATS; repeat++)); do
     "TOKENIZERS_PARALLELISM=false"
     "PYTHONPATH=$ROOT"
     "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+    "WKVM_ENABLE_TOKEN_POOL_TRITON=1"
+    "WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON=1"
+    "WKVM_ENABLE_TOKEN_POOL_PAGED_SPLIT_TRITON=1"
+    "WKVM_TOKEN_POOL_TRITON_STRICT=1"
+    "WKVM_TOKEN_POOL_SLIDING_PAGED_METADATA_ONLY=1"
+    "WKVM_TOKEN_POOL_ROUTE_BOUNDARY_BATCH=1"
     "$WKVM_PY" -m wkvm.gemma_server
     --model "$MODEL_PATH"
     --served-model-name "$SERVED_MODEL_NAME"
@@ -714,7 +721,7 @@ for ((repeat = 1; repeat <= REPEATS; repeat++)); do
     --max-request-body-bytes 67108864
     --request-read-timeout-s 600
     --stream-flush-tokens 1
-    --max-completed-requests 4096
+    --max-completed-requests "$WKVM_MAX_COMPLETED_REQUESTS"
     --ignore-eos
     --enable-token-session-teacher-forcing
     --batch-wait-s 0.01

@@ -1,6 +1,7 @@
 import contextlib
 import copy
 import io
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -235,13 +236,42 @@ def _artifact_payload(
             f"http-report-{engine}-{repeat_id}-{trace_sha256}",
         )
     )
+    engine_versions = {
+        "wkvm": "git:" + "c" * 40,
+        "vllm": "0.24.0",
+        "sglang": "0.5.14",
+    }
+    engine_ports = {"wkvm": 8000, "vllm": 8001, "sglang": 8002}
+    engine_version = engine_versions[engine]
+    target_server_config = {
+        "dtype": "bfloat16",
+        "port": engine_ports[engine],
+        "served_model": "mock-gemma",
+    }
     payload = {
         "schema": BENCH_SCHEMA,
         "engine": engine,
+        "engine_version": engine_version,
         "semantic_mode": (
             "routed_span_approximate" if engine == "wkvm" else "full_kv"
         ),
         "model": "mock-gemma",
+        "git_commit": "c" * 40,
+        "provenance": {
+            "engine": {
+                "label": engine,
+                "version": engine_version,
+                "version_source": "frozen_campaign",
+            },
+            "target_server": {
+                "launch_command": (
+                    f"{engine} serve mock-gemma --port {engine_ports[engine]}"
+                ),
+                "launch_command_source": "operator_supplied",
+                "config": target_server_config,
+                "config_source": "operator_supplied",
+            },
+        },
         "prompt_token_source": "synthetic_lcg",
         "benchmark_identity": {
             "campaign_id": "http-campaign",
@@ -256,9 +286,14 @@ def _artifact_payload(
         "gpu_memory": {
             "schema": "wkvm.whole_gpu_memory.v1",
             "scope": "whole_device",
+            "source": "nvidia-smi",
+            "baseline_used_mib": 512,
             "peak_used_mib": peak_used_mib,
+            "peak_delta_mib": peak_used_mib - 512,
+            "memory_total_mib": 24_564,
             "gpu_name": "Mock GPU",
             "device_uuid": "GPU-mock",
+            "driver_version": "595.58.03",
             "query_error_count": 0,
             "gpu_runtime_telemetry": (
                 runtime_telemetry or _gpu_runtime_telemetry()
@@ -322,6 +357,195 @@ def _write_campaign(
 
 
 class MultiTurnHttp10xReportTests(unittest.TestCase):
+    def test_strict_publication_gate_accepts_clean_paired_three_repeat_campaign(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = _write_campaign(Path(tmp), repeats=3)
+            report = build_report(
+                load_records(paths),
+                min_repeats=3,
+                whole_device_memory_ceiling_mib=24_200,
+                strict=True,
+            )
+
+        self.assertTrue(report["passed"])
+        self.assertTrue(report["publication_passed"])
+        self.assertTrue(all(report["publication_checks"].values()))
+
+    def test_strict_publication_requires_three_repeats_and_exact_matrix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = _write_campaign(Path(tmp), repeats=1)
+            report = build_report(
+                load_records(paths),
+                min_repeats=1,
+                whole_device_memory_ceiling_mib=24_200,
+                strict=True,
+            )
+
+        self.assertFalse(report["passed"])
+        self.assertFalse(report["publication_checks"]["minimum_repeats"])
+        self.assertFalse(report["publication_checks"]["exact_repeat_matrix"])
+
+    def test_strict_publication_rejects_dirty_tree_and_mixed_gpu_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = _write_campaign(
+                Path(tmp),
+                repeats=3,
+                dirty=(2, "wkvm"),
+            )
+            payload = json.loads(paths[4].read_text())
+            payload["gpu_memory"]["device_uuid"] = "GPU-other"
+            paths[4].write_text(json.dumps(payload))
+            report = build_report(
+                load_records(paths),
+                min_repeats=3,
+                whole_device_memory_ceiling_mib=24_200,
+                strict=True,
+            )
+
+        self.assertFalse(report["passed"])
+        self.assertFalse(report["publication_checks"]["clean_worktree"])
+        self.assertFalse(report["publication_checks"]["same_gpu"])
+
+    def test_strict_publication_rejects_commit_model_and_driver_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = _write_campaign(Path(tmp), repeats=3)
+            mutations = (
+                (paths[0], "git_commit", "d" * 40),
+                (paths[1], "model", "other-gemma"),
+            )
+            for path, field, value in mutations:
+                payload = json.loads(path.read_text())
+                payload[field] = value
+                path.write_text(json.dumps(payload))
+            payload = json.loads(paths[2].read_text())
+            payload["gpu_memory"]["driver_version"] = "999.0"
+            paths[2].write_text(json.dumps(payload))
+            report = build_report(
+                load_records(paths),
+                min_repeats=3,
+                whole_device_memory_ceiling_mib=24_200,
+                strict=True,
+            )
+
+        self.assertFalse(report["passed"])
+        self.assertFalse(report["publication_checks"]["same_git_commit"])
+        self.assertFalse(report["publication_checks"]["stable_model_identity"])
+        self.assertFalse(report["publication_checks"]["same_driver"])
+
+    def test_strict_publication_rejects_engine_version_or_source_drift(self) -> None:
+        for field, value in (
+            ("version", "0.24.1"),
+            ("version_source", "different_environment"),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                paths = _write_campaign(Path(tmp), repeats=3)
+                payload = json.loads(paths[4].read_text())
+                payload["provenance"]["engine"][field] = value
+                if field == "version":
+                    payload["engine_version"] = value
+                paths[4].write_text(json.dumps(payload))
+                report = build_report(
+                    load_records(paths),
+                    min_repeats=3,
+                    whole_device_memory_ceiling_mib=24_200,
+                    strict=True,
+                )
+
+                self.assertFalse(report["passed"])
+                self.assertFalse(
+                    report["publication_checks"]["stable_engine_versions"]
+                )
+
+    def test_strict_publication_rejects_target_server_launch_or_config_drift(
+        self,
+    ) -> None:
+        for field in ("launch_command", "config"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                paths = _write_campaign(Path(tmp), repeats=3)
+                payload = json.loads(paths[4].read_text())
+                target = payload["provenance"]["target_server"]
+                if field == "launch_command":
+                    target[field] += " --changed"
+                    failed_check = "stable_engine_launches"
+                else:
+                    target[field]["changed"] = True
+                    failed_check = "stable_engine_configs"
+                paths[4].write_text(json.dumps(payload))
+                report = build_report(
+                    load_records(paths),
+                    min_repeats=3,
+                    whole_device_memory_ceiling_mib=24_200,
+                    strict=True,
+                )
+
+                self.assertFalse(report["passed"])
+                self.assertFalse(report["publication_checks"][failed_check])
+
+    def test_strict_publication_requires_target_server_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = _write_campaign(Path(tmp), repeats=3)
+            payload = json.loads(paths[4].read_text())
+            payload["provenance"].pop("target_server")
+            paths[4].write_text(json.dumps(payload))
+            report = build_report(
+                load_records(paths),
+                min_repeats=3,
+                whole_device_memory_ceiling_mib=24_200,
+                strict=True,
+            )
+
+        self.assertFalse(report["passed"])
+        self.assertFalse(
+            report["publication_checks"]["target_server_provenance"]
+        )
+
+    def test_trace_sha_alone_cannot_bind_different_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = []
+            for engine in ("wkvm", "vllm", "sglang"):
+                payload = _artifact_payload(
+                    engine=engine,
+                    repeat_index=1,
+                    continuation_rate={
+                        "wkvm": 110,
+                        "vllm": 10,
+                        "sglang": 5,
+                    }[engine],
+                    trace_sha256=_trace_sha(1),
+                    source=engine == "sglang",
+                    output_variant=1 if engine == "wkvm" else 0,
+                )
+                path = root / f"{engine}.json"
+                atomic_write_json(path, payload)
+                paths.append(path)
+            records = load_records(paths)
+            report = build_report(records, min_repeats=1)
+
+        self.assertFalse(report["checks"]["trace_or_output_linkage"])
+        self.assertFalse(report["repeat_groups"][0]["complete"])
+
+    def test_strict_publication_binds_trace_metadata_to_measured_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = _write_campaign(Path(tmp), repeats=3)
+            payload = json.loads(paths[1].read_text())
+            payload["history_trace"]["output_fingerprints"][0][
+                "request_output_token_ids_sha256"
+            ] = "f" * 64
+            paths[1].write_text(json.dumps(payload))
+            report = build_report(
+                load_records(paths),
+                min_repeats=3,
+                whole_device_memory_ceiling_mib=24_200,
+                strict=True,
+            )
+
+        self.assertFalse(report["passed"])
+        self.assertFalse(report["publication_checks"]["trace_output_binding"])
+        self.assertFalse(report["publication_checks"]["trace_role_contract"])
+
     def test_conservative_three_repeat_gate_passes_with_dirty_caveat(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = _write_campaign(
