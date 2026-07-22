@@ -112,14 +112,17 @@ The separately scoped provider-HTTP comparison follows.
 ## Performance evidence
 
 There is no honest workload-independent “WKVM is 10x faster” claim. The
-current evidence supports a scoped long-lived-session claim and also contains
-workloads where vLLM remains faster.
+current evidence supports scoped workload-specific speedups and also contains
+workloads where vLLM remains faster. A later exact-trace vLLM optimization
+audit superseded the earlier RTX 4090 10x-vLLM result.
 
 > **Current Open WebUI checkpoint:** The strict 2026-07-23 B32 x 8 run passed
 > all 256 requests and reused all 224 eligible continuations with 32 sessions
-> opened, zero closed, and zero parent-history rejections. It is one controlled
-> cross-run comparison on an active RTX 4090 desktop; repeated rotated runs are
-> still required before treating the ratios as a publication-grade envelope.
+> opened, zero closed, and zero parent-history rejections. R5 completed in
+> 94.953s at 345.097 output tok/s, measuring 2.153x the tested vLLM mode-0
+> profile and 5.305x the tested SGLang profile. It is one controlled cross-run
+> comparison on an active RTX 4090 desktop; repeated rotated runs are still
+> required before treating the ratios as a publication-grade envelope.
 
 > **A800 status:** A single exploratory B32, 98,304-token, 12-turn scout
 > measured 12.107x versus vLLM (346.300 s versus 4,192.690 s), but it is not a
@@ -129,27 +132,38 @@ workloads where vLLM remains faster.
 
 | measured workload | WKVM result | vs vLLM | vs SGLang | outcome |
 |---|---:|---:|---:|---|
-| Real Open WebUI 0.10.2, B32, 8 turns, 13,824-token initial context | **117.888s / 277.959 output tok/s** | **1.734x faster** | **4.273x faster** | strict 224/224 reuse pass; repeats pending |
-| RTX 4090 provider HTTP, B16, 48 turns, 36,864-token initial context | 180.415s complete wall | **11.151x faster** | **26.079x faster** | scoped exploratory pass |
-| **PROVISIONAL:** A800 provider HTTP scout, B32, 12 turns, 98,304-token initial context | 346.300s complete wall | **12.107x faster** | not matched | clean repeated campaign pending |
+| Real Open WebUI 0.10.2, B32, 8 turns, 13,824-token initial context | **94.953s / 345.097 output tok/s** | **2.153x throughput** | **5.305x throughput** | strict 224/224 reuse pass; repeats pending |
+| RTX 4090 provider HTTP, B16, 48 turns, 36,864-token initial context | 180.415s complete wall | **9.827x throughput** against later mode-3 audit | **26.079x throughput** against original SGLang row | original 10x-vLLM conclusion superseded |
+| **PROVISIONAL:** A800 provider HTTP scout, B32, 12 turns, 98,304-token initial context | 346.300s complete wall | **12.107x throughput** | not matched | clean repeated campaign pending |
 | **OUTDATED:** Real Open WebUI 0.10.2, offered B32, 8 turns | 53.963 output tok/s | 0.586x; vLLM is 70.6% faster | 0.998x; effectively tied | historical only; rerun required |
 | Repeated A800 strict short-session gate, B64/ctx16K/out32 | worst-repeat envelope | 0.790x | 1.400x | overall gate fail |
 
-The B16 x 48-turn result completed all 2,304 requests from a 36,864-token
-initial context: WKVM took 180.415s, vLLM took 2,011.890s, and SGLang took
-4,705.123s. It is one exploratory paired cohort on a desktop RTX 4090, with
-WKVM `routed_span_approximate` versus incumbent `full_kv` semantics. The safe
-claim is: **on that predeclared long-lived workload, WKVM measured 11.151x vLLM
-and 26.079x SGLang end to end**. It does not establish a universal engine
-ranking or quality equivalence.
+The original B16 x 48-turn cohort completed all 2,304 requests from a
+36,864-token initial context: WKVM took 180.415s, the original vLLM mode-0 row
+took 2,011.890s, and SGLang took 4,705.123s. A later clean vLLM mode-3 run
+replayed the identical trace in 1,772.936s, reducing the cross-run WKVM/vLLM
+ratio to **9.827x**. Therefore the repository no longer makes a 10x-vLLM claim
+from this artifact. The comparison remains exploratory and uses WKVM
+`routed_span_approximate` versus incumbent `full_kv` semantics; it does not
+establish a universal ranking or quality equivalence.
 
-The current strict Open WebUI row completed 256/256 requests in 117.888s and
-generated 277.959 output tok/s. Optimized vLLM completed the matching workload
-in 204.388s at 160.322 tok/s; optimized SGLang took 503.700s at 65.055 tok/s.
-WKVM reused 12 exact token prefixes plus 212 parent-bound deltas, with zero
-restarts. Continuation-only throughput was 345.607 tok/s, 2.126x vLLM and
-5.335x SGLang. This still is not a 10x Open WebUI result: turn 0 alone took
-34.926s, and B32 decode is split into 16-row model calls without CUDA graphs.
+The current strict Open WebUI row completed 256/256 requests in 94.953s and
+generated 345.097 output tok/s. The tested vLLM mode-0 profile completed the
+matching workload in 204.388s at 160.322 tok/s; the tested SGLang profile took
+503.700s at 65.055 tok/s. WKVM reused 17 exact token prefixes plus 207
+parent-bound deltas, with zero restarts. Continuation-only throughput was
+458.090 tok/s, 2.818x vLLM and 7.072x SGLang. R5 removed the B32 execution
+bottleneck: decode reached 32 rows with zero microbatch splits. This still is
+not a 10x Open WebUI result because turn 0 alone took 32.363s, above the entire
+20.439s 10x wall budget.
+
+The regular helper remains the conservative four-slot interactive profile. To
+start the measured high-memory recipe for controlled B32 testing, stop any
+managed interactive services first, then use
+`WKVM_DEMO_PROFILE=benchmark-b32 ./scripts/open_webui_demo.sh start`. It enables
+`--ignore-eos`, sets the Open WebUI default output limit to 128 tokens, and is
+not intended for normal chat. The benchmark driver explicitly requests that
+same 128-token limit for every measured request.
 
 Evidence and methodology:
 

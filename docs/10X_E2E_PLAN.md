@@ -746,24 +746,29 @@ High concurrency is now doing exactly what the architecture promises: WKVM
 keeps 16 compact session states resident while vLLM holds only 5.57 full
 histories and SGLang about 1.5. It does not make the one-time cold computation
 10x faster. The owner-only change removes avoidable cold work and brings WKVM
-turn 0 to parity with vLLM; the remaining 13.9x continuation advantage comes
-from resident-state capacity and batching.
+turn 0 near parity with vLLM. The original mode-0 cohort measured a 13.9x
+continuation advantage; the later mode-3 exact-trace audit narrows the 48-turn
+continuation ratio to about 12.38x while reducing the complete-session ratio to
+9.827x. The resident-state advantage remains, but the old 48-turn 10x-vLLM
+conclusion does not.
 
 There are two honest next claims:
 
 1. Publish the warm provider-HTTP continuation result after three complete,
-   paired, clean-tree, headless repeats for all engines.
+   paired, clean-tree, headless repeats using the fastest frozen profiles for
+   all engines.
 2. If complete-session 10x versus both engines is required, predeclare a
-   genuinely long-lived session. A linear extrapolation of this single fair
-   cohort crosses 10x vLLM at 36 total turns; use at least 48 turns for margin
-   and measure it rather than publishing the extrapolation.
+   longer genuinely stateful session and measure it. A linear extrapolation of
+   the audited single-run walls crosses 10x vLLM at roughly 53 total turns, so
+   64 turns is a reasonable scout shape, not a publishable result.
 
-For the fixed eight-turn BF16 workload, 10x vLLM would require WKVM full wall
-at or below 31.074 seconds. The measured cold turn alone is 40.202--41.359
-seconds, so no concurrency, SSE, scheduler, or small fusion adjustment can
-close that gap. A fixed-eight-turn 10x result needs a fundamentally different
-cold path such as a quality-gated FP8 implementation compared against FP8
-incumbents, or a separately disclosed precomputed-state/resume workload.
+Against the original fixed eight-turn BF16 profile, 10x vLLM would require
+WKVM full wall at or below 31.074 seconds. The measured cold turn alone is
+40.202--41.359 seconds, so no concurrency, SSE, scheduler, or small fusion
+adjustment can close that gap. A fixed-eight-turn 10x result needs a
+fundamentally different cold path such as a quality-gated FP8 implementation
+compared against FP8 incumbents, or a separately disclosed
+precomputed-state/resume workload.
 
 Artifacts:
 
@@ -775,7 +780,7 @@ Artifacts:
 /home/xiaol/X/results/4090/wkvm_fast_prefill_fair_http_20260717_r1/artifacts/sglang-source-r1.json
 ```
 
-## Measured 48-turn complete-session crossover
+## Measured 48-turn complete-session crossover (superseded)
 
 The predeclared long-lived campaign completed on the RTX 4090. It used B16,
 48 synchronized turns, 36,864 initial tokens/session, 32 new input tokens per
@@ -786,23 +791,27 @@ token IDs from fresh processes.
 | Engine | Semantic mode | Turn 0 | Continuations | Full wall | Full tok/s | Peak GPU |
 |---|---|---:|---:|---:|---:|---:|
 | WKVM | `routed_span_approximate` | 40.265 s | 140.150 s | **180.415 s** | **272.439** | 23,856 MiB |
-| vLLM 0.24.0 | `full_kv` | 40.469 s | 1,971.421 s | 2,011.890 s | 24.431 | 23,200 MiB |
+| vLLM 0.24.0 original mode-0 row | `full_kv` | 40.469 s | 1,971.421 s | 2,011.890 s | 24.431 | 23,200 MiB |
+| vLLM 0.24.0 later mode-3 audit | `full_kv` | 38.542 s | 1,734.394 s | 1,772.936 s | 27.724 | within 24,200 MiB |
 | SGLang 0.5.14 | `full_kv` | 90.711 s | 4,614.412 s | 4,705.123 s | 10.446 | 23,597 MiB |
 
-The complete-session ratios are 11.151462x versus vLLM and 26.079455x versus
-SGLang. All three engines complete 768/768 requests with zero errors, exact
+The original cohort ratios were 11.151462x versus vLLM and 26.079455x versus
+SGLang. The later clean mode-3 vLLM artifact replays the identical trace in
+1,772.936167s, reducing the valid cross-run WKVM/vLLM ratio to **9.826992x**.
+All referenced artifacts complete 768/768 requests with zero errors, exact
 output-ID accounting, one shared trace SHA, and valid memory measurements.
-Every report check passes.
 
-This establishes the scoped exploratory claim:
+Therefore the original scoped claim is retired:
 
-> WKVM delivers at least 10x provider-HTTP complete-session output throughput
-> on the named 48-turn long-lived workload, hardware, and memory ceiling, in
-> `routed_span_approximate` mode versus vLLM/SGLang `full_kv` mode.
+> The named 48-turn artifact demonstrates a 9.827x cross-run speedup over the
+> audited vLLM profile and a 26.079x speedup over the original SGLang row. It
+> does not establish a current 10x-vLLM result.
 
 It does not establish fixed-eight-turn 10x versus vLLM, same-semantics 10x, or
-a universal engine claim. It is one paired cohort from a dirty, non-headless
-tree. Publication still requires three paired clean-tree headless repeats.
+a universal engine claim. The original cohort came from a dirty, non-headless
+tree, and the audited vLLM row is a later cross-run comparison. A new 10x result
+must put WKVM below 177.293617s and still requires three paired clean-tree
+headless repeats with the fastest frozen incumbent profiles.
 
 The detailed report is
 `experiments/results/gemma_4090_48turn_10x_20260717.md`. Generated artifacts

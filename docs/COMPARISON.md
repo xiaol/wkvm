@@ -4,11 +4,12 @@
 
 > **Scope update:** the historical 10x-class rows below remain specialized
 > steady-state PoC decode. The strict short-session A800 gate remains FAIL at
-> 0.790x versus vLLM and 1.400x versus SGLang. A separate one-repeat RTX 4090
-> long-lived provider-HTTP cohort now passes the complete-session gate at
-> 11.151x versus vLLM and 26.079x versus SGLang. It is exploratory because the
-> tree was dirty, the GPU was not headless, and WKVM `routed_span_approximate`
-> semantics differ from incumbent `full_kv` semantics.
+> 0.790x versus vLLM and 1.400x versus SGLang. A later exact-trace vLLM mode-3
+> audit superseded the one-repeat RTX 4090 long-lived 10x-vLLM conclusion: the
+> corrected cross-run ratio is 9.827x. The original SGLang row remains 26.079x,
+> but it has no matching later optimization audit. All of these comparisons are
+> exploratory, and WKVM `routed_span_approximate` semantics differ from
+> incumbent `full_kv` semantics.
 
 ## Latest provider-HTTP complete-session result
 
@@ -19,15 +20,17 @@ Gemma-4-E4B-it, BF16, B16, 48 synchronized turns, 36,864 initial tokens,
 | Engine | Semantic mode | Full wall | Full output tok/s | Peak whole GPU |
 |---|---|---:|---:|---:|
 | WKVM | `routed_span_approximate` | **180.415 s** | **272.439** | 23,856 MiB |
-| vLLM 0.24.0 | `full_kv` | 2,011.890 s | 24.431 | 23,200 MiB |
+| vLLM 0.24.0 mode-3 audit | `full_kv` | 1,772.936 s | 27.724 | within 24,200 MiB |
 | SGLang 0.5.14 | `full_kv` | 4,705.123 s | 10.446 | 23,597 MiB |
 
-The full-session ratios are **11.151x** and **26.079x**. All engines complete
-768/768 requests with zero errors and share one exact 48-turn source/replay
-trace. Turn zero is tied between WKVM and vLLM; the 10x result comes from
-amortizing that one-time prompt over 47 resident-state continuations. See the
+The audited cross-run ratios are **9.827x versus vLLM** and **26.079x versus the
+original SGLang row**. Every referenced artifact completes 768/768 requests
+with zero errors and uses the same exact 48-turn source/replay trace. The long
+session still demonstrates the resident-state advantage, but it no longer
+passes a current 10x-vLLM gate. See the
 [`full report`](../experiments/results/gemma_4090_48turn_10x_20260717.md) for
-launch settings, continuation results, trace identity, and claim limits.
+launch settings, continuation results, trace identity, and the superseding
+audit.
 
 ## 1. What each engine is
 

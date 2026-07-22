@@ -1,8 +1,14 @@
 {
-  "schema": "wkvm.open_webui_parent_token_compare.v1",
+  "schema": "wkvm.open_webui_parent_token_compare.v2",
   "created_date": "2026-07-23",
-  "source_base_commit": "d73db9ef2fa78c1113964f4e9a0756fed01edd6c",
-  "comparison_design": "single cross-run cohort with identical workload fingerprints",
+  "source_provenance": {
+    "wkvm_commit": "1c2816728b2d550b6c69e37fcd3cab8c5f89f5e7",
+    "wkvm_tracked_tree_clean": true,
+    "wkvm_full_tree_clean": false,
+    "wkvm_untracked_path_count": 23,
+    "incumbent_profile_commit": "d73db9ef2fa78c1113964f4e9a0756fed01edd6c"
+  },
+  "comparison_design": "WKVM R5 compared with previously captured incumbent profiles using identical workload fingerprints",
   "publication_ready": false,
   "hardware": {
     "gpu": "NVIDIA GeForce RTX 4090",
@@ -46,41 +52,41 @@
   },
   "results": [
     {
-      "engine": "WKVM parent-token-v1",
+      "engine": "WKVM parent-token-v1 R5",
       "raw_status": "passed",
       "success_count": 256,
       "error_count": 0,
-      "synchronized_wall_s": 117.887751,
-      "e2e_generated_output_tok_s": 277.959328,
-      "api_accounted_total_tok_s": 31521.476731,
-      "total_application_goodput_tok_s": 4091.213853,
-      "completed_requests_per_s": 2.171557,
-      "turn_0_output_tok_s": 117.275181,
-      "continuation_output_tok_s": 345.606719,
+      "synchronized_wall_s": 94.953025,
+      "e2e_generated_output_tok_s": 345.096957,
+      "api_accounted_total_tok_s": 39144.577016,
+      "total_application_goodput_tok_s": 5079.395838,
+      "completed_requests_per_s": 2.69607,
+      "turn_0_output_tok_s": 126.565577,
+      "continuation_output_tok_s": 458.089749,
       "ack_latency_s": {
-        "p95": 1.139173
+        "p95": 1.134958
       },
       "ui_path_ttft_s": {
-        "p50": 2.460352,
-        "p95": 26.262137
+        "p50": 2.267243,
+        "p95": 26.1362
       },
       "e2e_latency_s": {
-        "p50": 11.650993,
-        "p95": 34.751874
+        "p50": 9.017577,
+        "p95": 32.200969
       },
       "whole_gpu_memory": {
-        "baseline_used_mib": 16910,
-        "peak_used_mib": 22947,
-        "peak_delta_mib": 6037
+        "baseline_used_mib": 16918,
+        "peak_used_mib": 23150,
+        "peak_delta_mib": 6232
       },
-      "gpu_utilization_percent_mean": 61.478648,
+      "gpu_utilization_percent_mean": 57.529284,
       "target_config": {
         "slots": 32,
         "max_chat_sessions": 32,
         "prefill_microbatch_rows": 2,
-        "continuation_prefill_microbatch_rows": 8,
-        "decode_microbatch_rows": 16,
-        "persistent_padded_decode_steps": 64,
+        "continuation_prefill_microbatch_rows": 32,
+        "decode_microbatch_rows": 32,
+        "persistent_padded_decode_steps": 128,
         "persistent_padded_decode_cuda_graph": false,
         "native_gemma_kv_sharing_fast_prefill": true,
         "token_pool_capacity": 114688,
@@ -88,7 +94,7 @@
       }
     },
     {
-      "engine": "vLLM optimized",
+      "engine": "vLLM tested mode-0 profile",
       "raw_status": "passed",
       "success_count": 256,
       "error_count": 0,
@@ -122,11 +128,12 @@
         "gpu_memory_utilization": 0.82,
         "enable_prefix_caching": true,
         "kv_sharing_fast_prefill": true,
+        "compilation_mode": 0,
         "cudagraph_mode": "FULL_DECODE_ONLY"
       }
     },
     {
-      "engine": "SGLang optimized",
+      "engine": "SGLang tested profile",
       "raw_status": "passed",
       "success_count": 256,
       "error_count": 0,
@@ -167,8 +174,8 @@
     "eligible_continuations": 224,
     "engine_session_reuse_hits": 224,
     "engine_session_reuse_misses": 0,
-    "chat_exact_prefix_reuse_hits": 12,
-    "parent_bound_continuation_hits": 212,
+    "chat_exact_prefix_reuse_hits": 17,
+    "parent_bound_continuation_hits": 207,
     "parent_bound_continuation_misses": 0,
     "parent_bound_continuation_rejections": {},
     "sessions_opened": 32,
@@ -176,32 +183,32 @@
     "cache_builds": 32,
     "final_parked_sessions": 32,
     "full_reprefill_turns": 0,
-    "prefix_tokens_reused": 3239163
+    "prefix_tokens_reused": 3239162
   },
   "wkvm_execution": {
     "max_running": 32,
     "max_resident_sessions": 32,
-    "max_decode_model_batch_rows": 16,
-    "decode_microbatch_splits": 1015,
-    "decode_model_calls": 2061,
-    "batched_decode_model_calls": 2047,
-    "scheduled_tokens": 484471
+    "max_decode_model_batch_rows": 32,
+    "decode_microbatch_splits": 0,
+    "decode_model_calls": 1048,
+    "batched_decode_model_calls": 1039,
+    "scheduled_tokens": 484479
   },
   "comparisons": {
-    "wkvm_vs_vllm_output_throughput_ratio": 1.733753,
-    "wkvm_vs_sglang_output_throughput_ratio": 4.272708,
-    "wkvm_vs_vllm_continuation_output_ratio": 2.126211,
-    "wkvm_vs_sglang_continuation_output_ratio": 5.335203,
+    "wkvm_vs_vllm_output_throughput_ratio": 2.15252,
+    "wkvm_vs_sglang_output_throughput_ratio": 5.304727,
+    "wkvm_vs_vllm_continuation_output_ratio": 2.818219,
+    "wkvm_vs_sglang_continuation_output_ratio": 7.071627,
     "ten_x_vllm_required_wall_s": 20.438824,
     "ten_x_sglang_required_wall_s": 50.369988,
-    "wkvm_turn_0_wall_s": 34.926401
+    "wkvm_turn_0_wall_s": 32.36267
   },
   "raw_artifacts": [
     {
       "engine": "WKVM",
-      "basename": "wkvm-parent-token-b32-t8-ctx13824-out128-normalized-r3.json",
-      "bytes": 874286,
-      "sha256": "b2343e88817a5b15d6ae8c60f7bae004b0be67e3ffc12256c51093c8f1e0125c"
+      "basename": "wkvm-parent-token-b32-t8-ctx13824-out128-opt-steps128-r5.json",
+      "bytes": 873668,
+      "sha256": "d24d3b1eeab6f5babb80cabfce229e20b34d578eb5a721837f98af86bd110108"
     },
     {
       "engine": "vLLM",
@@ -217,5 +224,5 @@
     }
   ],
   "raw_artifact_store_note": "Request-level JSON remains in the external local benchmark artifact store; this committed summary records hashes and audited aggregates.",
-  "claim": "On this exact real Open WebUI B32 x 8 workload, WKVM measured 1.734x vLLM and 4.273x SGLang in generated-output throughput with strict 224/224 continuation reuse. This is not a universal or 10x claim."
+  "claim": "On this exact real Open WebUI B32 x 8 workload, WKVM R5 measured 2.153x the tested vLLM mode-0 profile and 5.305x the tested SGLang profile in generated-output throughput with strict 224/224 continuation reuse. This single cross-run checkpoint is not a universal, publication-grade, or 10x claim."
 }

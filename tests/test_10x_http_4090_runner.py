@@ -78,6 +78,9 @@ class Test10xHttp4090Runner(unittest.TestCase):
                 "TURN_INPUT_TOKENS": "32",
                 "INITIAL_CONTEXT_TOKENS": "36864",
                 "WKVM_NATIVE_GEMMA_KV_SHARING_FAST_PREFILL": "1",
+                "WKVM_CONTINUATION_PREFILL_MICROBATCH_ROWS": "8",
+                "WKVM_DECODE_MICROBATCH_ROWS": "16",
+                "WKVM_PERSISTENT_PADDED_DECODE_STEPS": "64",
                 "WKVM_PY": sys.executable,
             }
         )
@@ -181,6 +184,14 @@ class Test10xHttp4090Runner(unittest.TestCase):
             "8",
         )
         self.assertEqual(
+            option_value(wkvm_server, "--decode-microbatch-rows"),
+            "16",
+        )
+        self.assertEqual(
+            option_value(wkvm_server, "--persistent-padded-decode-steps"),
+            "64",
+        )
+        self.assertEqual(
             option_value(wkvm_server, "--native-gemma-attention-backend"),
             "triton_dense_gqa",
         )
@@ -277,6 +288,20 @@ class Test10xHttp4090Runner(unittest.TestCase):
             recorded_configs[("wkvm", 1)]["token_pool_max_context_len"],
             37632,
         )
+        self.assertEqual(
+            recorded_configs[("wkvm", 1)][
+                "continuation_prefill_microbatch_rows"
+            ],
+            8,
+        )
+        self.assertEqual(
+            recorded_configs[("wkvm", 1)]["decode_microbatch_rows"],
+            16,
+        )
+        self.assertEqual(
+            recorded_configs[("wkvm", 1)]["persistent_padded_decode_steps"],
+            64,
+        )
         self.assertIs(
             recorded_configs[("wkvm", 1)][
                 "native_gemma_kv_sharing_fast_prefill"
@@ -336,6 +361,9 @@ class Test10xHttp4090Runner(unittest.TestCase):
                     "VLLM_MAX_NUM_BATCHED_TOKENS": "8192",
                     "VLLM_GPU_MEMORY_UTILIZATION": "0.90",
                     "WKVM_NATIVE_GEMMA_KV_SHARING_FAST_PREFILL": "0",
+                    "WKVM_CONTINUATION_PREFILL_MICROBATCH_ROWS": "16",
+                    "WKVM_DECODE_MICROBATCH_ROWS": "12",
+                    "WKVM_PERSISTENT_PADDED_DECODE_STEPS": "128",
                 },
             )
             disabled_default = self.dry_run(
@@ -361,6 +389,18 @@ class Test10xHttp4090Runner(unittest.TestCase):
 
         wkvm_server = server_commands["wkvm"]
         self.assertNotIn("--native-gemma-kv-sharing-fast-prefill", wkvm_server)
+        self.assertEqual(
+            option_value(wkvm_server, "--continuation-prefill-microbatch-rows"),
+            "16",
+        )
+        self.assertEqual(
+            option_value(wkvm_server, "--decode-microbatch-rows"),
+            "12",
+        )
+        self.assertEqual(
+            option_value(wkvm_server, "--persistent-padded-decode-steps"),
+            "128",
+        )
 
         vllm_server = server_commands["vllm"]
         self.assertIn("--no-kv-sharing-fast-prefill", vllm_server)
@@ -395,6 +435,15 @@ class Test10xHttp4090Runner(unittest.TestCase):
         self.assertIs(
             recorded_configs["wkvm"]["native_gemma_kv_sharing_fast_prefill"],
             False,
+        )
+        self.assertEqual(
+            recorded_configs["wkvm"]["continuation_prefill_microbatch_rows"],
+            16,
+        )
+        self.assertEqual(recorded_configs["wkvm"]["decode_microbatch_rows"], 12)
+        self.assertEqual(
+            recorded_configs["wkvm"]["persistent_padded_decode_steps"],
+            128,
         )
         self.assertIs(recorded_configs["vllm"]["kv_sharing_fast_prefill"], False)
         self.assertEqual(recorded_configs["vllm"]["max_num_batched_tokens"], 8192)
@@ -645,6 +694,21 @@ class Test10xHttp4090Runner(unittest.TestCase):
                 model_path=model,
                 extra_env={"VLLM_GPU_MEMORY_UTILIZATION": "0"},
             )
+            invalid_wkvm_continuation_rows = self.dry_run(
+                out_dir=base / "results-j",
+                model_path=model,
+                extra_env={"WKVM_CONTINUATION_PREFILL_MICROBATCH_ROWS": "0"},
+            )
+            invalid_wkvm_decode_rows = self.dry_run(
+                out_dir=base / "results-k",
+                model_path=model,
+                extra_env={"WKVM_DECODE_MICROBATCH_ROWS": "many"},
+            )
+            invalid_wkvm_persistent_steps = self.dry_run(
+                out_dir=base / "results-l",
+                model_path=model,
+                extra_env={"WKVM_PERSISTENT_PADDED_DECODE_STEPS": "0"},
+            )
 
         self.assertNotEqual(invalid_repeats.returncode, 0)
         self.assertIn("REPEATS must be an integer >= 1", invalid_repeats.stderr)
@@ -678,6 +742,21 @@ class Test10xHttp4090Runner(unittest.TestCase):
         self.assertIn(
             "VLLM_GPU_MEMORY_UTILIZATION must be a number greater than 0 and at most 1",
             invalid_vllm_utilization.stderr,
+        )
+        self.assertNotEqual(invalid_wkvm_continuation_rows.returncode, 0)
+        self.assertIn(
+            "WKVM_CONTINUATION_PREFILL_MICROBATCH_ROWS must be an integer >= 1",
+            invalid_wkvm_continuation_rows.stderr,
+        )
+        self.assertNotEqual(invalid_wkvm_decode_rows.returncode, 0)
+        self.assertIn(
+            "WKVM_DECODE_MICROBATCH_ROWS must be an integer >= 1",
+            invalid_wkvm_decode_rows.stderr,
+        )
+        self.assertNotEqual(invalid_wkvm_persistent_steps.returncode, 0)
+        self.assertIn(
+            "WKVM_PERSISTENT_PADDED_DECODE_STEPS must be an integer >= 1",
+            invalid_wkvm_persistent_steps.stderr,
         )
 
 

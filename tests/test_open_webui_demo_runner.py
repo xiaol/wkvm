@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -28,6 +29,7 @@ class TestOpenWebUIDemoRunner(unittest.TestCase):
         if model_exists:
             model_dir.mkdir(parents=True, exist_ok=True)
         env = os.environ.copy()
+        env.pop("OPEN_WEBUI_MAX_TOKENS", None)
         env.update(
             {
                 "DRY_RUN": "1" if dry_run else "0",
@@ -38,6 +40,7 @@ class TestOpenWebUIDemoRunner(unittest.TestCase):
                 "WKVM_PORT": "18000",
                 "OPEN_WEBUI_PORT": "13000",
                 "SERVED_MODEL_NAME": "local-wkvm-gemma",
+                "WKVM_DEMO_PROFILE": "interactive",
             }
         )
         if extra_env:
@@ -87,6 +90,117 @@ class TestOpenWebUIDemoRunner(unittest.TestCase):
         self.assertIn("huggingface_hub", tool_install)
         self.assertIn("open-webui==0.10.2", tool_install)
         self.assertFalse((base / "demo home").exists())
+
+    def test_start_dry_run_exposes_measured_b32_benchmark_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            result = self.run_demo(
+                "start",
+                base=base,
+                extra_env={"WKVM_DEMO_PROFILE": "benchmark-b32"},
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        wkvm_marker = next(
+            line for line in lines if line.startswith("launch service=wkvm")
+        )
+        wkvm_launch = shlex.split(lines[lines.index(wkvm_marker) + 1])
+        for environment_flag in (
+            "WKVM_ENABLE_TOKEN_POOL_TRITON=1",
+            "WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON=1",
+            "WKVM_ENABLE_TOKEN_POOL_PAGED_SPLIT_TRITON=1",
+            "WKVM_TOKEN_POOL_TRITON_STRICT=1",
+            "WKVM_TOKEN_POOL_SLIDING_PAGED_METADATA_ONLY=1",
+            "WKVM_TOKEN_POOL_ROUTE_BOUNDARY_BATCH=1",
+        ):
+            self.assertIn(environment_flag, wkvm_launch)
+        self.assertNotIn("--native-gemma-production-profile", wkvm_launch)
+        expected_values = {
+            "--slots": "32",
+            "--max-chat-sessions": "32",
+            "--max-queue": "128",
+            "--request-timeout-s": "1200",
+            "--request-read-timeout-s": "1200",
+            "--max-request-body-bytes": "67108864",
+            "--chat-session-ttl-s": "3600",
+            "--max-completed-requests": "320",
+            "--batch-wait-s": "0.01",
+            "--prefill-chunk": "2048",
+            "--prefill-microbatch-rows": "2",
+            "--continuation-prefill-microbatch-rows": "32",
+            "--decode-microbatch-rows": "32",
+            "--persistent-padded-decode-steps": "128",
+            "--token-pool-max-context-len": "15232",
+            "--token-pool-capacity": "114688",
+            "--token-pool-paged-block-size": "16",
+            "--m-slots": "32",
+            "--route-chunk": "2048",
+            "--native-gemma-attention-backend": "triton_dense_gqa",
+            "--native-gemma-projection-backend": "separate",
+        }
+        for option, value in expected_values.items():
+            self.assertEqual(wkvm_launch[wkvm_launch.index(option) + 1], value)
+        self.assertIn("--ignore-eos", wkvm_launch)
+        self.assertIn("--persistent-padded-sliding-metadata-padding", wkvm_launch)
+        self.assertIn("--enable-token-pool-attention", wkvm_launch)
+        self.assertNotIn("--persistent-padded-decode-cuda-graph", wkvm_launch)
+        self.assertIn("--native-gemma-kv-sharing-fast-prefill", wkvm_launch)
+
+        webui_marker = next(
+            line for line in lines if line.startswith("launch service=open-webui")
+        )
+        webui_launch = shlex.split(lines[lines.index(webui_marker) + 1])
+        self.assertIn(
+            'DEFAULT_MODEL_PARAMS={"temperature":0,"top_p":1,"reasoning_tags":false,"function_calling":"legacy","max_tokens":128}',
+            webui_launch,
+        )
+        self.assertIn(
+            'OPENAI_API_CONFIGS={"0":{"headers":{"X-WKVM-Stateful-Chat":"parent-token-v1","X-WKVM-Assistant-Message-ID":"{{MESSAGE_ID}}","X-WKVM-User-Message-ID":"{{USER_MESSAGE_ID}}","X-WKVM-Parent-Message-ID":"{{USER_MESSAGE_PARENT_ID}}"}}}',
+            webui_launch,
+        )
+
+    def test_b32_profile_rejects_output_length_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result = self.run_demo(
+                "start",
+                base=Path(temporary),
+                extra_env={
+                    "WKVM_DEMO_PROFILE": "benchmark-b32",
+                    "OPEN_WEBUI_MAX_TOKENS": "1152",
+                },
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "benchmark-b32 requires OPEN_WEBUI_MAX_TOKENS=128",
+            result.stderr,
+        )
+
+    def test_start_refuses_to_reuse_an_unknown_live_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            run_dir = base / "demo home" / "run"
+            run_dir.mkdir(parents=True)
+            for name in ("wkvm.pid", "open-webui.pid"):
+                (run_dir / name).write_text(f"{os.getpid()}\n")
+            result = self.run_demo(
+                "start",
+                base=base,
+                dry_run=False,
+                extra_env={
+                    "WKVM_DEMO_PROFILE": "benchmark-b32",
+                    "WKVM_PYTHON": sys.executable,
+                    "OPEN_WEBUI_BIN": "/bin/true",
+                },
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "managed services use a different or unknown launch profile",
+            result.stderr,
+        )
+        self.assertIn("stop", result.stderr)
 
     def test_start_dry_run_uses_safe_chat_profile_and_open_webui_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -196,6 +310,35 @@ class TestOpenWebUIDemoRunner(unittest.TestCase):
         self.assertIn("install", result.stderr)
         self.assertIn("start", result.stderr)
         self.assertIn("smoke", result.stderr)
+
+    def test_invalid_profile_is_actionable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result = self.run_demo(
+                "start",
+                base=Path(temporary),
+                extra_env={"WKVM_DEMO_PROFILE": "fastest"},
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "WKVM_DEMO_PROFILE must be interactive or benchmark-b32",
+            result.stderr,
+        )
+
+    def test_invalid_start_profile_does_not_block_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result = self.run_demo(
+                "stop",
+                base=Path(temporary),
+                extra_env={
+                    "WKVM_DEMO_PROFILE": "fastest",
+                    "OPEN_WEBUI_MAX_TOKENS": "invalid",
+                },
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stop-process service=open-webui", result.stdout)
+        self.assertIn("stop-process service=wkvm", result.stdout)
 
 
 if __name__ == "__main__":

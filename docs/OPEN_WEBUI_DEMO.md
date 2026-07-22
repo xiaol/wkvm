@@ -342,10 +342,24 @@ reviewed network policy first; changing a bind address alone is unsafe.
 
 ## Benchmark reproduction is different
 
-The measured Open WebUI B32 x 8 result uses 32 slots, fixed output length,
-`--ignore-eos`, explicit token-pool sizing, strict Triton settings, cache
-emptying, and benchmark-specific UI controls. Those settings reproduce one
-artifact and can OOM or distort normal chat behavior. Use the
+The measured Open WebUI B32 x 8 R5 result uses 32 slots, 32-row continuation
+prefill and decode, 128 persistent decode steps, fixed output length,
+`--ignore-eos`, explicit token-pool sizing, strict Triton settings, and
+benchmark-specific UI controls. Start that server recipe explicitly:
+
+```bash
+./scripts/open_webui_demo.sh stop
+WKVM_DEMO_PROFILE=benchmark-b32 \
+WKVM_MODEL_DIR="$WKVM_MODEL_DIR" \
+  ./scripts/open_webui_demo.sh start
+```
+
+The profile sets Open WebUI's default output limit to 128 tokens and refuses to
+reuse managed services started with another profile. The benchmark driver
+explicitly requests that same limit for each measured request; clients can
+still submit a different request-specific limit. The profile reproduces one
+high-memory artifact shape and can OOM or distort normal chat behavior; stop it
+before returning to the default `interactive` profile. Use the
 [current strict report](../experiments/results/open_webui_parent_token_b32_t8_20260723.md)
 when reproducing the parent-token measurement; the
 [2026-07-14 report](../experiments/results/open_webui_b32_t8_compare_20260714.md)

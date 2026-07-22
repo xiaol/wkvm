@@ -39,6 +39,9 @@ VLLM_CUDAGRAPH_MODE="${VLLM_CUDAGRAPH_MODE:-}"
 VLLM_COMPILE_MODE="${VLLM_COMPILE_MODE:-0}"
 VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-4096}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.82}"
+WKVM_CONTINUATION_PREFILL_MICROBATCH_ROWS="${WKVM_CONTINUATION_PREFILL_MICROBATCH_ROWS:-8}"
+WKVM_DECODE_MICROBATCH_ROWS="${WKVM_DECODE_MICROBATCH_ROWS:-16}"
+WKVM_PERSISTENT_PADDED_DECODE_STEPS="${WKVM_PERSISTENT_PADDED_DECODE_STEPS:-64}"
 BENCHMARK="${BENCHMARK:-$ROOT/experiments/gemma_multiturn_http_bench.py}"
 REPORT="${REPORT:-$ROOT/experiments/multiturn_http_10x_report.py}"
 GPU_LOCK_FILE="${GPU_LOCK_FILE:-${TMPDIR:-/tmp}/wkvm-10x-http-gpu-${GPU_DEVICE//[^[:alnum:]_.-]/_}.lock}"
@@ -373,6 +376,12 @@ print_path_manifest() {
   printf '# incumbent_context_length=%s\n' "$INCUMBENT_CONTEXT_LENGTH"
   printf '# wkvm_token_pool_max_context_len=%s\n' \
     "$WKVM_TOKEN_POOL_MAX_CONTEXT_LEN"
+  printf '# wkvm_continuation_prefill_microbatch_rows=%s\n' \
+    "$WKVM_CONTINUATION_PREFILL_MICROBATCH_ROWS"
+  printf '# wkvm_decode_microbatch_rows=%s\n' \
+    "$WKVM_DECODE_MICROBATCH_ROWS"
+  printf '# wkvm_persistent_padded_decode_steps=%s\n' \
+    "$WKVM_PERSISTENT_PADDED_DECODE_STEPS"
   printf '# sglang_max_total_tokens=%s\n' "$SGLANG_MAX_TOTAL_TOKENS"
   printf '# workload_tag=%s\n' "$WORKLOAD_TAG"
   printf 'kind\trepeat\tpath\n'
@@ -405,6 +414,12 @@ validate_positive_integer SERVER_STOP_TIMEOUT_S "$SERVER_STOP_TIMEOUT_S"
 validate_positive_integer GPU_CLEAR_TIMEOUT_S "$GPU_CLEAR_TIMEOUT_S"
 validate_positive_integer SGLANG_MAX_RUNNING_REQUESTS "$SGLANG_MAX_RUNNING_REQUESTS"
 validate_positive_integer VLLM_MAX_NUM_BATCHED_TOKENS "$VLLM_MAX_NUM_BATCHED_TOKENS"
+validate_positive_integer WKVM_CONTINUATION_PREFILL_MICROBATCH_ROWS \
+  "$WKVM_CONTINUATION_PREFILL_MICROBATCH_ROWS"
+validate_positive_integer WKVM_DECODE_MICROBATCH_ROWS \
+  "$WKVM_DECODE_MICROBATCH_ROWS"
+validate_positive_integer WKVM_PERSISTENT_PADDED_DECODE_STEPS \
+  "$WKVM_PERSISTENT_PADDED_DECODE_STEPS"
 validate_fraction VLLM_GPU_MEMORY_UTILIZATION "$VLLM_GPU_MEMORY_UTILIZATION"
 validate_boolean WKVM_NATIVE_GEMMA_KV_SHARING_FAST_PREFILL \
   "$WKVM_NATIVE_GEMMA_KV_SHARING_FAST_PREFILL"
@@ -523,8 +538,11 @@ printf -v SGLANG_CONFIG \
   "$SGLANG_CUDA_GRAPH_BACKEND_PREFILL" "$SGLANG_MAX_RUNNING_REQUESTS" \
   "$SGLANG_MAX_TOTAL_TOKENS"
 printf -v WKVM_CONFIG \
-  '{"backlog_min":64,"batch_wait_s":0.01,"continuation_prefill_microbatch_rows":8,"decode_microbatch_rows":16,"enable_token_pool_attention":true,"max_queue":64,"m_slots":32,"native_gemma_attention_backend":"triton_dense_gqa","native_gemma_kv_sharing_fast_prefill":%s,"native_gemma_projection_backend":"separate","persistent_padded_decode_cuda_graph":false,"persistent_padded_decode_steps":64,"prefill_chunk":2048,"prefill_microbatch_rows":2,"route_chunk":2048,"slots":16,"stream_flush_tokens":1,"token_pool_capacity":114688,"token_pool_max_context_len":%s,"token_pool_paged_block_size":16}' \
-  "$wkvm_fast_prefill_json" "$WKVM_TOKEN_POOL_MAX_CONTEXT_LEN"
+  '{"backlog_min":64,"batch_wait_s":0.01,"continuation_prefill_microbatch_rows":%s,"decode_microbatch_rows":%s,"enable_token_pool_attention":true,"max_queue":64,"m_slots":32,"native_gemma_attention_backend":"triton_dense_gqa","native_gemma_kv_sharing_fast_prefill":%s,"native_gemma_projection_backend":"separate","persistent_padded_decode_cuda_graph":false,"persistent_padded_decode_steps":%s,"prefill_chunk":2048,"prefill_microbatch_rows":2,"route_chunk":2048,"slots":16,"stream_flush_tokens":1,"token_pool_capacity":114688,"token_pool_max_context_len":%s,"token_pool_paged_block_size":16}' \
+  "$WKVM_CONTINUATION_PREFILL_MICROBATCH_ROWS" \
+  "$WKVM_DECODE_MICROBATCH_ROWS" "$wkvm_fast_prefill_json" \
+  "$WKVM_PERSISTENT_PADDED_DECODE_STEPS" \
+  "$WKVM_TOKEN_POOL_MAX_CONTEXT_LEN"
 printf -v VLLM_COMPILATION_CONFIG \
   '{"mode":%s,"cudagraph_mode":"%s","cudagraph_capture_sizes":[1,2,4,8,16],"max_cudagraph_capture_size":16}' \
   "$VLLM_COMPILE_MODE" "$VLLM_CUDAGRAPH_MODE"
@@ -743,9 +761,10 @@ for ((repeat = 1; repeat <= REPEATS; repeat++)); do
     --batch-wait-s 0.01
     --prefill-chunk 2048
     --prefill-microbatch-rows 2
-    --continuation-prefill-microbatch-rows 8
-    --decode-microbatch-rows 16
-    --persistent-padded-decode-steps 64
+    --continuation-prefill-microbatch-rows \
+    "$WKVM_CONTINUATION_PREFILL_MICROBATCH_ROWS"
+    --decode-microbatch-rows "$WKVM_DECODE_MICROBATCH_ROWS"
+    --persistent-padded-decode-steps "$WKVM_PERSISTENT_PADDED_DECODE_STEPS"
     --persistent-padded-sliding-metadata-padding
     --enable-token-pool-attention
     --token-pool-max-context-len "$WKVM_TOKEN_POOL_MAX_CONTEXT_LEN"

@@ -8,6 +8,8 @@ WKVM_MODEL_DIR="${WKVM_MODEL_DIR:-}"
 WKVM_PORT="${WKVM_PORT:-8000}"
 OPEN_WEBUI_PORT="${OPEN_WEBUI_PORT:-3000}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-wkvm-gemma-4-e4b-it}"
+WKVM_DEMO_PROFILE="${WKVM_DEMO_PROFILE:-interactive}"
+OPEN_WEBUI_MAX_TOKENS="${OPEN_WEBUI_MAX_TOKENS:-}"
 WKVM_VENV="${WKVM_VENV:-$WKVM_DEMO_HOME/wkvm-venv}"
 WKVM_PYTHON="${WKVM_PYTHON:-$WKVM_VENV/bin/python}"
 OPEN_WEBUI_BIN="${OPEN_WEBUI_BIN:-${UV_TOOL_BIN_DIR:-${XDG_BIN_HOME:-$HOME/.local/bin}}/open-webui}"
@@ -22,6 +24,7 @@ OPEN_WEBUI_DATA_DIR="$WKVM_DEMO_HOME/open-webui-data"
 SECRET_FILE="$WKVM_DEMO_HOME/open-webui-secret"
 WKVM_PID_FILE="$RUN_DIR/wkvm.pid"
 OPEN_WEBUI_PID_FILE="$RUN_DIR/open-webui.pid"
+PROFILE_FILE="$RUN_DIR/launch-profile"
 WKVM_LOG="$LOG_DIR/wkvm.log"
 OPEN_WEBUI_LOG="$LOG_DIR/open-webui.log"
 
@@ -40,6 +43,10 @@ Commands:
 
 Required for start:
   WKVM_MODEL_DIR=/path/to/gemma-4-E4B-it
+
+Profiles:
+  WKVM_DEMO_PROFILE=interactive   Four-slot normal chat (default)
+  WKVM_DEMO_PROFILE=benchmark-b32 Measured high-memory B32 throughput profile
 
 Set DRY_RUN=1 to print commands without executing or waiting.
 EOF
@@ -138,6 +145,50 @@ remove_stale_pid_file() {
   fi
 }
 
+resolve_start_profile_config() {
+  case "$WKVM_DEMO_PROFILE" in
+    interactive)
+      OPEN_WEBUI_MAX_TOKENS="${OPEN_WEBUI_MAX_TOKENS:-1152}"
+      ;;
+    benchmark-b32)
+      if [[ -n "$OPEN_WEBUI_MAX_TOKENS" && \
+            "$OPEN_WEBUI_MAX_TOKENS" != "128" ]]; then
+        fail "benchmark-b32 requires OPEN_WEBUI_MAX_TOKENS=128"
+      fi
+      OPEN_WEBUI_MAX_TOKENS=128
+      ;;
+    *)
+      fail "WKVM_DEMO_PROFILE must be interactive or benchmark-b32"
+      ;;
+  esac
+  if [[ ! "$OPEN_WEBUI_MAX_TOKENS" =~ ^[0-9]+$ ]] || \
+     ((OPEN_WEBUI_MAX_TOKENS < 1)); then
+    fail "OPEN_WEBUI_MAX_TOKENS must be a positive integer"
+  fi
+}
+
+launch_profile_signature() {
+  printf '%s|max_tokens=%s|model=%s|served_model=%s|wkvm_port=%s|webui_port=%s' \
+    "$WKVM_DEMO_PROFILE" "$OPEN_WEBUI_MAX_TOKENS" "$WKVM_MODEL_DIR" \
+    "$SERVED_MODEL_NAME" "$WKVM_PORT" "$OPEN_WEBUI_PORT"
+}
+
+ensure_live_profile_matches() {
+  if ! read_live_pid "$WKVM_PID_FILE" >/dev/null && \
+     ! read_live_pid "$OPEN_WEBUI_PID_FILE" >/dev/null; then
+    return
+  fi
+  local expected
+  local observed=""
+  expected="$(launch_profile_signature)"
+  if [[ -f "$PROFILE_FILE" ]]; then
+    IFS= read -r observed < "$PROFILE_FILE" || true
+  fi
+  if [[ "$observed" != "$expected" ]]; then
+    fail "managed services use a different or unknown launch profile; run '$0 stop' before switching profiles"
+  fi
+}
+
 ensure_secret() {
   if [[ "$DRY_RUN" == "1" ]]; then
     printf 'ensure-secret path=%s\n' "$SECRET_FILE"
@@ -163,13 +214,57 @@ launch_wkvm() {
     --served-model-name "$SERVED_MODEL_NAME"
     --port "$WKVM_PORT"
     --enable-openai-chat
-    --native-gemma-production-profile
-    --slots 4
-    --max-chat-sessions 4
-    --max-queue 16
-    --request-timeout-s 600
-    --chat-session-ttl-s 1800
   )
+  case "$WKVM_DEMO_PROFILE" in
+    interactive)
+      command+=(
+        --native-gemma-production-profile
+        --slots 4
+        --max-chat-sessions 4
+        --max-queue 16
+        --request-timeout-s 600
+        --chat-session-ttl-s 1800
+      )
+      ;;
+    benchmark-b32)
+      environment+=(
+        "WKVM_ENABLE_TOKEN_POOL_TRITON=1"
+        "WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON=1"
+        "WKVM_ENABLE_TOKEN_POOL_PAGED_SPLIT_TRITON=1"
+        "WKVM_TOKEN_POOL_TRITON_STRICT=1"
+        "WKVM_TOKEN_POOL_SLIDING_PAGED_METADATA_ONLY=1"
+        "WKVM_TOKEN_POOL_ROUTE_BOUNDARY_BATCH=1"
+      )
+      command+=(
+        --slots 32
+        --max-chat-sessions 32
+        --max-queue 128
+        --request-timeout-s 1200
+        --request-read-timeout-s 1200
+        --max-request-body-bytes 67108864
+        --chat-session-ttl-s 3600
+        --max-completed-requests 320
+        --ignore-eos
+        --batch-wait-s 0.01
+        --prefill-chunk 2048
+        --prefill-microbatch-rows 2
+        --continuation-prefill-microbatch-rows 32
+        --decode-microbatch-rows 32
+        --persistent-padded-decode-steps 128
+        --persistent-padded-sliding-metadata-padding
+        --enable-token-pool-attention
+        --token-pool-max-context-len 15232
+        --token-pool-capacity 114688
+        --token-pool-paged-block-size 16
+        --m-slots 32
+        --route-chunk 2048
+        --native-gemma-checkpoint-loader
+        --native-gemma-kv-sharing-fast-prefill
+        --native-gemma-attention-backend triton_dense_gqa
+        --native-gemma-projection-backend separate
+      )
+      ;;
+  esac
 
   printf 'launch service=wkvm log=%s pid_file=%s\n' "$WKVM_LOG" "$WKVM_PID_FILE"
   print_command env "${environment[@]}" "${command[@]}"
@@ -204,7 +299,7 @@ launch_open_webui() {
     "ENABLE_WEBSOCKET_SUPPORT=true"
     "ENABLE_PERSISTENT_CONFIG=false"
     "DEFAULT_MODELS=$SERVED_MODEL_NAME"
-    'DEFAULT_MODEL_PARAMS={"temperature":0,"top_p":1,"reasoning_tags":false,"function_calling":"legacy","max_tokens":1152}'
+    "DEFAULT_MODEL_PARAMS={\"temperature\":0,\"top_p\":1,\"reasoning_tags\":false,\"function_calling\":\"legacy\",\"max_tokens\":$OPEN_WEBUI_MAX_TOKENS}"
     'DEFAULT_MODEL_METADATA={"capabilities":{"builtin_tools":false,"vision":false,"file_upload":false,"file_context":false,"web_search":false,"image_generation":false,"code_interpreter":false,"terminal":false,"memory":false}}'
     "ENABLE_TITLE_GENERATION=false"
     "ENABLE_TAGS_GENERATION=false"
@@ -286,6 +381,7 @@ install_demo() {
 }
 
 start_demo() {
+  resolve_start_profile_config
   require_model
   if [[ "$DRY_RUN" == "0" ]]; then
     require_command curl "install curl with your system package manager"
@@ -305,6 +401,7 @@ start_demo() {
   else
     remove_stale_pid_file "$WKVM_PID_FILE"
     remove_stale_pid_file "$OPEN_WEBUI_PID_FILE"
+    ensure_live_profile_matches
     if read_live_pid "$WKVM_PID_FILE" >/dev/null; then
       printf 'already-running service=wkvm pid=%s\n' \
         "$(read_live_pid "$WKVM_PID_FILE")"
@@ -322,6 +419,7 @@ start_demo() {
     fi
     wait_for_health open-webui "http://127.0.0.1:$OPEN_WEBUI_PORT/health" \
       "$OPEN_WEBUI_PID_FILE" "$OPEN_WEBUI_LOG"
+    launch_profile_signature > "$PROFILE_FILE"
   fi
 
   printf 'Open WebUI: http://127.0.0.1:%s\n' "$OPEN_WEBUI_PORT"
@@ -359,6 +457,9 @@ stop_process() {
 stop_demo() {
   stop_process open-webui "$OPEN_WEBUI_PID_FILE"
   stop_process wkvm "$WKVM_PID_FILE"
+  if [[ "$DRY_RUN" == "0" ]]; then
+    rm -f -- "$PROFILE_FILE"
+  fi
 }
 
 show_process_status() {
