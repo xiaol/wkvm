@@ -10,6 +10,7 @@ greedy token-id requests.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import signal
@@ -26,6 +27,8 @@ from urllib.parse import unquote, urlparse
 DEFAULT_MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024
 DEFAULT_REQUEST_READ_TIMEOUT_S = 30.0
 _REQUEST_BODY_READ_CHUNK_BYTES = 64 * 1024
+PARENT_TOKEN_CHAT_CONTRACT = "parent-token-v1"
+_MAX_CHAT_IDENTITY_BYTES = 512
 
 
 @dataclass
@@ -52,6 +55,16 @@ class _ChatTurn:
     candidate_output_token_ids: list[int] = field(default_factory=list)
     teacher_forcing_overwrite_s: float = 0.0
     teacher_forcing_overwrites: int = 0
+    chat_messages: list[dict[str, str]] | None = None
+    chat_codec: Any | None = None
+    parent_bound_contract: str | None = None
+    assistant_message_id: str | None = None
+    user_message_id: str | None = None
+    parent_message_id: str | None = None
+    session_reuse_mode: str = "new_session"
+    parent_bound_continuation_attempted: bool = False
+    parent_bound_continuation_accepted: bool = False
+    parent_bound_continuation_rejection_reason: str | None = None
 
     @property
     def finished(self) -> bool:
@@ -66,6 +79,46 @@ class _ChatSession:
     request: Any
     active_turn: _ChatTurn | None
     last_access: float
+    parent_bound_contract: str | None = None
+    canonical_input_messages: list[dict[str, str]] | None = None
+    canonical_prompt_token_ids: list[int] | None = None
+    visible_output: str | None = None
+    visible_parent_history_digest: str | None = None
+    retained_token_digest: str | None = None
+    last_assistant_message_id: str | None = None
+    last_user_message_id: str | None = None
+    last_response_id: str | None = None
+    generation: int = 0
+
+
+def _chat_identity(value: str | None, field_name: str) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if not normalized:
+        return None
+    if len(normalized.encode("utf-8")) > _MAX_CHAT_IDENTITY_BYTES:
+        raise ValueError(
+            f"{field_name} exceeds {_MAX_CHAT_IDENTITY_BYTES} UTF-8 bytes"
+        )
+    return normalized
+
+
+def _token_history_digest(token_ids: list[int]) -> str:
+    digest = hashlib.sha256()
+    for token_id in token_ids:
+        digest.update(int(token_id).to_bytes(8, "little", signed=True))
+    return digest.hexdigest()
+
+
+def _message_history_digest(messages: list[dict[str, str]]) -> str:
+    payload = json.dumps(
+        messages,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 class BoundedGemmaService:
@@ -134,6 +187,10 @@ class BoundedGemmaService:
         self._chat_sessions_by_engine_id: dict[str, _ChatSession] = {}
         self._chat_active_turns: dict[str, _ChatTurn] = {}
         self._chat_req_counter = 0
+        self._chat_exact_prefix_reuse_hits = 0
+        self._parent_bound_continuation_hits = 0
+        self._parent_bound_continuation_misses = 0
+        self._parent_bound_continuation_rejections: dict[str, int] = {}
         self._worker = threading.Thread(target=self._run_engine, daemon=True)
         self._worker.start()
 
@@ -333,6 +390,12 @@ class BoundedGemmaService:
         req_id: str,
         break_mask: list[bool] | None = None,
         timeout_s: float | None = None,
+        chat_messages: list[dict[str, str]] | None = None,
+        chat_codec: Any | None = None,
+        parent_bound_contract: str | None = None,
+        assistant_message_id: str | None = None,
+        user_message_id: str | None = None,
+        parent_message_id: str | None = None,
     ) -> dict[str, Any]:
         tokens: list[int] = []
         finish: dict[str, Any] | None = None
@@ -343,6 +406,12 @@ class BoundedGemmaService:
             req_id=req_id,
             break_mask=break_mask,
             timeout_s=timeout_s,
+            chat_messages=chat_messages,
+            chat_codec=chat_codec,
+            parent_bound_contract=parent_bound_contract,
+            assistant_message_id=assistant_message_id,
+            user_message_id=user_message_id,
+            parent_message_id=parent_message_id,
         ):
             if event["type"] == "token":
                 tokens.append(int(event["token"]))
@@ -368,6 +437,12 @@ class BoundedGemmaService:
         req_id: str,
         break_mask: list[bool] | None = None,
         timeout_s: float | None = None,
+        chat_messages: list[dict[str, str]] | None = None,
+        chat_codec: Any | None = None,
+        parent_bound_contract: str | None = None,
+        assistant_message_id: str | None = None,
+        user_message_id: str | None = None,
+        parent_message_id: str | None = None,
         _session_kind: str = "chat",
         _input_mode: str = "full_prompt",
         _forced_output_ids: list[int] | None = None,
@@ -390,6 +465,12 @@ class BoundedGemmaService:
                 session_kind=_session_kind,
                 input_mode=_input_mode,
                 forced_output_ids=_forced_output_ids,
+                chat_messages=chat_messages,
+                chat_codec=chat_codec,
+                parent_bound_contract=parent_bound_contract,
+                assistant_message_id=assistant_message_id,
+                user_message_id=user_message_id,
+                parent_message_id=parent_message_id,
             )
 
         emitted = 0
@@ -451,6 +532,50 @@ class BoundedGemmaService:
         finally:
             if not turn.finished:
                 self._cancel_chat_turn(turn)
+
+    def commit_chat_visible_output(
+        self,
+        *,
+        session_id: str,
+        response_id: str,
+        text: str,
+    ) -> None:
+        with self.cv:
+            with self.engine_lock:
+                session = self._chat_sessions.get(session_id)
+                if session is None:
+                    raise ValueError(f"unknown chat session {session_id}")
+                if session.parent_bound_contract is None:
+                    raise ValueError(
+                        f"chat session {session_id} has no parent-bound contract"
+                    )
+                if session.active_turn is not None:
+                    raise SessionBusy(
+                        f"chat session {session_id} has not completed its active turn"
+                    )
+                if session.last_response_id != response_id:
+                    raise ValueError(
+                        f"chat session {session_id} response identity changed"
+                    )
+                if session.canonical_input_messages is None:
+                    raise ValueError(
+                        f"chat session {session_id} has no completed input history"
+                    )
+                visible_output = str(text).strip()
+                if session.visible_output is not None:
+                    if session.visible_output != visible_output:
+                        raise ValueError(
+                            f"chat session {session_id} visible output changed"
+                        )
+                    return
+                session.visible_output = visible_output
+                session.visible_parent_history_digest = _message_history_digest(
+                    [
+                        *session.canonical_input_messages,
+                        {"role": "assistant", "content": visible_output},
+                    ]
+                )
+                session.generation += 1
 
     def stream_token_session(
         self,
@@ -583,6 +708,18 @@ class BoundedGemmaService:
                     "max_chat_sessions": self.max_chat_sessions,
                     "chat_sessions": chat_sessions,
                     "token_sessions": token_sessions,
+                    "chat_exact_prefix_reuse_hits": (
+                        self._chat_exact_prefix_reuse_hits
+                    ),
+                    "parent_bound_continuation_hits": (
+                        self._parent_bound_continuation_hits
+                    ),
+                    "parent_bound_continuation_misses": (
+                        self._parent_bound_continuation_misses
+                    ),
+                    "parent_bound_continuation_rejections": dict(
+                        self._parent_bound_continuation_rejections
+                    ),
                     "token_session_teacher_forcing_enabled": (
                         self.enable_token_session_teacher_forcing
                     ),
@@ -764,6 +901,16 @@ class BoundedGemmaService:
                 "session_input_mode": turn.input_mode,
                 "session_input_tokens": len(turn.prompt_token_ids),
                 "session_reused": turn.session_reused,
+                "session_reuse_mode": turn.session_reuse_mode,
+                "parent_bound_continuation": {
+                    "enabled": turn.parent_bound_contract is not None,
+                    "contract": turn.parent_bound_contract,
+                    "attempted": turn.parent_bound_continuation_attempted,
+                    "accepted": turn.parent_bound_continuation_accepted,
+                    "rejection_reason": (
+                        turn.parent_bound_continuation_rejection_reason
+                    ),
+                },
             }
         )
         forced = turn.forced_output_token_ids
@@ -833,6 +980,12 @@ class BoundedGemmaService:
         session_kind: str = "chat",
         input_mode: str = "full_prompt",
         forced_output_ids: list[int] | None = None,
+        chat_messages: list[dict[str, str]] | None = None,
+        chat_codec: Any | None = None,
+        parent_bound_contract: str | None = None,
+        assistant_message_id: str | None = None,
+        user_message_id: str | None = None,
+        parent_message_id: str | None = None,
     ) -> _ChatTurn:
         if self.closed:
             self.total_errors += 1
@@ -854,6 +1007,44 @@ class BoundedGemmaService:
         if input_mode not in allowed_input_modes:
             raise ValueError(
                 f"unsupported {session_kind} session input mode {input_mode!r}"
+            )
+        assistant_message_id = _chat_identity(
+            assistant_message_id,
+            "assistant_message_id",
+        )
+        user_message_id = _chat_identity(user_message_id, "user_message_id")
+        parent_message_id = _chat_identity(
+            parent_message_id,
+            "parent_message_id",
+        )
+        if parent_bound_contract is not None:
+            parent_bound_contract = str(parent_bound_contract).strip()
+            if parent_bound_contract != PARENT_TOKEN_CHAT_CONTRACT:
+                raise ValueError(
+                    f"unsupported parent-bound chat contract {parent_bound_contract!r}"
+                )
+            if session_kind != "chat":
+                raise ValueError(
+                    "parent-bound chat metadata is only valid for chat sessions"
+                )
+            if chat_messages is None or chat_codec is None:
+                raise ValueError(
+                    "parent-bound chat requires normalized messages and a codec"
+                )
+            if assistant_message_id is None or user_message_id is None:
+                raise ValueError(
+                    "parent-bound chat requires assistant and user message IDs"
+                )
+        elif any(
+            value is not None
+            for value in (
+                assistant_message_id,
+                user_message_id,
+                parent_message_id,
+            )
+        ):
+            raise ValueError(
+                "chat message identity headers require a parent-bound contract"
             )
         if forced_output_ids is not None:
             if session_kind != "token":
@@ -915,6 +1106,16 @@ class BoundedGemmaService:
             session_kind=session_kind,
             input_mode=input_mode,
             forced_output_token_ids=forced_output_ids,
+            chat_messages=(
+                None
+                if chat_messages is None
+                else [dict(message) for message in chat_messages]
+            ),
+            chat_codec=chat_codec,
+            parent_bound_contract=parent_bound_contract,
+            assistant_message_id=assistant_message_id,
+            user_message_id=user_message_id,
+            parent_message_id=parent_message_id,
         )
         self.total_requests += 1
         self._pending_chat.append(turn)
@@ -927,6 +1128,9 @@ class BoundedGemmaService:
         session: _ChatSession,
         turn: _ChatTurn,
         continuation: list[int],
+        *,
+        break_mask: list[bool] | None = None,
+        reuse_mode: str,
     ) -> bool:
         scheduler = self.engine.scheduler
         max_running = getattr(
@@ -939,7 +1143,11 @@ class BoundedGemmaService:
         self.engine.continue_session_requests(
             {session.engine_req_id: continuation},
             max_new_tokens=turn.max_new_tokens,
-            break_masks={session.engine_req_id: turn.break_mask},
+            break_masks={
+                session.engine_req_id: (
+                    turn.break_mask if break_mask is None else break_mask
+                )
+            },
         )
         session.active_turn = turn
         session.last_access = time.monotonic()
@@ -947,7 +1155,122 @@ class BoundedGemmaService:
         turn.engine_req_id = session.engine_req_id
         turn.state = "running"
         turn.session_reused = True
+        turn.session_reuse_mode = reuse_mode
         return True
+
+    def _record_parent_bound_rejection_locked(
+        self,
+        turn: _ChatTurn,
+        reason: str,
+    ) -> None:
+        turn.parent_bound_continuation_attempted = True
+        turn.parent_bound_continuation_accepted = False
+        turn.parent_bound_continuation_rejection_reason = reason
+        turn.session_reuse_mode = "restart"
+        self._parent_bound_continuation_misses += 1
+        self._parent_bound_continuation_rejections[reason] = (
+            self._parent_bound_continuation_rejections.get(reason, 0) + 1
+        )
+
+    @staticmethod
+    def _validate_parent_bound_history(
+        session: _ChatSession,
+        turn: _ChatTurn,
+        retained: list[int],
+    ) -> list[dict[str, str]] | str:
+        turn.parent_bound_continuation_attempted = True
+        if session.parent_bound_contract != turn.parent_bound_contract:
+            return "contract_mismatch"
+        if (
+            turn.chat_messages is None
+            or turn.chat_codec is None
+            or turn.assistant_message_id is None
+            or turn.user_message_id is None
+        ):
+            return "request_metadata_unavailable"
+        if (
+            session.canonical_input_messages is None
+            or session.canonical_prompt_token_ids is None
+            or session.visible_output is None
+            or session.visible_parent_history_digest is None
+            or session.retained_token_digest is None
+            or session.last_assistant_message_id is None
+            or session.last_user_message_id is None
+        ):
+            return "session_history_unavailable"
+        if turn.parent_message_id != session.last_assistant_message_id:
+            return "parent_message_mismatch"
+        if turn.assistant_message_id == session.last_assistant_message_id:
+            return "assistant_message_reused"
+        if turn.user_message_id == session.last_user_message_id:
+            return "user_message_reused"
+        if _token_history_digest(retained) != session.retained_token_digest:
+            return "retained_history_mismatch"
+
+        previous_messages = session.canonical_input_messages
+        incoming_messages = turn.chat_messages
+        previous_count = len(previous_messages)
+        if incoming_messages[:previous_count] != previous_messages:
+            return "prior_history_mismatch"
+        if len(incoming_messages) <= previous_count:
+            return "prior_assistant_missing"
+        expected_assistant = {
+            "role": "assistant",
+            "content": session.visible_output,
+        }
+        if incoming_messages[previous_count] != expected_assistant:
+            return "prior_assistant_mismatch"
+        parent_history = incoming_messages[: previous_count + 1]
+        if (
+            _message_history_digest(parent_history)
+            != session.visible_parent_history_digest
+        ):
+            return "parent_history_digest_mismatch"
+        appended_messages = incoming_messages[previous_count + 1 :]
+        if not appended_messages:
+            return "new_messages_missing"
+        return appended_messages
+
+    @staticmethod
+    def _parent_bound_continuation(
+        session: _ChatSession,
+        turn: _ChatTurn,
+        retained: list[int],
+        appended_messages: list[dict[str, str]],
+    ) -> tuple[list[int], list[bool]] | str:
+        assert turn.chat_codec is not None
+        assert session.canonical_input_messages is not None
+        assert session.canonical_prompt_token_ids is not None
+        bridge_messages = [
+            *session.canonical_input_messages,
+            {"role": "assistant", "content": ""},
+            *appended_messages,
+        ]
+        try:
+            extended = turn.chat_codec.prompt_token_ids(bridge_messages)
+        except Exception:
+            return "template_render_failed"
+        base = session.canonical_prompt_token_ids
+        if len(extended) <= len(base) or extended[: len(base)] != base:
+            return "template_prefix_mismatch"
+        continuation = extended[len(base) :]
+        generated = session.request.output_token_ids
+        if generated and continuation and generated[-1] == continuation[0]:
+            try:
+                terminal_boundary_is_hidden = not turn.chat_codec.decode(
+                    [continuation[0]]
+                )
+            except Exception:
+                return "boundary_decode_failed"
+            if terminal_boundary_is_hidden:
+                continuation = continuation[1:]
+        if not continuation:
+            return "continuation_empty"
+        try:
+            break_mask = turn.chat_codec.break_mask([*retained, *continuation])
+        except Exception:
+            return "break_mask_failed"
+        return continuation, break_mask
 
     def _start_chat_turn_locked(self, turn: _ChatTurn) -> bool:
         from wkvm.core.request import Request
@@ -970,12 +1293,20 @@ class BoundedGemmaService:
                 session,
                 turn,
                 list(turn.prompt_token_ids),
+                reuse_mode="token_delta",
             )
         if turn.session_kind == "token" and session is not None:
             raise ValueError(
                 f"token session {turn.session_id} already exists; send delta_ids"
             )
+        parent_rejection_recorded = False
         if session is not None and session.request.status.name != "PARKED":
+            if turn.parent_bound_contract is not None:
+                self._record_parent_bound_rejection_locked(
+                    turn,
+                    "session_not_parked",
+                )
+                parent_rejection_recorded = True
             self._drop_chat_session_locked(session)
             session = None
         if session is not None:
@@ -983,14 +1314,85 @@ class BoundedGemmaService:
                 list(session.request.prompt_token_ids)
                 + list(session.request.output_token_ids)
             )
-            exact_prefix = (
-                len(turn.prompt_token_ids) > len(retained)
-                and turn.prompt_token_ids[: len(retained)] == retained
+            parent_bound = (
+                session.parent_bound_contract is not None
+                or turn.parent_bound_contract is not None
             )
-            if exact_prefix:
-                continuation = turn.prompt_token_ids[len(retained) :]
-                return self._resume_chat_session_locked(session, turn, continuation)
-            self._retire_chat_session_locked(session)
+            appended_messages: list[dict[str, str]] | None = None
+            if parent_bound:
+                validation = self._validate_parent_bound_history(
+                    session,
+                    turn,
+                    retained,
+                )
+                if isinstance(validation, str):
+                    self._record_parent_bound_rejection_locked(turn, validation)
+                    parent_rejection_recorded = True
+                    self._retire_chat_session_locked(session)
+                    session = None
+                else:
+                    appended_messages = validation
+
+            if session is not None:
+                exact_prefix = (
+                    len(turn.prompt_token_ids) > len(retained)
+                    and turn.prompt_token_ids[: len(retained)] == retained
+                )
+                if exact_prefix:
+                    continuation = turn.prompt_token_ids[len(retained) :]
+                    turn.parent_bound_continuation_accepted = parent_bound
+                    resumed = self._resume_chat_session_locked(
+                        session,
+                        turn,
+                        continuation,
+                        reuse_mode="exact_prefix",
+                    )
+                    if resumed:
+                        self._chat_exact_prefix_reuse_hits += 1
+                    return resumed
+                if parent_bound:
+                    assert appended_messages is not None
+                    parent_continuation = self._parent_bound_continuation(
+                        session,
+                        turn,
+                        retained,
+                        appended_messages,
+                    )
+                    if isinstance(parent_continuation, str):
+                        self._record_parent_bound_rejection_locked(
+                            turn,
+                            parent_continuation,
+                        )
+                        parent_rejection_recorded = True
+                        self._retire_chat_session_locked(session)
+                        session = None
+                    else:
+                        continuation, parent_break_mask = parent_continuation
+                        turn.parent_bound_continuation_accepted = True
+                        resumed = self._resume_chat_session_locked(
+                            session,
+                            turn,
+                            continuation,
+                            break_mask=parent_break_mask,
+                            reuse_mode="parent_bound_delta",
+                        )
+                        if resumed:
+                            self._parent_bound_continuation_hits += 1
+                        return resumed
+                else:
+                    self._retire_chat_session_locked(session)
+                    session = None
+
+        if (
+            session is None
+            and turn.parent_bound_contract is not None
+            and turn.parent_message_id is not None
+            and not parent_rejection_recorded
+        ):
+            self._record_parent_bound_rejection_locked(
+                turn,
+                "session_unavailable",
+            )
 
         if not self._make_chat_session_room_locked():
             return False
@@ -1009,6 +1411,7 @@ class BoundedGemmaService:
             request=request,
             active_turn=turn,
             last_access=time.monotonic(),
+            parent_bound_contract=turn.parent_bound_contract,
         )
         self._chat_sessions[turn.session_id] = session
         self._chat_sessions_by_engine_id[engine_req_id] = session
@@ -1039,9 +1442,33 @@ class BoundedGemmaService:
             if forcing_mismatch:
                 turn.error = "selected outputs did not match forced_output_ids"
                 turn.finish_reason = "error"
-            turn.metrics = self._stateful_turn_metrics(turn, engine_metrics)
             session.active_turn = None
             session.last_access = time.monotonic()
+            if (
+                turn.parent_bound_contract is not None
+                and request.status.name == "PARKED"
+                and not forcing_mismatch
+            ):
+                assert turn.chat_messages is not None
+                assert turn.assistant_message_id is not None
+                assert turn.user_message_id is not None
+                session.parent_bound_contract = turn.parent_bound_contract
+                session.canonical_input_messages = [
+                    dict(message) for message in turn.chat_messages
+                ]
+                session.canonical_prompt_token_ids = list(turn.prompt_token_ids)
+                session.visible_output = None
+                session.visible_parent_history_digest = None
+                session.retained_token_digest = _token_history_digest(
+                    [
+                        *session.request.prompt_token_ids,
+                        *session.request.output_token_ids,
+                    ]
+                )
+                session.last_assistant_message_id = turn.assistant_message_id
+                session.last_user_message_id = turn.user_message_id
+                session.last_response_id = turn.response_id
+            turn.metrics = self._stateful_turn_metrics(turn, engine_metrics)
             if forcing_mismatch:
                 self._retire_chat_session_locked(session)
             elif request.status.name != "PARKED":
@@ -1621,6 +2048,10 @@ def _openai_chat_request(
     request_id: str | None,
     openwebui_user_id: str | None,
     openwebui_chat_id: str | None,
+    stateful_chat_contract: str | None,
+    assistant_message_id: str | None,
+    user_message_id: str | None,
+    parent_message_id: str | None,
     server_ignore_eos: bool,
 ) -> dict[str, Any]:
     if body.get("tools") not in (None, []):
@@ -1666,12 +2097,30 @@ def _openai_chat_request(
     explicit_session_id = body.get("session_id")
     if explicit_session_id is not None:
         openwebui_chat_id = str(explicit_session_id)
-    chat_id = None
-    if openwebui_chat_id is not None:
-        chat_id = openwebui_chat_id.strip() or None
-    user_id = None
-    if openwebui_user_id is not None:
-        user_id = openwebui_user_id.strip() or None
+    chat_id = _chat_identity(openwebui_chat_id, "Open WebUI chat ID")
+    user_id = _chat_identity(openwebui_user_id, "Open WebUI user ID")
+    contract = _chat_identity(stateful_chat_contract, "stateful chat contract")
+    assistant_id = _chat_identity(
+        assistant_message_id,
+        "assistant message ID",
+    )
+    user_message = _chat_identity(user_message_id, "user message ID")
+    parent_id = _chat_identity(parent_message_id, "parent message ID")
+    if contract is not None:
+        if contract != PARENT_TOKEN_CHAT_CONTRACT:
+            raise ValueError(f"unsupported stateful chat contract {contract!r}")
+        if chat_id is None or user_id is None:
+            raise ValueError(
+                "parent-token-v1 requires Open WebUI user and chat identity headers"
+            )
+        if assistant_id is None or user_message is None:
+            raise ValueError(
+                "parent-token-v1 requires assistant and user message ID headers"
+            )
+    elif any(value is not None for value in (assistant_id, user_message, parent_id)):
+        raise ValueError(
+            "WKVM message identity headers require X-WKVM-Stateful-Chat"
+        )
     session_id = None
     if chat_id is not None:
         # Open WebUI chat IDs are only unique within a user account. Keep the
@@ -1690,6 +2139,7 @@ def _openai_chat_request(
     )
     return {
         "model": model,
+        "messages": messages,
         "prompt_ids": prompt_ids,
         "break_mask": codec.break_mask(prompt_ids),
         "max_tokens": max_tokens,
@@ -1697,6 +2147,10 @@ def _openai_chat_request(
         "include_usage": include_usage,
         "req_id": response_id,
         "session_id": session_id,
+        "parent_bound_contract": contract,
+        "assistant_message_id": assistant_id,
+        "user_message_id": user_message,
+        "parent_message_id": parent_id,
         "timeout_s": timeout_s,
     }
 
@@ -2242,6 +2696,14 @@ def build_app(
                 request_id=self.headers.get("x-request-id"),
                 openwebui_user_id=self.headers.get("x-openwebui-user-id"),
                 openwebui_chat_id=self.headers.get("x-openwebui-chat-id"),
+                stateful_chat_contract=self.headers.get(
+                    "x-wkvm-stateful-chat"
+                ),
+                assistant_message_id=self.headers.get(
+                    "x-wkvm-assistant-message-id"
+                ),
+                user_message_id=self.headers.get("x-wkvm-user-message-id"),
+                parent_message_id=self.headers.get("x-wkvm-parent-message-id"),
                 server_ignore_eos=ignore_eos,
             )
             if not req["stream"]:
@@ -2261,17 +2723,33 @@ def build_app(
                         req_id=req["req_id"],
                         break_mask=req["break_mask"],
                         timeout_s=req["timeout_s"],
+                        chat_messages=req["messages"],
+                        chat_codec=chat_codec,
+                        parent_bound_contract=req["parent_bound_contract"],
+                        assistant_message_id=req["assistant_message_id"],
+                        user_message_id=req["user_message_id"],
+                        parent_message_id=req["parent_message_id"],
                     )
                 if out.get("error"):
                     self._json(500, _openai_error(str(out["error"])))
                     return
                 output_tokens = list(out["tokens"])
+                visible_text = chat_codec.decode(output_tokens)
+                if (
+                    req["session_id"] is not None
+                    and req["parent_bound_contract"] is not None
+                ):
+                    service.commit_chat_visible_output(
+                        session_id=req["session_id"],
+                        response_id=req["req_id"],
+                        text=visible_text,
+                    )
                 self._json(
                     200,
                     _openai_chat_response(
                         req_id=req["req_id"],
                         model=req["model"],
-                        text=chat_codec.decode(output_tokens),
+                        text=visible_text,
                         prompt_tokens=len(req["prompt_ids"]),
                         completion_tokens=len(output_tokens),
                         finish_reason=out.get("finish_reason"),
@@ -2295,6 +2773,12 @@ def build_app(
                     req_id=req["req_id"],
                     break_mask=req["break_mask"],
                     timeout_s=req["timeout_s"],
+                    chat_messages=req["messages"],
+                    chat_codec=chat_codec,
+                    parent_bound_contract=req["parent_bound_contract"],
+                    assistant_message_id=req["assistant_message_id"],
+                    user_message_id=req["user_message_id"],
+                    parent_message_id=req["parent_message_id"],
                 )
             first_event = next(stream_iter)
             self.send_response(200)
@@ -2304,6 +2788,7 @@ def build_app(
             self.end_headers()
             decoder = _IncrementalChatDecoder(chat_codec)
             emitted = 0
+            visible_parts: list[str] = []
             try:
                 self._sse_event(
                     _openai_chat_chunk(
@@ -2329,6 +2814,7 @@ def build_app(
                                     delta={"content": text_delta},
                                 )
                             )
+                            visible_parts.append(text_delta)
                         event = next(stream_iter)
                         continue
                     if event_type != "finish":
@@ -2343,10 +2829,20 @@ def build_app(
                                 delta={"content": final_text},
                             )
                         )
+                        visible_parts.append(final_text)
                     error = event.get("error")
                     if error:
                         self._sse_event(_openai_error(str(error)))
                         break
+                    if (
+                        req["session_id"] is not None
+                        and req["parent_bound_contract"] is not None
+                    ):
+                        service.commit_chat_visible_output(
+                            session_id=req["session_id"],
+                            response_id=req["req_id"],
+                            text="".join(visible_parts),
+                        )
                     self._sse_event(
                         _openai_chat_chunk(
                             req_id=req["req_id"],

@@ -94,6 +94,12 @@ PROVENANCE_PACKAGES = (
     "python-socketio",
     "websocket-client",
 )
+WKVM_PARENT_TOKEN_HEADERS = {
+    "X-WKVM-Stateful-Chat": "parent-token-v1",
+    "X-WKVM-Assistant-Message-ID": "{{MESSAGE_ID}}",
+    "X-WKVM-User-Message-ID": "{{USER_MESSAGE_ID}}",
+    "X-WKVM-Parent-Message-ID": "{{USER_MESSAGE_PARENT_ID}}",
+}
 
 
 @dataclass(frozen=True)
@@ -121,6 +127,7 @@ class BenchmarkConfig:
     open_webui_config: Mapping[str, Any] = field(default_factory=dict)
     provider_metrics_url: str | None = None
     require_wkvm_session_reuse: bool = False
+    configure_wkvm_parent_token_contract: bool = False
     gpu_memory_device: str | None = None
     gpu_memory_sample_interval_s: float = 0.2
 
@@ -148,6 +155,14 @@ class BenchmarkConfig:
         if self.require_wkvm_session_reuse and not self.provider_metrics_url:
             raise ValueError(
                 "require_wkvm_session_reuse requires provider_metrics_url"
+            )
+        if (
+            self.require_wkvm_session_reuse
+            and not self.configure_wkvm_parent_token_contract
+        ):
+            raise ValueError(
+                "require_wkvm_session_reuse requires "
+                "configure_wkvm_parent_token_contract"
             )
 
 
@@ -730,12 +745,90 @@ class SocketIOOpenWebUITransport:
         except Exception as exc:
             return {"error": f"{type(exc).__name__}: {exc}"}
 
+    def get_openai_config(self) -> Any:
+        return self._request_json("/openai/config", method="GET")
+
+    def update_openai_config(self, config: Mapping[str, Any]) -> Any:
+        return self._request_json(
+            "/openai/config/update",
+            method="POST",
+            body=config,
+        )
+
     def post_completion(self, payload: Mapping[str, Any]) -> Any:
         return self._request_json(
             "/api/chat/completions",
             method="POST",
             body=payload,
         )
+
+
+def configure_wkvm_parent_token_contract(transport: Any) -> dict[str, Any]:
+    current = transport.get_openai_config()
+    if not isinstance(current, Mapping):
+        raise RuntimeError("Open WebUI /openai/config did not return an object")
+    base_urls = current.get("OPENAI_API_BASE_URLS")
+    api_keys = current.get("OPENAI_API_KEYS")
+    api_configs = current.get("OPENAI_API_CONFIGS")
+    if not isinstance(base_urls, list) or not base_urls:
+        raise RuntimeError("Open WebUI has no provider at index 0")
+    if not isinstance(api_keys, list):
+        raise RuntimeError("Open WebUI config omitted OPENAI_API_KEYS")
+    if not isinstance(api_configs, Mapping):
+        api_configs = {}
+
+    normalized_configs: dict[str, Any] = {}
+    for index, base_url in enumerate(base_urls):
+        raw_provider = api_configs.get(str(index), api_configs.get(str(base_url), {}))
+        normalized_configs[str(index)] = (
+            dict(raw_provider) if isinstance(raw_provider, Mapping) else {}
+        )
+    provider = normalized_configs["0"]
+    raw_headers = provider.get("headers")
+    headers = dict(raw_headers) if isinstance(raw_headers, Mapping) else {}
+    headers.update(WKVM_PARENT_TOKEN_HEADERS)
+    provider["headers"] = headers
+
+    updated = transport.update_openai_config(
+        {
+            "ENABLE_OPENAI_API": current.get("ENABLE_OPENAI_API"),
+            "OPENAI_API_BASE_URLS": list(base_urls),
+            "OPENAI_API_KEYS": list(api_keys),
+            "OPENAI_API_CONFIGS": normalized_configs,
+        }
+    )
+    if not isinstance(updated, Mapping):
+        raise RuntimeError("Open WebUI config update did not return an object")
+    observed_configs = updated.get("OPENAI_API_CONFIGS")
+    observed_provider = (
+        observed_configs.get("0")
+        if isinstance(observed_configs, Mapping)
+        else None
+    )
+    observed_headers = (
+        observed_provider.get("headers")
+        if isinstance(observed_provider, Mapping)
+        else None
+    )
+    configured = isinstance(observed_headers, Mapping) and all(
+        observed_headers.get(name) == value
+        for name, value in WKVM_PARENT_TOKEN_HEADERS.items()
+    )
+    if not configured:
+        raise RuntimeError("Open WebUI did not retain the WKVM parent-token headers")
+    return {
+        "requested": True,
+        "configured": True,
+        "provider_index": "0",
+        "header_names": sorted(WKVM_PARENT_TOKEN_HEADERS),
+        "expected_headers_sha256": canonical_sha256(WKVM_PARENT_TOKEN_HEADERS),
+        "observed_headers_sha256": canonical_sha256(
+            {
+                name: observed_headers.get(name)
+                for name in sorted(WKVM_PARENT_TOKEN_HEADERS)
+            }
+        ),
+    }
 
 
 def _message_uuid(config: BenchmarkConfig, role: str, session_index: int, turn: int) -> str:
@@ -1299,10 +1392,32 @@ def validate_wkvm_session_metrics(
     if not isinstance(server, Mapping) or not isinstance(engine, Mapping):
         return ["WKVM provider metrics omitted server or engine data"]
     expected_reuse = config.sessions * max(0, config.turns - 1)
+    exact_prefix_hits = server.get("chat_exact_prefix_reuse_hits")
+    parent_bound_hits = server.get("parent_bound_continuation_hits")
+    server_reuse_hits = (
+        exact_prefix_hits + parent_bound_hits
+        if type(exact_prefix_hits) is int
+        and exact_prefix_hits >= 0
+        and type(parent_bound_hits) is int
+        and parent_bound_hits >= 0
+        else None
+    )
     expected = {
         "server.chat_sessions": (server.get("chat_sessions"), config.sessions),
+        "server.reuse_hits_total": (server_reuse_hits, expected_reuse),
+        "server.parent_bound_continuation_misses": (
+            server.get("parent_bound_continuation_misses"),
+            0,
+        ),
+        "server.parent_bound_continuation_rejections": (
+            server.get("parent_bound_continuation_rejections"),
+            {},
+        ),
         "engine.parked_sessions": (engine.get("parked_sessions"), config.sessions),
         "engine.resident_sessions": (engine.get("resident_sessions"), config.sessions),
+        "engine.sessions_opened": (engine.get("sessions_opened"), config.sessions),
+        "engine.sessions_closed": (engine.get("sessions_closed"), 0),
+        "engine.cache_builds": (engine.get("cache_builds"), config.sessions),
         "engine.session_reuse_hits": (
             engine.get("session_reuse_hits"),
             expected_reuse,
@@ -1443,6 +1558,10 @@ def run_benchmark(
     transport.connect(tracker.handle_event)
     observed_version: Any = None
     models_response: Any = None
+    parent_token_contract = {
+        "requested": config.configure_wkvm_parent_token_contract,
+        "configured": False,
+    }
     all_records: list[dict[str, Any]] = []
     turn_rows: list[dict[str, Any]] = []
     provider_metrics_snapshots: list[dict[str, Any]] = []
@@ -1450,6 +1569,10 @@ def run_benchmark(
     run_origin_ns = clock_ns()
     try:
         observed_version = transport.get_version()
+        if config.configure_wkvm_parent_token_contract:
+            parent_token_contract = configure_wkvm_parent_token_contract(
+                transport
+            )
         models_response = transport.get_models()
         available_models = model_ids(models_response)
         if config.model not in available_models:
@@ -1608,9 +1731,10 @@ def run_benchmark(
             "logical_conversations": config.sessions,
             "browser_users": 1,
             "config": redact_secrets(config.open_webui_config),
+            "parent_token_contract": parent_token_contract,
             "forwarded_session_contract": (
-                "WKVM state identity must use forwarded Open WebUI user/chat identity "
-                "and validate exact token-prefix continuity before reuse."
+                "parent-token-v1 binds WKVM state to model/user/chat identity, current "
+                "and parent message IDs, exact visible history, and parked raw tokens."
             ),
         },
         "workload": {
@@ -1703,6 +1827,9 @@ def run_benchmark(
             ),
             "snapshots": provider_metrics_snapshots,
             "wkvm_session_reuse_required": config.require_wkvm_session_reuse,
+            "parent_token_contract_required": (
+                config.configure_wkvm_parent_token_contract
+            ),
         },
         "validation": validation,
         "provenance": {
@@ -1802,6 +1929,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "all continuations reused, and no full reprefills."
         ),
     )
+    parser.add_argument(
+        "--configure-wkvm-parent-token-contract",
+        action="store_true",
+        help=(
+            "Use the authenticated Open WebUI admin API to install and verify "
+            "the parent-token-v1 provider header templates at index 0."
+        ),
+    )
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--json", type=Path, required=True)
     return parser
@@ -1832,6 +1967,9 @@ def config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
         open_webui_config=args.open_webui_config_json,
         provider_metrics_url=args.provider_metrics_url,
         require_wkvm_session_reuse=args.require_wkvm_session_reuse,
+        configure_wkvm_parent_token_contract=(
+            args.configure_wkvm_parent_token_contract
+        ),
         gpu_memory_device=args.gpu_memory_device,
         gpu_memory_sample_interval_s=args.gpu_memory_sample_interval_s,
     )

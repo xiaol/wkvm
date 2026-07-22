@@ -15,9 +15,11 @@ from unittest.mock import patch
 from experiments.wkvm_serving_bench import stream_request_openai_completions
 from wkvm.gemma_server import (
     BoundedGemmaService,
+    PARENT_TOKEN_CHAT_CONTRACT,
     QueueFull,
     ServiceUnavailable,
     _ChatTurn,
+    _OpenAIChatCodec,
     _TokenSSEWriter,
     _chat_stop_token_ids,
     _write_token_sse_stream,
@@ -149,6 +151,28 @@ class FakeChatTokenizer:
         )
 
 
+class ContextSensitiveDecodeChatTokenizer(FakeChatTokenizer):
+    def decode(
+        self,
+        token_ids,
+        *,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    ):
+        ids = list(token_ids)
+        if ids == [65, 66]:
+            return "streamed\n"
+        if ids == [65, 66, 67]:
+            return "whole-decode"
+        if ids == [67]:
+            return "tail"
+        return super().decode(
+            ids,
+            skip_special_tokens=skip_special_tokens,
+            clean_up_tokenization_spaces=clean_up_tokenization_spaces,
+        )
+
+
 class FakeSessionArena:
     def __init__(self, engine, num_slots=2):
         self.engine = engine
@@ -174,7 +198,7 @@ class FakeSessionTrace:
 
 
 class FakeSessionEngine:
-    def __init__(self, num_slots=2):
+    def __init__(self, num_slots=2, output_token_ids=None):
         self.scheduler = SimpleNamespace(
             waiting=deque(),
             running=[],
@@ -187,6 +211,7 @@ class FakeSessionEngine:
         self.started = []
         self.continuations = []
         self.closed_sessions = []
+        self.output_token_ids = list(output_token_ids or [65, 13])
 
     @property
     def has_unfinished(self):
@@ -226,7 +251,7 @@ class FakeSessionEngine:
             self.scheduler.running.append(request)
         completed = []
         for request in list(self.scheduler.running):
-            output = [65, 13][: request.max_new_tokens]
+            output = self.output_token_ids[: request.max_new_tokens]
             request.output_token_ids.extend(output)
             request.parked_finish_status = RequestStatus.FINISHED_LENGTH
             request.status = RequestStatus.PARKED
@@ -1950,6 +1975,26 @@ class TestOpenAIChatCompatibility(unittest.TestCase):
             return response.status, response.headers, response.read()
 
     @staticmethod
+    def _parent_bound_headers(
+        *,
+        chat_id: str,
+        assistant_message_id: str,
+        user_message_id: str,
+        parent_message_id: str | None = None,
+        user_id: str = "user-a",
+    ) -> dict[str, str]:
+        headers = {
+            "X-OpenWebUI-User-Id": user_id,
+            "X-OpenWebUI-Chat-Id": chat_id,
+            "X-WKVM-Stateful-Chat": PARENT_TOKEN_CHAT_CONTRACT,
+            "X-WKVM-Assistant-Message-Id": assistant_message_id,
+            "X-WKVM-User-Message-Id": user_message_id,
+        }
+        if parent_message_id is not None:
+            headers["X-WKVM-Parent-Message-Id"] = parent_message_id
+        return headers
+
+    @staticmethod
     def _sse_events(body):
         events = []
         for block in body.decode().strip().split("\n\n"):
@@ -2108,6 +2153,537 @@ class TestOpenAIChatCompatibility(unittest.TestCase):
             )
             self.assertEqual(continuation, second_prompt[len(first_prompt) + 2 :])
             self.assertFalse(engine.closed_sessions)
+        finally:
+            self._stop_server(service, server, thread)
+
+    def test_parent_bound_chat_reuses_lossy_tokens_across_multiple_turns(self) -> None:
+        engine = FakeSessionEngine(num_slots=1, output_token_ids=[65, 2])
+        tokenizer = FakeChatTokenizer()
+        codec = _OpenAIChatCodec(tokenizer)
+        service, server, thread = self._start_server(
+            engine,
+            tokenizer=tokenizer,
+            model_id="gemma-test",
+        )
+        host, port = server.server_address
+        try:
+            first_input = [{"role": "user", "content": "Hi"}]
+            _, _, first_raw = self._post(
+                host,
+                port,
+                "/v1/chat/completions",
+                {
+                    "model": "gemma-test",
+                    "messages": first_input,
+                    "max_tokens": 2,
+                    "temperature": 0,
+                    "request_id": "parent-turn-0",
+                },
+                self._parent_bound_headers(
+                    chat_id="parent-chat",
+                    assistant_message_id="assistant-0",
+                    user_message_id="user-0",
+                ),
+            )
+            self.assertEqual(
+                json.loads(first_raw)["choices"][0]["message"]["content"],
+                "A",
+            )
+
+            second_input = [
+                *first_input,
+                {"role": "assistant", "content": "A"},
+                {"role": "user", "content": "Next"},
+            ]
+            self._post(
+                host,
+                port,
+                "/v1/chat/completions",
+                {
+                    "model": "gemma-test",
+                    "messages": second_input,
+                    "max_tokens": 2,
+                    "temperature": 0,
+                    "request_id": "parent-turn-1",
+                },
+                self._parent_bound_headers(
+                    chat_id="parent-chat",
+                    assistant_message_id="assistant-1",
+                    user_message_id="user-1",
+                    parent_message_id="assistant-0",
+                ),
+            )
+
+            third_input = [
+                *second_input,
+                {"role": "assistant", "content": "A"},
+                {"role": "user", "content": "Again"},
+            ]
+            self._post(
+                host,
+                port,
+                "/v1/chat/completions",
+                {
+                    "model": "gemma-test",
+                    "messages": third_input,
+                    "max_tokens": 2,
+                    "temperature": 0,
+                    "request_id": "parent-turn-2",
+                },
+                self._parent_bound_headers(
+                    chat_id="parent-chat",
+                    assistant_message_id="assistant-2",
+                    user_message_id="user-2",
+                    parent_message_id="assistant-1",
+                ),
+            )
+
+            first_base = codec.prompt_token_ids(first_input)
+            first_extended = codec.prompt_token_ids(
+                [
+                    *first_input,
+                    {"role": "assistant", "content": ""},
+                    {"role": "user", "content": "Next"},
+                ]
+            )
+            second_base = codec.prompt_token_ids(second_input)
+            second_extended = codec.prompt_token_ids(
+                [
+                    *second_input,
+                    {"role": "assistant", "content": ""},
+                    {"role": "user", "content": "Again"},
+                ]
+            )
+            self.assertEqual(len(engine.started), 1)
+            self.assertEqual(len(engine.continuations), 2)
+            self.assertEqual(
+                engine.continuations[0][1],
+                first_extended[len(first_base) :],
+            )
+            self.assertEqual(
+                engine.continuations[1][1],
+                second_extended[len(second_base) :],
+            )
+            metrics = service.metrics()["server"]
+            self.assertEqual(metrics["chat_exact_prefix_reuse_hits"], 0)
+            self.assertEqual(metrics["parent_bound_continuation_hits"], 2)
+            self.assertEqual(metrics["parent_bound_continuation_misses"], 0)
+            self.assertEqual(metrics["parent_bound_continuation_rejections"], {})
+            self.assertFalse(engine.closed_sessions)
+        finally:
+            self._stop_server(service, server, thread)
+
+    def test_parent_bound_streaming_commits_emitted_visible_text(self) -> None:
+        engine = FakeSessionEngine(num_slots=1, output_token_ids=[65, 66, 67])
+        tokenizer = ContextSensitiveDecodeChatTokenizer()
+        codec = _OpenAIChatCodec(tokenizer)
+        service, server, thread = self._start_server(
+            engine,
+            tokenizer=tokenizer,
+            model_id="gemma-test",
+        )
+        host, port = server.server_address
+        try:
+            first_input = [{"role": "user", "content": "Hi"}]
+            _, _, first_raw = self._post(
+                host,
+                port,
+                "/v1/chat/completions",
+                {
+                    "model": "gemma-test",
+                    "messages": first_input,
+                    "max_tokens": 3,
+                    "temperature": 0,
+                    "stream": True,
+                    "request_id": "stream-parent-turn-0",
+                },
+                self._parent_bound_headers(
+                    chat_id="stream-parent-chat",
+                    assistant_message_id="assistant-0",
+                    user_message_id="user-0",
+                ),
+            )
+            first_events = self._sse_events(first_raw)
+            first_text = "".join(
+                event["choices"][0]["delta"].get("content", "")
+                for event in first_events
+                if isinstance(event, dict) and event.get("choices")
+            )
+            self.assertEqual(first_text, "streamed\ntail")
+            self.assertNotEqual(first_text, codec.decode([65, 66, 67]))
+
+            second_input = [
+                *first_input,
+                {"role": "assistant", "content": first_text},
+                {"role": "user", "content": "Next"},
+            ]
+            _, _, second_raw = self._post(
+                host,
+                port,
+                "/v1/chat/completions",
+                {
+                    "model": "gemma-test",
+                    "messages": second_input,
+                    "max_tokens": 3,
+                    "temperature": 0,
+                    "stream": True,
+                    "request_id": "stream-parent-turn-1",
+                },
+                self._parent_bound_headers(
+                    chat_id="stream-parent-chat",
+                    assistant_message_id="assistant-1",
+                    user_message_id="user-1",
+                    parent_message_id="assistant-0",
+                ),
+            )
+            second_events = self._sse_events(second_raw)
+            self.assertEqual(second_events[-1], "[DONE]")
+            self.assertEqual(len(engine.started), 1)
+            self.assertEqual(len(engine.continuations), 1)
+            metrics = service.metrics()["server"]
+            self.assertEqual(metrics["parent_bound_continuation_hits"], 1)
+            self.assertEqual(metrics["parent_bound_continuation_misses"], 0)
+            self.assertEqual(metrics["parent_bound_continuation_rejections"], {})
+        finally:
+            self._stop_server(service, server, thread)
+
+    def test_parent_bound_streaming_matches_openwebui_outer_whitespace(self) -> None:
+        engine = FakeSessionEngine(num_slots=1, output_token_ids=[32, 65, 32])
+        service, server, thread = self._start_server(
+            engine,
+            tokenizer=FakeChatTokenizer(),
+            model_id="gemma-test",
+        )
+        host, port = server.server_address
+        try:
+            first_input = [{"role": "user", "content": "Hi"}]
+            _, _, first_raw = self._post(
+                host,
+                port,
+                "/v1/chat/completions",
+                {
+                    "model": "gemma-test",
+                    "messages": first_input,
+                    "max_tokens": 3,
+                    "temperature": 0,
+                    "stream": True,
+                    "request_id": "whitespace-parent-turn-0",
+                },
+                self._parent_bound_headers(
+                    chat_id="whitespace-parent-chat",
+                    assistant_message_id="assistant-0",
+                    user_message_id="user-0",
+                ),
+            )
+            first_events = self._sse_events(first_raw)
+            provider_text = "".join(
+                event["choices"][0]["delta"].get("content", "")
+                for event in first_events
+                if isinstance(event, dict) and event.get("choices")
+            )
+            self.assertEqual(provider_text, " A ")
+
+            self._post(
+                host,
+                port,
+                "/v1/chat/completions",
+                {
+                    "model": "gemma-test",
+                    "messages": [
+                        *first_input,
+                        {"role": "assistant", "content": provider_text.strip()},
+                        {"role": "user", "content": "Next"},
+                    ],
+                    "max_tokens": 3,
+                    "temperature": 0,
+                    "stream": True,
+                    "request_id": "whitespace-parent-turn-1",
+                },
+                self._parent_bound_headers(
+                    chat_id="whitespace-parent-chat",
+                    assistant_message_id="assistant-1",
+                    user_message_id="user-1",
+                    parent_message_id="assistant-0",
+                ),
+            )
+            self.assertEqual(len(engine.started), 1)
+            self.assertEqual(len(engine.continuations), 1)
+            metrics = service.metrics()["server"]
+            self.assertEqual(metrics["parent_bound_continuation_hits"], 1)
+            self.assertEqual(metrics["parent_bound_continuation_misses"], 0)
+        finally:
+            self._stop_server(service, server, thread)
+
+    def test_parent_bound_chat_exact_prefix_still_validates_parent(self) -> None:
+        engine = FakeSessionEngine(num_slots=1)
+        service, server, thread = self._start_server(
+            engine,
+            tokenizer=FakeChatTokenizer(),
+            model_id="gemma-test",
+        )
+        host, port = server.server_address
+        try:
+            first_input = [{"role": "user", "content": "Hi"}]
+            self._post(
+                host,
+                port,
+                "/v1/chat/completions",
+                {
+                    "model": "gemma-test",
+                    "messages": first_input,
+                    "max_tokens": 2,
+                    "temperature": 0,
+                },
+                self._parent_bound_headers(
+                    chat_id="exact-parent-chat",
+                    assistant_message_id="assistant-0",
+                    user_message_id="user-0",
+                ),
+            )
+            self._post(
+                host,
+                port,
+                "/v1/chat/completions",
+                {
+                    "model": "gemma-test",
+                    "messages": [
+                        *first_input,
+                        {"role": "assistant", "content": "A"},
+                        {"role": "user", "content": "Next"},
+                    ],
+                    "max_tokens": 2,
+                    "temperature": 0,
+                },
+                self._parent_bound_headers(
+                    chat_id="exact-parent-chat",
+                    assistant_message_id="assistant-1",
+                    user_message_id="user-1",
+                    parent_message_id="assistant-0",
+                ),
+            )
+            metrics = service.metrics()["server"]
+            self.assertEqual(metrics["chat_exact_prefix_reuse_hits"], 1)
+            self.assertEqual(metrics["parent_bound_continuation_hits"], 0)
+            self.assertEqual(metrics["parent_bound_continuation_misses"], 0)
+            self.assertEqual(len(engine.started), 1)
+            self.assertEqual(len(engine.continuations), 1)
+        finally:
+            self._stop_server(service, server, thread)
+
+    def test_parent_bound_chat_avoids_duplicate_terminal_boundary(self) -> None:
+        engine = FakeSessionEngine(num_slots=1, output_token_ids=[2, 65, 13])
+        tokenizer = FakeChatTokenizer()
+        codec = _OpenAIChatCodec(tokenizer)
+        service, server, thread = self._start_server(
+            engine,
+            tokenizer=tokenizer,
+            model_id="gemma-test",
+        )
+        host, port = server.server_address
+        try:
+            first_input = [{"role": "user", "content": "Hi"}]
+            self._post(
+                host,
+                port,
+                "/v1/chat/completions",
+                {
+                    "model": "gemma-test",
+                    "messages": first_input,
+                    "max_tokens": 3,
+                    "temperature": 0,
+                },
+                self._parent_bound_headers(
+                    chat_id="boundary-parent-chat",
+                    assistant_message_id="assistant-0",
+                    user_message_id="user-0",
+                ),
+            )
+            self._post(
+                host,
+                port,
+                "/v1/chat/completions",
+                {
+                    "model": "gemma-test",
+                    "messages": [
+                        *first_input,
+                        {"role": "assistant", "content": "A"},
+                        {"role": "user", "content": "Next"},
+                    ],
+                    "max_tokens": 3,
+                    "temperature": 0,
+                },
+                self._parent_bound_headers(
+                    chat_id="boundary-parent-chat",
+                    assistant_message_id="assistant-1",
+                    user_message_id="user-1",
+                    parent_message_id="assistant-0",
+                ),
+            )
+            base = codec.prompt_token_ids(first_input)
+            extended = codec.prompt_token_ids(
+                [
+                    *first_input,
+                    {"role": "assistant", "content": ""},
+                    {"role": "user", "content": "Next"},
+                ]
+            )
+            structural_delta = extended[len(base) :]
+            self.assertEqual(structural_delta[0], 13)
+            self.assertEqual(engine.continuations[0][1], structural_delta[1:])
+            self.assertEqual(
+                service.metrics()["server"]["parent_bound_continuation_hits"],
+                1,
+            )
+        finally:
+            self._stop_server(service, server, thread)
+
+    def test_parent_bound_chat_restarts_on_stale_parent(self) -> None:
+        engine = FakeSessionEngine(num_slots=1, output_token_ids=[65, 2])
+        service, server, thread = self._start_server(
+            engine,
+            tokenizer=FakeChatTokenizer(),
+            model_id="gemma-test",
+        )
+        host, port = server.server_address
+        try:
+            first_input = [{"role": "user", "content": "Hi"}]
+            self._post(
+                host,
+                port,
+                "/v1/chat/completions",
+                {
+                    "model": "gemma-test",
+                    "messages": first_input,
+                    "max_tokens": 2,
+                    "temperature": 0,
+                },
+                self._parent_bound_headers(
+                    chat_id="stale-parent-chat",
+                    assistant_message_id="assistant-0",
+                    user_message_id="user-0",
+                ),
+            )
+            old_engine_id = engine.started[0][0]
+            self._post(
+                host,
+                port,
+                "/v1/chat/completions",
+                {
+                    "model": "gemma-test",
+                    "messages": [
+                        *first_input,
+                        {"role": "assistant", "content": "A"},
+                        {"role": "user", "content": "Next"},
+                    ],
+                    "max_tokens": 2,
+                    "temperature": 0,
+                },
+                self._parent_bound_headers(
+                    chat_id="stale-parent-chat",
+                    assistant_message_id="assistant-1",
+                    user_message_id="user-1",
+                    parent_message_id="wrong-parent",
+                ),
+            )
+            self.assertEqual(len(engine.started), 2)
+            self.assertFalse(engine.continuations)
+            self.assertEqual(engine.closed_sessions, [old_engine_id])
+            metrics = service.metrics()["server"]
+            self.assertEqual(metrics["parent_bound_continuation_hits"], 0)
+            self.assertEqual(metrics["parent_bound_continuation_misses"], 1)
+            self.assertEqual(
+                metrics["parent_bound_continuation_rejections"],
+                {"parent_message_mismatch": 1},
+            )
+        finally:
+            self._stop_server(service, server, thread)
+
+    def test_parent_bound_chat_restarts_on_visible_history_edit(self) -> None:
+        engine = FakeSessionEngine(num_slots=1, output_token_ids=[65, 2])
+        service, server, thread = self._start_server(
+            engine,
+            tokenizer=FakeChatTokenizer(),
+            model_id="gemma-test",
+        )
+        host, port = server.server_address
+        try:
+            first_input = [{"role": "user", "content": "Hi"}]
+            self._post(
+                host,
+                port,
+                "/v1/chat/completions",
+                {
+                    "model": "gemma-test",
+                    "messages": first_input,
+                    "max_tokens": 2,
+                    "temperature": 0,
+                },
+                self._parent_bound_headers(
+                    chat_id="edited-parent-chat",
+                    assistant_message_id="assistant-0",
+                    user_message_id="user-0",
+                ),
+            )
+            self._post(
+                host,
+                port,
+                "/v1/chat/completions",
+                {
+                    "model": "gemma-test",
+                    "messages": [
+                        *first_input,
+                        {"role": "assistant", "content": "Edited"},
+                        {"role": "user", "content": "Next"},
+                    ],
+                    "max_tokens": 2,
+                    "temperature": 0,
+                },
+                self._parent_bound_headers(
+                    chat_id="edited-parent-chat",
+                    assistant_message_id="assistant-1",
+                    user_message_id="user-1",
+                    parent_message_id="assistant-0",
+                ),
+            )
+            metrics = service.metrics()["server"]
+            self.assertEqual(metrics["parent_bound_continuation_misses"], 1)
+            self.assertEqual(
+                metrics["parent_bound_continuation_rejections"],
+                {"prior_assistant_mismatch": 1},
+            )
+            self.assertEqual(len(engine.started), 2)
+            self.assertFalse(engine.continuations)
+        finally:
+            self._stop_server(service, server, thread)
+
+    def test_parent_bound_chat_rejects_incomplete_identity_headers(self) -> None:
+        service, server, thread = self._start_server(
+            FakeSessionEngine(num_slots=1),
+            tokenizer=FakeChatTokenizer(),
+            model_id="gemma-test",
+        )
+        host, port = server.server_address
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                self._post(
+                    host,
+                    port,
+                    "/v1/chat/completions",
+                    {
+                        "model": "gemma-test",
+                        "messages": [{"role": "user", "content": "Hi"}],
+                        "max_tokens": 2,
+                        "temperature": 0,
+                    },
+                    {
+                        "X-OpenWebUI-User-Id": "user-a",
+                        "X-OpenWebUI-Chat-Id": "header-chat",
+                        "X-WKVM-Stateful-Chat": PARENT_TOKEN_CHAT_CONTRACT,
+                    },
+                )
+            self.assertEqual(raised.exception.code, 400)
+            error = json.loads(raised.exception.read())
+            self.assertIn("assistant and user message ID", error["error"])
         finally:
             self._stop_server(service, server, thread)
 

@@ -159,20 +159,42 @@ For this provider:
 - both streaming and blocking text responses work.
 
 Open WebUI forwards `X-OpenWebUI-User-Id` and `X-OpenWebUI-Chat-Id`. WKVM uses
-the model, user, and chat tuple as the parked-session identity. After two turns,
-inspect the counters:
+the model, user, and chat tuple as the parked-session identity. The helper also
+sets these provider headers through Open WebUI's supported metadata templates:
+
+```text
+X-WKVM-Stateful-Chat: parent-token-v1
+X-WKVM-Assistant-Message-ID: {{MESSAGE_ID}}
+X-WKVM-User-Message-ID: {{USER_MESSAGE_ID}}
+X-WKVM-Parent-Message-ID: {{USER_MESSAGE_PARENT_ID}}
+```
+
+WKVM validates the current and parent IDs, the complete visible parent history,
+and an internal digest of the exact parked token history before continuing. An
+edit, branch, stale parent, expired session, or missing header starts a fresh
+state. After two turns, inspect the counters:
 
 ```bash
 curl -fsS http://127.0.0.1:8000/metrics
 ```
 
 Relevant fields are `engine.session_reuse_hits`,
-`engine.session_reuse_misses`, `engine.parked_sessions`, and
-`server.total_errors`. Reuse is deliberately strict: the next rendered prompt
-must contain the exact prior token history as a prefix. Open WebUI normalizes
-persisted assistant text, so a safe retire-and-restart can occur instead of a
-reuse hit. The measured B32 run reused 125 of 224 continuations and safely
-restarted 99 normalized histories.
+`server.chat_exact_prefix_reuse_hits`,
+`server.parent_bound_continuation_hits`,
+`server.parent_bound_continuation_misses`, and
+`server.parent_bound_continuation_rejections`. The first two server hit counters
+must sum to the number of eligible follow-ups; misses or rejection reasons mean
+the strict state-continuity gate failed.
+
+`parent-token-v1` is intentionally an explicit stateful API contract. WKVM
+preserves the exact generated token history behind the verified parent message,
+including hidden or noncanonical tokens that visible text alone cannot recover.
+It must not be described as transparent stateless OpenAI-chat equivalence.
+
+Open WebUI 0.10.2 strips outer whitespace before persisting an assistant output,
+so WKVM binds the same normalized visible text. The demo disables reasoning-tag
+extraction because that transformation intentionally removes text from the next
+provider request; custom content-changing filters safely force a fresh state.
 
 ## Docker Compose alternative
 
@@ -224,11 +246,12 @@ export ENABLE_OLLAMA_API=false
 export ENABLE_OPENAI_API=true
 export OPENAI_API_BASE_URLS=http://127.0.0.1:8000/v1
 export OPENAI_API_KEYS=wkvm-local
+export OPENAI_API_CONFIGS='{"0":{"headers":{"X-WKVM-Stateful-Chat":"parent-token-v1","X-WKVM-Assistant-Message-ID":"{{MESSAGE_ID}}","X-WKVM-User-Message-ID":"{{USER_MESSAGE_ID}}","X-WKVM-Parent-Message-ID":"{{USER_MESSAGE_PARENT_ID}}"}}}'
 export ENABLE_FORWARD_USER_INFO_HEADERS=true
 export ENABLE_WEBSOCKET_SUPPORT=true
 export ENABLE_PERSISTENT_CONFIG=false
 export DEFAULT_MODELS=wkvm-gemma-4-e4b-it
-export DEFAULT_MODEL_PARAMS='{"temperature":0,"top_p":1,"function_calling":"legacy","max_tokens":1152}'
+export DEFAULT_MODEL_PARAMS='{"temperature":0,"top_p":1,"reasoning_tags":false,"function_calling":"legacy","max_tokens":1152}'
 export DEFAULT_MODEL_METADATA='{"capabilities":{"builtin_tools":false,"vision":false,"file_upload":false,"file_context":false,"web_search":false,"image_generation":false,"code_interpreter":false,"terminal":false,"memory":false}}'
 export ENABLE_TITLE_GENERATION=false
 export ENABLE_TAGS_GENERATION=false
@@ -296,9 +319,13 @@ field. Normal chat must use `temperature=0` and `top_p=1`.
 
 ### Reuse does not increase on every turn
 
-Serving is still correct. Exact parked-state reuse is conditional on token-prefix
-continuity; Open WebUI persistence normalization can change the reconstructed
-history, in which case WKVM safely starts a fresh state.
+Inspect `server.parent_bound_continuation_rejections`. Missing identity headers
+usually mean the Open WebUI provider config was not applied; a parent or history
+mismatch means the chat was edited, branched, retried from a stale parent, or
+resumed after its parked state expired. WKVM safely starts a fresh state in all
+of those cases. With an existing persistent Open WebUI database, update provider
+index `0` in Admin Settings or use `POST /openai/config/update`; an existing
+`openai.api_configs` database row overrides the environment default.
 
 ### A port is already in use or a PID is stale
 
@@ -315,9 +342,11 @@ reviewed network policy first; changing a bind address alone is unsafe.
 
 ## Benchmark reproduction is different
 
-The historical Open WebUI B32 x 8 result uses 32 slots, fixed output length,
+The measured Open WebUI B32 x 8 result uses 32 slots, fixed output length,
 `--ignore-eos`, explicit token-pool sizing, strict Triton settings, cache
 emptying, and benchmark-specific UI controls. Those settings reproduce one
 artifact and can OOM or distort normal chat behavior. Use the
-[historical report](../experiments/results/open_webui_b32_t8_compare_20260714.md)
-only when reproducing that exact measurement.
+[current strict report](../experiments/results/open_webui_parent_token_b32_t8_20260723.md)
+when reproducing the parent-token measurement; the
+[2026-07-14 report](../experiments/results/open_webui_b32_t8_compare_20260714.md)
+is historical only.

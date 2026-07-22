@@ -9,8 +9,10 @@ from experiments.open_webui_multiturn_bench import (
     PendingRequest,
     RequestPlan,
     SocketEventTracker,
+    WKVM_PARENT_TOKEN_HEADERS,
     build_request_plan,
     build_workload,
+    configure_wkvm_parent_token_contract,
     exact_initial_content,
     redact_command,
     redact_secrets,
@@ -68,6 +70,15 @@ class _FakeOpenWebUITransport:
         self.closed = False
         self._lock = threading.Lock()
         self._next_chat = 0
+        self.openai_config = {
+            "ENABLE_OPENAI_API": True,
+            "OPENAI_API_BASE_URLS": ["http://provider.test/v1"],
+            "OPENAI_API_KEYS": ["secret-test-key"],
+            "OPENAI_API_CONFIGS": {
+                "http://provider.test/v1": {"timeout": 300}
+            },
+        }
+        self.updated_openai_config = None
 
     def connect(self, event_handler):
         self.event_handler = event_handler
@@ -80,6 +91,14 @@ class _FakeOpenWebUITransport:
 
     def get_models(self):
         return {"data": [{"id": self.model, "name": self.model}]}
+
+    def get_openai_config(self):
+        return json.loads(json.dumps(self.openai_config))
+
+    def update_openai_config(self, config):
+        self.updated_openai_config = json.loads(json.dumps(config))
+        self.openai_config = self.updated_openai_config
+        return json.loads(json.dumps(self.openai_config))
 
     def post_completion(self, payload):
         with self._lock:
@@ -315,6 +334,7 @@ class TestOpenWebUIMultiturnBench(unittest.TestCase):
             turn_input_tokens=5,
             output_tokens_per_turn=3,
             request_order_policy="alternating",
+            configure_wkvm_parent_token_contract=True,
         )
         transport = _FakeOpenWebUITransport(tokenizer, config.model, 3)
 
@@ -371,6 +391,26 @@ class TestOpenWebUIMultiturnBench(unittest.TestCase):
         ]
         self.assertEqual(len(continuation_payloads), 2)
         self.assertTrue(all(len(payload["messages"]) == 3 for payload in continuation_payloads))
+        proof = artifact["open_webui"]["parent_token_contract"]
+        self.assertTrue(proof["configured"])
+        self.assertEqual(proof["provider_index"], "0")
+        provider = transport.updated_openai_config["OPENAI_API_CONFIGS"]["0"]
+        self.assertEqual(provider["timeout"], 300)
+        self.assertEqual(provider["headers"], WKVM_PARENT_TOKEN_HEADERS)
+        self.assertEqual(
+            transport.updated_openai_config["OPENAI_API_KEYS"],
+            ["secret-test-key"],
+        )
+
+    def test_parent_token_config_normalizes_url_key_and_preserves_provider_fields(self):
+        transport = _FakeOpenWebUITransport(_FakeTokenizer(), "gemma-test", 2)
+        proof = configure_wkvm_parent_token_contract(transport)
+        self.assertTrue(proof["configured"])
+        self.assertNotIn("secret-test-key", json.dumps(proof))
+        configs = transport.updated_openai_config["OPENAI_API_CONFIGS"]
+        self.assertEqual(set(configs), {"0"})
+        self.assertEqual(configs["0"]["timeout"], 300)
+        self.assertEqual(configs["0"]["headers"], WKVM_PARENT_TOKEN_HEADERS)
 
     def test_summary_with_missing_usage_refuses_all_token_rates(self):
         records = [
@@ -436,14 +476,24 @@ class TestOpenWebUIMultiturnBench(unittest.TestCase):
             turns=3,
             provider_metrics_url="http://provider.test/metrics",
             require_wkvm_session_reuse=True,
+            configure_wkvm_parent_token_contract=True,
         )
         snapshot = {
             "phase": "after-run",
             "data": {
-                "server": {"chat_sessions": 2},
+                "server": {
+                    "chat_sessions": 2,
+                    "chat_exact_prefix_reuse_hits": 1,
+                    "parent_bound_continuation_hits": 3,
+                    "parent_bound_continuation_misses": 0,
+                    "parent_bound_continuation_rejections": {},
+                },
                 "engine": {
                     "parked_sessions": 2,
                     "resident_sessions": 2,
+                    "sessions_opened": 2,
+                    "sessions_closed": 0,
+                    "cache_builds": 2,
                     "session_reuse_hits": 4,
                     "session_reuse_misses": 0,
                     "full_reprefill_turns": 0,
@@ -456,6 +506,73 @@ class TestOpenWebUIMultiturnBench(unittest.TestCase):
         issues = validate_wkvm_session_metrics([snapshot], config)
         self.assertEqual(len(issues), 1)
         self.assertIn("expected 4, got 3", issues[0])
+
+    def test_wkvm_session_metrics_reject_lifecycle_and_bridge_churn(self):
+        config = BenchmarkConfig(
+            open_webui_url="http://example.test",
+            model="gemma-test",
+            run_id="strict-metrics",
+            sessions=2,
+            turns=3,
+            provider_metrics_url="http://provider.test/metrics",
+            require_wkvm_session_reuse=True,
+            configure_wkvm_parent_token_contract=True,
+        )
+
+        def valid_snapshot():
+            return {
+                "phase": "after-run",
+                "data": {
+                    "server": {
+                        "chat_sessions": 2,
+                        "chat_exact_prefix_reuse_hits": 1,
+                        "parent_bound_continuation_hits": 3,
+                        "parent_bound_continuation_misses": 0,
+                        "parent_bound_continuation_rejections": {},
+                    },
+                    "engine": {
+                        "parked_sessions": 2,
+                        "resident_sessions": 2,
+                        "sessions_opened": 2,
+                        "sessions_closed": 0,
+                        "cache_builds": 2,
+                        "session_reuse_hits": 4,
+                        "session_reuse_misses": 0,
+                        "full_reprefill_turns": 0,
+                    },
+                },
+            }
+
+        failures = (
+            ("engine", "sessions_opened", 3, "engine.sessions_opened"),
+            ("engine", "sessions_closed", 1, "engine.sessions_closed"),
+            ("engine", "cache_builds", 3, "engine.cache_builds"),
+            (
+                "server",
+                "parent_bound_continuation_hits",
+                2,
+                "server.reuse_hits_total",
+            ),
+            (
+                "server",
+                "parent_bound_continuation_misses",
+                1,
+                "server.parent_bound_continuation_misses",
+            ),
+            (
+                "server",
+                "parent_bound_continuation_rejections",
+                {"parent_digest_mismatch": 1},
+                "server.parent_bound_continuation_rejections",
+            ),
+        )
+        for section, field, value, issue_name in failures:
+            with self.subTest(field=field):
+                snapshot = valid_snapshot()
+                snapshot["data"][section][field] = value
+                issues = validate_wkvm_session_metrics([snapshot], config)
+                self.assertEqual(len(issues), 1)
+                self.assertIn(issue_name, issues[0])
 
     def test_secret_redaction_is_recursive(self):
         redacted = redact_secrets(

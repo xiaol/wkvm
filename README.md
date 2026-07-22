@@ -53,9 +53,16 @@ does **not** reuse the high-memory B32 benchmark recipe or `--ignore-eos`.
   `/metrics` are available.
 - Requests must use text messages, `temperature=0`, `top_p=1`, and `n=1`;
   tools, images, logprobs, and custom stop sequences are not supported.
-- Open WebUI forwards user/chat identity headers so WKVM can park state per
-  chat. Reuse still requires exact rendered-token prefix continuity; UI text
-  normalization can safely force a session restart.
+- The helper configures Open WebUI's `parent-token-v1` provider headers. WKVM
+  binds each parked state to the model, user, chat, current assistant message,
+  previous assistant parent, exact visible history, and an internal raw-token
+  digest. Edits, branches, stale parents, or missing metadata restart safely.
+- `parent-token-v1` is an explicit stateful contract: WKVM preserves the exact
+  provider-generated token history, including hidden or noncanonical tokens,
+  instead of pretending that a decode-to-text-to-token round trip is identical.
+- WKVM mirrors Open WebUI 0.10.2's persisted outer-whitespace normalization,
+  and the helper disables reasoning-tag extraction. Content-changing filters
+  or edits fail the visible-history check and safely start a fresh state.
 - Both services bind to loopback. WKVM currently has no API-key enforcement,
   so do not expose port 8000 to a LAN or the Internet.
 - This UI path exercises approximate Gemma routed-span mode. WKVM's native
@@ -108,10 +115,11 @@ There is no honest workload-independent “WKVM is 10x faster” claim. The
 current evidence supports a scoped long-lived-session claim and also contains
 workloads where vLLM remains faster.
 
-> **Outdated benchmark:** The 2026-07-14 Open WebUI B32 x 8 comparison predates
-> the current serving and benchmark code. It is retained only as historical
-> context and is excluded from current performance claims until it is rerun
-> from the current commit with optimized vLLM and SGLang configurations.
+> **Current Open WebUI checkpoint:** The strict 2026-07-23 B32 x 8 run passed
+> all 256 requests and reused all 224 eligible continuations with 32 sessions
+> opened, zero closed, and zero parent-history rejections. It is one controlled
+> cross-run comparison on an active RTX 4090 desktop; repeated rotated runs are
+> still required before treating the ratios as a publication-grade envelope.
 
 > **A800 status:** A single exploratory B32, 98,304-token, 12-turn scout
 > measured 12.107x versus vLLM (346.300 s versus 4,192.690 s), but it is not a
@@ -121,6 +129,7 @@ workloads where vLLM remains faster.
 
 | measured workload | WKVM result | vs vLLM | vs SGLang | outcome |
 |---|---:|---:|---:|---|
+| Real Open WebUI 0.10.2, B32, 8 turns, 13,824-token initial context | **117.888s / 277.959 output tok/s** | **1.734x faster** | **4.273x faster** | strict 224/224 reuse pass; repeats pending |
 | RTX 4090 provider HTTP, B16, 48 turns, 36,864-token initial context | 180.415s complete wall | **11.151x faster** | **26.079x faster** | scoped exploratory pass |
 | **PROVISIONAL:** A800 provider HTTP scout, B32, 12 turns, 98,304-token initial context | 346.300s complete wall | **12.107x faster** | not matched | clean repeated campaign pending |
 | **OUTDATED:** Real Open WebUI 0.10.2, offered B32, 8 turns | 53.963 output tok/s | 0.586x; vLLM is 70.6% faster | 0.998x; effectively tied | historical only; rerun required |
@@ -134,17 +143,18 @@ claim is: **on that predeclared long-lived workload, WKVM measured 11.151x vLLM
 and 26.079x SGLang end to end**. It does not establish a universal engine
 ranking or quality equivalence.
 
-The outdated Open WebUI run completed 256/256 requests for every engine. WKVM
-retained 32 states, but only 125/224 continuations exactly matched parked token
-history; 99 normalized histories were safely restarted. Those measurements
-describe the old code path and must not be used as current WKVM, vLLM, or
-SGLang performance evidence. High concurrency increases residency and batching
-opportunity, but it does not by itself remove WKVM's decode-kernel and
-microbatch bottlenecks.
+The current strict Open WebUI row completed 256/256 requests in 117.888s and
+generated 277.959 output tok/s. Optimized vLLM completed the matching workload
+in 204.388s at 160.322 tok/s; optimized SGLang took 503.700s at 65.055 tok/s.
+WKVM reused 12 exact token prefixes plus 212 parent-bound deltas, with zero
+restarts. Continuation-only throughput was 345.607 tok/s, 2.126x vLLM and
+5.335x SGLang. This still is not a 10x Open WebUI result: turn 0 alone took
+34.926s, and B32 decode is split into 16-row model calls without CUDA graphs.
 
 Evidence and methodology:
 
 - [48-turn RTX 4090 E2E report](experiments/results/gemma_4090_48turn_10x_20260717.md)
+- [Current strict Open WebUI B32 x 8 report](experiments/results/open_webui_parent_token_b32_t8_20260723.md)
 - [A800 10x methodology and pending gate](docs/10X_E2E_PLAN.md)
 - [Outdated historical Open WebUI B32 x 8 report](experiments/results/open_webui_b32_t8_compare_20260714.md)
 - [Repeated A800 comparison](experiments/results/gemma_a800_reliable_20260716/report.md)

@@ -199,11 +199,12 @@ launch_open_webui() {
     "ENABLE_OPENAI_API=true"
     "OPENAI_API_BASE_URLS=http://127.0.0.1:$WKVM_PORT/v1"
     "OPENAI_API_KEYS=wkvm-local"
+    'OPENAI_API_CONFIGS={"0":{"headers":{"X-WKVM-Stateful-Chat":"parent-token-v1","X-WKVM-Assistant-Message-ID":"{{MESSAGE_ID}}","X-WKVM-User-Message-ID":"{{USER_MESSAGE_ID}}","X-WKVM-Parent-Message-ID":"{{USER_MESSAGE_PARENT_ID}}"}}}'
     "ENABLE_FORWARD_USER_INFO_HEADERS=true"
     "ENABLE_WEBSOCKET_SUPPORT=true"
     "ENABLE_PERSISTENT_CONFIG=false"
     "DEFAULT_MODELS=$SERVED_MODEL_NAME"
-    'DEFAULT_MODEL_PARAMS={"temperature":0,"top_p":1,"function_calling":"legacy","max_tokens":1152}'
+    'DEFAULT_MODEL_PARAMS={"temperature":0,"top_p":1,"reasoning_tags":false,"function_calling":"legacy","max_tokens":1152}'
     'DEFAULT_MODEL_METADATA={"capabilities":{"builtin_tools":false,"vision":false,"file_upload":false,"file_context":false,"web_search":false,"image_generation":false,"code_interpreter":false,"terminal":false,"memory":false}}'
     "ENABLE_TITLE_GENERATION=false"
     "ENABLE_TAGS_GENERATION=false"
