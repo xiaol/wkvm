@@ -158,12 +158,13 @@ not a 10x Open WebUI result because turn 0 alone took 32.363s, above the entire
 20.439s 10x wall budget.
 
 The regular helper remains the conservative four-slot interactive profile. To
-start the measured high-memory recipe for controlled B32 testing, stop any
-managed interactive services first, then use
-`WKVM_DEMO_PROFILE=benchmark-b32 ./scripts/open_webui_demo.sh start`. It enables
-`--ignore-eos`, sets the Open WebUI default output limit to 128 tokens, and is
-not intended for normal chat. The benchmark driver explicitly requests that
-same 128-token limit for every measured request.
+keep the B32 scheduler for normal browser chat, stop any managed profile and use
+`WKVM_DEMO_PROFILE=interactive-b32 ./scripts/open_webui_demo.sh start`; it keeps
+normal EOS handling, so `max_tokens` is a ceiling rather than a required output
+length. The separate `benchmark-b32` profile enables `--ignore-eos`, sets the
+Open WebUI default output limit to 128 tokens, and is only for reproducing the
+controlled measurement. The benchmark driver explicitly requests that same
+128-token limit for every measured request.
 
 Evidence and methodology:
 

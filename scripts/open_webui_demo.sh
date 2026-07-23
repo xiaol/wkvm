@@ -45,8 +45,9 @@ Required for start:
   WKVM_MODEL_DIR=/path/to/gemma-4-E4B-it
 
 Profiles:
-  WKVM_DEMO_PROFILE=interactive   Four-slot normal chat (default)
-  WKVM_DEMO_PROFILE=benchmark-b32 Measured high-memory B32 throughput profile
+  WKVM_DEMO_PROFILE=interactive     Four-slot normal chat (default)
+  WKVM_DEMO_PROFILE=interactive-b32 Normal-EOS high-memory B32 chat
+  WKVM_DEMO_PROFILE=benchmark-b32   Exact-output B32 measurement profile
 
 Set DRY_RUN=1 to print commands without executing or waiting.
 EOF
@@ -147,7 +148,7 @@ remove_stale_pid_file() {
 
 resolve_start_profile_config() {
   case "$WKVM_DEMO_PROFILE" in
-    interactive)
+    interactive|interactive-b32)
       OPEN_WEBUI_MAX_TOKENS="${OPEN_WEBUI_MAX_TOKENS:-1152}"
       ;;
     benchmark-b32)
@@ -158,7 +159,7 @@ resolve_start_profile_config() {
       OPEN_WEBUI_MAX_TOKENS=128
       ;;
     *)
-      fail "WKVM_DEMO_PROFILE must be interactive or benchmark-b32"
+      fail "WKVM_DEMO_PROFILE must be interactive, interactive-b32, or benchmark-b32"
       ;;
   esac
   if [[ ! "$OPEN_WEBUI_MAX_TOKENS" =~ ^[0-9]+$ ]] || \
@@ -226,7 +227,7 @@ launch_wkvm() {
         --chat-session-ttl-s 1800
       )
       ;;
-    benchmark-b32)
+    interactive-b32|benchmark-b32)
       environment+=(
         "WKVM_ENABLE_TOKEN_POOL_TRITON=1"
         "WKVM_ENABLE_TOKEN_POOL_PAGED_TRITON=1"
@@ -244,7 +245,6 @@ launch_wkvm() {
         --max-request-body-bytes 67108864
         --chat-session-ttl-s 3600
         --max-completed-requests 320
-        --ignore-eos
         --batch-wait-s 0.01
         --prefill-chunk 2048
         --prefill-microbatch-rows 2
@@ -263,6 +263,9 @@ launch_wkvm() {
         --native-gemma-attention-backend triton_dense_gqa
         --native-gemma-projection-backend separate
       )
+      if [[ "$WKVM_DEMO_PROFILE" == "benchmark-b32" ]]; then
+        command+=(--ignore-eos)
+      fi
       ;;
   esac
 

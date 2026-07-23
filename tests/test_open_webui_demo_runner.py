@@ -177,6 +177,46 @@ class TestOpenWebUIDemoRunner(unittest.TestCase):
             result.stderr,
         )
 
+    def test_interactive_b32_keeps_batching_with_normal_eos(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            result = self.run_demo(
+                "start",
+                base=base,
+                extra_env={
+                    "WKVM_DEMO_PROFILE": "interactive-b32",
+                    "OPEN_WEBUI_MAX_TOKENS": "12000",
+                },
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        wkvm_marker = next(
+            line for line in lines if line.startswith("launch service=wkvm")
+        )
+        wkvm_launch = shlex.split(lines[lines.index(wkvm_marker) + 1])
+        self.assertNotIn("--native-gemma-production-profile", wkvm_launch)
+        self.assertNotIn("--ignore-eos", wkvm_launch)
+        self.assertEqual(wkvm_launch[wkvm_launch.index("--slots") + 1], "32")
+        self.assertEqual(
+            wkvm_launch[wkvm_launch.index("--decode-microbatch-rows") + 1],
+            "32",
+        )
+        self.assertEqual(
+            wkvm_launch[
+                wkvm_launch.index("--continuation-prefill-microbatch-rows") + 1
+            ],
+            "32",
+        )
+        webui_marker = next(
+            line for line in lines if line.startswith("launch service=open-webui")
+        )
+        webui_launch = shlex.split(lines[lines.index(webui_marker) + 1])
+        self.assertIn(
+            'DEFAULT_MODEL_PARAMS={"temperature":0,"top_p":1,"reasoning_tags":false,"function_calling":"legacy","max_tokens":12000}',
+            webui_launch,
+        )
+
     def test_start_refuses_to_reuse_an_unknown_live_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -321,7 +361,7 @@ class TestOpenWebUIDemoRunner(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(
-            "WKVM_DEMO_PROFILE must be interactive or benchmark-b32",
+            "WKVM_DEMO_PROFILE must be interactive, interactive-b32, or benchmark-b32",
             result.stderr,
         )
 

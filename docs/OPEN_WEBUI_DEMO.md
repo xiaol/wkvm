@@ -98,6 +98,21 @@ endpoint:
 ./scripts/open_webui_demo.sh start
 ```
 
+For normal-EOS chat with the measured 32-slot scheduler shape, stop the current
+managed services and select the interactive B32 profile:
+
+```bash
+./scripts/open_webui_demo.sh stop
+WKVM_DEMO_PROFILE=interactive-b32 \
+WKVM_MODEL_DIR="$WKVM_MODEL_DIR" \
+  ./scripts/open_webui_demo.sh start
+```
+
+`max_tokens` is an upper bound. The model can stop much earlier on EOS/EOT. A
+single 12,000-token ceiling is usable for testing, but 32 simultaneous
+12,000-token generations exceed this profile's measured token-pool envelope;
+do not treat the ceiling as a safe C32 capacity promise.
+
 Model loading can take several minutes on the first run. The helper prints the
 log locations and waits up to 15 minutes by default. Inspect lifecycle state at
 any time:
@@ -345,7 +360,8 @@ reviewed network policy first; changing a bind address alone is unsafe.
 The measured Open WebUI B32 x 8 R5 result uses 32 slots, 32-row continuation
 prefill and decode, 128 persistent decode steps, fixed output length,
 `--ignore-eos`, explicit token-pool sizing, strict Triton settings, and
-benchmark-specific UI controls. Start that server recipe explicitly:
+benchmark-specific UI controls. It is not a normal chat profile. Start that
+server recipe explicitly:
 
 ```bash
 ./scripts/open_webui_demo.sh stop
