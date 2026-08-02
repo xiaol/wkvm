@@ -4,6 +4,8 @@ This directory contains an arXiv-oriented technical report and an explicit
 claim audit. The report deliberately separates the exact native RWKV-7 path
 from the approximate Gemma retained-KV routed-span path.
 
+Rendered report: [wkvm-technical-report.pdf](wkvm-technical-report.pdf)
+
 ## Build
 
 ```bash
@@ -12,6 +14,12 @@ make pdf
 ```
 
 The PDF is written to `paper/build/main.pdf`.
+
+Refresh the committed PDF after editing the report:
+
+```bash
+make publish-pdf
+```
 
 Create the source archive used for an arXiv upload:
 
