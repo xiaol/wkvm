@@ -163,13 +163,17 @@ def main() -> None:
         help="rwkv7: fla-format RWKV-7 (M1); qwen35: Qwen3.5 GDN+attention hybrid (M4)",
     )
     ap.add_argument(
-        "--guest-ctx", type=int, default=4096,
-        help="qwen35 only: fixed per-slot KV window for the full-attention guest layers",
+        "--guest-pool-tokens", type=int, default=None,
+        help="qwen35 only: total guest-KV pool (tokens) shared by all requests; default 4096 x slots",
     )
+    ap.add_argument("--page-tokens", type=int, default=256, help="qwen35 only: guest page size")
     args = ap.parse_args()
 
     if args.model_type == "qwen35":
-        engine = Engine.from_qwen35(args.model, num_slots=args.slots, guest_ctx=args.guest_ctx)
+        engine = Engine.from_qwen35(
+            args.model, num_slots=args.slots,
+            guest_pool_tokens=args.guest_pool_tokens, page_tokens=args.page_tokens,
+        )
     else:
         engine = Engine.from_pretrained(args.model, num_slots=args.slots)
     engine.attach_store(args.store)

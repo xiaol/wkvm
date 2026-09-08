@@ -245,17 +245,18 @@ Gemma routed-span mode, with bounded approximate memory. See
 
 ## Status
 
-**M4 (slice 1)—hybrid GDN + attention serving:** Qwen3.5-9B (24 Gated DeltaNet
+**M4—hybrid GDN + attention serving:** Qwen3.5-9B (24 Gated DeltaNet
 layers + 8 full-attention layers) runs from the state arena with the recurrent
-state as the primary object and the attention layers as guests in a fixed
-per-slot KV window. `Engine` and the Durable State API are model-agnostic
-behind a layout/bank protocol, and a tuned initial state from RNN-StateTuning
-imports as a handle (`POST /v1/states/import`)—a state no token prefix
-produces, served at batch. Greedy output is bit-identical to HF on the 9B;
+state as the primary object and the attention layers as guests in a paged KV
+pool; the arena is the one allocator for slots and pages, and a request
+reserves its lifetime pages at admission so admission stays a count. `Engine`
+and the Durable State API are model-agnostic behind a layout/bank protocol, and
+a tuned initial state from RNN-StateTuning imports as a handle
+(`POST /v1/states/import`)—a state no token prefix produces, served at batch.
+Greedy output is bit-identical to HF on the 9B, including a 12k-token prompt;
 see [`docs/HYBRID_ENGINE_PLAN.md`](docs/HYBRID_ENGINE_PLAN.md) and
 [`experiments/results/m4_qwen35_hybrid_smoke.md`](experiments/results/m4_qwen35_hybrid_smoke.md).
-Pure-torch kernels on this slice: no throughput claim; the paged guest pool
-is the next slice.
+Pure-torch kernels on this path: no throughput claim yet.
 
 **M3—Durable State API:** named, versioned, forkable, mutable state handles over
 a tiered StateStore (GPU slot, pinned host, and NVMe safetensors). Measured demos

@@ -23,23 +23,27 @@ owns, what it still borrows from HF, and the exact state semantics the
 
 `config.layer_types` (Qwen3.5-9B: `full_attention` every 4th layer):
 
-| layer type | count (9B) | family | per-slot shape (layer-major bank) | dtype |
-|---|---:|---|---|---|
-| `linear_attention` | 24 | `gdn_state` | `[24, H_v=32, K=128, V=128]` | fp32 |
-| `linear_attention` | 24 | `gdn_conv` | `[24, conv_dim=8192, kernel=4]` | model |
-| `full_attention` | 8 | `guest_kv` | K and V `[8, kv_heads=4, guest_ctx, head_dim=256]` | model |
+| layer type | count (9B) | family | unit | shape (layer-major bank) | dtype |
+|---|---:|---|---|---|---|
+| `linear_attention` | 24 | `gdn_state` | slot | `[24, H_v=32, K=128, V=128]` | fp32 |
+| `linear_attention` | 24 | `gdn_conv` | slot | `[24, conv_dim=8192, kernel=4]` | model |
+| `full_attention` | 8 | `guest_kv` | **page** | K and V `[8, kv_heads=4, page_tokens, head_dim=256]` per page | model |
 
-Per slot at `guest_ctx=4096`: 48 MiB + 1.5 MiB + 128 MiB = 177.5 MiB; the
-guest window costs 32 KiB per token across the 8 attention layers.
+Per request: 48 MiB + 1.5 MiB of recurrent state (constant) plus
+`ceil((prompt + max_new_tokens) / page_tokens)` pages at 32 KiB per token
+(8 MiB per 256-token page). The arena hands out slots and pages together
+(`slots["guest_kv"]` is the tuple of page ids); token `t` lives at
+`pages[t // page_tokens]`, offset `t % page_tokens`. Page 0 is reserved as
+the read target of masked-out positions.
 
 The recurrent state is fp32 because the HF reference kernels
 (`torch_chunk_gated_delta_rule`, `torch_recurrent_gated_delta_rule`) emit and
 consume fp32 states. `conv_dim = 2*num_k_heads*head_k_dim +
 num_v_heads*head_v_dim`.
 
-`guest_len` (tokens resident in the window) is bank-owned host metadata,
-exported with snapshots; the engine's `num_computed_tokens` equals it for a
-live request.
+`guest_len` (tokens resident in the pages) is bank-owned host metadata keyed
+by the request's `gdn_state` slot and exported with snapshots; the engine's
+`num_computed_tokens` equals it for a live request.
 
 ## Zero state is fresh state
 
@@ -71,10 +75,14 @@ kernel exactly when `seq_len == 1`. Admission is `zero_slots`.
 
 | HF call | wkvm behaviour |
 |---|---|
-| `cache.update(k, v, i)` | remembers `k_new, v_new`; returns `cat([k_past, k], -2)` (past trimmed to `Lmax = max(lens)`) |
+| `cache.update(k, v, i)` | remembers `k_new, v_new`; returns `cat([k_past, k], -2)` (past gathered from pages, padded to `Lmax = max(lens)`) |
 
 Keys are stored **post-RoPE** at their absolute positions; nothing is
-re-rotated. Batch rows are laid out `[past_0 .. past_{Lmax-1} | new_0 .. new_{T-1}]`;
+re-rotated. `gather` materialises the batch's resident tokens out of their
+pages with one advanced-index op per layer (`pool[j][page_idx, :, off_idx]`,
+positions beyond a row's length pointing at page 0); `scatter` writes the new
+tokens back with one fused write per layer for decode. Batch rows are laid
+out `[past_0 .. past_{Lmax-1} | new_0 .. new_{T-1}]`;
 a row with fewer resident tokens has its unused past columns masked. Because
 attention is permutation-invariant over keys, this padded layout is exact and
 the boolean mask (`True` = attend) is the whole contract:
@@ -100,23 +108,28 @@ chunks (`prefill_chunk`, keep it a multiple of the GDN scan chunk 64);
 requests scheduled exactly 1 token — decodes and 1-token crumbs — run as one
 batched decode step. Both call `bank.gather -> decoder.forward -> bank.scatter`.
 
-## Exact admission with a bounded guest window
+## Exact admission with paged guests
 
-A request is admissible iff every family has a free slot **and**
-`num_tokens + max_new_tokens <= guest_ctx`. The engine checks the second
-condition at intake (`add_request`, `submit_from_handle`) so a request can
-never outgrow its slot mid-flight; `GuestWindowExceeded` from the bank is a
-bug, not a runtime path.
+A request is admissible iff every slot family has a free slot **and** the
+pool has `ceil((num_tokens + max_new_tokens) / page_tokens)` free pages. The
+scheduler reserves those pages for the request's whole lifetime at
+admission (FCFS; a head-of-line request that does not fit blocks the queue
+until pages return), so a request can never outgrow its reservation
+mid-flight; `GuestCapacityExceeded` from the bank is a bug, not a runtime
+path. A request larger than the whole pool is rejected at intake
+(`add_request`, `submit_from_handle`) rather than left waiting forever.
 
 ## Durable-state protocol
 
 `Qwen35StateBank` implements the store protocol
 (`fingerprint_key`, `export_slot`, `import_slot`, `memory_families`):
 
-- snapshots trim the guest window to `guest_len` (O(tokens), not O(window));
-- `import_slot` zeroes first, then copies the families present — a record
-  holding only `gdn_state` is valid and means "tuned initial state, no
-  tokens";
+- snapshots gather the guest tokens out of their pages, trimmed to
+  `guest_len` (O(tokens)); the format is page-size independent and the
+  fingerprint excludes `page_tokens`;
+- `import_slot` zeroes the recurrent families first, then copies the
+  families present into the pages the caller reserved — a record holding
+  only `gdn_state` is valid and means "tuned initial state, no tokens";
 - `decay` scales `gdn_state` only; `merge` averages families of equal shape
   and keeps the receiver's guest window otherwise.
 
@@ -138,10 +151,10 @@ handle's provenance (`rule="import"`).
 It must not rely on `DynamicCache` or any HF mask builder: the wkvm slot is
 the durable owner of GDN state, conv window, guest KV, lengths and masks.
 
-## Known limits of this slice (see `docs/HYBRID_ENGINE_PLAN.md`)
+## Known limits (see `docs/HYBRID_ENGINE_PLAN.md`, H5)
 
-- Fixed guest window: contexts above `guest_ctx` are rejected, not paged.
 - Guest K/V are gathered per step (`B x Lmax` tokens x 8 layers copied);
-  the paged pool + gather-free attention is the next slice.
+  a gather-free paged attention kernel is the next slice.
+- Lifetime page reservation over-reserves for requests that stop early.
 - Pure-torch GDN kernels: throughput is not a claim of this slice.
 - No CUDA graphs on the hybrid path yet.

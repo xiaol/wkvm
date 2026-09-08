@@ -28,14 +28,20 @@ Status legend: ✅ done in this checkout, ▶ next, ☐ later.
 1. **Same ownership split as M1.** HF `Qwen3_5DecoderLayer` modules are the
    compute graph; wkvm owns state, positions, masks and the cache object
    (`SlotCache`). No fork of HF, no patched `DynamicCache`.
-2. **Guest allocator slice 1 = fixed per-slot KV window** (`guest_ctx`
-   tokens per attention layer per slot), exact attention inside the window,
-   rejection at intake beyond it. This keeps the two M0 invariants intact:
-   admission is counting slots, decode batches are uniform. The paged pool
-   with page-bytes unified to state pages (ROADMAP M4 wording) is slice 2; it
-   only pays off with a gather-free paged attention kernel, which this host
-   cannot build (no triton/flash-attn) and which is not needed to prove the
-   engine contract.
+2. **Guest allocator = paged KV pool inside the arena, reserved for the
+   request's lifetime.** `guest_kv` is a *paged family*
+   (`StateFamilySpec.page_tokens`); the arena hands out
+   `ceil((prompt + max_new_tokens) / page_tokens)` pages at admission next to
+   the recurrent slots, so the M0 invariant survives unchanged: admission is
+   a count (free slots AND free pages), nothing is preempted or retracted
+   mid-flight, and a request that could never fit the pool is rejected at
+   intake. The cost is that a request which stops early at EOS held pages it
+   did not use; the benefit is exactness and a torch-free allocator that is
+   unit-tested without a GPU (`tests/test_pages.py`). ROADMAP's "page-bytes
+   unified with state pages" trick exists in vLLM to make one block pool serve
+   two kinds of memory; with slots and pages both living in the arena there
+   is no second allocator to unify, so it is not needed. (Slice 1 of this
+   milestone used a fixed per-slot window; it is superseded.)
 3. **The engine never branches on model family.** Layouts build their bank and
    runner (`make_bank`/`make_runner`); the store talks to banks through a
    four-method protocol (`fingerprint_key`, `export_slot`, `import_slot`,
@@ -101,20 +107,32 @@ generated from at batch, compared with the adapter's own runtime and scored
 on the scene task (valid JSON / exact match, zero vs tuned state); COLD
 resume of the imported handle; per-slot bytes and slot capacity.
 
-### H4. Paged guest pool ▶
+### H4. Paged guest pool ✅
 
-- `GuestPagePool`: pages sized so `page_bytes == gdn_state + gdn_conv`
-  per-layer-group bytes (vLLM's unification trick), free list, per-request
-  page tables; admission = free slots **and** free pages for
-  `num_tokens + max_new_tokens`.
-- Gather-free attention over page tables: FlashInfer/FA3 paged decode when
-  available; a torch fallback that materialises only the batch's pages.
-- Exit: same CPU parity gates over a paged bank; the 13,824-token / B=16
-  ladder used for Gemma, reported with the same `experiments/gemma_bench_report.py`
-  contract.
+- `StateFamilySpec.page_tokens` marks a paged family; `ModelStateSpec`
+  exposes `pages_for(num_tokens)`, `bytes_per_page`; `StateArena(spec,
+  num_slots, num_pages)` allocates `slots[name] = (page ids...)` for paged
+  families and frees/forks them; the scheduler admits with
+  `arena.can_admit(pages=pages_for(prompt + remaining budget))` (FCFS,
+  head-of-line blocks). Page 0 is the dummy read target of masked positions.
+- `Qwen35StateBank` keeps K/V pools `[n_attn, P+1, kv_heads, page_tokens,
+  head_dim]`; token `t` of a request lives at `pages[t // page_tokens]`,
+  offset `t % page_tokens`. Gather materialises only the batch's resident
+  tokens (`B x Lmax`) with one advanced-index op per layer; decode scatter is
+  one fused write per layer. Snapshots are token-trimmed and page-size
+  independent (the fingerprint excludes `page_tokens`).
+- `Engine.from_qwen35(..., guest_pool_tokens, page_tokens)`; default pool is
+  4096 tokens per slot, shared, so one request may take the whole pool.
+- Acceptance: `tests/test_pages.py` (torch-free) and
+  `tests/test_qwen35_hybrid_cpu.py` with 8-token pages so every prompt and
+  decode crosses page boundaries; 9B smoke phase E: a 12k-token natural-text
+  prompt through 49 pages, greedy-identical to HF.
 
-### H5. Throughput floor ☐
+### H5. Throughput floor ▶
 
+- Gather-free paged attention (FlashInfer/FA3 paged decode) when the host
+  has the kernels; until then the per-step `B x Lmax` gather is the cost of
+  long contexts at high concurrency.
 - Mask-free decode when all rows share a length (already taken), then
   length-bucketed batches to hit the SDPA fast path more often.
 - CUDA-graph the GDN decode step (static shapes: `[B, H, K, V]`), attention
@@ -131,9 +149,9 @@ imports), same three-family contract plus a `mlp_only_layers` no-op.
 
 | Slice | Estimate | Proves |
 |---|---:|---|
-| H0–H3 (this checkout) | done | hybrid state contract, tuned-state import, exact hibernate/resume, batch-composition independence on the 9B |
-| H4 paged pool | 1–2 weeks | long contexts beyond a fixed window without losing exact admission |
+| H0–H4 (this checkout) | done | hybrid state contract, paged guests under exact admission, tuned-state import, exact hibernate/resume, batch-composition independence and 12k-token parity on the 9B |
 | H5 throughput | 1–2 weeks | numbers comparable to the RWKV-7 M2 table |
+| H6 second family | 1–2 weeks | the contract is not Qwen3.5-shaped |
 
 ## Risks
 
@@ -142,4 +160,7 @@ imports), same three-family contract plus a `mlp_only_layers` no-op.
 - bf16 batched matmuls can flip a greedy argmax vs single-row execution;
   the smoke reports prefix-match lengths rather than hiding it.
 - Copying `B x Lmax` guest tokens per step caps decode throughput at high
-  concurrency until H4.
+  concurrency until H5's paged kernel.
+- Lifetime reservation over-reserves for requests that stop early; a lazy
+  page allocation with the same admission test is a small follow-up if pool
+  pressure shows up in practice.

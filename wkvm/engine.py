@@ -60,10 +60,20 @@ class Engine:
         device: torch.device | str = "cuda",
         stop_token_ids: frozenset[int] = frozenset(),
         prefill_chunk: int = 512,
+        num_pages: int | None = None,
     ) -> None:
+        """``num_pages`` sizes the guest page pool of hybrid models (ignored
+        by models without paged families). Default: 4096 tokens per slot
+        worth of pages, shared across all requests."""
         self.layout = layout
-        self.bank = layout.make_bank(num_slots, device)
-        self.arena = StateArena(layout.state_spec(), num_slots=num_slots)
+        spec = layout.state_spec()
+        if spec.paged_families:
+            if num_pages is None:
+                num_pages = num_slots * spec.pages_for(4096)
+        else:
+            num_pages = 0
+        self.bank = layout.make_bank(num_slots, device, num_pages=num_pages)
+        self.arena = StateArena(spec, num_slots=num_slots, num_pages=num_pages)
         self.scheduler = Scheduler(
             scheduler_config or SchedulerConfig(max_running_requests=num_slots),
             self.arena,
@@ -93,27 +103,36 @@ class Engine:
         cls,
         model_path: str,
         num_slots: int,
-        guest_ctx: int = 4096,
+        guest_pool_tokens: int | None = None,
+        page_tokens: int = 256,
         device: torch.device | str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         **kwargs,
     ) -> "Engine":
-        """Qwen3.5 hybrid (Gated DeltaNet + full-attention guest window)."""
+        """Qwen3.5 hybrid (Gated DeltaNet + paged full-attention guests).
+
+        ``guest_pool_tokens`` is the total guest-KV pool shared by all
+        requests (default: 4096 per slot); a single request may reserve up
+        to the whole pool."""
         from wkvm.models.qwen35 import load_qwen35
 
-        model, layout = load_qwen35(model_path, device=device, dtype=dtype, guest_ctx=guest_ctx)
-        return cls(model, layout, num_slots=num_slots, device=device, **kwargs)
+        model, layout = load_qwen35(model_path, device=device, dtype=dtype, page_tokens=page_tokens)
+        num_pages = None
+        if guest_pool_tokens is not None:
+            num_pages = layout.state_spec().pages_for(guest_pool_tokens)
+        return cls(model, layout, num_slots=num_slots, device=device, num_pages=num_pages, **kwargs)
 
     # -- intake ---------------------------------------------------------------
 
     def _check_capacity(self, num_tokens: int, max_new_tokens: int) -> None:
-        """Exact admission for models with a bounded guest window: a request
-        that could outgrow its slot is rejected at intake, never mid-flight."""
-        cap = getattr(self.runner, "max_tokens_per_request", None)
+        """A request that could never fit the guest pool is rejected at
+        intake, not left waiting forever; a request that fits waits for pages
+        under exact admission and can never outgrow its reservation."""
+        cap = self.arena.max_tokens_per_request
         if cap is not None and num_tokens + max_new_tokens > cap:
             raise ValueError(
                 f"request needs up to {num_tokens + max_new_tokens} tokens, "
-                f"guest window holds {cap}"
+                f"guest pool holds {cap}"
             )
 
     def add_request(
@@ -298,7 +317,8 @@ class Engine:
         if len(tokens) <= record.num_computed_tokens:
             raise ValueError(f"{handle}: nothing to schedule (add suffix tokens)")
         self._check_capacity(len(tokens), max_new_tokens)
-        slots = self.arena.allocate()
+        pages = self.arena.pages_for(len(tokens) + max_new_tokens)
+        slots = self.arena.allocate(pages=pages)
         try:
             record = self.store.load(handle, slots)
         except Exception:

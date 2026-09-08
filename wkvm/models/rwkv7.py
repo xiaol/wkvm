@@ -82,7 +82,7 @@ class RWKV7StateLayout:
 
     # -- engine factories (the engine never branches on model family) -------------
 
-    def make_bank(self, num_slots: int, device):
+    def make_bank(self, num_slots: int, device, num_pages: int = 0):
         from wkvm.runner.state import RWKV7StateBank
 
         return RWKV7StateBank(self, num_slots=num_slots, device=device)

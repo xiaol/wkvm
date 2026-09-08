@@ -149,12 +149,14 @@ class Scheduler:
             budget -= n
 
         # 2) WAITING: admit while there is budget AND a free slot in every
-        #    family. Exact admission — the whole point of the state arena.
+        #    family AND (paged guests) the pages for the request's whole
+        #    lifetime. Exact admission — the whole point of the state arena.
+        #    FCFS: a head-of-line request that does not fit blocks the queue.
         while (
             self.waiting
             and budget > 0
             and len(self.running) < self.config.max_running_requests
-            and self.arena.can_admit()
+            and self.arena.can_admit(pages=self._pages_for(self.waiting[0]))
         ):
             req = self.waiting.popleft()
             n = min(
@@ -164,7 +166,7 @@ class Scheduler:
             )
             if n <= 0:  # defensive; a waiting request always has a gap
                 continue
-            req.slots = self.arena.allocate()
+            req.slots = self.arena.allocate(pages=self._pages_for(req))
             req.status = RequestStatus.RUNNING
             self.running.append(req)
             out.admitted.append(req)
@@ -223,10 +225,10 @@ class Scheduler:
                 len(self._completion_prefill_lane) < lane_size
                 and self.waiting
                 and len(self.running) < self.config.max_running_requests
-                and self.arena.can_admit()
+                and self.arena.can_admit(pages=self._pages_for(self.waiting[0]))
             ):
                 req = self.waiting.popleft()
-                req.slots = self.arena.allocate()
+                req.slots = self.arena.allocate(pages=self._pages_for(req))
                 req.status = RequestStatus.RUNNING
                 self.running.append(req)
                 out.admitted.append(req)
@@ -343,6 +345,12 @@ class Scheduler:
         self.running.append(request)
 
     # -- internals -----------------------------------------------------------
+
+    def _pages_for(self, req: Request) -> int:
+        """Guest pages reserved for the request's whole lifetime: every token
+        it can ever hold (prompt + outputs so far + remaining budget)."""
+        remaining = req.max_new_tokens - len(req.output_token_ids)
+        return self.arena.pages_for(req.num_tokens + max(remaining, 0))
 
     def _retire_completion_prefill_member(
         self,

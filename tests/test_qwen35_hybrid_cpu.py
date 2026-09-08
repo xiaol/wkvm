@@ -29,7 +29,8 @@ except ImportError:  # pragma: no cover - core stays torch-free
     HAS_DEPS = False
 
 LAYER_TYPES = ("linear_attention", "linear_attention", "full_attention", "linear_attention")
-GUEST_CTX = 64
+PAGE_TOKENS = 8  # tiny pages so prompts of 7/23/31 tokens cross page boundaries everywhere
+NUM_PAGES = 32
 
 
 def _tiny_config() -> "Qwen3_5TextConfig":
@@ -71,7 +72,7 @@ def _fixture():
         hf = Qwen3_5ForCausalLM._from_config(config, attn_implementation="sdpa")
         hf = hf.float().eval().requires_grad_(False)
         decoder = Qwen35Decoder.from_hf(hf)
-        layout = Qwen35HybridLayout.from_config(config, dtype=torch.float32, guest_ctx=GUEST_CTX)
+        layout = Qwen35HybridLayout.from_config(config, dtype=torch.float32, page_tokens=PAGE_TOKENS)
         gen = torch.Generator().manual_seed(1)
         prompts = [
             torch.randint(1, 128, (n,), generator=gen).tolist() for n in (23, 7, 31)
@@ -88,13 +89,13 @@ def _sched(num_slots: int = 4, chunk: int = 5) -> SchedulerConfig:
     )
 
 
-def _engine(num_slots: int = 4, chunk: int = 5):
+def _engine(num_slots: int = 4, chunk: int = 5, num_pages: int = NUM_PAGES):
     from wkvm.engine import Engine
 
     fx = _fixture()
     return Engine(
         fx["decoder"], fx["layout"], num_slots=num_slots, device="cpu",
-        scheduler_config=_sched(num_slots, chunk), prefill_chunk=chunk,
+        scheduler_config=_sched(num_slots, chunk), prefill_chunk=chunk, num_pages=num_pages,
     )
 
 
@@ -123,10 +124,13 @@ class TestQwen35Layout(unittest.TestCase):
         self.assertEqual(spec.families[0].bytes_per_slot, 3 * 4 * 16 * 16 * 4)
         # gdn_conv: 3 layers x (2*2*16 + 4*16) x 4 x fp32
         self.assertEqual(spec.families[1].bytes_per_slot, 3 * 128 * 4 * 4)
-        # guest_kv: 1 layer x 2 (K,V) x 2 kv heads x 64 ctx x 64 head_dim x fp32
-        self.assertEqual(spec.families[2].bytes_per_slot, 1 * 2 * 2 * 64 * 64 * 4)
+        # guest_kv is paged: one page = 1 layer x 2 (K,V) x 2 kv heads x 8 tokens x 64 head_dim x fp32
+        self.assertEqual(spec.families[2].page_tokens, PAGE_TOKENS)
+        self.assertEqual(spec.families[2].bytes_per_slot, 1 * 2 * 2 * 8 * 64 * 4)
         self.assertEqual(spec.families[2].layer_ids, (2,))
-        self.assertEqual(layout.bytes_per_slot, spec.bytes_per_request)
+        self.assertEqual(layout.bytes_per_slot, spec.bytes_per_request)  # recurrent families only
+        self.assertEqual(layout.bytes_per_page, spec.bytes_per_page)
+        self.assertEqual(spec.pages_for(23 + 12), 5)
 
     def test_qwen35_9b_layout_numbers(self) -> None:
         """The real checkpoint's per-slot footprint, from config numbers only."""
@@ -136,13 +140,14 @@ class TestQwen35Layout(unittest.TestCase):
         layout = Qwen35HybridLayout(
             n_layer=32, layer_types=types, hidden_size=4096,
             num_k_heads=16, num_v_heads=32, head_k_dim=128, head_v_dim=128, conv_kernel=4,
-            num_kv_heads=4, head_dim=256, guest_ctx=4096, vocab_size=248320, dtype=torch.bfloat16,
+            num_kv_heads=4, head_dim=256, vocab_size=248320, dtype=torch.bfloat16, page_tokens=256,
         )
         spec = {f.name: f.bytes_per_slot for f in layout.state_spec().families}
         self.assertEqual(spec["gdn_state"], 24 * 32 * 128 * 128 * 4)  # 48 MiB
         self.assertEqual(spec["gdn_conv"], 24 * 8192 * 4 * 2)  # 1.5 MiB
         self.assertEqual(layout.guest_bytes_per_token, 8 * 2 * 4 * 256 * 2)  # 32 KiB/token
-        self.assertEqual(spec["guest_kv"], 4096 * 32 * 1024)  # 128 MiB at a 4k window
+        self.assertEqual(spec["guest_kv"], 256 * 32 * 1024)  # 8 MiB per 256-token page
+        self.assertEqual(layout.state_spec().pages_for(4096), 16)
 
 
 @unittest.skipUnless(HAS_DEPS, "torch/transformers unavailable")
@@ -152,12 +157,12 @@ class TestQwen35RunnerParity(unittest.TestCase):
 
         fx = _fixture()
         layout, hf = fx["layout"], fx["hf"]
-        bank = layout.make_bank(2, "cpu")
-        arena = StateArena(layout.state_spec(), num_slots=2)
+        bank = layout.make_bank(2, "cpu", num_pages=16)
+        arena = StateArena(layout.state_spec(), num_slots=2, num_pages=16)
         for chunk in (5, 64):  # sub-kernel-chunk re-entry and a single chunk
             runner = layout.make_runner(fx["decoder"], bank, prefill_chunk=chunk)
             for prompt in fx["prompts"]:
-                slots = arena.allocate()
+                slots = arena.allocate(pages=arena.pages_for(len(prompt)))
                 bank.zero_slots(slots)
                 ours = runner.prefill(prompt, slots)
                 with torch.inference_mode():
@@ -192,13 +197,37 @@ class TestQwen35RunnerParity(unittest.TestCase):
         # Slots are back; guest lengths of freed slots are reset on reuse only.
         self.assertEqual(engine.arena.num_free_slots(), 4)
 
-    def test_guest_window_enforced_at_intake(self) -> None:
-        engine = _engine()
+    def test_guest_pool_enforced_at_intake(self) -> None:
+        engine = _engine(num_pages=8)  # 64 guest tokens in total
         with self.assertRaises(ValueError):
             engine.add_request(Request(prompt_token_ids=[1] * 60, max_new_tokens=8))
         ok = Request(prompt_token_ids=[1] * 60, max_new_tokens=4)
         engine.add_request(ok)
         self.assertEqual(len(_run(engine, ok)), 4)
+        self.assertEqual(engine.arena.num_free_pages(), 8)
+
+    def test_pages_gate_admission_but_not_results(self) -> None:
+        """Two requests that each need most of the pool run one after the
+        other under exact admission and still produce the alone outputs."""
+        fx = _fixture()
+        prompts = [fx["prompts"][2], fx["prompts"][0]]  # 31 and 23 tokens
+        alone = []
+        for p in prompts:
+            engine = _engine()
+            req = Request(prompt_token_ids=list(p), max_new_tokens=9)
+            engine.add_request(req)
+            alone.append(_run(engine, req))
+        engine = _engine(num_pages=6)  # 48 tokens: 31+9 -> 5 pages, 23+9 -> 4 pages
+        reqs = [Request(prompt_token_ids=list(p), max_new_tokens=9) for p in prompts]
+        for r in reqs:
+            engine.add_request(r)
+        engine.step()
+        self.assertEqual(len(engine.scheduler.running), 1)
+        self.assertEqual(len(engine.scheduler.waiting), 1)
+        while engine.has_unfinished:
+            engine.step()
+        self.assertEqual([r.output_token_ids for r in reqs], alone)
+        self.assertEqual(engine.arena.num_free_pages(), 6)
 
 
 @unittest.skipUnless(HAS_DEPS, "torch/transformers unavailable")

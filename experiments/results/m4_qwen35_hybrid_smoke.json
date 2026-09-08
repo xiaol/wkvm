@@ -2,32 +2,35 @@
  "engine": "wkvm-m4-hybrid",
  "model": "/root/x/Qwen3.5-9B",
  "dtype": "bfloat16",
- "guest_ctx": 4096,
+ "page_tokens": 256,
  "slots": 16,
  "prefill_chunk": 512,
  "gpu": "NVIDIA A100-PCIE-40GB",
  "torch": "2.6.0+cu128",
  "kernels": "transformers pure-torch GDN fallback (no fla/triton on host), SDPA guest attention",
- "git": "93e7a87",
+ "git": "977b4ff",
+ "guest_pool_tokens": 65536,
  "footprint": {
-  "load_s": 6.149688482284546,
+  "load_s": 7.4754228591918945,
   "weights_bytes": 17907606528,
-  "bytes_per_slot": {
+  "bytes_per_family": {
    "gdn_state": 50331648,
    "gdn_conv": 1572864,
-   "guest_kv": 134217728
+   "guest_kv": 8388608
   },
-  "bytes_per_slot_total": 186122240,
+  "recurrent_bytes_per_slot": 51904512,
+  "bytes_per_page": 8388608,
   "guest_bytes_per_token": 32768,
-  "bank_bytes": 3164078080,
+  "num_pages": 256,
+  "bank_bytes": 3038248960,
   "layers": {
    "gdn": 24,
    "attn": 8
   },
-  "after_load_allocated_gib": 19.62456226348877,
-  "slots_at_ctx4096_on_this_gpu": 120,
-  "slots_at_ctx16384_on_this_gpu": 37,
-  "slots_at_ctx65536_on_this_gpu": 10
+  "after_load_allocated_gib": 19.50737476348877,
+  "sessions_at_ctx4096_on_this_gpu": 120,
+  "sessions_at_ctx16384_on_this_gpu": 37,
+  "sessions_at_ctx65536_on_this_gpu": 10
  },
  "parity": [
   {
@@ -103,42 +106,42 @@
    48,
    48
   ],
-  "wall_alone_s": 26.629952907562256,
-  "wall_batched_s": 8.53512692451477,
+  "wall_alone_s": 27.104401111602783,
+  "wall_batched_s": 8.807624816894531,
   "pure_decode_steps": 47,
-  "pure_decode_tok_s": 58.284642547742685,
-  "peak_reserved_gib": 20.24609375,
-  "peak_allocated_gib": 20.208361625671387
+  "pure_decode_tok_s": 56.8463063218814,
+  "peak_reserved_gib": 20.12890625,
+  "peak_allocated_gib": 20.091174125671387
  },
  "decode_ladder": [
   {
    "B": 1,
-   "decode_step_ms": 87.08459138870239,
-   "decode_tok_s": 11.483087697299931,
+   "decode_step_ms": 88.91844749450684,
+   "decode_tok_s": 11.24626023257747,
    "resident_tokens_per_row": 348
   },
   {
    "B": 4,
-   "decode_step_ms": 89.71282839775085,
-   "decode_tok_s": 44.586711526534394,
+   "decode_step_ms": 92.15995669364929,
+   "decode_tok_s": 43.402798172925344,
    "resident_tokens_per_row": 348
   },
   {
    "B": 8,
-   "decode_step_ms": 92.61468052864075,
-   "decode_tok_s": 86.37939422061743,
+   "decode_step_ms": 95.26413679122925,
+   "decode_tok_s": 83.97703762888179,
    "resident_tokens_per_row": 348
   },
   {
    "B": 16,
-   "decode_step_ms": 98.73238205909729,
-   "decode_tok_s": 162.05422847412953,
+   "decode_step_ms": 103.0484139919281,
+   "decode_tok_s": 155.266824400163,
    "resident_tokens_per_row": 348
   }
  ],
  "tuned_state": {
   "adapter": "/root/x/RNN-StateTuning/outputs/qwen35-state-novel-scene-e1",
-  "handle": "scene-ce@1",
+  "handle": "scene-ce@0",
   "record": {
    "rule": "import",
    "num_computed_tokens": 0,
@@ -171,7 +174,7 @@
     30
    ]
   },
-  "import_s": 0.1673572063446045,
+  "import_s": 0.13556766510009766,
   "zero_state": {
    "valid_json": 0,
    "exact_match": 0,
@@ -265,5 +268,17 @@
   ],
   "cold_resume_identical": true,
   "cold_file_bytes": 50331744
+ },
+ "long_context": {
+  "prompt_tokens": 12637,
+  "pages_reserved": 50,
+  "page_tokens": 256,
+  "greedy_equal": true,
+  "greedy_prefix_match": 16,
+  "generated": 16,
+  "text": "该文本包含多个独立的故事片段，涵盖了校园青春、古代言情、现代",
+  "wall_engine_s": 12.149767875671387,
+  "wall_reference_s": 5.159894943237305,
+  "peak_allocated_gib": 20.546878337860107
  }
 }

@@ -16,18 +16,17 @@ Per-request state carried by Qwen3.5 (verified against
   * ``gdn_conv``: causal-conv1d window ``[conv_dim, kernel]`` in model dtype,
     ``conv_dim = 2 * key_dim + value_dim``.
 - ``full_attention`` layers (8 of 32): the **guest** family ``guest_kv`` — a
-  fixed ``guest_ctx``-token KV window per slot per layer, exact attention
-  inside the window. Keys are stored post-RoPE (``[kv_heads, guest_ctx,
-  head_dim]`` for K and again for V). This is the deliberately simple guest
-  allocator of ROADMAP M4 in its first form: fixed-size per-slot windows keep
-  admission exact (counting) and decode batches uniform; the paged pool with
-  page-bytes unified to state pages is the follow-on slice
-  (``docs/HYBRID_ENGINE_PLAN.md``).
+  *paged* family: K and V pools of ``page_tokens``-token pages
+  (``[kv_heads, page_tokens, head_dim]`` per page per layer), keys stored
+  post-RoPE. A request reserves the pages for its whole lifetime
+  (``prompt + max_new_tokens``) at admission, so admission stays a count
+  (free slots and free pages) and nothing is preempted mid-flight. This is
+  the deliberately dumb guest allocator of ROADMAP M4 (``docs/HYBRID_ENGINE_PLAN.md``).
 
 Zero state is exactly "fresh sequence" for every family: a zero recurrent
 state is what the kernels use for ``initial_state=None``; a zero conv window
 reproduces the left zero padding of the cache-less path; an empty guest
-window has length 0. Slot admission therefore just zeroes. A *tuned* initial
+history has length 0. Slot admission therefore just zeroes. A *tuned* initial
 state (an RNN-StateTuning adapter) is the same slot with a non-zero
 ``gdn_state`` at length 0 — a state that is not ``f(token-prefix)`` for any
 prefix, which is the capability prefix-keyed caches cannot represent
@@ -59,8 +58,8 @@ FULL = "full_attention"
 class Qwen35HybridLayout:
     """Shapes/dtypes of the per-slot state, derived from a loaded config.
 
-    Family names: ``gdn_state``, ``gdn_conv`` (linear layers) and
-    ``guest_kv`` (full-attention layers). Byte counts are exact.
+    Family names: ``gdn_state``, ``gdn_conv`` (linear layers, one slot each)
+    and ``guest_kv`` (full-attention layers, paged). Byte counts are exact.
     """
 
     n_layer: int
@@ -73,9 +72,9 @@ class Qwen35HybridLayout:
     conv_kernel: int
     num_kv_heads: int
     head_dim: int
-    guest_ctx: int
     vocab_size: int
     dtype: torch.dtype
+    page_tokens: int = 256
 
     def __post_init__(self) -> None:
         if len(self.layer_types) != self.n_layer:
@@ -83,14 +82,14 @@ class Qwen35HybridLayout:
         bad = set(self.layer_types) - {LINEAR, FULL}
         if bad:
             raise NotImplementedError(f"unsupported layer types: {sorted(bad)}")
-        if self.guest_ctx < 1:
-            raise ValueError("guest_ctx must be >= 1")
+        if self.page_tokens < 1:
+            raise ValueError("page_tokens must be >= 1")
         if self.num_v_heads % self.num_k_heads != 0:
             raise ValueError("num_v_heads must be a multiple of num_k_heads")
 
     @classmethod
     def from_config(
-        cls, config, dtype: torch.dtype, guest_ctx: int
+        cls, config, dtype: torch.dtype, page_tokens: int = 256
     ) -> "Qwen35HybridLayout":
         cfg = getattr(config, "text_config", config)
         return cls(
@@ -105,9 +104,9 @@ class Qwen35HybridLayout:
             num_kv_heads=cfg.num_key_value_heads,
             head_dim=getattr(cfg, "head_dim", None)
             or cfg.hidden_size // cfg.num_attention_heads,
-            guest_ctx=guest_ctx,
             vocab_size=cfg.vocab_size,
             dtype=dtype,
+            page_tokens=page_tokens,
         )
 
     # -- layer families --------------------------------------------------------
@@ -143,14 +142,18 @@ class Qwen35HybridLayout:
         return (self.conv_dim, self.conv_kernel)
 
     @property
-    def guest_kv_shape(self) -> tuple[int, ...]:
-        """One of K or V for one layer: ``[kv_heads, guest_ctx, head_dim]``."""
-        return (self.num_kv_heads, self.guest_ctx, self.head_dim)
+    def guest_page_shape(self) -> tuple[int, ...]:
+        """One page of K (or V) for one layer: ``[kv_heads, page_tokens, head_dim]``."""
+        return (self.num_kv_heads, self.page_tokens, self.head_dim)
 
     @property
     def guest_bytes_per_token(self) -> int:
         """K+V bytes one token costs across all guest layers."""
         return self.n_attn * 2 * self.num_kv_heads * self.head_dim * self.dtype.itemsize
+
+    @property
+    def bytes_per_page(self) -> int:
+        return self.page_tokens * self.guest_bytes_per_token
 
     def state_spec(self) -> ModelStateSpec:
         families: list[StateFamilySpec] = []
@@ -175,8 +178,9 @@ class Qwen35HybridLayout:
             families.append(
                 StateFamilySpec(
                     name=GUEST_KV_FAMILY,
-                    bytes_per_slot=self.guest_ctx * self.guest_bytes_per_token,
+                    bytes_per_slot=self.bytes_per_page,  # per PAGE for a paged family
                     layer_ids=self.attn_layers,
+                    page_tokens=self.page_tokens,
                 )
             )
         if not families:
@@ -185,14 +189,16 @@ class Qwen35HybridLayout:
 
     @property
     def bytes_per_slot(self) -> int:
+        """Fixed per-request bytes (the recurrent families); guest pages are
+        extra, ``bytes_per_page`` per reserved page."""
         return self.state_spec().bytes_per_request
 
     # -- engine factories (Engine never branches on model family) -----------------
 
-    def make_bank(self, num_slots: int, device):
+    def make_bank(self, num_slots: int, device, num_pages: int = 0):
         from wkvm.runner.hybrid_state import Qwen35StateBank
 
-        return Qwen35StateBank(self, num_slots=num_slots, device=device)
+        return Qwen35StateBank(self, num_slots=num_slots, device=device, num_pages=num_pages)
 
     def make_runner(self, model, bank, prefill_chunk: int):
         from wkvm.runner.hybrid_runner import Qwen35HybridRunner
@@ -332,7 +338,7 @@ def load_qwen35(
     model_path: str,
     device: torch.device | str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
-    guest_ctx: int = 4096,
+    page_tokens: int = 256,
     attn_implementation: str = "sdpa",
     drop_vision: bool = True,
 ):
@@ -360,5 +366,5 @@ def load_qwen35(
     hf = hf.to(device).eval().requires_grad_(False)
     decoder = Qwen35Decoder.from_hf(hf)
     decoder._hf_model = hf  # keep the owner alive; submodules are shared
-    layout = Qwen35HybridLayout.from_config(decoder.config, dtype=dtype, guest_ctx=guest_ctx)
+    layout = Qwen35HybridLayout.from_config(decoder.config, dtype=dtype, page_tokens=page_tokens)
     return decoder, layout

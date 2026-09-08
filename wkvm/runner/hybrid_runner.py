@@ -29,9 +29,6 @@ class Qwen35HybridRunner:
         self.bank = bank
         self.prefill_chunk = prefill_chunk
         self.device = bank.device
-        # Exact admission needs this at intake: prompt + max_new_tokens must
-        # fit the guest window (the engine checks it before queueing).
-        self.max_tokens_per_request = bank.layout.guest_ctx
 
     @torch.inference_mode()
     def prefill(self, token_ids: list[int], slots: dict[str, int]) -> torch.Tensor:

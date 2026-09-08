@@ -103,7 +103,11 @@ def main() -> None:
     ap.add_argument("--n-scenes", type=int, default=8)
     ap.add_argument("--engine-device", default="cuda:0")
     ap.add_argument("--ref-device", default="cuda:1")
-    ap.add_argument("--guest-ctx", type=int, default=4096)
+    ap.add_argument("--guest-pool-tokens", type=int, default=None,
+                    help="total guest-KV pool shared by all requests (default 4096 x slots)")
+    ap.add_argument("--page-tokens", type=int, default=256)
+    ap.add_argument("--long-prompt-tokens", type=int, default=12288,
+                    help="phase E: long-context parity prompt length (0 disables)")
     ap.add_argument("--slots", type=int, default=16)
     ap.add_argument("--prefill-chunk", type=int, default=512)
     ap.add_argument("--max-new", type=int, default=32)
@@ -123,7 +127,7 @@ def main() -> None:
         "engine": "wkvm-m4-hybrid",
         "model": args.model,
         "dtype": "bfloat16",
-        "guest_ctx": args.guest_ctx,
+        "page_tokens": args.page_tokens,
         "slots": args.slots,
         "prefill_chunk": args.prefill_chunk,
         "gpu": torch.cuda.get_device_name(0),
@@ -135,7 +139,8 @@ def main() -> None:
     # -- engine -------------------------------------------------------------------
     t0 = time.time()
     engine = Engine.from_qwen35(
-        args.model, num_slots=args.slots, guest_ctx=args.guest_ctx, device=args.engine_device,
+        args.model, num_slots=args.slots, guest_pool_tokens=args.guest_pool_tokens,
+        page_tokens=args.page_tokens, device=args.engine_device,
         stop_token_ids=frozenset({eos}), prefill_chunk=args.prefill_chunk,
         scheduler_config=SchedulerConfig(
             max_tokens_per_step=8192, max_running_requests=args.slots,
@@ -147,20 +152,23 @@ def main() -> None:
     dev = torch.device(args.engine_device)
     weights = sum(p.numel() * p.element_size() for p in engine.runner.model._hf_model.parameters())
     spec = {f.name: f.bytes_per_slot for f in layout.state_spec().families}
+    result["guest_pool_tokens"] = engine.arena.max_tokens_per_request
     result["footprint"] = {
         "load_s": load_s,
         "weights_bytes": weights,
-        "bytes_per_slot": spec,
-        "bytes_per_slot_total": layout.bytes_per_slot,
+        "bytes_per_family": spec,  # guest_kv is per PAGE
+        "recurrent_bytes_per_slot": layout.bytes_per_slot,
+        "bytes_per_page": layout.bytes_per_page,
         "guest_bytes_per_token": layout.guest_bytes_per_token,
+        "num_pages": engine.arena.num_pages,
         "bank_bytes": engine.bank.state_bytes(),
         "layers": {"gdn": layout.n_gdn, "attn": layout.n_attn},
         "after_load_allocated_gib": torch.cuda.memory_allocated(dev) / 2**30,
     }
     total = torch.cuda.get_device_properties(dev).total_memory
     for ctx in (4096, 16384, 65536):
-        per_slot = spec["gdn_state"] + spec["gdn_conv"] + ctx * layout.guest_bytes_per_token
-        result["footprint"][f"slots_at_ctx{ctx}_on_this_gpu"] = int((total - weights - 2 * 2**30) // per_slot)
+        per_session = layout.bytes_per_slot + ctx * layout.guest_bytes_per_token
+        result["footprint"][f"sessions_at_ctx{ctx}_on_this_gpu"] = int((total - weights - 2 * 2**30) // per_session)
     print("loaded engine", json.dumps(result["footprint"], indent=1), flush=True)
 
     # -- reference model (HF, other GPU) ------------------------------------------
@@ -179,7 +187,7 @@ def main() -> None:
         with torch.inference_mode():
             ref_logits = ref(input_ids=torch.tensor([prompt], device=rdev), use_cache=False,
                              logits_to_keep=1).logits[0, -1].float().cpu()
-        slots = engine.arena.allocate()
+        slots = engine.arena.allocate(pages=engine.arena.pages_for(len(prompt)))
         engine.bank.zero_slots(slots)
         ours_logits = engine.runner.prefill(prompt, slots).cpu()
         engine.arena.free(slots)
@@ -321,6 +329,51 @@ def main() -> None:
     result["tuned_state"]["cold_file_bytes"] = os.path.getsize(engine.store._cold_path(handle))
     print("tuned", json.dumps({k: v for k, v in result["tuned_state"].items() if k != "targets"},
                               ensure_ascii=False, indent=1), flush=True)
+
+    # -- E. long-context parity through the paged pool -----------------------------
+    if args.long_prompt_tokens:
+        # Natural text: concatenate scene paragraphs until the rendered chat
+        # prompt reaches the target length (the fixed 4k window of slice 1
+        # could not hold this; the paged pool reserves ceil(n / page) pages).
+        all_rows = [json.loads(l) for l in open(args.scenes)]
+        body, i = "", 0
+        while True:
+            body += all_rows[i % len(all_rows)]["messages"][1]["content"] + "\n\n"
+            i += 1
+            probe = render(tok, [{"role": "user", "content": body + "\n用一句话总结以上内容。"}])
+            if len(probe) >= args.long_prompt_tokens:
+                break
+        long_prompt = probe
+        need = engine.arena.pages_for(len(long_prompt) + 16)
+        if need > engine.arena.num_pages:
+            result["long_context"] = {"skipped": f"needs {need} pages > pool {engine.arena.num_pages}"}
+        else:
+            t0 = time.time()
+            req = Request(prompt_token_ids=long_prompt, max_new_tokens=16)
+            engine.add_request(req)
+            ours = run_all(engine, [req])[0]
+            t_ours = time.time() - t0
+            torch.cuda.synchronize(rdev)
+            t0 = time.time()
+            # Reference is the *base* model again (adapter states zeroed).
+            for m in ref.modules():
+                if hasattr(m, "initial_state") and isinstance(getattr(m, "initial_state"), torch.nn.Parameter):
+                    m.initial_state.data.zero_()
+            ref_out = hf_greedy(ref, long_prompt, 16, eos, pad, rdev)
+            t_ref = time.time() - t0
+            result["long_context"] = {
+                "prompt_tokens": len(long_prompt),
+                "pages_reserved": need,
+                "page_tokens": args.page_tokens,
+                "greedy_equal": ours == ref_out,
+                "greedy_prefix_match": prefix_match(ours, ref_out),
+                "generated": len(ours),
+                "text": tok.decode(ours, skip_special_tokens=True),
+                "wall_engine_s": t_ours,
+                "wall_reference_s": t_ref,
+                "peak_allocated_gib": torch.cuda.max_memory_allocated(dev) / 2**30,
+            }
+        print("long_context", json.dumps(result["long_context"], ensure_ascii=False, indent=1), flush=True)
 
     Path(args.json).parent.mkdir(parents=True, exist_ok=True)
     Path(args.json).write_text(json.dumps(result, ensure_ascii=False, indent=1))

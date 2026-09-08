@@ -20,12 +20,22 @@ class StateFamilySpec:
     A model declares one family per distinct state kind it carries, e.g.:
       - "wkv":  RWKV-7 matrix state, layers x heads x d x d
       - "shift": token-shift / conv window state
-      - "ring":  sink+window KV ring for guest/recurrent-mode attention layers
+      - "gdn_state"/"gdn_conv": Gated DeltaNet matrix state / conv window
+      - "guest_kv": paged KV for full-attention guest layers in hybrids (M4)
+      - "ring":  sink+window KV ring for recurrent-mode attention layers
       - "bank":  segmented state bank (K states per slot, docs/RECURRENT_MODE.md)
 
-    ``bytes_per_slot`` is the full per-request footprint of this family across
-    all layers that use it. The arena allocates exactly ``num_slots`` of these
-    at startup; admission is counting free slots — that exactness is the point.
+    Slot families: ``bytes_per_slot`` is the full per-request footprint of
+    this family across all layers that use it. The arena allocates exactly
+    ``num_slots`` of these at startup; admission is counting free slots —
+    that exactness is the point.
+
+    Paged families (``page_tokens`` set): the unit is a page of
+    ``page_tokens`` tokens and ``bytes_per_slot`` is the bytes of ONE page.
+    A request reserves ``ceil((num_tokens + max_new_tokens) / page_tokens)``
+    pages for its whole lifetime at admission, so admission stays exact
+    (counting free pages) and a request can never outgrow its reservation
+    mid-flight — the deliberately dumb guest allocator of ROADMAP M4.
     """
 
     name: str
@@ -33,10 +43,17 @@ class StateFamilySpec:
     # Layer indices using this family (heterogeneous per-layer layouts are
     # first-class: shallow-band memory, KV-shared tails, etc.).
     layer_ids: tuple[int, ...] = ()
+    page_tokens: int | None = None
 
     def __post_init__(self) -> None:
         if self.bytes_per_slot <= 0:
             raise ValueError(f"family {self.name!r}: bytes_per_slot must be > 0")
+        if self.page_tokens is not None and self.page_tokens < 1:
+            raise ValueError(f"family {self.name!r}: page_tokens must be >= 1")
+
+    @property
+    def is_paged(self) -> bool:
+        return self.page_tokens is not None
 
 
 @dataclass(frozen=True)
@@ -49,10 +66,42 @@ class ModelStateSpec:
         names = [f.name for f in self.families]
         if len(names) != len(set(names)):
             raise ValueError(f"duplicate family names: {names}")
+        sizes = {f.page_tokens for f in self.families if f.is_paged}
+        if len(sizes) > 1:
+            raise ValueError(f"paged families must share one page size, got {sorted(sizes)}")
+        if not any(not f.is_paged for f in self.families):
+            raise ValueError("a model needs at least one slot family (request identity)")
+
+    @property
+    def slot_families(self) -> tuple[StateFamilySpec, ...]:
+        return tuple(f for f in self.families if not f.is_paged)
+
+    @property
+    def paged_families(self) -> tuple[StateFamilySpec, ...]:
+        return tuple(f for f in self.families if f.is_paged)
+
+    @property
+    def page_tokens(self) -> int | None:
+        paged = self.paged_families
+        return paged[0].page_tokens if paged else None
 
     @property
     def bytes_per_request(self) -> int:
-        return sum(f.bytes_per_slot for f in self.families)
+        """Fixed per-request bytes (slot families only)."""
+        return sum(f.bytes_per_slot for f in self.slot_families)
+
+    @property
+    def bytes_per_page(self) -> int:
+        """Bytes one page costs across all paged families."""
+        return sum(f.bytes_per_slot for f in self.paged_families)
+
+    def pages_for(self, num_tokens: int) -> int:
+        """Pages a request holding ``num_tokens`` tokens must reserve (0 for
+        models without paged families)."""
+        pt = self.page_tokens
+        if pt is None or num_tokens <= 0:
+            return 0
+        return -(-num_tokens // pt)
 
 
 @dataclass(frozen=True)
