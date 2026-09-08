@@ -98,3 +98,34 @@ class RWKV7StateBank:
 
     def state_bytes(self) -> int:
         return self.wkv.numel() * self.wkv.element_size() + self.shift.numel() * self.shift.element_size()
+
+    # -- durable-state protocol (wkvm/store.py) ------------------------------------
+
+    memory_families = ("wkv",)
+
+    def fingerprint_key(self) -> str:
+        l = self.layout
+        # Unchanged from the M3 store's inline key so existing indexes stay valid.
+        return f"rwkv7:L{l.n_layer}:wkv{tuple(l.wkv_shape)}:shift{tuple(l.shift_shape)}:{l.dtype}"
+
+    def export_slot(self, slots: dict[str, int]) -> dict[str, torch.Tensor]:
+        return {
+            "wkv": self._to_host(self.wkv[:, slots["wkv"]]),
+            "shift": self._to_host(self.shift[:, :, slots["shift"]]),
+        }
+
+    def import_slot(self, slots: dict[str, int], tensors: dict[str, torch.Tensor]) -> None:
+        self.zero_slots(slots)
+        unknown = set(tensors) - {"wkv", "shift"}
+        if unknown:
+            raise KeyError(f"unknown state tensors for RWKV-7 bank: {sorted(unknown)}")
+        if "wkv" in tensors:
+            self.wkv[:, slots["wkv"]].copy_(tensors["wkv"], non_blocking=True)
+        if "shift" in tensors:
+            self.shift[:, :, slots["shift"]].copy_(tensors["shift"], non_blocking=True)
+
+    def _to_host(self, view: torch.Tensor) -> torch.Tensor:
+        pin = view.is_cuda
+        host = torch.empty(view.shape, dtype=view.dtype, pin_memory=pin)
+        host.copy_(view, non_blocking=pin)
+        return host

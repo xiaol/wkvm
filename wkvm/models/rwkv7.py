@@ -80,6 +80,18 @@ class RWKV7StateLayout:
         # 2 token-shift caches per layer: [0] attn conv_state, [1] ffn_state.
         return (self.hidden_size,)
 
+    # -- engine factories (the engine never branches on model family) -------------
+
+    def make_bank(self, num_slots: int, device):
+        from wkvm.runner.state import RWKV7StateBank
+
+        return RWKV7StateBank(self, num_slots=num_slots, device=device)
+
+    def make_runner(self, model, bank, prefill_chunk: int):
+        from wkvm.runner.runner import RWKV7Runner
+
+        return RWKV7Runner(model, bank, prefill_chunk=prefill_chunk)
+
     def state_spec(self) -> ModelStateSpec:
         wkv_elems = self.n_layer * self.num_heads * self.head_dim * self.head_v_dim
         shift_elems = self.n_layer * 2 * self.hidden_size

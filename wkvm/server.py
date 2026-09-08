@@ -6,6 +6,7 @@ demonstrates is that every session-lifecycle operation — create, resume,
 fork, mutate, persist — is a handle operation with O(state-size) cost.
 
   POST   /v1/states                {"prompt_ids": [...], "name": "..."}
+  POST   /v1/states/import         {"path": adapter_dir_or_file, "name": "..."}
   GET    /v1/states                list records
   GET    /v1/states/<handle>       metadata
   POST   /v1/states/<handle>/fork  {"name": "..."}
@@ -92,6 +93,16 @@ def build_app(engine):
                         engine.save_on_finish(req.req_id, body.get("name", "state"))
                         run_request(req)
                         self._json(200, {"handle": engine._finish_handles[req.req_id]})
+                    elif parts == ["v1", "states", "import"]:
+                        # A state that is *given*, not computed: e.g. a tuned
+                        # initial state (RNN-StateTuning adapter). Handle at
+                        # num_computed_tokens = 0; generate with prompt_ids.
+                        h = engine.import_state(
+                            body.get("name", "import"),
+                            body["path"],
+                            strict=bool(body.get("strict", True)),
+                        )
+                        self._json(200, {"handle": h, **asdict(engine.store.get(h))})
                     elif parts[:2] == ["v1", "states"] and parts[3:] == ["fork"]:
                         self._json(
                             200,
@@ -147,9 +158,20 @@ def main() -> None:
     ap.add_argument("--store", required=True)
     ap.add_argument("--slots", type=int, default=64)
     ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument(
+        "--model-type", choices=("rwkv7", "qwen35"), default="rwkv7",
+        help="rwkv7: fla-format RWKV-7 (M1); qwen35: Qwen3.5 GDN+attention hybrid (M4)",
+    )
+    ap.add_argument(
+        "--guest-ctx", type=int, default=4096,
+        help="qwen35 only: fixed per-slot KV window for the full-attention guest layers",
+    )
     args = ap.parse_args()
 
-    engine = Engine.from_pretrained(args.model, num_slots=args.slots)
+    if args.model_type == "qwen35":
+        engine = Engine.from_qwen35(args.model, num_slots=args.slots, guest_ctx=args.guest_ctx)
+    else:
+        engine = Engine.from_pretrained(args.model, num_slots=args.slots)
     engine.attach_store(args.store)
     server = ThreadingHTTPServer(("127.0.0.1", args.port), build_app(engine))
     print(f"wkvm /v1/states serving on 127.0.0.1:{args.port}")

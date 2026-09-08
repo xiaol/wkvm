@@ -9,14 +9,24 @@ state is NOT ``f(token-prefix)`` for any prefix — provenance is recorded as
 prefix-hash/radix cache indexes cannot represent (docs/ANGLE.md §5).
 
 Handles are ``name@version`` strings. Versions are append-only per name;
-records are immutable once written (fork/mutate/save create new versions).
+records are immutable once written (fork/mutate/save/import create new
+versions).
 
 Tiers:
-- HOT:  arena slot in the ``RWKV7StateBank`` (owned by the engine, not here).
-- WARM: pinned host tensors held by this store.
+- HOT:  arena slot in the model's state bank (owned by the engine, not here).
+- WARM: host tensors held by this store (pinned when a CUDA bank is used).
 - COLD: one safetensors file per handle + a JSON index, rewritten atomically,
   under ``store_dir``. A fresh process can rebuild the store from the index
   alone — restart persistence needs nothing in memory.
+
+The store is model-agnostic through a small bank protocol:
+
+    bank.fingerprint_key() -> str            layout/dtype identity
+    bank.export_slot(slots) -> {name: host tensor}
+    bank.import_slot(slots, tensors)         missing families = fresh (zero)
+    bank.memory_families -> (family, ...)    what ``decay`` scales
+
+``RWKV7StateBank`` (M1) and ``Qwen35StateBank`` (M4) both implement it.
 
 Concurrency: synchronous, single-threaded-engine assumption throughout (the
 HTTP layer serialises access). D2H/H2D copies synchronize before returning.
@@ -33,9 +43,9 @@ from typing import Callable
 
 import torch
 
-from wkvm.runner.state import RWKV7StateBank
-
 MutationRule = Callable[[dict[str, torch.Tensor], dict], dict[str, torch.Tensor]]
+
+IMPORT_RULE = "import"
 
 
 @dataclass(frozen=True)
@@ -67,7 +77,7 @@ class FingerprintMismatch(RuntimeError):
 class StateStore:
     def __init__(
         self,
-        bank: RWKV7StateBank,
+        bank,
         store_dir: str | Path,
     ) -> None:
         self.bank = bank
@@ -78,17 +88,15 @@ class StateStore:
         self._meta: dict[str, StateRecord] = {}
         self._cold: set[str] = set()
         self._rules: dict[str, MutationRule] = {}
-        self.register_rule("decay", _rule_decay)
+        self.register_rule("decay", self._rule_decay)
         self.register_rule("merge", self._rule_merge)
         self._load_index()
 
     # -- identity ----------------------------------------------------------
 
     @staticmethod
-    def _fingerprint(bank: RWKV7StateBank) -> str:
-        l = bank.layout
-        key = f"rwkv7:L{l.n_layer}:wkv{tuple(l.wkv_shape)}:shift{tuple(l.shift_shape)}:{l.dtype}"
-        return hashlib.sha256(key.encode()).hexdigest()[:16]
+    def _fingerprint(bank) -> str:
+        return hashlib.sha256(bank.fingerprint_key().encode()).hexdigest()[:16]
 
     def _next_version(self, name: str) -> int:
         versions = [r.version for r in self._meta.values() if r.name == name]
@@ -126,11 +134,8 @@ class StateStore:
             rule=rule,
             rule_params=rule_params or {},
         )
-        tensors = {
-            "wkv": self._to_host(self.bank.wkv[:, slots["wkv"]]),
-            "shift": self._to_host(self.bank.shift[:, :, slots["shift"]]),
-        }
-        torch.cuda.synchronize()
+        tensors = self.bank.export_slot(slots)
+        _sync(self.bank)
         self._warm[record.handle] = tensors
         self._meta[record.handle] = record
         self._write_index()
@@ -147,11 +152,46 @@ class StateStore:
                 f"{handle}: saved for model {record.fingerprint}, "
                 f"engine is {self.fingerprint}"
             )
-        tensors = self._tensors(handle)
-        self.bank.wkv[:, slots["wkv"]].copy_(tensors["wkv"], non_blocking=True)
-        self.bank.shift[:, :, slots["shift"]].copy_(tensors["shift"], non_blocking=True)
-        torch.cuda.synchronize()
+        self.bank.import_slot(slots, self._tensors(handle))
+        _sync(self.bank)
         return record
+
+    def import_state(
+        self,
+        name: str,
+        tensors: dict[str, torch.Tensor],
+        *,
+        metadata: dict | None = None,
+        token_ids: tuple[int, ...] = (),
+        num_computed_tokens: int = 0,
+    ) -> str:
+        """Register externally produced state tensors as a new record.
+
+        This is the third way a state comes to exist besides being computed
+        from tokens or mutated from a parent: it is *given* — a tuned initial
+        state from RNN-StateTuning, a state shipped alongside a checkpoint.
+        Its provenance is ``rule="import"`` with the source and hash in
+        ``rule_params``; by construction no token prefix produces it.
+        """
+        if not tensors:
+            raise ValueError("import_state: no tensors")
+        for k, v in tensors.items():
+            if not isinstance(v, torch.Tensor):
+                raise TypeError(f"import_state: {k!r} is not a tensor")
+        record = StateRecord(
+            name=name,
+            version=self._next_version(name),
+            fingerprint=self.fingerprint,
+            num_computed_tokens=num_computed_tokens,
+            token_ids=tuple(token_ids),
+            parent=None,
+            rule=IMPORT_RULE,
+            rule_params=dict(metadata or {}),
+        )
+        self._warm[record.handle] = {k: self._pin(v.detach().cpu().contiguous()) for k, v in tensors.items()}
+        self._meta[record.handle] = record
+        self._write_index()
+        return record.handle
 
     # -- lineage ---------------------------------------------------------------
 
@@ -245,27 +285,41 @@ class StateStore:
             return tensors
         raise KeyError(f"{handle}: metadata present but no WARM or COLD data")
 
-    def _to_host(self, view: torch.Tensor) -> torch.Tensor:
-        host = torch.empty(view.shape, dtype=view.dtype, pin_memory=True)
-        host.copy_(view, non_blocking=True)
-        return host
-
-    @staticmethod
-    def _pin(t: torch.Tensor) -> torch.Tensor:
-        return t if t.is_pinned() else t.pin_memory()
+    def _pin(self, t: torch.Tensor) -> torch.Tensor:
+        if t.is_pinned() or not _bank_is_cuda(self.bank):
+            return t
+        return t.pin_memory()
 
     def _cold_path(self, handle: str) -> Path:
         return self.store_dir / f"{handle.replace('@', '_v')}.safetensors"
+
+    def _rule_decay(
+        self, tensors: dict[str, torch.Tensor], params: dict
+    ) -> dict[str, torch.Tensor]:
+        """Scale the associative memory families toward zero; token-shift /
+        conv windows and guest KV untouched. The simplest useful mutation:
+        softly forget, keeping recency channels. ``params["families"]``
+        overrides the bank's default memory families."""
+        alpha = float(params.get("alpha", 0.9))
+        families = tuple(params.get("families") or getattr(self.bank, "memory_families", ("wkv",)))
+        out = dict(tensors)
+        for name in families:
+            if name in out:
+                out[name] = (out[name].float() * alpha).to(out[name].dtype)
+        return out
 
     def _rule_merge(
         self, tensors: dict[str, torch.Tensor], params: dict
     ) -> dict[str, torch.Tensor]:
         other = self._tensors(params["other"])
         w = float(params.get("weight", 0.5))
-        return {
-            k: ((1.0 - w) * tensors[k].float() + w * other[k].float()).to(tensors[k].dtype)
-            for k in tensors
-        }
+        out = {}
+        for k in tensors:
+            if k not in other or tensors[k].shape != other[k].shape:
+                out[k] = tensors[k]  # e.g. guest windows of different lengths
+                continue
+            out[k] = ((1.0 - w) * tensors[k].float() + w * other[k].float()).to(tensors[k].dtype)
+        return out
 
     # -- index (restart persistence) -----------------------------------------------
 
@@ -295,11 +349,11 @@ class StateStore:
             # the metadata (lineage) but loads will fail until re-persisted.
 
 
-def _rule_decay(tensors: dict[str, torch.Tensor], params: dict) -> dict[str, torch.Tensor]:
-    """Scale the associative wkv memory toward zero; token-shift untouched.
+def _bank_is_cuda(bank) -> bool:
+    device = getattr(bank, "device", None)
+    return device is not None and torch.device(device).type == "cuda"
 
-    The simplest useful mutation: softly forget, keeping recency channels."""
-    alpha = float(params.get("alpha", 0.9))
-    out = dict(tensors)
-    out["wkv"] = (tensors["wkv"].float() * alpha).to(tensors["wkv"].dtype)
-    return out
+
+def _sync(bank) -> None:
+    if _bank_is_cuda(bank):
+        torch.cuda.synchronize()

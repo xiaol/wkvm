@@ -33,9 +33,10 @@ Rationale for every design choice lives in `docs/ANGLE.md` §5 and `docs/RECURRE
 - Mutation hooks: registered state-update rules (decay / merge / consolidate).
 - Exit demos: agent survives engine restart; corpus-state forked to 1k requests; N-thousand warm sessions with sub-100ms resume.
 
-## M4 — Hybrid guest allocator
+## M4 — Hybrid guest allocator — ▶ slice 1 DONE 2026-09-09 (see docs/HYBRID_ENGINE_PLAN.md, experiments/results/m4_qwen35_hybrid_smoke.md)
 
-- Paged full-attention pool (page-bytes unified with state pages — vLLM's one load-bearing hybrid trick), FA3 or FlashInfer backend.
+- Slice 1 (done): Qwen3.5-9B (24 Gated DeltaNet + 8 full-attention layers) served from the arena with three state families (`gdn_state`, `gdn_conv`, `guest_kv`); full-attention layers are guests in a fixed per-slot KV window (`guest_ctx`, exact admission at intake); `Engine`/`StateStore` generalised behind layout factories and a bank protocol; RNN-StateTuning initial states import as durable handles (`/v1/states/import`, `rule="import"` provenance). CPU parity suite `tests/test_qwen35_hybrid_cpu.py`; 9B smoke bit-exact vs HF.
+- Slice 2 (next): paged full-attention pool (page-bytes unified with state pages — vLLM's one load-bearing hybrid trick), FA3 or FlashInfer backend.
 - First hybrid model: Qwen3-Next class (forces MoE-by-dependency: FlashInfer/vLLM fused-MoE kernels as imports, never in-tree).
 - Exit: hybrid model E2E; pure transformer runs as all-guest parity baseline.
 

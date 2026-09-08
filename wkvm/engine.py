@@ -1,4 +1,4 @@
-"""Engine: the M0 scheduler driving the M1 runner (M2-minimal).
+"""Engine: the M0 scheduler driving a model runner (M2-minimal).
 
 One ``step()`` is the whole contract:
 
@@ -26,6 +26,11 @@ Invariants this class maintains:
   so every prefill chunk is exactly ``min(gap, cap)``. With per-request RNG
   (see runner/sampling.py) outputs are then independent of what else is in
   flight — the property the continuous-batching test asserts.
+- **The engine never branches on model family.** A *layout* (see
+  ``wkvm/models/rwkv7.py``, ``wkvm/models/qwen35.py``) knows its state
+  families and builds its own bank and runner (``make_bank``/``make_runner``);
+  the engine only relies on the shared bank/runner contract
+  (``zero_slots``, ``prefill``, ``decode_step``, the store protocol).
 
 Per-request ``SamplingParams`` carry temperature/seed; stop tokens are
 engine-global (a single-model engine has one EOS set), matching the
@@ -40,13 +45,11 @@ from wkvm.core.arena import StateArena
 from wkvm.core.config import SchedulerConfig
 from wkvm.core.request import Request
 from wkvm.core.scheduler import Scheduler, SchedulerOutput
-from wkvm.runner.runner import RWKV7Runner
 from wkvm.runner.sampling import SamplingParams, make_generator, sample_token
-from wkvm.runner.state import RWKV7StateBank
 
 
 class Engine:
-    """Owns Scheduler + StateArena + RWKV7StateBank + RWKV7Runner."""
+    """Owns Scheduler + StateArena + a state bank + a runner."""
 
     def __init__(
         self,
@@ -58,13 +61,14 @@ class Engine:
         stop_token_ids: frozenset[int] = frozenset(),
         prefill_chunk: int = 512,
     ) -> None:
-        self.bank = RWKV7StateBank(layout, num_slots=num_slots, device=device)
+        self.layout = layout
+        self.bank = layout.make_bank(num_slots, device)
         self.arena = StateArena(layout.state_spec(), num_slots=num_slots)
         self.scheduler = Scheduler(
             scheduler_config or SchedulerConfig(max_running_requests=num_slots),
             self.arena,
         )
-        self.runner = RWKV7Runner(model, self.bank, prefill_chunk=prefill_chunk)
+        self.runner = layout.make_runner(model, self.bank, prefill_chunk)
         self.stop_token_ids = stop_token_ids
         self._params: dict[str, SamplingParams] = {}
         self._generators: dict[str, torch.Generator | None] = {}
@@ -78,12 +82,39 @@ class Engine:
         dtype: torch.dtype = torch.bfloat16,
         **kwargs,
     ) -> "Engine":
+        """RWKV-7 (fla-format checkpoint)."""
         from wkvm.models.rwkv7 import load_rwkv7
 
         model, layout = load_rwkv7(model_path, device=device, dtype=dtype)
         return cls(model, layout, num_slots=num_slots, device=device, **kwargs)
 
+    @classmethod
+    def from_qwen35(
+        cls,
+        model_path: str,
+        num_slots: int,
+        guest_ctx: int = 4096,
+        device: torch.device | str = "cuda",
+        dtype: torch.dtype = torch.bfloat16,
+        **kwargs,
+    ) -> "Engine":
+        """Qwen3.5 hybrid (Gated DeltaNet + full-attention guest window)."""
+        from wkvm.models.qwen35 import load_qwen35
+
+        model, layout = load_qwen35(model_path, device=device, dtype=dtype, guest_ctx=guest_ctx)
+        return cls(model, layout, num_slots=num_slots, device=device, **kwargs)
+
     # -- intake ---------------------------------------------------------------
+
+    def _check_capacity(self, num_tokens: int, max_new_tokens: int) -> None:
+        """Exact admission for models with a bounded guest window: a request
+        that could outgrow its slot is rejected at intake, never mid-flight."""
+        cap = getattr(self.runner, "max_tokens_per_request", None)
+        if cap is not None and num_tokens + max_new_tokens > cap:
+            raise ValueError(
+                f"request needs up to {num_tokens + max_new_tokens} tokens, "
+                f"guest window holds {cap}"
+            )
 
     def add_request(
         self, request: Request, params: SamplingParams = SamplingParams()
@@ -94,6 +125,7 @@ class Engine:
                 "per-request stop_token_ids must be empty or equal to the "
                 "engine-global set (single stop set until the server frontend)"
             )
+        self._check_capacity(request.num_tokens, request.max_new_tokens)
         self.scheduler.add_request(request)
         self._params[request.req_id] = params
 
@@ -238,6 +270,17 @@ class Engine:
         self.abort_request(req_id)
         return handle
 
+    def import_state(self, name: str, path: str, **kwargs) -> str:
+        """Register an externally produced state (e.g. a tuned initial state
+        from RNN-StateTuning) as a handle with ``num_computed_tokens = 0`` and
+        no tokens: generation from it starts at the prompt, from a state no
+        token prefix produces. The layout decides what files it understands."""
+        loader = getattr(self.layout, "load_state_adapter", None)
+        if loader is None:
+            raise NotImplementedError(f"{type(self.layout).__name__} has no state-adapter loader")
+        tensors, meta = loader(path, **kwargs)
+        return self.store.import_state(name, tensors, metadata=meta)
+
     def submit_from_handle(
         self,
         handle: str,
@@ -250,12 +293,14 @@ class Engine:
         The record's token list may run one past its computed count (a
         sampled-but-unfed token); together with any suffix that gap is what
         the scheduler sees — resume needs no special path in the loop."""
+        record = self.store.get(handle)
+        tokens = list(record.token_ids) + list(suffix_tokens or [])
+        if len(tokens) <= record.num_computed_tokens:
+            raise ValueError(f"{handle}: nothing to schedule (add suffix tokens)")
+        self._check_capacity(len(tokens), max_new_tokens)
         slots = self.arena.allocate()
         try:
             record = self.store.load(handle, slots)
-            tokens = list(record.token_ids) + list(suffix_tokens or [])
-            if len(tokens) <= record.num_computed_tokens:
-                raise ValueError(f"{handle}: nothing to schedule (add suffix tokens)")
         except Exception:
             self.arena.free(slots)
             raise
