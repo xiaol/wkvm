@@ -43,7 +43,7 @@ import torch
 
 from wkvm.core.arena import StateArena
 from wkvm.core.config import SchedulerConfig
-from wkvm.core.request import Request
+from wkvm.core.request import Request, RequestStatus
 from wkvm.core.scheduler import Scheduler, SchedulerOutput
 from wkvm.runner.sampling import SamplingParams, make_generator, sample_token
 
@@ -131,16 +131,25 @@ class Engine:
         page_tokens: int = 256,
         device: torch.device | str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
+        guest_mode: str = "paged",
+        sink_tokens: int = 16,
+        ring_tokens: int = 1024,
         **kwargs,
     ) -> "Engine":
-        """Qwen3.5 hybrid (Gated DeltaNet + paged full-attention guests).
+        """Qwen3.5 hybrid (Gated DeltaNet + full-attention guests).
 
+        ``guest_mode="paged"``: exact attention over a paged pool;
         ``guest_pool_tokens`` is the total guest-KV pool shared by all
         requests (default: 4096 per slot); a single request may reserve up
-        to the whole pool."""
+        to the whole pool. ``guest_mode="ring"``: sink + sliding window per
+        slot (``sink_tokens`` + ``ring_tokens``), constant memory, unbounded
+        context, approximate beyond the window."""
         from wkvm.models.qwen35 import load_qwen35
 
-        model, layout = load_qwen35(model_path, device=device, dtype=dtype, page_tokens=page_tokens)
+        model, layout = load_qwen35(
+            model_path, device=device, dtype=dtype, page_tokens=page_tokens,
+            guest_mode=guest_mode, sink_tokens=sink_tokens, ring_tokens=ring_tokens,
+        )
         num_pages = None
         if guest_pool_tokens is not None:
             num_pages = layout.state_spec().pages_for(guest_pool_tokens)
@@ -160,17 +169,51 @@ class Engine:
             )
 
     def add_request(
-        self, request: Request, params: SamplingParams = SamplingParams()
+        self, request: Request, params: SamplingParams = SamplingParams(),
+        park_on_finish: bool = False,
     ) -> None:
-        """Queue a request. Legal at any time, including between steps."""
+        """Queue a request. Legal at any time, including between steps.
+
+        ``park_on_finish``: keep the state slots after the turn completes so
+        the session can be continued with ``continue_request`` (multi-turn
+        without re-prefill)."""
         if params.stop_token_ids and params.stop_token_ids != self.stop_token_ids:
             raise ValueError(
                 "per-request stop_token_ids must be empty or equal to the "
                 "engine-global set (single stop set until the server frontend)"
             )
         self._check_capacity(request.num_tokens, request.max_new_tokens)
-        self.scheduler.add_request(request)
+        self.scheduler.add_request(request, park_on_finish=park_on_finish)
         self._params[request.req_id] = params
+
+    def continue_request(self, req_id: str, new_tokens: list[int], max_new_tokens: int) -> Request:
+        """Append a turn to a parked session and put it back in the running
+        set: the appended tokens are the schedulable gap, so the ordinary
+        loop prefills them (chunked) and decodes on — no special path."""
+        req = self.scheduler.parked.get(req_id)
+        if req is None:
+            raise ValueError(f"{req_id}: not parked")
+        if not new_tokens:
+            raise ValueError("continue_request needs at least one token")
+        self._check_capacity(req.num_tokens + len(new_tokens), max_new_tokens)
+        req.output_token_ids.extend(new_tokens)
+        req.max_new_tokens = len(req.output_token_ids) + max_new_tokens
+        if req.parked_finish_status is not None:
+            pass
+        self.scheduler.resume_parked_request(req_id)
+        self.scheduler._park_on_finish.add(req_id)
+        if req_id not in self._generators:
+            self._generators[req_id] = make_generator(self._params[req_id], self.runner.device)
+        return req
+
+    def close_request(self, req_id: str) -> None:
+        """Release a parked session's slots (and any resident graph row)."""
+        req = self.scheduler.parked.get(req_id)
+        if req is not None and req.slots:
+            self._release_bank(req.slots)
+        self.scheduler.close_parked_request(req_id)
+        self._params.pop(req_id, None)
+        self._generators.pop(req_id, None)
 
     def abort_request(self, req_id: str) -> None:
         req = self.scheduler.requests.get(req_id)
@@ -207,6 +250,8 @@ class Engine:
             out, sampled, stop_token_ids=self.stop_token_ids
         )
         for req in finished:
+            if req.status is RequestStatus.PARKED:
+                continue  # session kept: params/RNG survive for continue_request
             self._params.pop(req.req_id, None)
             self._generators.pop(req.req_id, None)
         return finished
@@ -232,6 +277,24 @@ class Engine:
                 prefills.append((req, n))
 
         sampled: dict[str, list[int]] = {}
+        batch_prefill = getattr(self.runner, "prefill_batch", None)
+        if batch_prefill is not None and len(prefills) > 1:
+            # Group equal-length chunks (<= one runner chunk) into one forward;
+            # everything else takes the per-request path below.
+            groups: dict[int, list[tuple[Request, int]]] = {}
+            for req, n in prefills:
+                if n <= self.runner.prefill_chunk:
+                    groups.setdefault(n, []).append((req, n))
+            done: set[str] = set()
+            for n, members in groups.items():
+                if len(members) < 2:
+                    continue
+                logits = batch_prefill([(self._feed_tokens(req, n), req.slots) for req, _ in members])
+                for (req, _), row in zip(members, logits):
+                    done.add(req.req_id)
+                    if self._closes_gap(req, n):
+                        sampled[req.req_id] = [self._sample(req, row)]
+            prefills = [(req, n) for req, n in prefills if req.req_id not in done]
         for req, n in prefills:
             logits = self.runner.prefill(self._feed_tokens(req, n), req.slots)
             if self._closes_gap(req, n):
@@ -285,6 +348,13 @@ class Engine:
 
     def _on_finish(self, req: Request) -> None:
         self._snapshot_on_finish(req)
+        if req.req_id in self.scheduler._park_on_finish:
+            # Parked: the slots stay; a resident graph row must be written
+            # back (parked requests are not in the next batch) — not dropped.
+            park = getattr(self.bank, "park_slots", None)
+            if park is not None:
+                park(req.slots)
+            return
         self._release_bank(req.slots)
 
     def _snapshot_on_finish(self, req: Request) -> None:

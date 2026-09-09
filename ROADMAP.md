@@ -44,6 +44,9 @@ Rationale for every design choice lives in `docs/ANGLE.md` §5 and `docs/RECURRE
 
 ## M5 — Recurrent mode for transformers (`docs/RECURRENT_MODE.md`)
 
+Status 2026-09-10: item 1 (ring-only slots) is done on the Qwen3.5 hybrid's guest layers (`guest_mode="ring"`, docs/HYBRID_ENGINE_PLAN.md H9): constant per-session memory, unbounded context, 24.6x per turn vs vLLM past its capacity wall, needle recall lost beyond the window. Items 2–3 (banks) on the hybrid are next; the Gemma routed-span mechanism is the template.
+
+
 1. Ring-only slots (sink + sliding window) — also the SWA path hybrids need anyway.
 2. Timescale bank: K states, per-state decay, no boundary logic (static graph ops).
 3. Segmented bank: novelty/DLA boundaries + capacity-bounded merge, exposed as a `/v1/states` mutation op.

@@ -1,0 +1,129 @@
+{
+ "schema": "wkvm.multiturn_bench.v1",
+ "engine": "wkvm-hybrid-ring16+1024",
+ "semantics": "sink_ring_approximate",
+ "model_path": "/root/x/Qwen3.5-9B",
+ "sessions": 16,
+ "context_tokens": 13824,
+ "turns": 8,
+ "turn_in_tokens": 128,
+ "out_tokens": 128,
+ "prompt_lengths": [
+  13824,
+  13817,
+  13810,
+  13803,
+  13796,
+  13789,
+  13782,
+  13775,
+  13768,
+  13761,
+  13754,
+  13747,
+  13740,
+  13733,
+  13726,
+  13719
+ ],
+ "total_wall_s": 71.24595808982849,
+ "total_output_tokens": 16384,
+ "output_tok_s_overall": 229.9639227160464,
+ "turns_table": [
+  {
+   "turn": 0,
+   "wall_s": 33.38336539268494,
+   "p50_ttft_s": 29.38396716117859,
+   "p95_ttft_s": 29.38396716117859,
+   "output_tokens": 2048,
+   "output_tok_s": 61.347919118087596,
+   "context_tokens_p50": 13898.5,
+   "peak_reserved_gib": 20.470703125
+  },
+  {
+   "turn": 1,
+   "wall_s": 5.422228097915649,
+   "p50_ttft_s": 1.92317795753479,
+   "p95_ttft_s": 1.92317795753479,
+   "output_tokens": 2048,
+   "output_tok_s": 377.7045087401005,
+   "context_tokens_p50": 14154.5,
+   "peak_reserved_gib": 20.419921875
+  },
+  {
+   "turn": 2,
+   "wall_s": 5.394363880157471,
+   "p50_ttft_s": 1.9002103805541992,
+   "p95_ttft_s": 1.9002103805541992,
+   "output_tokens": 2048,
+   "output_tok_s": 379.65551555269116,
+   "context_tokens_p50": 14410.5,
+   "peak_reserved_gib": 20.419921875
+  },
+  {
+   "turn": 3,
+   "wall_s": 5.4051384925842285,
+   "p50_ttft_s": 1.9096603393554688,
+   "p95_ttft_s": 1.9096603393554688,
+   "output_tokens": 2048,
+   "output_tok_s": 378.8987095908507,
+   "context_tokens_p50": 14666.5,
+   "peak_reserved_gib": 20.419921875
+  },
+  {
+   "turn": 4,
+   "wall_s": 5.40873122215271,
+   "p50_ttft_s": 1.911745548248291,
+   "p95_ttft_s": 1.911745548248291,
+   "output_tokens": 2048,
+   "output_tok_s": 378.64702753428423,
+   "context_tokens_p50": 14922.5,
+   "peak_reserved_gib": 20.419921875
+  },
+  {
+   "turn": 5,
+   "wall_s": 5.400734186172485,
+   "p50_ttft_s": 1.9031364917755127,
+   "p95_ttft_s": 1.9031364917755127,
+   "output_tokens": 2048,
+   "output_tok_s": 379.20770202753175,
+   "context_tokens_p50": 15178.5,
+   "peak_reserved_gib": 20.419921875
+  },
+  {
+   "turn": 6,
+   "wall_s": 5.405874013900757,
+   "p50_ttft_s": 1.907024621963501,
+   "p95_ttft_s": 1.907024621963501,
+   "output_tokens": 2048,
+   "output_tok_s": 378.8471567657215,
+   "context_tokens_p50": 15434.5,
+   "peak_reserved_gib": 20.419921875
+  },
+  {
+   "turn": 7,
+   "wall_s": 5.421175956726074,
+   "p50_ttft_s": 1.9169774055480957,
+   "p95_ttft_s": 1.9169774055480957,
+   "output_tokens": 2048,
+   "output_tok_s": 377.77781358655926,
+   "context_tokens_p50": 15690.5,
+   "peak_reserved_gib": 20.419921875
+  }
+ ],
+ "git_commit": "4d964ae",
+ "launch_command": "experiments/hybrid_multiturn_bench.py --engine wkvm --guest-mode ring --ring-tokens 1024 --ctx 13824 --turns 8 --sessions 16 --device cuda:1 --json experiments/results/mt_wkvm_ring1024_ctx13824_b16_t8.json",
+ "weights_plus_state_gib": 19.320496559143066,
+ "graph_stats": {
+  "replays": 1016,
+  "captures": 1,
+  "eager_fallbacks": 0,
+  "acquires": 128,
+  "flushes": 128,
+  "evicts": 128,
+  "releases": 0,
+  "row_moves": 64
+ },
+ "bytes_per_session_recurrent": 85983232,
+ "guest_bytes_per_session": 34078720
+}

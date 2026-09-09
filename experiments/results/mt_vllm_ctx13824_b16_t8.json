@@ -1,0 +1,118 @@
+{
+ "schema": "wkvm.multiturn_bench.v1",
+ "engine": "vllm",
+ "semantics": "exact_full_kv",
+ "model_path": "/root/x/Qwen3.5-9B",
+ "sessions": 16,
+ "context_tokens": 13824,
+ "turns": 8,
+ "turn_in_tokens": 128,
+ "out_tokens": 128,
+ "prompt_lengths": [
+  13824,
+  13817,
+  13810,
+  13803,
+  13796,
+  13789,
+  13782,
+  13775,
+  13768,
+  13761,
+  13754,
+  13747,
+  13740,
+  13733,
+  13726,
+  13719
+ ],
+ "total_wall_s": 47.252965450286865,
+ "total_output_tokens": 16384,
+ "output_tok_s_overall": 346.72956170839717,
+ "turns_table": [
+  {
+   "turn": 0,
+   "wall_s": 21.681217908859253,
+   "p50_ttft_s": null,
+   "p95_ttft_s": null,
+   "output_tokens": 2048,
+   "output_tok_s": 94.4596382273875,
+   "context_tokens_p50": 13899.5,
+   "peak_reserved_gib": 0.0
+  },
+  {
+   "turn": 1,
+   "wall_s": 3.4202170372009277,
+   "p50_ttft_s": null,
+   "p95_ttft_s": null,
+   "output_tokens": 2048,
+   "output_tok_s": 598.7924092899271,
+   "context_tokens_p50": 14155.5,
+   "peak_reserved_gib": 0.0
+  },
+  {
+   "turn": 2,
+   "wall_s": 3.710024118423462,
+   "p50_ttft_s": null,
+   "p95_ttft_s": null,
+   "output_tokens": 2048,
+   "output_tok_s": 552.0179747160989,
+   "context_tokens_p50": 14411.5,
+   "peak_reserved_gib": 0.0
+  },
+  {
+   "turn": 3,
+   "wall_s": 3.5195231437683105,
+   "p50_ttft_s": null,
+   "p95_ttft_s": null,
+   "output_tokens": 2048,
+   "output_tok_s": 581.8970117091577,
+   "context_tokens_p50": 14667.5,
+   "peak_reserved_gib": 0.0
+  },
+  {
+   "turn": 4,
+   "wall_s": 3.7038214206695557,
+   "p50_ttft_s": null,
+   "p95_ttft_s": null,
+   "output_tokens": 2048,
+   "output_tok_s": 552.9424255097521,
+   "context_tokens_p50": 14923.5,
+   "peak_reserved_gib": 0.0
+  },
+  {
+   "turn": 5,
+   "wall_s": 3.626910924911499,
+   "p50_ttft_s": null,
+   "p95_ttft_s": null,
+   "output_tokens": 2048,
+   "output_tok_s": 564.6678516236165,
+   "context_tokens_p50": 15179.5,
+   "peak_reserved_gib": 0.0
+  },
+  {
+   "turn": 6,
+   "wall_s": 3.721287488937378,
+   "p50_ttft_s": null,
+   "p95_ttft_s": null,
+   "output_tokens": 2048,
+   "output_tok_s": 550.3471597097194,
+   "context_tokens_p50": 15435.5,
+   "peak_reserved_gib": 0.0
+  },
+  {
+   "turn": 7,
+   "wall_s": 3.815854549407959,
+   "p50_ttft_s": null,
+   "p95_ttft_s": null,
+   "output_tokens": 2048,
+   "output_tok_s": 536.7080881837472,
+   "context_tokens_p50": 15691.5,
+   "peak_reserved_gib": 0.0
+  }
+ ],
+ "git_commit": "4d964ae",
+ "launch_command": "experiments/hybrid_multiturn_bench.py --engine vllm --ctx 13824 --turns 8 --sessions 16 --json experiments/results/mt_vllm_ctx13824_b16_t8.json",
+ "vllm_gpu_mem_util": 0.85,
+ "prefix_caching": true
+}

@@ -68,6 +68,9 @@ def main() -> None:
     ap.add_argument("--prefill-chunk", type=int, default=1024)
     ap.add_argument("--page-tokens", type=int, default=256)
     ap.add_argument("--no-graphs", action="store_true")
+    ap.add_argument("--guest-mode", choices=("paged", "ring"), default="paged")
+    ap.add_argument("--sink-tokens", type=int, default=16)
+    ap.add_argument("--ring-tokens", type=int, default=1024)
     ap.add_argument("--warmup", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--mem-cap-gib", type=float, default=float(os.environ.get("WKVM_MEM_CAP_GIB", 38)))
     ap.add_argument("--headroom-gib", type=float, default=1.0)
@@ -103,7 +106,7 @@ def main() -> None:
         device=dev, stop_token_ids=frozenset(), prefill_chunk=args.prefill_chunk,
         scheduler_config=SchedulerConfig(max_tokens_per_step=max(8192, args.prefill_chunk * slots),
                                          max_running_requests=slots, max_tokens_per_request_per_step=args.prefill_chunk),
-        cuda_graphs=graphs,
+        cuda_graphs=graphs, guest_mode=args.guest_mode, sink_tokens=args.sink_tokens, ring_tokens=args.ring_tokens,
     )
     load_s = time.time() - t0
     weights_gib = (torch.cuda.memory_allocated(dev) - base_alloc) / 2**30
@@ -178,8 +181,11 @@ def main() -> None:
 
     payload = {
         "schema": SCHEMA,
-        "engine": "wkvm-hybrid",
-        "semantics": "exact_paged_attention_gdn",
+        "engine": "wkvm-hybrid" if args.guest_mode == "paged" else f"wkvm-hybrid-ring{args.sink_tokens}+{args.ring_tokens}",
+        "semantics": "exact_paged_attention_gdn" if args.guest_mode == "paged" else "sink_ring_approximate_gdn",
+        "guest_mode": args.guest_mode,
+        "sink_tokens": args.sink_tokens,
+        "ring_tokens": args.ring_tokens,
         "model_path": args.model_path,
         "dtype": "bfloat16",
         "context_tokens_per_session": args.ctx,

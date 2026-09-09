@@ -55,6 +55,31 @@ class Qwen35HybridRunner:
         return logits[0].float()
 
     @torch.inference_mode()
+    def prefill_batch(self, items: list[tuple[list[int], dict]]) -> list[torch.Tensor]:
+        """Prefill several requests' chunks of EQUAL length as one forward.
+
+        Equal lengths keep the batch rectangular (no padding, no ragged
+        kernels): the bank gathers each row's state, the mask handles each
+        row's own past, and the scatter writes each row back. Callers group
+        chunks by length; the multi-turn case (every session gets the same
+        turn length) and the bulk of a same-shape ladder land here, the
+        remainder runs one request at a time. Returns last-position logits
+        per row, in order."""
+        if not items:
+            return []
+        t = len(items[0][0])
+        if any(len(tokens) != t for tokens, _ in items):
+            raise ValueError("prefill_batch needs equal-length chunks")
+        if t > self.prefill_chunk:
+            raise ValueError("prefill_batch chunk exceeds prefill_chunk")
+        ids = torch.tensor([tokens for tokens, _ in items], dtype=torch.long, device=self.device)
+        slot_batch = [slots for _, slots in items]
+        cache = self.bank.gather(slot_batch, new_tokens=t)
+        logits = self._forward(ids, cache)
+        self.bank.scatter(slot_batch, cache)
+        return [row.float() for row in logits]
+
+    @torch.inference_mode()
     def decode_step(self, slot_batch: list[dict[str, int]], last_tokens: list[int]) -> torch.Tensor:
         if len(slot_batch) != len(last_tokens):
             raise ValueError("slot_batch and last_tokens length mismatch")

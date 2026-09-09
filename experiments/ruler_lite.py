@@ -354,6 +354,7 @@ def run_wkvm(samples, tok, args):
         scheduler_config=SchedulerConfig(max_tokens_per_step=16384, max_running_requests=slots,
                                          max_tokens_per_request_per_step=1024),
         cuda_graphs=graphs if not args.no_graphs else False,
+        guest_mode=args.guest_mode, sink_tokens=args.sink_tokens, ring_tokens=args.ring_tokens,
     )
     results = []
     for start in range(0, len(samples), slots):
@@ -444,6 +445,10 @@ def main() -> None:
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--no-graphs", action="store_true")
+    ap.add_argument("--guest-mode", choices=("paged", "ring"), default="paged",
+                    help="wkvm guest memory: exact paged pool, or sink+ring window (approximate beyond the window)")
+    ap.add_argument("--sink-tokens", type=int, default=16)
+    ap.add_argument("--ring-tokens", type=int, default=1024)
     ap.add_argument("--json", default=None)
     ap.add_argument("--data-cache", default="experiments/results/ruler_lite_data.json")
     ap.add_argument("--compare", nargs=2, default=None)
@@ -485,6 +490,8 @@ def main() -> None:
     for k, v in summary.items():
         print(f"{k:<24} {v['score']:.3f} (n={v['n']})")
     payload = {"engine": args.engine, "kernels": kernels, "cuda_graphs": not args.no_graphs and args.engine == "wkvm",
+               "guest_mode": args.guest_mode if args.engine == "wkvm" else "exact",
+               "sink_tokens": args.sink_tokens, "ring_tokens": args.ring_tokens,
                "model": args.model, "lengths": args.lengths, "samples_per_task": args.samples, "seed": args.seed,
                "haystack": "squad-validation-contexts (RULER essay haystack replaced)", "wall_s": time.time() - t0,
                "summary": summary, "results": results, **extra}

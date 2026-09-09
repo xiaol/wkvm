@@ -75,6 +75,13 @@ class Qwen35HybridLayout:
     vocab_size: int
     dtype: torch.dtype
     page_tokens: int = 256
+    # Guest memory mode for the full-attention layers:
+    #   "paged": exact attention over a paged pool (M4; context bounded by the pool)
+    #   "ring":  sink + sliding window per slot (M5.1; constant memory, tokens
+    #            older than ``ring_tokens`` are evicted — approximate beyond the window)
+    guest_mode: str = "paged"
+    sink_tokens: int = 16
+    ring_tokens: int = 1024
 
     def __post_init__(self) -> None:
         if len(self.layer_types) != self.n_layer:
@@ -86,10 +93,19 @@ class Qwen35HybridLayout:
             raise ValueError("page_tokens must be >= 1")
         if self.num_v_heads % self.num_k_heads != 0:
             raise ValueError("num_v_heads must be a multiple of num_k_heads")
+        if self.guest_mode not in ("paged", "ring"):
+            raise ValueError("guest_mode must be 'paged' or 'ring'")
+        if self.guest_mode == "ring" and (self.sink_tokens < 0 or self.ring_tokens < 1):
+            raise ValueError("ring mode needs sink_tokens >= 0 and ring_tokens >= 1")
+
+    @property
+    def window_tokens(self) -> int:
+        """Columns of the ring-mode guest window (sink + ring)."""
+        return self.sink_tokens + self.ring_tokens
 
     @classmethod
     def from_config(
-        cls, config, dtype: torch.dtype, page_tokens: int = 256
+        cls, config, dtype: torch.dtype, page_tokens: int = 256, **guest
     ) -> "Qwen35HybridLayout":
         cfg = getattr(config, "text_config", config)
         return cls(
@@ -107,6 +123,7 @@ class Qwen35HybridLayout:
             vocab_size=cfg.vocab_size,
             dtype=dtype,
             page_tokens=page_tokens,
+            **guest,
         )
 
     # -- layer families --------------------------------------------------------
@@ -174,13 +191,21 @@ class Qwen35HybridLayout:
                     layer_ids=self.gdn_layers,
                 )
             )
-        if self.n_attn:
+        if self.n_attn and self.guest_mode == "paged":
             families.append(
                 StateFamilySpec(
                     name=GUEST_KV_FAMILY,
                     bytes_per_slot=self.bytes_per_page,  # per PAGE for a paged family
                     layer_ids=self.attn_layers,
                     page_tokens=self.page_tokens,
+                )
+            )
+        elif self.n_attn:  # ring: a fixed window per slot, no pages
+            families.append(
+                StateFamilySpec(
+                    name=GUEST_KV_FAMILY,
+                    bytes_per_slot=self.window_tokens * self.guest_bytes_per_token,
+                    layer_ids=self.attn_layers,
                 )
             )
         if not families:
@@ -341,6 +366,9 @@ def load_qwen35(
     page_tokens: int = 256,
     attn_implementation: str = "sdpa",
     drop_vision: bool = True,
+    guest_mode: str = "paged",
+    sink_tokens: int = 16,
+    ring_tokens: int = 1024,
 ):
     """Load a Qwen3.5 checkpoint (text-only or conditional-generation layout)
     for inference. Returns ``(decoder, layout)``; the decoder is frozen, in
@@ -372,5 +400,8 @@ def load_qwen35(
     hf = hf.to(device).eval().requires_grad_(False)
     decoder = Qwen35Decoder.from_hf(hf)
     decoder._hf_model = hf  # keep the owner alive; submodules are shared
-    layout = Qwen35HybridLayout.from_config(decoder.config, dtype=dtype, page_tokens=page_tokens)
+    layout = Qwen35HybridLayout.from_config(
+        decoder.config, dtype=dtype, page_tokens=page_tokens,
+        guest_mode=guest_mode, sink_tokens=sink_tokens, ring_tokens=ring_tokens,
+    )
     return decoder, layout

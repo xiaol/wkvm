@@ -198,6 +198,37 @@ class TestHybridGraphs(unittest.TestCase):
         self.assertEqual(_run_all(graphed, [req])[0], ref)
         self.assertGreater(graphed.runner.graphs.stats["replays"], 0)
 
+    def test_ring_mode_graphs_match_band_reference(self) -> None:
+        """Ring-mode guests (sink 2 + ring 8) under graphs: one graph per
+        batch bucket, context beyond any bucket, results equal the
+        from-scratch band-mask reference and the eager ring engine."""
+        import sys
+
+        sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
+        import test_qwen35_ring_cpu as R
+
+        rfx = R._fixture()
+        rfx["decoder"].to("cuda")
+        try:
+            prompts = [list(rfx["prompts"][2]) * 3, list(rfx["prompts"][0]), list(rfx["prompts"][1])]  # 93, 23, 7 tokens
+            refs = [R.band_reference(p, 10, device="cuda") for p in prompts]
+            eager = R._engine(chunk=5, cuda_graphs=False, device="cuda")
+            reqs = [Request(prompt_token_ids=list(p), max_new_tokens=10) for p in prompts]
+            for r in reqs:
+                eager.add_request(r)
+            self.assertEqual(_run_all(eager, reqs), refs)
+            graphed = R._engine(chunk=5, cuda_graphs={"batch_buckets": (1, 2, 4), "warmup_iters": 1}, device="cuda")
+            reqs = [Request(prompt_token_ids=list(p), max_new_tokens=10) for p in prompts]
+            for r in reqs:
+                graphed.add_request(r)
+            self.assertEqual(_run_all(graphed, reqs), refs)
+            g = graphed.runner.graphs
+            self.assertEqual(g.stats["eager_fallbacks"], 0)
+            self.assertEqual(g.length_buckets, (10,))
+            self.assertGreater(g.stats["replays"], 0)
+        finally:
+            rfx["decoder"].to("cpu")
+
     def test_eager_fallback_beyond_buckets(self) -> None:
         """62 prompt tokens + 6 new crosses the 64 bucket mid-decode: the
         first steps replay, the rest run eagerly after the row is evicted."""

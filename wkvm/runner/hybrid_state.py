@@ -133,6 +133,32 @@ class SlotCache:
         return mask[:, None]
 
 
+class RingSlotCache(SlotCache):
+    """Guest memory as sink + sliding window (``guest_mode="ring"``).
+
+    Past columns carry absolute positions (``past_pos``, -1 = empty); the
+    mask is a position band: a query at absolute position ``q`` sees key
+    position ``p`` iff ``p <= q`` and (``p < sink`` or ``p > q - ring``).
+    Keys are stored post-RoPE at their absolute positions and never
+    re-rotated (same contract as the Gemma routed-span path).
+    """
+
+    def __init__(self, layout, lens: list[int], layers: dict, past_pos: torch.Tensor) -> None:
+        super().__init__(layout, lens, layers)
+        self.past_pos = past_pos  # [B, window]
+
+    def attention_mask(self, query_len: int, device) -> torch.Tensor | None:
+        s, w = self.layout.sink_tokens, self.layout.ring_tokens
+        lens = torch.tensor(self.lens, device=device)
+        q = lens[:, None] + torch.arange(query_len, device=device)[None, :]  # [B, T]
+        pp = self.past_pos[:, None, :]  # [B, 1, window]
+        qq = q[:, :, None]  # [B, T, 1]
+        allow_past = (pp >= 0) & ((pp < s) | (pp > qq - w))
+        pn = q[:, None, :]  # new tokens as keys: [B, 1, T] positions
+        allow_new = (pn <= qq) & ((pn < s) | (pn > qq - w))
+        return torch.cat([allow_past, allow_new], dim=-1)[:, None]
+
+
 class Qwen35StateBank:
     memory_families = (GDN_STATE_FAMILY,)
 
@@ -145,11 +171,12 @@ class Qwen35StateBank:
     ) -> None:
         if layout.n_gdn < 1:
             raise ValueError("Qwen35StateBank needs at least one linear_attention layer")
-        if layout.n_attn and num_pages < 1:
+        self.ring = layout.guest_mode == "ring"
+        if layout.n_attn and not self.ring and num_pages < 1:
             raise ValueError("num_pages must be >= 1 for a model with full-attention layers")
         self.layout = layout
         self.num_slots = num_slots
-        self.num_pages = num_pages if layout.n_attn else 0
+        self.num_pages = num_pages if (layout.n_attn and not self.ring) else 0
         self.device = torch.device(device)
         s = num_slots + 1
         self.gdn_state = torch.zeros(
@@ -158,11 +185,20 @@ class Qwen35StateBank:
         self.gdn_conv = torch.zeros(
             (layout.n_gdn, s, *layout.gdn_conv_shape), dtype=layout.dtype, device=self.device
         )
-        self.pool_k = torch.zeros(
-            (layout.n_attn, self.num_pages + 1, *layout.guest_page_shape),
-            dtype=layout.dtype, device=self.device,
-        )
-        self.pool_v = torch.zeros_like(self.pool_k)
+        if self.ring:
+            wt = layout.window_tokens
+            self.ring_k = torch.zeros(
+                (layout.n_attn, s, layout.num_kv_heads, wt, layout.head_dim), dtype=layout.dtype, device=self.device
+            )
+            self.ring_v = torch.zeros_like(self.ring_k)
+            self.ring_pos = torch.full((s, wt), -1, dtype=torch.long, device=self.device)
+            self.pool_k = self.pool_v = torch.zeros(0, device=self.device)
+        else:
+            self.pool_k = torch.zeros(
+                (layout.n_attn, self.num_pages + 1, *layout.guest_page_shape),
+                dtype=layout.dtype, device=self.device,
+            )
+            self.pool_v = torch.zeros_like(self.pool_k)
         # Request identity is the gdn_state slot; guest length lives with it.
         self.guest_len: list[int] = [0] * s
         # model layer idx -> position inside the family bank
@@ -193,6 +229,12 @@ class Qwen35StateBank:
         if self.resident is not None:
             self.resident.release(slots)
 
+    def park_slots(self, slots: dict) -> None:
+        """The request pauses (turn complete, session kept): write any
+        resident row back to the bank and free the row."""
+        if self.resident is not None:
+            self.resident.evict(slots)
+
     def zero_slots(self, slots: dict) -> None:
         """Reset a freshly admitted request's slots (zero == fresh sequence).
         Pages are not zeroed: positions beyond ``guest_len`` are never read
@@ -201,14 +243,40 @@ class Qwen35StateBank:
         self.gdn_state[:, slots[GDN_STATE_FAMILY]].zero_()
         self.gdn_conv[:, slots[GDN_CONV_FAMILY]].zero_()
         self.guest_len[slots[GDN_STATE_FAMILY]] = 0
+        if self.ring and self.layout.n_attn:
+            self.ring_pos[slots[GUEST_KV_FAMILY]].fill_(-1)
 
     def slot_len(self, slots: dict) -> int:
         return self.guest_len[slots[GDN_STATE_FAMILY]]
 
+    # -- ring addressing (guest_mode="ring") -------------------------------------------
+
+    def ring_columns(self, positions: torch.Tensor) -> torch.Tensor:
+        """Window column of absolute token position(s): sinks keep their
+        position, the rest cycle through the ring."""
+        s, w = self.layout.sink_tokens, self.layout.ring_tokens
+        return torch.where(positions < s, positions, s + (positions - s) % w)
+
+    def ring_positions_for(self, length: int) -> torch.Tensor:
+        """Absolute position held by each window column after ``length``
+        tokens (-1 = empty) — derivable, so resident graph rows need not
+        track it."""
+        s, w, wt = self.layout.sink_tokens, self.layout.ring_tokens, self.layout.window_tokens
+        cols = torch.arange(wt, device=self.device)
+        sink = torch.where(cols < length, cols, torch.full_like(cols, -1))
+        j = cols - s
+        p = length - 1 - ((length - 1 - s - j) % w)
+        ring = torch.where((length > s) & (p >= s), p, torch.full_like(cols, -1))
+        return torch.where(cols < s, sink, ring)
+
     def capacity(self, slots: dict) -> int:
+        if self.ring:
+            return 1 << 62  # unbounded context: the window evicts, it never fills
         return len(self._pages(slots)) * self.layout.page_tokens
 
     def check_capacity(self, slots: dict, new_tokens: int) -> None:
+        if self.ring:
+            return
         if self.slot_len(slots) + new_tokens > self.capacity(slots):
             raise GuestCapacityExceeded(
                 f"reserved {len(self._pages(slots))} pages x {self.layout.page_tokens} tokens: "
@@ -265,6 +333,14 @@ class Qwen35StateBank:
                 conv=self.gdn_conv[j].index_select(0, cids),
                 state=self.gdn_state[j].index_select(0, sids),
             )
+        if self.layout.n_attn and self.ring:
+            gids = self._ids(slot_batch, GUEST_KV_FAMILY)
+            for li, j in self._attn_pos.items():
+                layers[li] = _AttnEntry(
+                    k_past=self.ring_k[j].index_select(0, gids),
+                    v_past=self.ring_v[j].index_select(0, gids),
+                )
+            return RingSlotCache(self.layout, lens, layers, self.ring_pos.index_select(0, gids))
         if self.layout.n_attn:
             page_idx, off_idx = self._past_index(slot_batch, lens, lmax)
             for li, j in self._attn_pos.items():
@@ -288,6 +364,11 @@ class Qwen35StateBank:
         if first.k_new is None:
             raise RuntimeError("attention cache was never updated this forward")
         t = first.k_new.shape[-2]
+        if self.ring:
+            self._scatter_ring(slot_batch, cache, t)
+            for row, slots in enumerate(slot_batch):
+                self.guest_len[slots[GDN_STATE_FAMILY]] = cache.lens[row] + t
+            return
         if t == 1:  # batched decode: one fused write per layer
             pg = torch.cat([self._positions_index(self._pages(s), cache.lens[r], 1)[0]
                             for r, s in enumerate(slot_batch)])
@@ -307,29 +388,66 @@ class Qwen35StateBank:
         for row, slots in enumerate(slot_batch):
             self.guest_len[slots[GDN_STATE_FAMILY]] = cache.lens[row] + t
 
+    def _scatter_ring(self, slot_batch: list[dict], cache: SlotCache, t: int) -> None:
+        """Write the new tokens into their window columns. Within one chunk
+        only the last ``ring`` positions (plus sinks) can survive, so those
+        are the only columns written — no duplicate-index writes."""
+        s, w = self.layout.sink_tokens, self.layout.ring_tokens
+        if t == 1:
+            pos = torch.tensor(cache.lens, device=self.device)
+            cols = self.ring_columns(pos)
+            gids = self._ids(slot_batch, GUEST_KV_FAMILY)
+            for li, j in self._attn_pos.items():
+                entry = cache.layers[li]
+                self.ring_k[j][gids, :, cols] = entry.k_new[:, :, 0].to(self.ring_k.dtype)
+                self.ring_v[j][gids, :, cols] = entry.v_new[:, :, 0].to(self.ring_v.dtype)
+            self.ring_pos[gids, cols] = pos
+            return
+        idx_all = torch.arange(t, device=self.device)
+        for row, slots in enumerate(slot_batch):
+            g = slots[GUEST_KV_FAMILY]
+            pos = cache.lens[row] + idx_all
+            keep = (pos < s) | (idx_all >= t - w)
+            pos_k, idx_k = pos[keep], idx_all[keep]
+            cols = self.ring_columns(pos_k)
+            for li, j in self._attn_pos.items():
+                entry = cache.layers[li]
+                # int on dim 0 is basic indexing; the single tensor index keeps its place: target [kv_heads, K, hd]
+                self.ring_k[j][g, :, cols] = entry.k_new[row][:, idx_k].to(self.ring_k.dtype)
+                self.ring_v[j][g, :, cols] = entry.v_new[row][:, idx_k].to(self.ring_v.dtype)
+            self.ring_pos[g, cols] = pos_k
+
     # -- durable-state protocol (wkvm/store.py) ------------------------------------
 
     def fingerprint_key(self) -> str:
         l = self.layout
         # Page size is deliberately not part of the identity: snapshots are
-        # token-trimmed and page-size independent.
+        # token-trimmed and page-size independent. Ring mode is: its window
+        # is the state.
+        guest = f"ring{l.sink_tokens}+{l.ring_tokens}" if self.ring else "paged"
         return (
             f"qwen35:L{l.n_layer}:types{''.join('l' if t == LINEAR else 'f' for t in l.layer_types)}"
             f":gdn{tuple(l.gdn_state_shape)}:conv{tuple(l.gdn_conv_shape)}"
-            f":kv{(l.num_kv_heads, l.head_dim)}:{l.dtype}"
+            f":kv{(l.num_kv_heads, l.head_dim)}:{guest}:{l.dtype}"
         )
 
     def export_slot(self, slots: dict) -> dict[str, torch.Tensor]:
         """Device -> host copies of one request's state. The guest tokens are
         gathered out of their pages, trimmed to ``guest_len`` — a snapshot
-        costs O(tokens) and is page-size independent."""
+        costs O(tokens) and is page-size independent. In ring mode the
+        window itself (and its column positions) is the snapshot."""
         self._sync_resident([slots], evict=False)  # the row stays; the bank is now current
         n = self.slot_len(slots)
         out = {
             GDN_STATE_FAMILY: self.gdn_state[:, slots[GDN_STATE_FAMILY]],
             GDN_CONV_FAMILY: self.gdn_conv[:, slots[GDN_CONV_FAMILY]],
         }
-        if self.layout.n_attn:
+        if self.layout.n_attn and self.ring:
+            g = slots[GUEST_KV_FAMILY]
+            out["ring_k"] = self.ring_k[:, g]
+            out["ring_v"] = self.ring_v[:, g]
+            out["ring_pos"] = self.ring_pos[g]
+        elif self.layout.n_attn:
             pg, off = self._positions_index(self._pages(slots), 0, n)
             # Advanced indices on dims 1 and 3 (separated by a slice) come
             # first: [n, n_attn, kv_heads, hd] -> [n_attn, kv_heads, n, hd].
@@ -344,7 +462,7 @@ class Qwen35StateBank:
         stay zero (fresh), which is what makes a tuned-initial-state import —
         only ``gdn_state`` present — a valid request."""
         self.zero_slots(slots)
-        known = {GDN_STATE_FAMILY, GDN_CONV_FAMILY, "guest_k", "guest_v", "guest_len"}
+        known = {GDN_STATE_FAMILY, GDN_CONV_FAMILY, "guest_k", "guest_v", "guest_len", "ring_k", "ring_v", "ring_pos"}
         unknown = set(tensors) - known
         if unknown:
             raise KeyError(f"unknown state tensors for Qwen3.5 bank: {sorted(unknown)}")
@@ -357,7 +475,20 @@ class Qwen35StateBank:
             _check(tensors[GDN_CONV_FAMILY], dst.shape, GDN_CONV_FAMILY)
             dst.copy_(tensors[GDN_CONV_FAMILY], non_blocking=True)
         n = 0
+        if "ring_k" in tensors:
+            if not self.ring:
+                raise ValueError("ring-mode snapshot cannot be loaded into a paged bank")
+            g = slots[GUEST_KV_FAMILY]
+            _check(tensors["ring_k"], self.ring_k[:, g].shape, "ring_k")
+            self.ring_k[:, g].copy_(tensors["ring_k"], non_blocking=True)
+            self.ring_v[:, g].copy_(tensors["ring_v"], non_blocking=True)
+            self.ring_pos[g].copy_(tensors["ring_pos"], non_blocking=True)
+            n = int(tensors["guest_len"].reshape(-1)[0]) if "guest_len" in tensors else int(tensors["ring_pos"].max()) + 1
+            self.guest_len[slots[GDN_STATE_FAMILY]] = n
+            return
         if "guest_k" in tensors:
+            if self.ring:
+                raise ValueError("paged snapshot cannot be loaded into a ring bank")
             k, v = tensors["guest_k"], tensors["guest_v"]
             n = k.shape[-2]
             if n > self.capacity(slots):
@@ -380,10 +511,10 @@ class Qwen35StateBank:
         self.guest_len[slots[GDN_STATE_FAMILY]] = n
 
     def state_bytes(self) -> int:
-        return sum(
-            t.numel() * t.element_size()
-            for t in (self.gdn_state, self.gdn_conv, self.pool_k, self.pool_v)
-        )
+        tensors = [self.gdn_state, self.gdn_conv, self.pool_k, self.pool_v]
+        if self.ring:
+            tensors += [self.ring_k, self.ring_v]
+        return sum(t.numel() * t.element_size() for t in tensors)
 
 
 def _check(t: torch.Tensor, shape, name: str) -> None:

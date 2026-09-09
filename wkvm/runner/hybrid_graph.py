@@ -51,19 +51,21 @@ def _bucket(n: int, buckets: tuple[int, ...]) -> int | None:
 
 class ResidentSlotCache(SlotCache):
     """SlotCache over static row views: the new K/V token is written in
-    place at column ``lens[row]`` (no concatenation), and attention reads the
-    whole ``l + 1``-column window under the mask ``col <= lens[row]``."""
+    place at column ``col_t[row]`` (``lens[row]`` for the paged layout, the
+    ring column for ring mode; no concatenation), and attention reads the
+    whole static window under the mask computed in ``_forward_static``."""
 
     def __init__(self, layout, b: int, rows_idx: torch.Tensor, lens_t: torch.Tensor, layers: dict) -> None:
         super().__init__(layout, [0] * b, layers)
         self.rows_idx = rows_idx
         self.lens_t = lens_t
+        self.col_t = lens_t  # ring mode replaces this per forward (a graph-pool tensor)
 
     def update(self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int, *_, **__):
         entry = self.layers[layer_idx]
         entry.k_new, entry.v_new = key_states, value_states
-        entry.k_past[self.rows_idx, :, self.lens_t] = key_states[:, :, 0]
-        entry.v_past[self.rows_idx, :, self.lens_t] = value_states[:, :, 0]
+        entry.k_past[self.rows_idx, :, self.col_t] = key_states[:, :, 0]
+        entry.v_past[self.rows_idx, :, self.col_t] = value_states[:, :, 0]
         return entry.k_past, entry.v_past
 
 
@@ -81,7 +83,10 @@ class HybridDecodeGraphs:
         self.layout = bank.layout
         self.device = bank.device
         self.batch_buckets = tuple(sorted(set(batch_buckets)))
-        self.length_buckets = tuple(sorted(set(length_buckets)))
+        self.ring = bank.ring
+        # Ring mode: the window is the only "length bucket"; its columns are
+        # the static row itself, so no +1 column and no length dispatch.
+        self.length_buckets = (self.layout.window_tokens,) if self.ring else tuple(sorted(set(length_buckets)))
         self.warmup_iters = warmup_iters
         bmax, lmax = self.batch_buckets[-1], self.length_buckets[-1]
         lay = self.layout
@@ -92,8 +97,9 @@ class HybridDecodeGraphs:
         self.rows_idx = torch.arange(bmax, device=self.device)
         self.gdn_state = torch.zeros((lay.n_gdn, bmax, *lay.gdn_state_shape), dtype=GDN_STATE_DTYPE, device=self.device)
         self.gdn_conv = torch.zeros((lay.n_gdn, bmax, *lay.gdn_conv_shape), dtype=dt, device=self.device)
-        # +1 column: a request whose length equals the bucket writes at column l.
-        self.k_win = torch.zeros((lay.n_attn, bmax, lay.num_kv_heads, lmax + 1, lay.head_dim), dtype=dt, device=self.device)
+        # Paged: +1 column so a request whose length equals the bucket writes at column l.
+        cols = lmax if self.ring else lmax + 1
+        self.k_win = torch.zeros((lay.n_attn, bmax, lay.num_kv_heads, cols, lay.head_dim), dtype=dt, device=self.device)
         self.v_win = torch.zeros_like(self.k_win)
         self._graphs: dict[tuple[int, int], tuple[torch.cuda.CUDAGraph, ResidentSlotCache, torch.Tensor]] = {}
         self._pool = None
@@ -109,25 +115,40 @@ class HybridDecodeGraphs:
     # -- buckets --------------------------------------------------------------------
 
     def bucket_for(self, batch: int, lmax: int) -> tuple[int, int] | None:
-        """Bucket key, or None when the step must run eagerly."""
+        """Bucket key, or None when the step must run eagerly. Ring mode
+        never falls back on length: the window absorbs any context."""
         b = _bucket(batch, self.batch_buckets)
+        if b is None:
+            return None
+        if self.ring:
+            return (b, self.layout.window_tokens)
         l = _bucket(lmax, self.length_buckets)
-        return None if b is None or l is None else (b, l)
+        return None if l is None else (b, l)
 
     def _cache(self, b: int, l: int) -> ResidentSlotCache:
         layers: dict = {}
         for j, li in enumerate(self.layout.gdn_layers):
             layers[li] = _GdnEntry(conv=self.gdn_conv[j, :b], state=self.gdn_state[j, :b])
+        ncol = l if self.ring else l + 1
         for j, li in enumerate(self.layout.attn_layers):
-            layers[li] = _AttnEntry(k_past=self.k_win[j, :b, :, : l + 1], v_past=self.v_win[j, :b, :, : l + 1])
+            layers[li] = _AttnEntry(k_past=self.k_win[j, :b, :, :ncol], v_past=self.v_win[j, :b, :, :ncol])
         return ResidentSlotCache(self.layout, b, self.rows_idx[:b], self.lens[:b], layers)
 
     def _forward_static(self, b: int, l: int, cache: ResidentSlotCache) -> torch.Tensor:
         ids = self.ids[:b]
         lens = self.lens[:b]
         positions = lens[:, None]  # [b, 1], T == 1
-        cols = torch.arange(l + 1, device=self.device)
-        mask = (cols[None, :] <= lens[:, None])[:, None, None, :]  # [b,1,1,l+1]; new token at column lens
+        if self.ring:
+            # Window columns [0, min(len+1, window)) are the sinks + the last
+            # ring tokens including the one written this step at ring_column(len).
+            wt = self.layout.window_tokens
+            cache.col_t = self.bank.ring_columns(lens)
+            cols = torch.arange(wt, device=self.device)
+            mask = (cols[None, :] < (lens[:, None] + 1).clamp(max=wt))[:, None, None, :]
+        else:
+            cache.col_t = lens
+            cols = torch.arange(l + 1, device=self.device)
+            mask = (cols[None, :] <= lens[:, None])[:, None, None, :]  # [b,1,1,l+1]; new token at column lens
         return self.model(ids, cache, positions, mask)
 
     def _capture(self, b: int, l: int):
@@ -178,7 +199,7 @@ class HybridDecodeGraphs:
         row writes at ``lens[row]`` (not the whole window — at B=16 x 14k
         tokens that clone alone is 3.4 GiB)."""
         rows = self.rows_idx[:b]
-        cols = self.lens[:b]
+        cols = self.bank.ring_columns(self.lens[:b]) if self.ring else self.lens[:b]
         return (self.gdn_state[:, :b].clone(), self.gdn_conv[:, :b].clone(),
                 self.k_win[:, rows, :, cols].clone(), self.v_win[:, rows, :, cols].clone(), rows, cols)
 
@@ -209,7 +230,11 @@ class HybridDecodeGraphs:
             self.gdn_state[j, row].copy_(bank.gdn_state[j, sid])
             self.gdn_conv[j, row].copy_(bank.gdn_conv[j, cid])
         n = bank.slot_len(slots)
-        if n and self.layout.n_attn:
+        if self.layout.n_attn and self.ring:
+            g = slots[GUEST_KV_FAMILY]
+            self.k_win[:, row].copy_(bank.ring_k[:, g])
+            self.v_win[:, row].copy_(bank.ring_v[:, g])
+        elif n and self.layout.n_attn:
             pg, off = bank._positions_index(tuple(slots[GUEST_KV_FAMILY]), 0, n)
             for j in range(self.layout.n_attn):
                 self.k_win[j, row, :, :n] = bank.pool_k[j][pg, :, off].permute(1, 0, 2)
@@ -233,7 +258,13 @@ class HybridDecodeGraphs:
             bank.gdn_state[j, sid].copy_(self.gdn_state[j, row])
             bank.gdn_conv[j, cid].copy_(self.gdn_conv[j, row])
         n, start = bank.slot_len(slots), self.synced_len[row]
-        if n > start and self.layout.n_attn:
+        if self.layout.n_attn and self.ring:
+            if n > start:
+                g = slots[GUEST_KV_FAMILY]
+                bank.ring_k[:, g].copy_(self.k_win[:, row])
+                bank.ring_v[:, g].copy_(self.v_win[:, row])
+                bank.ring_pos[g].copy_(bank.ring_positions_for(n))
+        elif n > start and self.layout.n_attn:
             pg, off = bank._positions_index(tuple(slots[GUEST_KV_FAMILY]), start, n - start)
             for j in range(self.layout.n_attn):
                 bank.pool_k[j][pg, :, off] = self.k_win[j, row, :, start:n].permute(1, 0, 2)
@@ -265,7 +296,10 @@ class HybridDecodeGraphs:
             n = self.bank.slot_len(moved)
             self.gdn_state[:, row].copy_(self.gdn_state[:, last])
             self.gdn_conv[:, row].copy_(self.gdn_conv[:, last])
-            if n and self.layout.n_attn:
+            if self.layout.n_attn and self.ring:
+                self.k_win[:, row].copy_(self.k_win[:, last])
+                self.v_win[:, row].copy_(self.v_win[:, last])
+            elif n and self.layout.n_attn:
                 self.k_win[:, row, :, :n].copy_(self.k_win[:, last, :, :n])
                 self.v_win[:, row, :, :n].copy_(self.v_win[:, last, :, :n])
             self.row_of[self._sid(moved)] = row

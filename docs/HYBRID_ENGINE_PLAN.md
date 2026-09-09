@@ -207,6 +207,39 @@ resume of the imported handle; per-slot bytes and slot capacity.
   were silent no-ops. Capture/replay now run under `torch.cuda.device(bank)`
   and a post-capture replay check refuses graphs that do not recompute.
 
+### H9. Ten times, the way Gemma got it: bounded guest memory ✅ (ring), ▶ (routed bank)
+
+- **Insight.** On an exact hybrid both engines carry the same bytes per
+  token, so the memory physics is a wash and vLLM's kernels win. The
+  main-branch 10x came from a *bounded* per-session state that never
+  re-prefills, measured past the incumbent's capacity wall. The same lever
+  exists on the hybrid: the 8 guest layers are the only per-token memory.
+- **Ring mode ✅** (`guest_mode="ring"`, `sink_tokens` + `ring_tokens`):
+  the `guest_kv` family becomes a fixed per-slot window (33 MiB at 16+1024),
+  keys stay post-RoPE at absolute positions, prefill uses a position band
+  mask (in-chunk eviction exact), decode writes the new token into its ring
+  column in-graph and masks `cols < min(len+1, window)`; one graph per batch
+  bucket, no length buckets, unbounded context. Gates: `tests/test_qwen35_ring_cpu.py`
+  (from-scratch band-mask reference, wraps, batched, hibernate/resume) and
+  the ring case in `tests/test_hybrid_graph_gpu.py`.
+- **Result** (`experiments/results/qwen35_ring_wall_20260910.md`): 32
+  sessions x 36,864 tokens x 8 turns on one A100 — vLLM re-prefills every
+  turn at 129–133 s; wkvm ring 5.25 s per turn: **24.6x per turn, 6.2x over
+  8 turns, 16.5x on the README's 48-turn shape**. Below the wall (16 x
+  13.8k) vLLM still wins 1.5x.
+- **Price** (RULER-lite, ring 16+1024): needle recall only inside the
+  window (0.25 at 4k -> ~0 at 32k); the GDN layers do not carry retrievable
+  content. Same as Gemma's ring column.
+- **Next ▶: routed span bank on the hybrid** — the Gemma mechanism
+  (`docs/gemma_native_contract.md`): evicted ring tokens -> pending buffer ->
+  sentence/punctuation spans routed atomically by mean *value* to 64 slots,
+  each slot keeps a mean-KV summary plus exact representatives under a
+  144-token budget (farthest-point retention, near-duplicate floor), readout
+  = sink + summaries + representatives + pending + ring. Target: Gemma's
+  ~0.90 recall at 8k–32k with ~4k materialized columns, measured with
+  RULER-lite; then the wall workload again to see what the extra columns
+  cost per turn.
+
 ### H8. What the comparison says to build next ▶
 
 1. Batched prefill: run every scheduled prefill chunk of the step as one
