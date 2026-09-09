@@ -256,7 +256,15 @@ a tuned initial state from RNN-StateTuning imports as a handle
 Greedy output is bit-identical to HF on the 9B, including a 12k-token prompt;
 see [`docs/HYBRID_ENGINE_PLAN.md`](docs/HYBRID_ENGINE_PLAN.md) and
 [`experiments/results/m4_qwen35_hybrid_smoke.md`](experiments/results/m4_qwen35_hybrid_smoke.md).
-Pure-torch kernels on this path: no throughput claim yet.
+Kernels: fla/Triton Gated DeltaNet when `fla` imports, pure torch otherwise
+(`WKVM_KERNELS=auto|fla|torch`). Decode is CUDA-graphed per batch/length
+bucket (`cuda_graphs=True`): on one A100 the 9B decodes at 26 ms/step (B=1)
+and 46 ms/step (B=16, 344 tok/s) vs 82/96 ms eager; single run, no incumbent
+comparison yet.
+The native RWKV-7 path now also runs from official `.pth` weights via
+[`scripts/convert_rwkv7_pth.py`](scripts/convert_rwkv7_pth.py) and matches the
+official `rwkv` package greedy-for-greedy
+([`experiments/results/m1_rwkv7_native_a100_20260909.md`](experiments/results/m1_rwkv7_native_a100_20260909.md)).
 
 **M3—Durable State API:** named, versioned, forkable, mutable state handles over
 a tiered StateStore (GPU slot, pinned host, and NVMe safetensors). Measured demos

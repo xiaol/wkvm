@@ -128,17 +128,53 @@ resume of the imported handle; per-slot bytes and slot capacity.
   decode crosses page boundaries; 9B smoke phase E: a 12k-token natural-text
   prompt through 49 pages, greedy-identical to HF.
 
-### H5. Throughput floor ▶
+### H5. Throughput floor ▶ (kernels ✅, profile ✅, graphs ✅, paged kernel ☐)
 
-- Gather-free paged attention (FlashInfer/FA3 paged decode) when the host
-  has the kernels; until then the per-step `B x Lmax` gather is the cost of
-  long contexts at high concurrency.
-- Mask-free decode when all rows share a length (already taken), then
-  length-bucketed batches to hit the SDPA fast path more often.
-- CUDA-graph the GDN decode step (static shapes: `[B, H, K, V]`), attention
-  eager — the SGLang out-graph/in-graph split.
-- FLA kernels when the host has triton (`kernels`/`fla` names are what HF
-  dispatches on; nothing in wkvm changes).
+- **CUDA-graph decode ✅** (`wkvm/runner/hybrid_graph.py`,
+  `Engine(..., cuda_graphs=True)` / `Engine.from_qwen35(..., cuda_graphs=True)`):
+  the decode forward is captured once per (batch bucket, length bucket) over
+  static buffers allocated at the largest bucket and sliced as views; the
+  mask and positions are computed in-graph from a static `lens` tensor; the
+  paged gather fills the static buffers before replay and `bank.scatter`
+  commits after it (out-graph); padded rows use slot 0 / page 0. Steps
+  outside every bucket run eagerly. Gate: `tests/test_hybrid_graph_gpu.py`
+  (eager == graph token-for-token across padding, bucket transitions, the
+  eager fallback and store resume). On the 9B (fla kernels):
+
+  | B | eager step | graphed step (engine.step) | replay alone | gather + scatter |
+  |---:|---:|---:|---:|---:|
+  | 1 | 82 ms | 26 ms (38 tok/s) | 18 ms | 3 + 2 ms |
+  | 4 | 85 ms | 30 ms (132 tok/s) | 19 ms | |
+  | 8 | 88 ms | 36 ms (220 tok/s) | 21 ms | |
+  | 16 | 96 ms | 46 ms (344 tok/s) | 25 ms | 9 + 7 ms |
+
+  The remaining gap to the replay time is the out-graph paged gather and
+  scatter, which grow with B; folding them into the static buffers (keep the
+  resident K/V of running requests in place between steps, append only the
+  new token) is the next step, then a gather-free paged kernel.
+
+- **fla Triton kernels ✅** (`wkvm/runner/kernels.py`, `WKVM_KERNELS=auto|fla|torch`):
+  transformers dispatches Gated DeltaNet to `fla.ops.gated_delta_rule` when
+  `fla` imports; wkvm decides that before any modeling import and, on
+  torch < 2.7, imports `fla` with `torch.compile` stubbed (its import-time
+  compile trips over Triton >= 3.3). Effect on the 9B: 12.6k-token prefill
+  12.1 s → 4.2 s, batched 8-prompt run 8.8 s → 5.6 s, decode step only
+  89 → 82 ms at B=1 and 103 → 96 ms at B=16. Parity vs HF unchanged
+  (bit-exact, HF on the same kernels).
+- **Decode profile ✅** (`experiments/hybrid_decode_profile.py`,
+  `experiments/results/m4_hybrid_decode_profile_fla.json`): at B=1 a step
+  is 82 ms wall of which the model forward is 77 ms, and only ~23 ms of that
+  is GPU kernel time — the rest is ~6,300 kernel launches of HF-module
+  glue (`aten::to/copy_/mul` dominate CPU time, the GEMMs dominate GPU
+  time). At B=16: forward 94 ms (GPU ~26 ms), gather 12 ms, scatter 9 ms.
+  Conclusion: the floor is launch overhead, not kernels.
+- **Next, in order:** (1) keep running requests' K/V resident in the static
+  graph buffers between steps (write the new token in-graph; the paged pool
+  stays the durable owner for admission, hibernate and long tails) so the
+  per-step gather disappears; (2) gather-free paged attention
+  (FlashInfer/FA3) for long contexts at high concurrency; (3) pre-capture
+  buckets at startup (`HybridDecodeGraphs` captures lazily today, ~0.5 s per
+  bucket on first use).
 
 ### H6. Second hybrid family ☐
 

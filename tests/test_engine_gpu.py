@@ -193,20 +193,37 @@ class TestEngine1p5BParity(unittest.TestCase):
         model = engine.runner.model
         for req, prompt in zip(reqs, prompts):
             ref: list[int] = []
+            margins: list[float] = []
             cache = Cache()
             ids = torch.tensor([prompt], dtype=torch.long, device="cuda")
             with torch.inference_mode():
                 step = model(input_ids=ids, past_key_values=cache,
                              use_cache=True, logits_to_keep=1)
                 for _ in range(self.NEW_TOKENS):
-                    tok = int(step.logits[0, -1].argmax().item())
+                    logits = step.logits[0, -1].float()
+                    top2 = torch.topk(logits, 2).values
+                    margins.append(float(top2[0] - top2[1]))
+                    tok = int(logits.argmax().item())
                     ref.append(tok)
                     step = model(
                         input_ids=torch.tensor([[tok]], dtype=torch.long,
                                                device="cuda"),
                         past_key_values=cache, use_cache=True, logits_to_keep=1,
                     )
-            self.assertEqual(req.output_token_ids, ref, f"len={len(prompt)}")
+            # Exact equality, except at a genuine bf16 near-tie (reference
+            # top-1/top-2 margin under two ulps at |logit| in [16, 32)), where
+            # chunked prefill and one-shot prefill legitimately disagree and
+            # the continuations diverge from there on.
+            for i, (a, b) in enumerate(zip(req.output_token_ids, ref)):
+                if a == b:
+                    continue
+                self.assertLess(margins[i], 0.25,
+                                f"len={len(prompt)}: token {i} {a} vs {b}, margin {margins[i]:.3f}")
+                print(f"\n[1.5B parity] len={len(prompt)}: near-tie at token {i} "
+                      f"(margin {margins[i]:.3f}), {i} tokens matched before it")
+                break
+            else:
+                self.assertEqual(len(req.output_token_ids), len(ref), f"len={len(prompt)}")
         self.assertEqual(engine.arena.num_free_slots(), 4)
 
 

@@ -61,10 +61,16 @@ class Engine:
         stop_token_ids: frozenset[int] = frozenset(),
         prefill_chunk: int = 512,
         num_pages: int | None = None,
+        cuda_graphs: bool | dict = False,
     ) -> None:
         """``num_pages`` sizes the guest page pool of hybrid models (ignored
         by models without paged families). Default: 4096 tokens per slot
-        worth of pages, shared across all requests."""
+        worth of pages, shared across all requests.
+
+        ``cuda_graphs``: True (or a dict of ``HybridDecodeGraphs`` kwargs)
+        captures decode forwards per batch/length bucket on runners that
+        support it (the hybrid runner); batch buckets are capped at
+        ``num_slots``."""
         self.layout = layout
         spec = layout.state_spec()
         if spec.paged_families:
@@ -79,6 +85,18 @@ class Engine:
             self.arena,
         )
         self.runner = layout.make_runner(model, self.bank, prefill_chunk)
+        if cuda_graphs and hasattr(self.runner, "enable_cuda_graphs"):
+            kwargs = dict(cuda_graphs) if isinstance(cuda_graphs, dict) else {}
+            buckets = kwargs.get("batch_buckets", (1, 2, 4, 8, 16, 32))
+            buckets = tuple(b for b in buckets if b <= num_slots) or (1,)
+            if buckets[-1] < num_slots and num_slots <= 64:
+                buckets = buckets + (num_slots,)
+            kwargs["batch_buckets"] = buckets
+            cap = self.arena.max_tokens_per_request
+            if cap is not None:
+                lb = kwargs.get("length_buckets", (256, 512, 1024, 2048, 4096))
+                kwargs["length_buckets"] = tuple(l for l in lb if l <= cap) or (min(lb),)
+            self.runner.enable_cuda_graphs(**kwargs)
         self.stop_token_ids = stop_token_ids
         self._params: dict[str, SamplingParams] = {}
         self._generators: dict[str, torch.Generator | None] = {}

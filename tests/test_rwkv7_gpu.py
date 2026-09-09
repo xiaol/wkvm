@@ -179,24 +179,50 @@ class TestRWKV7Parity(unittest.TestCase):
                 past_key_values=cache, use_cache=True, logits_to_keep=1,
             ).logits[0, -1].float()
 
-    def _reference_greedy(self, model, prompt: list[int], n: int) -> list[int]:
-        """Reference decode: fla's own Cache management, no arena."""
+    # A greedy pick whose top-1/top-2 logit margin is under two bf16 ulps at
+    # the logit scale of these models (|x| in [16, 32) -> ulp 0.125) is a
+    # coin flip decided by accumulation order (chunk boundaries, Triton
+    # autotune configs); such positions are exempt from gate 3 and comparison
+    # stops there, since the sequences legitimately diverge afterwards.
+    NEAR_TIE_MARGIN = 0.25
+
+    def _reference_greedy(self, model, prompt: list[int], n: int):
+        """Reference decode: fla's own Cache management, no arena. Returns
+        the tokens and the top-1/top-2 margin at each step."""
         from fla.models.utils import Cache
 
         cache = Cache()
         ids = torch.tensor([prompt], dtype=torch.long, device="cuda")
         out: list[int] = []
+        margins: list[float] = []
         with torch.inference_mode():
             step = model(input_ids=ids, past_key_values=cache, use_cache=True,
                          logits_to_keep=1)
             for _ in range(n):
-                tok = int(step.logits[0, -1].argmax().item())
+                logits = step.logits[0, -1].float()
+                top2 = torch.topk(logits, 2).values
+                margins.append(float(top2[0] - top2[1]))
+                tok = int(logits.argmax().item())
                 out.append(tok)
                 step = model(
                     input_ids=torch.tensor([[tok]], dtype=torch.long, device="cuda"),
                     past_key_values=cache, use_cache=True, logits_to_keep=1,
                 )
-        return out
+        return out, margins
+
+    def _assert_greedy_match(self, ours: list[int], ref: list[int], margins: list[float], label: str) -> None:
+        for i, (a, b) in enumerate(zip(ours, ref)):
+            if a == b:
+                continue
+            self.assertLess(
+                margins[i], self.NEAR_TIE_MARGIN,
+                f"{label}: token {i} differs ({a} vs {b}) with reference margin "
+                f"{margins[i]:.3f} >= {self.NEAR_TIE_MARGIN} (not a bf16 near-tie)",
+            )
+            print(f"\n[parity/greedy] {label}: near-tie at token {i} (margin {margins[i]:.3f}), "
+                  f"{i} tokens matched before it")
+            return
+        self.assertEqual(len(ours), len(ref), label)
 
     def test_plumbing_parity_single_chunk(self) -> None:
         """Gate 1: arena round-trip is lossless. Prefill with the whole
@@ -248,8 +274,8 @@ class TestRWKV7Parity(unittest.TestCase):
         ]
         loop.generate(reqs, SamplingParams(temperature=0.0))
         for req, prompt in zip(reqs, eng["prompts"]):
-            ref = self._reference_greedy(eng["model"], prompt, 32)
-            self.assertEqual(req.output_token_ids, ref, f"len={len(prompt)}")
+            ref, margins = self._reference_greedy(eng["model"], prompt, 32)
+            self._assert_greedy_match(req.output_token_ids, ref, margins, f"len={len(prompt)}")
 
     def test_concurrent_matches_sequential(self) -> None:
         """State isolation: two requests decoded as one batch produce the

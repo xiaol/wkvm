@@ -113,8 +113,15 @@ def main() -> None:
     ap.add_argument("--max-new", type=int, default=32)
     ap.add_argument("--scene-max-new", type=int, default=48)
     ap.add_argument("--json", default="experiments/results/m4_qwen35_hybrid_smoke.json")
+    ap.add_argument("--kernels", default=None, choices=(None, "auto", "fla", "torch"),
+                    help="overrides WKVM_KERNELS for this run")
     args = ap.parse_args()
+    if args.kernels:
+        os.environ["WKVM_KERNELS"] = args.kernels
 
+    from wkvm.runner.kernels import select_kernels
+
+    kernels = select_kernels()  # WKVM_KERNELS=auto|fla|torch, before any modeling import
     from transformers import AutoTokenizer
 
     from wkvm.core.config import SchedulerConfig
@@ -123,6 +130,12 @@ def main() -> None:
 
     tok = AutoTokenizer.from_pretrained(args.model)
     eos, pad = tok.eos_token_id, tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+    versions = {}
+    if kernels == "fla":
+        import fla
+        import triton
+
+        versions = {"fla": fla.__version__, "triton": triton.__version__}
     result: dict = {
         "engine": "wkvm-m4-hybrid",
         "model": args.model,
@@ -132,7 +145,13 @@ def main() -> None:
         "prefill_chunk": args.prefill_chunk,
         "gpu": torch.cuda.get_device_name(0),
         "torch": torch.__version__,
-        "kernels": "transformers pure-torch GDN fallback (no fla/triton on host), SDPA guest attention",
+        "kernels": (
+            f"fla {versions.get('fla')} Triton {versions.get('triton')} GDN kernels (chunk + fused recurrent), "
+            "torch causal conv1d, SDPA guest attention"
+            if kernels == "fla"
+            else "transformers pure-torch GDN fallback, SDPA guest attention"
+        ),
+        "kernel_mode": kernels,
         "git": os.popen("git rev-parse --short HEAD").read().strip(),
     }
 

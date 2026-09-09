@@ -29,6 +29,17 @@ class Qwen35HybridRunner:
         self.bank = bank
         self.prefill_chunk = prefill_chunk
         self.device = bank.device
+        self.graphs = None  # HybridDecodeGraphs once enable_cuda_graphs() is called
+
+    def enable_cuda_graphs(self, **kwargs) -> None:
+        """Capture-and-replay decode forwards per (batch, length) bucket
+        (``wkvm/runner/hybrid_graph.py``). Steps outside every bucket run
+        eagerly; prefill always runs eagerly."""
+        if self.device.type != "cuda":
+            raise RuntimeError("CUDA graphs need a CUDA bank")
+        from wkvm.runner.hybrid_graph import HybridDecodeGraphs
+
+        self.graphs = HybridDecodeGraphs(self.model, self.bank, **kwargs)
 
     @torch.inference_mode()
     def prefill(self, token_ids: list[int], slots: dict[str, int]) -> torch.Tensor:
@@ -47,6 +58,10 @@ class Qwen35HybridRunner:
     def decode_step(self, slot_batch: list[dict[str, int]], last_tokens: list[int]) -> torch.Tensor:
         if len(slot_batch) != len(last_tokens):
             raise ValueError("slot_batch and last_tokens length mismatch")
+        if self.graphs is not None:
+            logits = self.graphs.decode_step(slot_batch, last_tokens)
+            if logits is not None:
+                return logits.float()
         ids = torch.tensor(last_tokens, dtype=torch.long, device=self.device).unsqueeze(1)
         cache = self.bank.gather(slot_batch, new_tokens=1)
         logits = self._forward(ids, cache)

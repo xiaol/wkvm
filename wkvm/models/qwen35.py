@@ -346,7 +346,13 @@ def load_qwen35(
     for inference. Returns ``(decoder, layout)``; the decoder is frozen, in
     eval mode (the GDN layer dispatches on ``seq_len == 1`` for the recurrent
     kernel, not on ``training``, but eval also disables dropout).
+
+    Kernel path (fla Triton vs pure torch) is decided here, before the
+    modeling module is imported — see ``wkvm/runner/kernels.py``.
     """
+    from wkvm.runner.kernels import select_kernels
+
+    select_kernels()
     from transformers import AutoConfig
 
     config = AutoConfig.from_pretrained(model_path)

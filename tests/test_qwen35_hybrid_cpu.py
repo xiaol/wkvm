@@ -21,6 +21,12 @@ from wkvm.core.request import Request
 
 try:
     import torch
+
+    from wkvm.runner.kernels import select_kernels
+
+    # This suite certifies the state plumbing on CPU against HF's own torch
+    # path; fla (Triton) must not be resolved by the modeling module.
+    select_kernels("torch")
     from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
 
     HAS_DEPS = True

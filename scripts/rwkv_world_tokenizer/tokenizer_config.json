@@ -1,0 +1,8 @@
+{
+  "tokenizer_class": "RwkvWorldTokenizer",
+  "auto_map": {
+    "AutoTokenizer": ["tokenization_rwkv_world.RwkvWorldTokenizer", null]
+  },
+  "eos_token": "\n\n",
+  "clean_up_tokenization_spaces": false
+}

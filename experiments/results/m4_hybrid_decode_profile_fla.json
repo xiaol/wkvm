@@ -1,0 +1,178 @@
+{
+ "kernels": "fla",
+ "prompt_tokens": 320,
+ "rows": [
+  {
+   "B": 1,
+   "wall_step_ms": 88.25535774230957,
+   "tok_s": 11.330756858068918,
+   "components_ms": {
+    "gather": 2.8681516647338867,
+    "forward": 76.97672843933105,
+    "scatter": 2.3617982864379883
+   },
+   "forward_cuda_kernel_ms_est": 23.201045333332893,
+   "kernel_launches_per_step": 6338,
+   "top": [
+    {
+     "op": "aten::matmul",
+     "cuda_ms": 14.820569666666648,
+     "cpu_ms": 17.989762999999936,
+     "calls": 250
+    },
+    {
+     "op": "aten::linear",
+     "cuda_ms": 14.816342999999993,
+     "cpu_ms": 20.368963999999867,
+     "calls": 249
+    },
+    {
+     "op": "aten::mm",
+     "cuda_ms": 14.816342999999993,
+     "cpu_ms": 13.549342666666833,
+     "calls": 249
+    },
+    {
+     "op": "ampere_bf16_s16816gemm_bf16_128x64_ldg8_f2f_stages_32x6_tn",
+     "cuda_ms": 5.559145000000021,
+     "cpu_ms": 0.0,
+     "calls": 64
+    },
+    {
+     "op": "ampere_bf16_s16816gemm_bf16_64x64_sliced1x2_ldg8_f2f_stages_64x6_tn",
+     "cuda_ms": 4.906653666666622,
+     "cpu_ms": 0.0,
+     "calls": 88
+    },
+    {
+     "op": "aten::copy_",
+     "cuda_ms": 2.8812396666666067,
+     "cpu_ms": 12.498338333333232,
+     "calls": 497
+    },
+    {
+     "op": "aten::to",
+     "cuda_ms": 2.2364393333332866,
+     "cpu_ms": 18.23043466666684,
+     "calls": 548
+    },
+    {
+     "op": "aten::_to_copy",
+     "cuda_ms": 2.2364393333332866,
+     "cpu_ms": 16.481198666666447,
+     "calls": 391
+    },
+    {
+     "op": "ampere_bf16_s16816gemm_bf16_128x64_sliced1x2_ldg8_f2f_stages_64x6_tn",
+     "cuda_ms": 1.9419819999999575,
+     "cpu_ms": 0.0,
+     "calls": 32
+    },
+    {
+     "op": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_k",
+     "cuda_ms": 1.693602000000193,
+     "cpu_ms": 0.0,
+     "calls": 250
+    },
+    {
+     "op": "aten::mul",
+     "cuda_ms": 1.674656000000068,
+     "cpu_ms": 8.932044333333115,
+     "calls": 332
+    },
+    {
+     "op": "ampere_bf16_s16816gemm_bf16_64x64_sliced1x2_ldg8_f2f_stages_64x5_tn",
+     "cuda_ms": 1.5145746666666722,
+     "cpu_ms": 0.0,
+     "calls": 1
+    }
+   ]
+  },
+  {
+   "B": 16,
+   "wall_step_ms": 115.14863967895508,
+   "tok_s": 138.95083819148417,
+   "components_ms": {
+    "gather": 11.708784103393555,
+    "forward": 94.26100254058838,
+    "scatter": 9.300065040588379
+   },
+   "forward_cuda_kernel_ms_est": 25.750820333333138,
+   "kernel_launches_per_step": 6385,
+   "top": [
+    {
+     "op": "aten::matmul",
+     "cuda_ms": 14.71799633333344,
+     "cpu_ms": 18.181989000000094,
+     "calls": 250
+    },
+    {
+     "op": "aten::linear",
+     "cuda_ms": 14.714206333333431,
+     "cpu_ms": 21.536638000000238,
+     "calls": 249
+    },
+    {
+     "op": "aten::mm",
+     "cuda_ms": 14.714206333333431,
+     "cpu_ms": 14.55523833333339,
+     "calls": 249
+    },
+    {
+     "op": "ampere_bf16_s16816gemm_bf16_64x64_sliced1x2_ldg8_f2f_stages_64x5_tn",
+     "cuda_ms": 7.316479000000066,
+     "cpu_ms": 0.0,
+     "calls": 96
+    },
+    {
+     "op": "ampere_bf16_s16816gemm_bf16_64x64_sliced1x2_ldg8_f2f_stages_64x6_tn",
+     "cuda_ms": 5.060056333333358,
+     "cpu_ms": 0.0,
+     "calls": 88
+    },
+    {
+     "op": "aten::copy_",
+     "cuda_ms": 4.033964333333071,
+     "cpu_ms": 13.655126000000061,
+     "calls": 521
+    },
+    {
+     "op": "aten::to",
+     "cuda_ms": 2.1873659999998822,
+     "cpu_ms": 17.966668666666514,
+     "calls": 548
+    },
+    {
+     "op": "aten::_to_copy",
+     "cuda_ms": 2.1873659999998822,
+     "cpu_ms": 17.107678666667006,
+     "calls": 391
+    },
+    {
+     "op": "aten::mul",
+     "cuda_ms": 1.8361679999999814,
+     "cpu_ms": 8.750030666666406,
+     "calls": 332
+    },
+    {
+     "op": "aten::cat",
+     "cuda_ms": 1.650504999999993,
+     "cpu_ms": 2.582090666666684,
+     "calls": 73
+    },
+    {
+     "op": "FusedRecurrentFunction",
+     "cuda_ms": 1.6490129999999696,
+     "cpu_ms": 8.661495666666681,
+     "calls": 24
+    },
+    {
+     "op": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_k",
+     "cuda_ms": 1.6475229999999235,
+     "cpu_ms": 0.0,
+     "calls": 250
+    }
+   ]
+  }
+ ]
+}

@@ -122,6 +122,9 @@ def load_rwkv7(
     eval matters beyond dropout: the fla layer dispatches chunk vs fused
     recurrent kernels on ``self.training or seq_len >= 64``.
     """
+    from wkvm.runner.kernels import select_kernels
+
+    select_kernels("fla")  # the native RWKV-7 path is fla's compute graph
     from fla.models.rwkv7 import RWKV7ForCausalLM
 
     model = RWKV7ForCausalLM.from_pretrained(model_path, dtype=dtype)

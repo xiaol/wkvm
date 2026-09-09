@@ -111,6 +111,52 @@ every session held the given context: 120 at 4k, 37 at 16k, 10 at 64k. The
 recurrent part is a constant 49.5 MiB per session; the pages are the whole
 context cost and are shared across sessions of different lengths.
 
+## F. Same smoke on fla Triton kernels (`m4_qwen35_hybrid_smoke_fla.json`)
+
+With `fla` 0.5.2 / Triton 3.8.0 installed (see `wkvm/runner/kernels.py`),
+transformers dispatches Gated DeltaNet to fla's chunk and fused-recurrent
+kernels; the HF reference on the second GPU uses the same kernels.
+
+| check | torch path | fla path |
+|---|---|---|
+| parity vs HF (3 prompts) | bit-exact | bit-exact |
+| 8 scene prompts, batched == alone | 8/8 | 8/8 |
+| tuned handle == adapter runtime | 8/8 | 8/8 |
+| 12,637-token prompt, greedy == HF | yes, 12.1 s | yes, 4.2 s |
+| 8-prompt batched wall | 8.8 s | 5.6 s |
+| decode step B=1 / 4 / 8 / 16 (ms) | 88.9 / 92.2 / 95.3 / 103.0 | 82.3 / 85.4 / 88.2 / 96.1 |
+
+Prefill is now kernel-bound and fast; decode barely moves, because a decode
+step is launch-bound: `experiments/hybrid_decode_profile.py` measures the
+B=1 forward at 77 ms wall for ~23 ms of GPU kernel time over ~6,300 kernel
+launches (HF-module glue: `aten::to`, `copy_`, `mul` dominate CPU time; the
+GEMMs dominate GPU time). At B=16 the paged gather adds 12 ms and scatter
+9 ms. CUDA graphs on the decode forward are the next lever
+(`docs/HYBRID_ENGINE_PLAN.md`, H5).
+
+## G. CUDA-graph decode (`m4_hybrid_decode_profile_fla_graphs.json`)
+
+`Engine.from_qwen35(..., cuda_graphs=True)` captures the decode forward per
+(batch, length) bucket and replays it; gather/scatter stay eager. Same 9B,
+same 320-token prompts, fla kernels, one A100:
+
+| B | eager step (ms) | graphed step (ms) | graphed tok/s | replay alone (ms) | fill + scatter (ms) |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 82 | 26 | 38 | 18 | 3 + 2 |
+| 4 | 85 | 30 | 132 | 19 | |
+| 8 | 88 | 36 | 220 | 21 | |
+| 16 | 96 | 46 | 344 | 25 | 9 + 7 |
+
+Steps are `engine.step()` wall (scheduling, gather, replay, scatter, greedy
+argmax + host sync); "replay alone" is the captured forward.
+
+Token output is identical to eager decode (`tests/test_hybrid_graph_gpu.py`
+on a tiny fp32 model: batched with padding, bucket transitions, eager
+fallback beyond the largest bucket, and store resume). Graph capture
+happens lazily on first use of a bucket (~0.5 s each); the first
+`hybrid_decode_profile.py` run without a warm step averaged that into the
+timing, hence the corrected numbers here.
+
 ## Caveats
 
 - Single run, one GPU, greedy only; no incumbent comparison.
