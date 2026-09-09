@@ -130,28 +130,35 @@ resume of the imported handle; per-slot bytes and slot capacity.
 
 ### H5. Throughput floor ▶ (kernels ✅, profile ✅, graphs ✅, paged kernel ☐)
 
-- **CUDA-graph decode ✅** (`wkvm/runner/hybrid_graph.py`,
+- **CUDA-graph decode with resident rows ✅** (`wkvm/runner/hybrid_graph.py`,
   `Engine(..., cuda_graphs=True)` / `Engine.from_qwen35(..., cuda_graphs=True)`):
   the decode forward is captured once per (batch bucket, length bucket) over
-  static buffers allocated at the largest bucket and sliced as views; the
-  mask and positions are computed in-graph from a static `lens` tensor; the
-  paged gather fills the static buffers before replay and `bank.scatter`
-  commits after it (out-graph); padded rows use slot 0 / page 0. Steps
-  outside every bucket run eagerly. Gate: `tests/test_hybrid_graph_gpu.py`
-  (eager == graph token-for-token across padding, bucket transitions, the
-  eager fallback and store resume). On the 9B (fla kernels):
+  static buffers allocated at the largest bucket and sliced as views; mask
+  and positions are computed in-graph from a static `lens` tensor. A running
+  request's state stays *resident* in a row between steps: the GDN state is
+  updated in place and the new K/V token is written in-graph at column
+  `lens[row]`, so nothing is gathered or scattered per step. The bank
+  (recurrent slots + pages) remains the durable owner: a row is filled once
+  when the request first decodes, flushed when eager code needs the state
+  (store export, snapshot), evicted when the request leaves the graph path
+  (prefill, eager fallback, absent from the batch), dropped on finish/abort.
+  Rows stay contiguous by swap-on-departure. Gate:
+  `tests/test_hybrid_graph_gpu.py` (eager == graph token-for-token with
+  staggered departures and arrivals, bucket transitions, eager fallback,
+  hibernate mid-decode, store resume). On the 9B (fla kernels), the step is
+  now the replay itself:
 
-  | B | eager step | graphed step (engine.step) | replay alone | gather + scatter |
-  |---:|---:|---:|---:|---:|
-  | 1 | 82 ms | 26 ms (38 tok/s) | 18 ms | 3 + 2 ms |
-  | 4 | 85 ms | 30 ms (132 tok/s) | 19 ms | |
-  | 8 | 88 ms | 36 ms (220 tok/s) | 21 ms | |
-  | 16 | 96 ms | 46 ms (344 tok/s) | 25 ms | 9 + 7 ms |
+  | B | eager step | graphed step (engine.step) | replay alone |
+  |---:|---:|---:|---:|
+  | 1 | 82 ms | 21 ms (48 tok/s) | 18 ms |
+  | 4 | 85 ms | 20 ms (196 tok/s) | 19 ms |
+  | 8 | 88 ms | 22 ms (369 tok/s) | 20 ms |
+  | 16 | 96 ms | 26 ms (616 tok/s) | 24 ms |
 
-  The remaining gap to the replay time is the out-graph paged gather and
-  scatter, which grow with B; folding them into the static buffers (keep the
-  resident K/V of running requests in place between steps, append only the
-  new token) is the next step, then a gather-free paged kernel.
+  The full smoke under graphs (`m4_qwen35_hybrid_smoke_fla_graphs.json`)
+  keeps every gate: bit-exact parity, batched == alone 8/8, tuned handle ==
+  adapter runtime 8/8, cold resume identical, 12.6k-token prompt identical
+  through the eager fallback; the 8-prompt batched run drops 5.6 s → 3.7 s.
 
 - **fla Triton kernels ✅** (`wkvm/runner/kernels.py`, `WKVM_KERNELS=auto|fla|torch`):
   transformers dispatches Gated DeltaNet to `fla.ops.gated_delta_rule` when
@@ -168,13 +175,16 @@ resume of the imported handle; per-slot bytes and slot capacity.
   glue (`aten::to/copy_/mul` dominate CPU time, the GEMMs dominate GPU
   time). At B=16: forward 94 ms (GPU ~26 ms), gather 12 ms, scatter 9 ms.
   Conclusion: the floor is launch overhead, not kernels.
-- **Next, in order:** (1) keep running requests' K/V resident in the static
-  graph buffers between steps (write the new token in-graph; the paged pool
-  stays the durable owner for admission, hibernate and long tails) so the
-  per-step gather disappears; (2) gather-free paged attention
-  (FlashInfer/FA3) for long contexts at high concurrency; (3) pre-capture
-  buckets at startup (`HybridDecodeGraphs` captures lazily today, ~0.5 s per
-  bucket on first use).
+- **Next, in order:** (1) the replay itself is now the floor (18 ms at B=1
+  for 32 layers of bf16 GEMMs on a 9B: weight-read bound, as expected); the
+  levers left are within-graph — a fused GDN step over all 24 layers is not
+  possible (layers are sequential), so this is the ceiling for a single
+  request on one A100; (2) larger batch buckets (32/64) once the pool and
+  static rows are sized for them (each row holds a full-length K/V window:
+  B=64 at a 4k window is 8 GiB), or a paged attention kernel so rows can
+  drop the window; (3) split mixed batches so one over-long request does not
+  push the whole batch to the eager path; (4) pre-capture buckets at startup
+  (~0.5 s per bucket on first use today).
 
 ### H6. Second hybrid family ☐
 

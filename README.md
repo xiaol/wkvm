@@ -258,9 +258,9 @@ see [`docs/HYBRID_ENGINE_PLAN.md`](docs/HYBRID_ENGINE_PLAN.md) and
 [`experiments/results/m4_qwen35_hybrid_smoke.md`](experiments/results/m4_qwen35_hybrid_smoke.md).
 Kernels: fla/Triton Gated DeltaNet when `fla` imports, pure torch otherwise
 (`WKVM_KERNELS=auto|fla|torch`). Decode is CUDA-graphed per batch/length
-bucket (`cuda_graphs=True`): on one A100 the 9B decodes at 26 ms/step (B=1)
-and 46 ms/step (B=16, 344 tok/s) vs 82/96 ms eager; single run, no incumbent
-comparison yet.
+bucket with running requests resident in the static rows (`cuda_graphs=True`):
+on one A100 the 9B decodes at 21 ms/step (B=1) and 26 ms/step (B=16,
+616 tok/s) vs 82/96 ms eager; single run, no incumbent comparison yet.
 The native RWKV-7 path now also runs from official `.pth` weights via
 [`scripts/convert_rwkv7_pth.py`](scripts/convert_rwkv7_pth.py) and matches the
 official `rwkv` package greedy-for-greedy

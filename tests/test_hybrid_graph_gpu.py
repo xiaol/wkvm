@@ -71,7 +71,9 @@ def _engine(cuda_graphs, num_slots: int = 4, chunk: int = 5, num_pages: int = 48
     )
 
 
-GRAPH_CFG = {"batch_buckets": (1, 2, 4), "length_buckets": (8, 16, 32), "warmup_iters": 1}
+# Length buckets cover prompt + new tokens of the fixture (max 31 + 15), so
+# rows stay resident for whole runs; the fallback test exceeds 64 on purpose.
+GRAPH_CFG = {"batch_buckets": (1, 2, 4), "length_buckets": (8, 16, 64), "warmup_iters": 1}
 
 
 def _run_all(engine, reqs):
@@ -82,41 +84,104 @@ def _run_all(engine, reqs):
 
 @unittest.skipUnless(HAS_CUDA, "CUDA unavailable")
 class TestHybridGraphs(unittest.TestCase):
+    NEW = (12, 7, 15)  # staggered departures: rows leave mid-batch, compaction moves rows
+
     def test_graph_matches_eager_batched_and_alone(self) -> None:
         fx = _fixture()
         eager = _engine(False)
-        reqs = [Request(prompt_token_ids=list(p), max_new_tokens=12) for p in fx["prompts"]]
+        reqs = [Request(prompt_token_ids=list(p), max_new_tokens=n) for p, n in zip(fx["prompts"], self.NEW)]
         for r in reqs:
             eager.add_request(r)
         ref = _run_all(eager, reqs)
 
         graphed = _engine(GRAPH_CFG)
-        reqs = [Request(prompt_token_ids=list(p), max_new_tokens=12) for p in fx["prompts"]]
+        reqs = [Request(prompt_token_ids=list(p), max_new_tokens=n) for p, n in zip(fx["prompts"], self.NEW)]
         for r in reqs:
             graphed.add_request(r)
         out = _run_all(graphed, reqs)
         self.assertEqual(out, ref)
-        stats = graphed.runner.graphs.stats
-        self.assertGreater(stats["replays"], 0)
-        self.assertGreaterEqual(stats["captures"], 2)  # 3 rows -> bucket 4; lengths cross 32 -> 8/16/32
-        self.assertEqual(graphed.bank.guest_len[0], 0)
-        # alone, B=1 bucket
-        for p, r in zip(fx["prompts"], ref):
-            req = Request(prompt_token_ids=list(p), max_new_tokens=12)
+        g = graphed.runner.graphs
+        self.assertGreater(g.stats["replays"], 0)
+        self.assertGreaterEqual(g.stats["captures"], 2)  # 3 rows -> bucket 4; lengths cross 16 -> 16/64
+        self.assertEqual(g.stats["acquires"], 3)
+        self.assertEqual(g.stats["releases"], 3)  # every row left through finish, none through fallback
+        self.assertEqual(g.stats["eager_fallbacks"], 0)
+        self.assertGreater(g.stats["row_moves"], 0)
+        self.assertEqual(g.n_resident, 0)
+        self.assertEqual(g.row_of, {})
+        # alone, B=1 bucket, slots reused
+        for p, r, n in zip(fx["prompts"], ref, self.NEW):
+            req = Request(prompt_token_ids=list(p), max_new_tokens=n)
             graphed.add_request(req)
             self.assertEqual(_run_all(graphed, [req])[0], r)
+        self.assertEqual(g.n_resident, 0)
+
+    def test_staggered_arrivals_match_alone(self) -> None:
+        """A request joining a running graphed batch is acquired mid-flight;
+        results equal the alone runs (mixed residency + prefill eviction)."""
+        fx = _fixture()
+        alone = []
+        for p, n in zip(fx["prompts"], self.NEW):
+            e = _engine(GRAPH_CFG)
+            req = Request(prompt_token_ids=list(p), max_new_tokens=n)
+            e.add_request(req)
+            alone.append(_run_all(e, [req])[0])
+        eng = _engine(GRAPH_CFG)
+        reqs = []
+        for i, (p, n) in enumerate(zip(fx["prompts"], self.NEW)):
+            req = Request(prompt_token_ids=list(p), max_new_tokens=n)
+            eng.add_request(req)
+            reqs.append(req)
+            for _ in range(3):  # let the batch decode a few steps before the next arrival
+                eng.step()
+        while eng.has_unfinished:
+            eng.step()
+        self.assertEqual([r.output_token_ids for r in reqs], alone)
+
+    def test_hibernate_mid_decode_under_graphs(self) -> None:
+        """Snapshot a resident request (flush row -> bank -> store), abort it
+        (release), resume from the handle: identical to the uninterrupted run."""
+        fx = _fixture()
+        tmp = tempfile.mkdtemp()
+        try:
+            eng = _engine(GRAPH_CFG)
+            eng.attach_store(tmp)
+            prompt = fx["prompts"][2]
+            full = Request(prompt_token_ids=list(prompt), max_new_tokens=16)
+            eng.add_request(full)
+            reference = _run_all(eng, [full])[0]
+
+            req = Request(prompt_token_ids=list(prompt), max_new_tokens=16)
+            eng.add_request(req)
+            while len(req.output_token_ids) < 6:
+                eng.step()
+            self.assertTrue(eng.runner.graphs.is_resident(req.slots))
+            handle = eng.hibernate(req.req_id, "mid")
+            self.assertEqual(eng.runner.graphs.n_resident, 0)
+            done = list(req.output_token_ids)
+            rest = _run_all(eng, [eng.submit_from_handle(handle, max_new_tokens=16 - len(done))])[0]
+            self.assertEqual(reference, done + rest)
+            self.assertGreater(eng.runner.graphs.stats["flushes"], 0)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def test_eager_fallback_beyond_buckets(self) -> None:
+        """62 prompt tokens + 6 new crosses the 64 bucket mid-decode: the
+        first steps replay, the rest run eagerly after the row is evicted."""
         fx = _fixture()
         eager = _engine(False, num_pages=64)
-        req = Request(prompt_token_ids=list(fx["prompts"][2]) * 2, max_new_tokens=6)  # 62 + 6 > 32 bucket
+        req = Request(prompt_token_ids=list(fx["prompts"][2]) * 2, max_new_tokens=6)
         eager.add_request(req)
         ref = _run_all(eager, [req])[0]
         graphed = _engine(GRAPH_CFG, num_pages=64)
         req = Request(prompt_token_ids=list(fx["prompts"][2]) * 2, max_new_tokens=6)
         graphed.add_request(req)
         self.assertEqual(_run_all(graphed, [req])[0], ref)
-        self.assertGreater(graphed.runner.graphs.stats["eager_fallbacks"], 0)
+        g = graphed.runner.graphs
+        self.assertGreater(g.stats["replays"], 0)
+        self.assertGreater(g.stats["eager_fallbacks"], 0)
+        self.assertEqual(g.stats["evicts"], 1)
+        self.assertEqual(g.n_resident, 0)
 
     def test_resume_from_store_under_graphs(self) -> None:
         fx = _fixture()

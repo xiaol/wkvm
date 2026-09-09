@@ -134,28 +134,49 @@ GEMMs dominate GPU time). At B=16 the paged gather adds 12 ms and scatter
 9 ms. CUDA graphs on the decode forward are the next lever
 (`docs/HYBRID_ENGINE_PLAN.md`, H5).
 
-## G. CUDA-graph decode (`m4_hybrid_decode_profile_fla_graphs.json`)
+## G. CUDA-graph decode with resident rows (`m4_hybrid_decode_profile_fla_graphs.json`)
 
 `Engine.from_qwen35(..., cuda_graphs=True)` captures the decode forward per
-(batch, length) bucket and replays it; gather/scatter stay eager. Same 9B,
-same 320-token prompts, fla kernels, one A100:
+(batch, length) bucket and replays it. Running requests keep their state
+resident in the static rows between steps (GDN state updated in place, the
+new K/V token written in-graph at column `lens[row]`), so a step is the
+replay plus host-side bookkeeping. Same 9B, 320-token prompts, fla kernels,
+one A100:
 
-| B | eager step (ms) | graphed step (ms) | graphed tok/s | replay alone (ms) | fill + scatter (ms) |
-|---:|---:|---:|---:|---:|---:|
-| 1 | 82 | 26 | 38 | 18 | 3 + 2 |
-| 4 | 85 | 30 | 132 | 19 | |
-| 8 | 88 | 36 | 220 | 21 | |
-| 16 | 96 | 46 | 344 | 25 | 9 + 7 |
+| B | eager step (ms) | graphed step (ms) | graphed tok/s | replay alone (ms) |
+|---:|---:|---:|---:|---:|
+| 1 | 82 | 21 | 48 | 18 |
+| 4 | 85 | 20 | 196 | 19 |
+| 8 | 88 | 22 | 369 | 20 |
+| 16 | 96 | 26 | 616 | 24 |
 
-Steps are `engine.step()` wall (scheduling, gather, replay, scatter, greedy
-argmax + host sync); "replay alone" is the captured forward.
+Steps are `engine.step()` wall (scheduling, ids/lens copy, replay, greedy
+argmax + host sync); "replay alone" is the captured forward. An earlier
+variant that re-gathered and re-scattered the batch's state every step sat
+at 26–46 ms; residency removed that.
 
 Token output is identical to eager decode (`tests/test_hybrid_graph_gpu.py`
-on a tiny fp32 model: batched with padding, bucket transitions, eager
-fallback beyond the largest bucket, and store resume). Graph capture
-happens lazily on first use of a bucket (~0.5 s each); the first
-`hybrid_decode_profile.py` run without a warm step averaged that into the
-timing, hence the corrected numbers here.
+on a tiny fp32 model: staggered departures and arrivals with row
+compaction, bucket transitions, eager fallback beyond the largest bucket,
+hibernate mid-decode, store resume). Graph capture happens lazily on first
+use of a bucket (~0.5 s each) and is excluded from these timings.
+
+## H. The whole smoke under graphs (`m4_qwen35_hybrid_smoke_fla_graphs.json`)
+
+Same script with `--cuda-graphs`: parity vs HF bit-exact (3/3), tuned
+handle == adapter runtime 8/8 with cold resume identical, the 12,637-token
+prompt identical to HF through the eager fallback (above the 4096 length
+bucket; 4.4 s). The 8-prompt batched run took 3.7 s (5.6 s eager fla,
+8.8 s torch). Graph stats over the run: 450 replays, 9 captures, 15 eager
+fallbacks, 57 row acquires / releases, 27 row moves, 0 flushes needed.
+
+Batched == alone: 7/8. Prompt 4 (583 tokens) diverges at output token 25,
+where the alone run's top-1/top-2 logit margin is **exactly 0.0** — a bf16
+tie that the batch-shape-dependent GEMM accumulation order breaks the other
+way (the same effect the M2 1.5B gate documents). Eager-alone equals
+graph-alone on all 8 prompts, so residency itself is exact; the diagnostic
+(per-step margins for alone-graph, alone-eager, batched-graph) is what
+established this.
 
 ## Caveats
 

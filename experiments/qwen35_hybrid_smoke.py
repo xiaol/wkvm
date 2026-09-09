@@ -115,6 +115,7 @@ def main() -> None:
     ap.add_argument("--json", default="experiments/results/m4_qwen35_hybrid_smoke.json")
     ap.add_argument("--kernels", default=None, choices=(None, "auto", "fla", "torch"),
                     help="overrides WKVM_KERNELS for this run")
+    ap.add_argument("--cuda-graphs", action="store_true", help="CUDA-graph decode with resident rows (H5)")
     args = ap.parse_args()
     if args.kernels:
         os.environ["WKVM_KERNELS"] = args.kernels
@@ -152,6 +153,7 @@ def main() -> None:
             else "transformers pure-torch GDN fallback, SDPA guest attention"
         ),
         "kernel_mode": kernels,
+        "cuda_graphs": args.cuda_graphs,
         "git": os.popen("git rev-parse --short HEAD").read().strip(),
     }
 
@@ -160,7 +162,7 @@ def main() -> None:
     engine = Engine.from_qwen35(
         args.model, num_slots=args.slots, guest_pool_tokens=args.guest_pool_tokens,
         page_tokens=args.page_tokens, device=args.engine_device,
-        stop_token_ids=frozenset({eos}), prefill_chunk=args.prefill_chunk,
+        stop_token_ids=frozenset({eos}), prefill_chunk=args.prefill_chunk, cuda_graphs=args.cuda_graphs,
         scheduler_config=SchedulerConfig(
             max_tokens_per_step=8192, max_running_requests=args.slots,
             max_tokens_per_request_per_step=args.prefill_chunk,
@@ -286,6 +288,7 @@ def main() -> None:
             engine.add_request(r)
         while not pure_decode_step():  # prefill everything first
             engine.step()
+        engine.step()  # one warm decode step: lazy graph capture, if enabled, lands here
         torch.cuda.synchronize(dev)
         times = []
         for _ in range(8):
@@ -394,6 +397,9 @@ def main() -> None:
             }
         print("long_context", json.dumps(result["long_context"], ensure_ascii=False, indent=1), flush=True)
 
+    if engine.runner.graphs is not None:
+        result["graph_stats"] = dict(engine.runner.graphs.stats)
+        print("graph_stats", result["graph_stats"], flush=True)
     Path(args.json).parent.mkdir(parents=True, exist_ok=True)
     Path(args.json).write_text(json.dumps(result, ensure_ascii=False, indent=1))
     print("M4_SMOKE_OK", args.json)

@@ -168,6 +168,9 @@ class Qwen35StateBank:
         # model layer idx -> position inside the family bank
         self._gdn_pos = {li: j for j, li in enumerate(layout.gdn_layers)}
         self._attn_pos = {li: j for j, li in enumerate(layout.attn_layers)}
+        # Set by HybridDecodeGraphs: rows of running requests may live in its
+        # static buffers between decode steps (write-back cache over this bank).
+        self.resident = None
 
     # -- slot lifecycle -----------------------------------------------------------
 
@@ -175,10 +178,26 @@ class Qwen35StateBank:
     def _pages(slots: dict) -> tuple[int, ...]:
         return tuple(slots.get(GUEST_KV_FAMILY, ()))
 
+    def _sync_resident(self, slot_batch, evict: bool) -> None:
+        if self.resident is None:
+            return
+        for slots in slot_batch:
+            if evict:
+                self.resident.evict(slots)
+            else:
+                self.resident.flush(slots)
+
+    def release_slots(self, slots: dict) -> None:
+        """The request is done with these slots (finish/abort): drop any
+        resident row without writing back."""
+        if self.resident is not None:
+            self.resident.release(slots)
+
     def zero_slots(self, slots: dict) -> None:
         """Reset a freshly admitted request's slots (zero == fresh sequence).
         Pages are not zeroed: positions beyond ``guest_len`` are never read
         unmasked, and stale page contents are finite model outputs."""
+        self.release_slots(slots)
         self.gdn_state[:, slots[GDN_STATE_FAMILY]].zero_()
         self.gdn_conv[:, slots[GDN_CONV_FAMILY]].zero_()
         self.guest_len[slots[GDN_STATE_FAMILY]] = 0
@@ -231,6 +250,9 @@ class Qwen35StateBank:
     # -- gather / scatter -----------------------------------------------------------
 
     def gather(self, slot_batch: list[dict], new_tokens: int) -> SlotCache:
+        # The eager path takes over these requests: resident rows are written
+        # back and freed so the bank is the only copy again.
+        self._sync_resident(slot_batch, evict=True)
         for slots in slot_batch:
             self.check_capacity(slots, new_tokens)
         lens = [self.slot_len(s) for s in slot_batch]
@@ -301,6 +323,7 @@ class Qwen35StateBank:
         """Device -> host copies of one request's state. The guest tokens are
         gathered out of their pages, trimmed to ``guest_len`` — a snapshot
         costs O(tokens) and is page-size independent."""
+        self._sync_resident([slots], evict=False)  # the row stays; the bank is now current
         n = self.slot_len(slots)
         out = {
             GDN_STATE_FAMILY: self.gdn_state[:, slots[GDN_STATE_FAMILY]],

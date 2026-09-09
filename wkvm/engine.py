@@ -100,6 +100,12 @@ class Engine:
         self.stop_token_ids = stop_token_ids
         self._params: dict[str, SamplingParams] = {}
         self._generators: dict[str, torch.Generator | None] = {}
+        self.store = None
+        self._save_on_finish: dict[str, str] = {}
+        self._finish_handles: dict[str, str] = {}
+        # The one moment end-of-life state is still addressable: snapshot if
+        # armed, then let the bank drop any resident graph row.
+        self.scheduler.on_finish = self._on_finish
 
     @classmethod
     def from_pretrained(
@@ -167,9 +173,17 @@ class Engine:
         self._params[request.req_id] = params
 
     def abort_request(self, req_id: str) -> None:
+        req = self.scheduler.requests.get(req_id)
+        if req is not None and req.slots:
+            self._release_bank(req.slots)
         self.scheduler.abort_request(req_id)
         self._params.pop(req_id, None)
         self._generators.pop(req_id, None)
+
+    def _release_bank(self, slots: dict) -> None:
+        release = getattr(self.bank, "release_slots", None)
+        if release is not None:
+            release(slots)
 
     @property
     def has_unfinished(self) -> bool:
@@ -264,17 +278,20 @@ class Engine:
     # -- durable state (M3) ---------------------------------------------------
 
     def attach_store(self, store_dir) -> None:
-        """Create the StateStore and wire snapshot-on-finish."""
+        """Create the StateStore (snapshot-on-finish is wired at construction)."""
         from wkvm.store import StateStore
 
         self.store = StateStore(self.bank, store_dir)
-        self._save_on_finish: dict[str, str] = {}
-        self._finish_handles: dict[str, str] = {}
-        self.scheduler.on_finish = self._snapshot_on_finish
+
+    def _on_finish(self, req: Request) -> None:
+        self._snapshot_on_finish(req)
+        self._release_bank(req.slots)
 
     def _snapshot_on_finish(self, req: Request) -> None:
         name = self._save_on_finish.pop(req.req_id, None)
         if name is not None:
+            if self.store is None:
+                raise RuntimeError("save_on_finish armed without a store (call attach_store)")
             self._finish_handles[req.req_id] = self.store.save(
                 name,
                 req.slots,
@@ -284,6 +301,8 @@ class Engine:
 
     def save_on_finish(self, req_id: str, name: str) -> None:
         """Arm an automatic snapshot for when this request finishes."""
+        if self.store is None:
+            raise RuntimeError("attach_store() before save_on_finish()")
         self._save_on_finish[req_id] = name
 
     def snapshot_request(self, req_id: str, name: str) -> str:
