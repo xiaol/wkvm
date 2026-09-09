@@ -55,16 +55,33 @@ def _fixture():
         layout = Qwen35HybridLayout.from_config(config, dtype=torch.float32, page_tokens=PAGE_TOKENS)
         gen = torch.Generator().manual_seed(1)
         prompts = [torch.randint(1, 128, (n,), generator=gen).tolist() for n in (23, 7, 31)]
-        _shared.update(decoder=decoder, layout=layout, prompts=prompts)
+        _shared.update(hf=hf, decoder=decoder, layout=layout, prompts=prompts)
     return _shared
 
 
-def _engine(cuda_graphs, num_slots: int = 4, chunk: int = 5, num_pages: int = 48):
+def _decoder_on(device: str):
+    """The fixture's decoder on another device, as an independent copy (the
+    shared one stays on the default device for the other tests)."""
+    import copy
+
+    from wkvm.models.qwen35 import Qwen35Decoder
+
+    fx = _fixture()
+    if device == "cuda":
+        return fx["decoder"]
+    key = f"decoder@{device}"
+    if key not in _shared:
+        hf = copy.deepcopy(fx["hf"]).to(device)
+        _shared[key] = Qwen35Decoder.from_hf(hf)
+    return _shared[key]
+
+
+def _engine(cuda_graphs, num_slots: int = 4, chunk: int = 5, num_pages: int = 48, device: str = "cuda"):
     from wkvm.engine import Engine
 
     fx = _fixture()
     return Engine(
-        fx["decoder"], fx["layout"], num_slots=num_slots, device="cuda",
+        _decoder_on(device), fx["layout"], num_slots=num_slots, device=device,
         scheduler_config=SchedulerConfig(max_tokens_per_step=64, max_running_requests=num_slots,
                                          max_tokens_per_request_per_step=chunk),
         prefill_chunk=chunk, num_pages=num_pages, cuda_graphs=cuda_graphs,
@@ -164,6 +181,22 @@ class TestHybridGraphs(unittest.TestCase):
             self.assertGreater(eng.runner.graphs.stats["flushes"], 0)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    @unittest.skipUnless(HAS_CUDA and torch.cuda.device_count() >= 2, "needs a second GPU")
+    def test_graphs_on_non_default_device(self) -> None:
+        """Capture on cuda:1 must recompute on replay (a capture recorded on
+        the default device's stream yields an empty graph whose replay is a
+        silent no-op; the engine now guards against exactly that)."""
+        fx = _fixture()
+        eager = _engine(False, device="cuda:1")
+        req = Request(prompt_token_ids=list(fx["prompts"][0]), max_new_tokens=10)
+        eager.add_request(req)
+        ref = _run_all(eager, [req])[0]
+        graphed = _engine(GRAPH_CFG, device="cuda:1")
+        req = Request(prompt_token_ids=list(fx["prompts"][0]), max_new_tokens=10)
+        graphed.add_request(req)
+        self.assertEqual(_run_all(graphed, [req])[0], ref)
+        self.assertGreater(graphed.runner.graphs.stats["replays"], 0)
 
     def test_eager_fallback_beyond_buckets(self) -> None:
         """62 prompt tokens + 6 new crosses the 64 bucket mid-decode: the

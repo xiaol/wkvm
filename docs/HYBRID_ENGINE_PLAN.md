@@ -186,6 +186,37 @@ resume of the imported handle; per-slot bytes and slot capacity.
   push the whole batch to the eager path; (4) pre-capture buckets at startup
   (~0.5 s per bucket on first use today).
 
+### H7. Long-context quality and incumbent comparison ✅ (first pass)
+
+- **RULER-lite** (`experiments/ruler_lite.py`): RULER's 12 synthetic tasks
+  (niah x8, vt, cwe, fwe, qa_1) ported onto local SQuAD text with RULER's
+  templates and metrics; 20 samples per task at 4k/8k/16k/32k. wkvm (graphs,
+  fla) scores 1.00 on every cell; the HF reference on byte-identical prompts
+  is the agreement gate (`--compare`), results in
+  `experiments/results/ruler_lite_*.json`.
+- **vLLM 0.29 on the same box** (`experiments/results/qwen35_hybrid_vs_vllm_20260910.md`):
+  run through NVIDIA's CUDA 13 forward-compat library on the 12.8 driver.
+  Same prompts, same shape: vLLM is 1.3x (348-token, B=1) to 2.2x
+  (13,824-token, B=16) faster end to end. The gap is prefill (one request at
+  a time through eager HF modules, ~7k tok/s vs ~21k), guest attention at
+  long context (SDPA math over a masked 14k window, 28 ms vs 14 ms per
+  step) and kernel granularity (~6.3k kernels per step even inside the
+  graph). SGLang cannot run here (aarch64 kernel wheels have no sm_80 code).
+- A capture bug surfaced on the way: `torch.cuda.graph` records the
+  *current* device's stream, so on `cuda:1` the graph was empty and replays
+  were silent no-ops. Capture/replay now run under `torch.cuda.device(bank)`
+  and a post-capture replay check refuses graphs that do not recompute.
+
+### H8. What the comparison says to build next ▶
+
+1. Batched prefill: run every scheduled prefill chunk of the step as one
+   ragged forward (`wkvm.core.mixed_batch` already defines the contract).
+2. Paged attention kernel for the guest layers (FlashInfer decode/prefill
+   over the pool's pages) — removes the masked SDPA and the row/page
+   duplication at once.
+3. Fused per-layer decode kernels (RMSNorm + projections + gated norm) to
+   close the 4 ms per-step gap at B=1.
+
 ### H6. Second hybrid family ☐
 
 Kimi-Linear / Qwen3-Next with MoE: MoE-by-dependency (fused-MoE kernels as

@@ -3,3 +3,6 @@ __pycache__/
 .venv/
 dist/
 build/
+
+# RULER-lite prompt cache (52 MB, deterministic from --seed/--lengths/--samples; regenerated on demand)
+experiments/results/ruler_lite_data.json

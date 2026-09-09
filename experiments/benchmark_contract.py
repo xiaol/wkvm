@@ -14,6 +14,7 @@ DIRECT_SCHEMAS = frozenset(
         "wkvm.native_gemma_bench.v1",
         "wkvm.hf_gemma_bench.v1",
         "wkvm.incumbent_gemma_bench.v1",
+        "wkvm.hybrid_bench.v1",
     }
 )
 SERVING_SCHEMA = "wkvm.serving_bench.v1"

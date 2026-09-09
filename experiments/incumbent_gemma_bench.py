@@ -1572,7 +1572,6 @@ def run_vllm(
         "gpu_memory_utilization": args.vllm_gpu_mem_util,
         "enforce_eager": args.enforce_eager,
         "enable_prefix_caching": False,
-        "swap_space": 0,
         "disable_log_stats": False,
         "dtype": "bfloat16",
     }

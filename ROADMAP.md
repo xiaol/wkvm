@@ -39,7 +39,8 @@ Rationale for every design choice lives in `docs/ANGLE.md` §5 and `docs/RECURRE
 - `Engine`/`StateStore` generalised behind layout factories and a bank protocol; RNN-StateTuning initial states import as durable handles (`/v1/states/import`, `rule="import"` provenance).
 - Evidence: CPU parity suite `tests/test_qwen35_hybrid_cpu.py` + torch-free `tests/test_pages.py`; 9B smoke bit-exact vs HF including a 12k-token prompt through the paged pool.
 - H5 progress: fla Triton GDN kernels selected at load (`wkvm/runner/kernels.py`); prefill of a 12.6k-token prompt 12.1 s → 4.2 s, decode was launch-bound (~6k launches for ~23 ms of GPU time); CUDA-graphed decode (`wkvm/runner/hybrid_graph.py`) with resident rows brings the 9B step to 21 ms at B=1 and 26 ms at B=16 (616 tok/s) on one A100 — the replay itself. Native RWKV-7 verified on an A100 from official `.pth` weights (`scripts/convert_rwkv7_pth.py`) against the official `rwkv` package.
-- Not done here: gather-free paged attention kernel (FA3/FlashInfer) and CUDA graphs on the hybrid decode — H5 in the plan. Pure transformer as all-guest parity baseline deferred (a spec needs at least one slot family; trivial to add a 1-byte identity family when wanted).
+- Incumbent comparison (2026-09-10): vLLM 0.29 on the same A100 and prompts is 1.3x–2.2x faster end to end (13.8k and 348-token ladders, exact semantics both sides); RULER-lite 1.00 across 4k–32k. SGLang has no A100 aarch64 kernels. See experiments/results/qwen35_hybrid_vs_vllm_20260910.md.
+- Not done here: batched prefill, gather-free paged attention kernel (FA3/FlashInfer), fused decode kernels — H8 in the plan. Pure transformer as all-guest parity baseline deferred (a spec needs at least one slot family; trivial to add a 1-byte identity family when wanted).
 
 ## M5 — Recurrent mode for transformers (`docs/RECURRENT_MODE.md`)
 

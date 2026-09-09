@@ -137,29 +137,57 @@ class HybridDecodeGraphs:
         cache = self._cache(b, l)
         saved = self._save_rows(b, l)
         try:
-            with torch.inference_mode():
-                for _ in range(self.warmup_iters):  # Triton autotune + allocator warm-up
-                    self._forward_static(b, l, cache)
+            # Capture must happen on a stream of the bank's device. Relying on
+            # torch.cuda.graph's default side stream is not enough: once graphs
+            # exist on another device in the same process, a capture on
+            # ``cuda:1`` came out empty and its replay was a silent no-op
+            # (caught by the recompute check below). An explicit stream bound
+            # to ``self.device`` for warm-up and capture is what works.
+            with torch.inference_mode(), torch.cuda.device(self.device):
+                stream = torch.cuda.Stream(device=self.device)
+                with torch.cuda.stream(stream):
+                    for _ in range(self.warmup_iters):  # Triton autotune + allocator warm-up
+                        self._forward_static(b, l, cache)
                 torch.cuda.synchronize(self.device)
                 graph = torch.cuda.CUDAGraph()
                 if self._pool is None:
                     self._pool = torch.cuda.graph_pool_handle()
-                with torch.cuda.graph(graph, pool=self._pool):
+                with torch.cuda.graph(graph, pool=self._pool, stream=stream):
                     logits = self._forward_static(b, l, cache)
+                # Sanity: a replay must actually recompute (guards the empty-graph case).
+                before = logits.clone()
+                vocab = self.layout.vocab_size
+                self.ids[:b, 0] = (self.ids[:b, 0] + 1) % vocab
+                graph.replay()
+                torch.cuda.synchronize(self.device)
+                changed = not torch.equal(before, logits)
+                self.ids[:b, 0] = (self.ids[:b, 0] - 1) % vocab
+                if not changed:
+                    raise RuntimeError(
+                        f"CUDA graph for bucket {(b, l)} replays without recomputing "
+                        f"(captured on the wrong device/stream? bank device {self.device})"
+                    )
         finally:
             self._restore_rows(b, l, saved)
         self.stats["captures"] += 1
         return graph, cache, logits
 
     def _save_rows(self, b: int, l: int):
+        """Snapshot exactly what a forward mutates: the GDN state/conv of the
+        first ``b`` rows and, per attention layer, the single K/V column each
+        row writes at ``lens[row]`` (not the whole window — at B=16 x 14k
+        tokens that clone alone is 3.4 GiB)."""
+        rows = self.rows_idx[:b]
+        cols = self.lens[:b]
         return (self.gdn_state[:, :b].clone(), self.gdn_conv[:, :b].clone(),
-                self.k_win[:, :b, :, : l + 1].clone(), self.v_win[:, :b, :, : l + 1].clone())
+                self.k_win[:, rows, :, cols].clone(), self.v_win[:, rows, :, cols].clone(), rows, cols)
 
     def _restore_rows(self, b: int, l: int, saved) -> None:
-        self.gdn_state[:, :b].copy_(saved[0])
-        self.gdn_conv[:, :b].copy_(saved[1])
-        self.k_win[:, :b, :, : l + 1].copy_(saved[2])
-        self.v_win[:, :b, :, : l + 1].copy_(saved[3])
+        gdn_state, gdn_conv, k_cols, v_cols, rows, cols = saved
+        self.gdn_state[:, :b].copy_(gdn_state)
+        self.gdn_conv[:, :b].copy_(gdn_conv)
+        self.k_win[:, rows, :, cols] = k_cols
+        self.v_win[:, rows, :, cols] = v_cols
 
     # -- residency ------------------------------------------------------------------
 
@@ -281,7 +309,8 @@ class HybridDecodeGraphs:
         if key not in self._graphs:
             self._graphs[key] = self._capture(b, l)
         graph, cache, logits = self._graphs[key]
-        graph.replay()
+        with torch.cuda.device(self.device):
+            graph.replay()
         self.stats["replays"] += 1
         for slots, ln in zip(slot_batch, lens):
             bank.guest_len[self._sid(slots)] = ln + 1

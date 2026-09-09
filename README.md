@@ -260,7 +260,12 @@ Kernels: fla/Triton Gated DeltaNet when `fla` imports, pure torch otherwise
 (`WKVM_KERNELS=auto|fla|torch`). Decode is CUDA-graphed per batch/length
 bucket with running requests resident in the static rows (`cuda_graphs=True`):
 on one A100 the 9B decodes at 21 ms/step (B=1) and 26 ms/step (B=16,
-616 tok/s) vs 82/96 ms eager; single run, no incumbent comparison yet.
+616 tok/s) vs 82/96 ms eager. Against vLLM 0.29 on the same GPU and prompts
+(exact semantics on both sides) wkvm is 1.3x–2.2x slower end to end
+([`experiments/results/qwen35_hybrid_vs_vllm_20260910.md`](experiments/results/qwen35_hybrid_vs_vllm_20260910.md));
+the gap is prefill batching, a paged attention kernel and kernel fusion, not
+the recurrent state. RULER-lite quality at 4k–32k is in
+`experiments/results/ruler_lite_*.json`.
 The native RWKV-7 path now also runs from official `.pth` weights via
 [`scripts/convert_rwkv7_pth.py`](scripts/convert_rwkv7_pth.py) and matches the
 official `rwkv` package greedy-for-greedy
