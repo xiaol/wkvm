@@ -47,12 +47,21 @@ class Qwen35HybridRunner:
             raise ValueError("empty prompt")
         ids = torch.tensor(token_ids, dtype=torch.long, device=self.device)
         logits = None
-        for start in range(0, len(token_ids), self.prefill_chunk):
-            chunk = ids[start : start + self.prefill_chunk].unsqueeze(0)
-            cache = self.bank.gather([slots], new_tokens=chunk.shape[1])
+        step = self.chunk_size()
+        for start in range(0, len(token_ids), step):
+            chunk = ids[start : start + step].unsqueeze(0)
+            cache = self.bank.gather([slots], new_tokens=chunk.shape[1], token_ids=chunk)
             logits = self._forward(chunk, cache)
             self.bank.scatter([slots], cache)
         return logits[0].float()
+
+    def chunk_size(self) -> int:
+        """Prefill sub-chunk: in routed mode bounded by the pending threshold
+        (one chunk's evictions always fit the pending buffer) and by the ring
+        (no token is overwritten by a later token of the same chunk)."""
+        if getattr(self.bank, "routed", False):
+            return min(self.prefill_chunk, self.bank.rg.p.pending, self.bank.rg.p.ring)
+        return self.prefill_chunk
 
     @torch.inference_mode()
     def prefill_batch(self, items: list[tuple[list[int], dict]]) -> list[torch.Tensor]:
@@ -70,11 +79,11 @@ class Qwen35HybridRunner:
         t = len(items[0][0])
         if any(len(tokens) != t for tokens, _ in items):
             raise ValueError("prefill_batch needs equal-length chunks")
-        if t > self.prefill_chunk:
-            raise ValueError("prefill_batch chunk exceeds prefill_chunk")
+        if t > self.chunk_size():
+            raise ValueError("prefill_batch chunk exceeds the runner's chunk size")
         ids = torch.tensor([tokens for tokens, _ in items], dtype=torch.long, device=self.device)
         slot_batch = [slots for _, slots in items]
-        cache = self.bank.gather(slot_batch, new_tokens=t)
+        cache = self.bank.gather(slot_batch, new_tokens=t, token_ids=ids)
         logits = self._forward(ids, cache)
         self.bank.scatter(slot_batch, cache)
         return [row.float() for row in logits]
@@ -88,7 +97,7 @@ class Qwen35HybridRunner:
             if logits is not None:
                 return logits.float()
         ids = torch.tensor(last_tokens, dtype=torch.long, device=self.device).unsqueeze(1)
-        cache = self.bank.gather(slot_batch, new_tokens=1)
+        cache = self.bank.gather(slot_batch, new_tokens=1, token_ids=ids)
         logits = self._forward(ids, cache)
         self.bank.scatter(slot_batch, cache)
         return logits.float()

@@ -229,6 +229,88 @@ class TestHybridGraphs(unittest.TestCase):
         finally:
             rfx["decoder"].to("cpu")
 
+    NEAR_TIE = 0.05  # eager top-2 logit margin below which an argmax flip is numeric, not semantic
+
+    def test_routed_mode_graphs_match_eager(self) -> None:
+        """Routed span bank under graphs, in lockstep with the eager routed
+        engine. After every step the guest store of each request (K/V,
+        validity, positions, breaks, pending count) must be bit-identical
+        between the eager bank row and the graph row — that covers in-graph
+        eviction, out-graph routing on graph rows, acquisition mid-flight and
+        row compaction — and the tokens must agree. The GDN recurrent state
+        differs by ~1e-4 between an eager batch of 3 and a padded bucket of 4
+        (kernel tiling order), which on this random tiny model can flip a
+        near-tie argmax; such a flip is accepted only when the eager top-2
+        margin is below NEAR_TIE, and the request is then excluded (its
+        continuation legitimately differs)."""
+        import sys
+
+        sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
+        import test_qwen35_routed_cpu as RT
+
+        fx = RT._fixture()
+        fx["decoder"].to("cuda")
+        try:
+            prompts = [list(fx["prompts"][2]), list(fx["prompts"][0]), list(fx["prompts"][2]) * 2]
+            eager = RT._engine(cuda_graphs=False, device="cuda")
+            graphed = RT._engine(cuda_graphs={"batch_buckets": (1, 2, 4), "warmup_iters": 1}, device="cuda")
+            re_ = [Request(prompt_token_ids=list(p), max_new_tokens=14) for p in prompts]
+            rg_ = [Request(prompt_token_ids=list(p), max_new_tokens=14) for p in prompts]
+            for r in re_:
+                eager.add_request(r)
+            for r in rg_:
+                graphed.add_request(r)
+            margins: dict = {}
+            orig = eager.runner.decode_step
+
+            def recording_decode(slot_batch, last_tokens):
+                logits = orig(slot_batch, last_tokens)
+                top2 = logits.float().topk(2, dim=-1).values
+                for s, m in zip(slot_batch, (top2[:, 0] - top2[:, 1]).tolist()):
+                    margins[s["gdn_state"]] = m
+                return logits
+
+            eager.runner.decode_step = recording_decode
+            live, flips, checked = set(range(len(prompts))), 0, 0
+            while eager.has_unfinished or graphed.has_unfinished:
+                sid_of = {r.req_id: r.slots["gdn_state"] for r in re_ if r.slots}
+                eager.step()
+                graphed.step()
+                for i in sorted(live):
+                    a, b = re_[i], rg_[i]
+                    if a.output_token_ids != b.output_token_ids:
+                        n = min(len(a.output_token_ids), len(b.output_token_ids))
+                        self.assertEqual(a.output_token_ids[:n - 1], b.output_token_ids[:n - 1])
+                        margin = margins.get(sid_of.get(a.req_id), float("inf"))
+                        self.assertLess(margin, self.NEAR_TIE, f"request {i} flipped with eager margin {margin:.4f}")
+                        flips += 1
+                        live.discard(i)
+                        continue
+                    if a.slots and b.slots:
+                        self._assert_same_guest(eager, graphed, a.slots, b.slots, i)
+                        checked += 1
+            self.assertLessEqual(flips, 1)
+            self.assertGreater(checked, 20)
+            g = graphed.runner.graphs
+            self.assertGreater(g.stats["replays"], 0)
+            self.assertGreater(g.stats["row_moves"], 0)
+            self.assertGreater(graphed.bank.rg.stats["routing_passes"], 0)
+        finally:
+            fx["decoder"].to("cpu")
+
+    def _assert_same_guest(self, eager, graphed, se: dict, sg: dict, i: int) -> None:
+        ge, gg = se["guest_kv"], sg["guest_kv"]
+        E = eager.bank.rstore
+        gr = graphed.runner.graphs
+        if gr.is_resident(sg):
+            row, G = gr.row_of[sg["gdn_state"]], gr.rstore
+        else:
+            row, G = gg, graphed.bank.rstore
+        for name, a, b in (("k", E.k[:, ge], G.k[:, row]), ("v", E.v[:, ge], G.v[:, row]),
+                           ("valid", E.valid[:, ge], G.valid[:, row]), ("pos", E.pos[ge], G.pos[row]),
+                           ("is_break", E.is_break[ge], G.is_break[row]), ("pend", E.pend[ge], G.pend[row])):
+            self.assertTrue(torch.equal(a, b), f"request {i}: routed store '{name}' differs")
+
     def test_eager_fallback_beyond_buckets(self) -> None:
         """62 prompt tokens + 6 new crosses the 64 bucket mid-decode: the
         first steps replay, the rest run eagerly after the row is evicted."""

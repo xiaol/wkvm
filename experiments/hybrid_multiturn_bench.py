@@ -78,6 +78,8 @@ def run_wkvm(args, tok, prompts):
         scheduler_config=SchedulerConfig(max_tokens_per_step=max(8192, args.prefill_chunk * b),
                                          max_running_requests=b, max_tokens_per_request_per_step=args.prefill_chunk),
         cuda_graphs=graphs, guest_mode=args.guest_mode, sink_tokens=args.sink_tokens, ring_tokens=args.ring_tokens,
+        routed_params=dict(routed_pending=args.routed_pending, routed_slots=args.routed_slots,
+                           routed_reps=args.routed_reps, routed_max_span=args.routed_max_span),
     )
     weights_gib = torch.cuda.memory_allocated(dev) / 2**30
     reqs = [Request(prompt_token_ids=list(p), max_new_tokens=args.out) for p in prompts]
@@ -114,9 +116,10 @@ def run_wkvm(args, tok, prompts):
     for r in reqs:
         engine.close_request(r.req_id)
     return turns, total, {"weights_plus_state_gib": weights_gib, "graph_stats": stats,
+                          "routing_stats": dict(engine.bank.rg.stats) if engine.bank.routed else None,
                           "bytes_per_session_recurrent": engine.layout.bytes_per_slot,
                           "guest_bytes_per_session": (engine.layout.window_tokens * engine.layout.guest_bytes_per_token
-                                                      if args.guest_mode == "ring" else None)}
+                                                      if args.guest_mode != "paged" else None)}
 
 
 def run_vllm(args, tok, prompts):
@@ -167,9 +170,13 @@ def main() -> None:
     ap.add_argument("--sessions", type=int, default=16)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--prefill-chunk", type=int, default=1024)
-    ap.add_argument("--guest-mode", choices=("paged", "ring"), default="ring")
+    ap.add_argument("--guest-mode", choices=("paged", "ring", "routed"), default="ring")
     ap.add_argument("--sink-tokens", type=int, default=16)
     ap.add_argument("--ring-tokens", type=int, default=1024)
+    ap.add_argument("--routed-pending", type=int, default=512)
+    ap.add_argument("--routed-slots", type=int, default=64)
+    ap.add_argument("--routed-reps", type=int, default=48)
+    ap.add_argument("--routed-max-span", type=int, default=48)
     ap.add_argument("--vllm-gpu-mem-util", type=float, default=0.85)
     ap.add_argument("--json", default=None)
     args = ap.parse_args()
@@ -182,9 +189,12 @@ def main() -> None:
     turns, total, extra = (run_wkvm if args.engine == "wkvm" else run_vllm)(args, tok, prompts)
     payload = {
         "schema": SCHEMA,
-        "engine": (args.engine if args.engine == "vllm"
-                   else f"wkvm-hybrid-{'ring' + str(args.sink_tokens) + '+' + str(args.ring_tokens) if args.guest_mode == 'ring' else 'paged'}"),
-        "semantics": "exact_full_kv" if args.engine == "vllm" or args.guest_mode == "paged" else "sink_ring_approximate",
+        "engine": (args.engine if args.engine == "vllm" else "wkvm-hybrid-" + {
+            "paged": "paged", "ring": f"ring{args.sink_tokens}+{args.ring_tokens}",
+            "routed": f"routed{args.sink_tokens}+{args.ring_tokens}+p{args.routed_pending}+{args.routed_slots}x{args.routed_reps}",
+        }[args.guest_mode]),
+        "semantics": ("exact_full_kv" if args.engine == "vllm" or args.guest_mode == "paged"
+                      else {"ring": "sink_ring_approximate", "routed": "routed_span_bank_approximate"}[args.guest_mode]),
         "model_path": args.model_path, "sessions": args.sessions, "context_tokens": args.ctx, "turns": args.turns,
         "turn_in_tokens": args.turn_in, "out_tokens": args.out, "prompt_lengths": lengths,
         "total_wall_s": total, "total_output_tokens": args.sessions * args.out * args.turns,

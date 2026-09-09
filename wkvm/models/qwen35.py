@@ -82,6 +82,16 @@ class Qwen35HybridLayout:
     guest_mode: str = "paged"
     sink_tokens: int = 16
     ring_tokens: int = 1024
+    # routed mode (docs/HYBRID_ENGINE_PLAN.md H9): pending threshold, span slots,
+    # representative budget per slot, span cutting, retention, routing.
+    routed_pending: int = 512
+    routed_slots: int = 64
+    routed_reps: int = 48
+    routed_max_span: int = 48
+    routed_fallback_span: int = 32
+    routed_dup_floor: float = 0.10
+    routed_new_slot_sim: float = 0.60
+    break_token_ids: tuple[int, ...] = ()  # tokens that end a span (sentence punctuation, newline)
 
     def __post_init__(self) -> None:
         if len(self.layer_types) != self.n_layer:
@@ -93,14 +103,28 @@ class Qwen35HybridLayout:
             raise ValueError("page_tokens must be >= 1")
         if self.num_v_heads % self.num_k_heads != 0:
             raise ValueError("num_v_heads must be a multiple of num_k_heads")
-        if self.guest_mode not in ("paged", "ring"):
-            raise ValueError("guest_mode must be 'paged' or 'ring'")
-        if self.guest_mode == "ring" and (self.sink_tokens < 0 or self.ring_tokens < 1):
-            raise ValueError("ring mode needs sink_tokens >= 0 and ring_tokens >= 1")
+        if self.guest_mode not in ("paged", "ring", "routed"):
+            raise ValueError("guest_mode must be 'paged', 'ring' or 'routed'")
+        if self.guest_mode in ("ring", "routed") and (self.sink_tokens < 0 or self.ring_tokens < 1):
+            raise ValueError("ring/routed mode needs sink_tokens >= 0 and ring_tokens >= 1")
+        if self.guest_mode == "routed" and self.routed_pending > self.ring_tokens:
+            raise ValueError("routed_pending must not exceed ring_tokens (prefill sub-chunks are bounded by it)")
+
+    def routed_params(self):
+        from wkvm.runner.hybrid_routed import RoutedParams
+
+        return RoutedParams(
+            sink=self.sink_tokens, ring=self.ring_tokens, pending=self.routed_pending, slots=self.routed_slots,
+            reps=self.routed_reps, max_span=self.routed_max_span, fallback_span=self.routed_fallback_span,
+            dup_floor=self.routed_dup_floor, new_slot_sim=self.routed_new_slot_sim,
+        )
 
     @property
     def window_tokens(self) -> int:
-        """Columns of the ring-mode guest window (sink + ring)."""
+        """Columns of the guest window: sink + ring (ring mode) or the whole
+        routed column space (routed mode)."""
+        if self.guest_mode == "routed":
+            return self.routed_params().columns
         return self.sink_tokens + self.ring_tokens
 
     @classmethod
@@ -200,7 +224,7 @@ class Qwen35HybridLayout:
                     page_tokens=self.page_tokens,
                 )
             )
-        elif self.n_attn:  # ring: a fixed window per slot, no pages
+        elif self.n_attn:  # ring / routed: a fixed column space per slot, no pages
             families.append(
                 StateFamilySpec(
                     name=GUEST_KV_FAMILY,
@@ -369,6 +393,7 @@ def load_qwen35(
     guest_mode: str = "paged",
     sink_tokens: int = 16,
     ring_tokens: int = 1024,
+    **routed,
 ):
     """Load a Qwen3.5 checkpoint (text-only or conditional-generation layout)
     for inference. Returns ``(decoder, layout)``; the decoder is frozen, in
@@ -400,8 +425,27 @@ def load_qwen35(
     hf = hf.to(device).eval().requires_grad_(False)
     decoder = Qwen35Decoder.from_hf(hf)
     decoder._hf_model = hf  # keep the owner alive; submodules are shared
+    if guest_mode == "routed" and not routed.get("break_token_ids"):
+        routed["break_token_ids"] = break_token_ids(model_path)
     layout = Qwen35HybridLayout.from_config(
         decoder.config, dtype=dtype, page_tokens=page_tokens,
-        guest_mode=guest_mode, sink_tokens=sink_tokens, ring_tokens=ring_tokens,
+        guest_mode=guest_mode, sink_tokens=sink_tokens, ring_tokens=ring_tokens, **routed,
     )
     return decoder, layout
+
+
+BREAK_CHARS = ".!?;:。！？；：\n"
+
+
+def break_token_ids(model_path: str) -> tuple[int, ...]:
+    """Token ids whose text ends a sentence-like span (routed mode splits
+    evicted text into spans at these tokens)."""
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(model_path)
+    ids = []
+    for i in range(len(tok)):
+        text = tok.decode([i])
+        if text and text.rstrip(" ") and text.rstrip(" ")[-1] in BREAK_CHARS:
+            ids.append(i)
+    return tuple(ids)

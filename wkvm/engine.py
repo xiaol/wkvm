@@ -134,6 +134,7 @@ class Engine:
         guest_mode: str = "paged",
         sink_tokens: int = 16,
         ring_tokens: int = 1024,
+        routed_params: dict | None = None,
         **kwargs,
     ) -> "Engine":
         """Qwen3.5 hybrid (Gated DeltaNet + full-attention guests).
@@ -148,7 +149,7 @@ class Engine:
 
         model, layout = load_qwen35(
             model_path, device=device, dtype=dtype, page_tokens=page_tokens,
-            guest_mode=guest_mode, sink_tokens=sink_tokens, ring_tokens=ring_tokens,
+            guest_mode=guest_mode, sink_tokens=sink_tokens, ring_tokens=ring_tokens, **(routed_params or {}),
         )
         num_pages = None
         if guest_pool_tokens is not None:

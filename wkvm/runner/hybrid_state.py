@@ -159,6 +159,20 @@ class RingSlotCache(SlotCache):
         return torch.cat([allow_past, allow_new], dim=-1)[:, None]
 
 
+class RoutedSlotCache(SlotCache):
+    """Routed span bank (``guest_mode="routed"``): the mask is
+    ``RoutedGuest.prefill_mask`` over the store's validity/positions."""
+
+    def __init__(self, layout, lens: list[int], layers: dict, bank, rows: list[int]) -> None:
+        super().__init__(layout, lens, layers)
+        self.bank = bank
+        self.rows = rows
+        self.new_ids: torch.Tensor | None = None
+
+    def attention_mask(self, query_len: int, device) -> torch.Tensor | None:
+        return self.bank.rg.prefill_mask(self.bank.rstore, self.rows, self.lens, query_len)
+
+
 class Qwen35StateBank:
     memory_families = (GDN_STATE_FAMILY,)
 
@@ -172,11 +186,13 @@ class Qwen35StateBank:
         if layout.n_gdn < 1:
             raise ValueError("Qwen35StateBank needs at least one linear_attention layer")
         self.ring = layout.guest_mode == "ring"
-        if layout.n_attn and not self.ring and num_pages < 1:
+        self.routed = layout.guest_mode == "routed"
+        fixed = self.ring or self.routed
+        if layout.n_attn and not fixed and num_pages < 1:
             raise ValueError("num_pages must be >= 1 for a model with full-attention layers")
         self.layout = layout
         self.num_slots = num_slots
-        self.num_pages = num_pages if (layout.n_attn and not self.ring) else 0
+        self.num_pages = num_pages if (layout.n_attn and not fixed) else 0
         self.device = torch.device(device)
         s = num_slots + 1
         self.gdn_state = torch.zeros(
@@ -185,7 +201,18 @@ class Qwen35StateBank:
         self.gdn_conv = torch.zeros(
             (layout.n_gdn, s, *layout.gdn_conv_shape), dtype=layout.dtype, device=self.device
         )
-        if self.ring:
+        if self.routed:
+            from wkvm.runner.hybrid_routed import RoutedGuest, RoutedStore
+
+            params = layout.routed_params()
+            self.rg = RoutedGuest(params, layout.n_attn, layout.num_kv_heads, layout.head_dim, self.device)
+            self.rstore = RoutedStore(params, layout.n_attn, s, layout.num_kv_heads, layout.head_dim,
+                                      layout.dtype, self.device)
+            self.break_lut = torch.zeros((layout.vocab_size,), dtype=torch.bool, device=self.device)
+            if layout.break_token_ids:
+                self.break_lut[torch.tensor(layout.break_token_ids, device=self.device)] = True
+            self.pool_k = self.pool_v = torch.zeros(0, device=self.device)
+        elif self.ring:
             wt = layout.window_tokens
             self.ring_k = torch.zeros(
                 (layout.n_attn, s, layout.num_kv_heads, wt, layout.head_dim), dtype=layout.dtype, device=self.device
@@ -245,6 +272,9 @@ class Qwen35StateBank:
         self.guest_len[slots[GDN_STATE_FAMILY]] = 0
         if self.ring and self.layout.n_attn:
             self.ring_pos[slots[GUEST_KV_FAMILY]].fill_(-1)
+        if self.routed and self.layout.n_attn:
+            self.rstore.reset(slots[GUEST_KV_FAMILY])
+            self.rg.drop_session(slots[GDN_STATE_FAMILY])
 
     def slot_len(self, slots: dict) -> int:
         return self.guest_len[slots[GDN_STATE_FAMILY]]
@@ -270,12 +300,12 @@ class Qwen35StateBank:
         return torch.where(cols < s, sink, ring)
 
     def capacity(self, slots: dict) -> int:
-        if self.ring:
+        if self.ring or self.routed:
             return 1 << 62  # unbounded context: the window evicts, it never fills
         return len(self._pages(slots)) * self.layout.page_tokens
 
     def check_capacity(self, slots: dict, new_tokens: int) -> None:
-        if self.ring:
+        if self.ring or self.routed:
             return
         if self.slot_len(slots) + new_tokens > self.capacity(slots):
             raise GuestCapacityExceeded(
@@ -317,7 +347,7 @@ class Qwen35StateBank:
 
     # -- gather / scatter -----------------------------------------------------------
 
-    def gather(self, slot_batch: list[dict], new_tokens: int) -> SlotCache:
+    def gather(self, slot_batch: list[dict], new_tokens: int, token_ids: torch.Tensor | None = None) -> SlotCache:
         # The eager path takes over these requests: resident rows are written
         # back and freed so the bank is the only copy again.
         self._sync_resident(slot_batch, evict=True)
@@ -333,6 +363,25 @@ class Qwen35StateBank:
                 conv=self.gdn_conv[j].index_select(0, cids),
                 state=self.gdn_state[j].index_select(0, sids),
             )
+        if self.layout.n_attn and self.routed:
+            if token_ids is None:
+                raise ValueError("routed mode needs the new token ids (span breaks)")
+            gids = self._ids(slot_batch, GUEST_KV_FAMILY)
+            rows = [int(g) for g in gids.tolist()]
+            # Evict before the forward: the tokens whose ring columns this
+            # chunk overwrites sit in pending while the chunk attends, so a
+            # token is visible from its write until routing drops it (the
+            # in-graph decode path evicts in the same order).
+            for row, g in enumerate(rows):
+                self.rg.evict_before_write(self.rstore, g, lens[row], new_tokens)
+            for li, j in self._attn_pos.items():
+                layers[li] = _AttnEntry(
+                    k_past=self.rstore.k[j].index_select(0, gids),
+                    v_past=self.rstore.v[j].index_select(0, gids),
+                )
+            cache = RoutedSlotCache(self.layout, lens, layers, self, rows)
+            cache.new_ids = token_ids
+            return cache
         if self.layout.n_attn and self.ring:
             gids = self._ids(slot_batch, GUEST_KV_FAMILY)
             for li, j in self._attn_pos.items():
@@ -364,6 +413,15 @@ class Qwen35StateBank:
         if first.k_new is None:
             raise RuntimeError("attention cache was never updated this forward")
         t = first.k_new.shape[-2]
+        if self.routed:
+            self._scatter_routed(slot_batch, cache, t)
+            for row, slots in enumerate(slot_batch):
+                self.guest_len[slots[GDN_STATE_FAMILY]] = cache.lens[row] + t
+            for row, slots in enumerate(slot_batch):
+                g = slots[GUEST_KV_FAMILY]
+                if self.rg.needs_routing(self.rstore, g):
+                    self.rg.route(self.rstore, g, session=slots[GDN_STATE_FAMILY])
+            return
         if self.ring:
             self._scatter_ring(slot_batch, cache, t)
             for row, slots in enumerate(slot_batch):
@@ -417,6 +475,29 @@ class Qwen35StateBank:
                 self.ring_v[j][g, :, cols] = entry.v_new[row][:, idx_k].to(self.ring_v.dtype)
             self.ring_pos[g, cols] = pos_k
 
+    def _scatter_routed(self, slot_batch: list[dict], cache: SlotCache, t: int) -> None:
+        """Ring writes as in ring mode (the overwritten tokens were moved to
+        pending by ``gather``); validity/positions/breaks travel with them."""
+        p = self.rg.p
+        s, w = p.sink, p.ring
+        st = self.rstore
+        idx_all = torch.arange(t, device=self.device)
+        breaks = self.break_lut[cache.new_ids]  # [B, T]
+        for row, slots in enumerate(slot_batch):
+            g = slots[GUEST_KV_FAMILY]
+            start = cache.lens[row]  # ring columns already evicted in gather()
+            pos = start + idx_all
+            keep = (pos < s) | (idx_all >= t - w)
+            pos_k, idx_k = pos[keep], idx_all[keep]
+            cols = self.rg.ring_columns(pos_k)
+            for li, j in self._attn_pos.items():
+                entry = cache.layers[li]
+                st.k[j][g, :, cols] = entry.k_new[row][:, idx_k].to(st.k.dtype)
+                st.v[j][g, :, cols] = entry.v_new[row][:, idx_k].to(st.v.dtype)
+            st.valid[:, g, cols] = True
+            st.pos[g, cols] = pos_k
+            st.is_break[g, cols] = breaks[row][idx_k]
+
     # -- durable-state protocol (wkvm/store.py) ------------------------------------
 
     def fingerprint_key(self) -> str:
@@ -424,7 +505,11 @@ class Qwen35StateBank:
         # Page size is deliberately not part of the identity: snapshots are
         # token-trimmed and page-size independent. Ring mode is: its window
         # is the state.
-        guest = f"ring{l.sink_tokens}+{l.ring_tokens}" if self.ring else "paged"
+        if self.routed:
+            p = self.rg.p
+            guest = f"routed{p.sink}+{p.ring}+{p.pend_cap}+{p.slots}x{p.reps}"
+        else:
+            guest = f"ring{l.sink_tokens}+{l.ring_tokens}" if self.ring else "paged"
         return (
             f"qwen35:L{l.n_layer}:types{''.join('l' if t == LINEAR else 'f' for t in l.layer_types)}"
             f":gdn{tuple(l.gdn_state_shape)}:conv{tuple(l.gdn_conv_shape)}"
@@ -442,6 +527,14 @@ class Qwen35StateBank:
             GDN_STATE_FAMILY: self.gdn_state[:, slots[GDN_STATE_FAMILY]],
             GDN_CONV_FAMILY: self.gdn_conv[:, slots[GDN_CONV_FAMILY]],
         }
+        if self.layout.n_attn and self.routed:
+            g, st = slots[GUEST_KV_FAMILY], self.rstore
+            out.update({"rt_k": st.k[:, g], "rt_v": st.v[:, g], "rt_valid": st.valid[:, g], "rt_pos": st.pos[g],
+                        "rt_break": st.is_break[g], "rt_pend": st.pend[g:g + 1]})
+            host = {k: _to_host(v) for k, v in out.items()}
+            host["rt_state"] = self.rg.export_session(slots[GDN_STATE_FAMILY])
+            host["guest_len"] = torch.tensor([n], dtype=torch.int64)
+            return host
         if self.layout.n_attn and self.ring:
             g = slots[GUEST_KV_FAMILY]
             out["ring_k"] = self.ring_k[:, g]
@@ -462,7 +555,8 @@ class Qwen35StateBank:
         stay zero (fresh), which is what makes a tuned-initial-state import —
         only ``gdn_state`` present — a valid request."""
         self.zero_slots(slots)
-        known = {GDN_STATE_FAMILY, GDN_CONV_FAMILY, "guest_k", "guest_v", "guest_len", "ring_k", "ring_v", "ring_pos"}
+        known = {GDN_STATE_FAMILY, GDN_CONV_FAMILY, "guest_k", "guest_v", "guest_len", "ring_k", "ring_v", "ring_pos",
+                 "rt_k", "rt_v", "rt_valid", "rt_pos", "rt_break", "rt_pend", "rt_state"}
         unknown = set(tensors) - known
         if unknown:
             raise KeyError(f"unknown state tensors for Qwen3.5 bank: {sorted(unknown)}")
@@ -475,6 +569,20 @@ class Qwen35StateBank:
             _check(tensors[GDN_CONV_FAMILY], dst.shape, GDN_CONV_FAMILY)
             dst.copy_(tensors[GDN_CONV_FAMILY], non_blocking=True)
         n = 0
+        if "rt_k" in tensors:
+            if not self.routed:
+                raise ValueError("routed-mode snapshot cannot be loaded into a non-routed bank")
+            g, st = slots[GUEST_KV_FAMILY], self.rstore
+            _check(tensors["rt_k"], st.k[:, g].shape, "rt_k")
+            st.k[:, g].copy_(tensors["rt_k"], non_blocking=True)
+            st.v[:, g].copy_(tensors["rt_v"], non_blocking=True)
+            st.valid[:, g].copy_(tensors["rt_valid"].to(self.device))
+            st.pos[g].copy_(tensors["rt_pos"].to(self.device))
+            st.is_break[g].copy_(tensors["rt_break"].to(self.device))
+            st.pend[g] = int(tensors["rt_pend"].reshape(-1)[0])
+            self.rg.import_session(slots[GDN_STATE_FAMILY], tensors["rt_state"])
+            self.guest_len[slots[GDN_STATE_FAMILY]] = int(tensors["guest_len"].reshape(-1)[0])
+            return
         if "ring_k" in tensors:
             if not self.ring:
                 raise ValueError("ring-mode snapshot cannot be loaded into a paged bank")
@@ -514,7 +622,10 @@ class Qwen35StateBank:
         tensors = [self.gdn_state, self.gdn_conv, self.pool_k, self.pool_v]
         if self.ring:
             tensors += [self.ring_k, self.ring_v]
-        return sum(t.numel() * t.element_size() for t in tensors)
+        total = sum(t.numel() * t.element_size() for t in tensors)
+        if self.routed:
+            total += self.rstore.state_bytes()
+        return total
 
 
 def _check(t: torch.Tensor, shape, name: str) -> None:

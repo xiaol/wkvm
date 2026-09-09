@@ -84,9 +84,11 @@ class HybridDecodeGraphs:
         self.device = bank.device
         self.batch_buckets = tuple(sorted(set(batch_buckets)))
         self.ring = bank.ring
-        # Ring mode: the window is the only "length bucket"; its columns are
-        # the static row itself, so no +1 column and no length dispatch.
-        self.length_buckets = (self.layout.window_tokens,) if self.ring else tuple(sorted(set(length_buckets)))
+        self.routed = getattr(bank, "routed", False)
+        # Ring / routed mode: the window is the only "length bucket"; its
+        # columns are the static row itself, so no +1 column and no length dispatch.
+        fixed = self.ring or self.routed
+        self.length_buckets = (self.layout.window_tokens,) if fixed else tuple(sorted(set(length_buckets)))
         self.warmup_iters = warmup_iters
         bmax, lmax = self.batch_buckets[-1], self.length_buckets[-1]
         lay = self.layout
@@ -94,13 +96,20 @@ class HybridDecodeGraphs:
         self.bmax = bmax
         self.ids = torch.zeros((bmax, 1), dtype=torch.long, device=self.device)
         self.lens = torch.zeros((bmax,), dtype=torch.long, device=self.device)
+        self.true_b = torch.ones(bmax, dtype=torch.bool, device=self.device)
         self.rows_idx = torch.arange(bmax, device=self.device)
         self.gdn_state = torch.zeros((lay.n_gdn, bmax, *lay.gdn_state_shape), dtype=GDN_STATE_DTYPE, device=self.device)
         self.gdn_conv = torch.zeros((lay.n_gdn, bmax, *lay.gdn_conv_shape), dtype=dt, device=self.device)
-        # Paged: +1 column so a request whose length equals the bucket writes at column l.
-        cols = lmax if self.ring else lmax + 1
-        self.k_win = torch.zeros((lay.n_attn, bmax, lay.num_kv_heads, cols, lay.head_dim), dtype=dt, device=self.device)
-        self.v_win = torch.zeros_like(self.k_win)
+        if self.routed:
+            from wkvm.runner.hybrid_routed import RoutedStore
+
+            self.rstore = RoutedStore(bank.rg.p, lay.n_attn, bmax, lay.num_kv_heads, lay.head_dim, dt, self.device)
+            self.k_win, self.v_win = self.rstore.k, self.rstore.v
+        else:
+            # Paged: +1 column so a request whose length equals the bucket writes at column l.
+            cols = lmax if self.ring else lmax + 1
+            self.k_win = torch.zeros((lay.n_attn, bmax, lay.num_kv_heads, cols, lay.head_dim), dtype=dt, device=self.device)
+            self.v_win = torch.zeros_like(self.k_win)
         self._graphs: dict[tuple[int, int], tuple[torch.cuda.CUDAGraph, ResidentSlotCache, torch.Tensor]] = {}
         self._pool = None
         # residency
@@ -120,7 +129,7 @@ class HybridDecodeGraphs:
         b = _bucket(batch, self.batch_buckets)
         if b is None:
             return None
-        if self.ring:
+        if self.ring or self.routed:
             return (b, self.layout.window_tokens)
         l = _bucket(lmax, self.length_buckets)
         return None if l is None else (b, l)
@@ -129,7 +138,7 @@ class HybridDecodeGraphs:
         layers: dict = {}
         for j, li in enumerate(self.layout.gdn_layers):
             layers[li] = _GdnEntry(conv=self.gdn_conv[j, :b], state=self.gdn_state[j, :b])
-        ncol = l if self.ring else l + 1
+        ncol = l if (self.ring or self.routed) else l + 1
         for j, li in enumerate(self.layout.attn_layers):
             layers[li] = _AttnEntry(k_past=self.k_win[j, :b, :, :ncol], v_past=self.v_win[j, :b, :, :ncol])
         return ResidentSlotCache(self.layout, b, self.rows_idx[:b], self.lens[:b], layers)
@@ -138,6 +147,28 @@ class HybridDecodeGraphs:
         ids = self.ids[:b]
         lens = self.lens[:b]
         positions = lens[:, None]  # [b, 1], T == 1
+        if self.routed:
+            # In-graph: the ring column about to be overwritten is moved to
+            # pending (or to the scratch column when it holds nothing), the
+            # new token's column becomes valid, and attention reads every
+            # valid column. Routing of pending runs out-graph after the step.
+            p, st, rows = self.bank.rg.p, self.rstore, self.rows_idx[:b]
+            col = self.bank.rg.ring_columns(lens)
+            do_evict = (lens >= p.sink) & st.valid[0, rows, col]
+            dst = torch.where(do_evict, p.pend_base + st.pend[:b], torch.full_like(lens, p.scratch))
+            for j in range(self.layout.n_attn):
+                st.k[j][rows, :, dst] = st.k[j][rows, :, col]
+                st.v[j][rows, :, dst] = st.v[j][rows, :, col]
+                st.valid[j][rows, dst] = do_evict
+            st.pos[rows, dst] = st.pos[rows, col]
+            st.is_break[rows, dst] = st.is_break[rows, col]
+            st.pend[:b] += do_evict.long()
+            st.valid[:, rows, col] = self.true_b[:b]  # device bool, no host scalar under capture
+            st.pos[rows, col] = lens
+            st.is_break[rows, col] = self.bank.break_lut[ids[:, 0]]
+            cache.col_t = col
+            mask = st.valid[0, :b][:, None, None, :]
+            return self.model(ids, cache, positions, mask)
         if self.ring:
             # Window columns [0, min(len+1, window)) are the sinks + the last
             # ring tokens including the one written this step at ring_column(len).
@@ -199,12 +230,36 @@ class HybridDecodeGraphs:
         row writes at ``lens[row]`` (not the whole window — at B=16 x 14k
         tokens that clone alone is 3.4 GiB)."""
         rows = self.rows_idx[:b]
+        if self.routed:
+            # Touched per forward: the ring column, the scratch column and the
+            # next few pending columns (warm-up + capture + check run ~4x).
+            p, st = self.bank.rg.p, self.rstore
+            col = self.bank.rg.ring_columns(self.lens[:b])
+            span = torch.arange(self.warmup_iters + 3, device=self.device)
+            pend_cols = (p.pend_base + st.pend[:b, None] + span[None, :]).clamp(max=p.summ_base - 1)
+            cols = torch.cat([col[:, None], torch.full_like(col[:, None], p.scratch), pend_cols], dim=1)  # [b, m]
+            r = rows[:, None].expand_as(cols)
+            return ("routed", self.gdn_state[:, :b].clone(), self.gdn_conv[:, :b].clone(),
+                    st.k[:, r, :, cols].clone(), st.v[:, r, :, cols].clone(), st.valid[:, r, cols].clone(),
+                    st.pos[r, cols].clone(), st.is_break[r, cols].clone(), st.pend[:b].clone(), r, cols)
         cols = self.bank.ring_columns(self.lens[:b]) if self.ring else self.lens[:b]
-        return (self.gdn_state[:, :b].clone(), self.gdn_conv[:, :b].clone(),
+        return ("plain", self.gdn_state[:, :b].clone(), self.gdn_conv[:, :b].clone(),
                 self.k_win[:, rows, :, cols].clone(), self.v_win[:, rows, :, cols].clone(), rows, cols)
 
     def _restore_rows(self, b: int, l: int, saved) -> None:
-        gdn_state, gdn_conv, k_cols, v_cols, rows, cols = saved
+        if saved[0] == "routed":
+            _, gdn_state, gdn_conv, k, v, valid, pos, brk, pend, r, cols = saved
+            st = self.rstore
+            self.gdn_state[:, :b].copy_(gdn_state)
+            self.gdn_conv[:, :b].copy_(gdn_conv)
+            st.k[:, r, :, cols] = k
+            st.v[:, r, :, cols] = v
+            st.valid[:, r, cols] = valid
+            st.pos[r, cols] = pos
+            st.is_break[r, cols] = brk
+            st.pend[:b].copy_(pend)
+            return
+        _, gdn_state, gdn_conv, k_cols, v_cols, rows, cols = saved
         self.gdn_state[:, :b].copy_(gdn_state)
         self.gdn_conv[:, :b].copy_(gdn_conv)
         self.k_win[:, rows, :, cols] = k_cols
@@ -230,7 +285,9 @@ class HybridDecodeGraphs:
             self.gdn_state[j, row].copy_(bank.gdn_state[j, sid])
             self.gdn_conv[j, row].copy_(bank.gdn_conv[j, cid])
         n = bank.slot_len(slots)
-        if self.layout.n_attn and self.ring:
+        if self.layout.n_attn and self.routed:
+            self.rstore.copy_row(bank.rstore, slots[GUEST_KV_FAMILY], row)
+        elif self.layout.n_attn and self.ring:
             g = slots[GUEST_KV_FAMILY]
             self.k_win[:, row].copy_(bank.ring_k[:, g])
             self.v_win[:, row].copy_(bank.ring_v[:, g])
@@ -258,7 +315,10 @@ class HybridDecodeGraphs:
             bank.gdn_state[j, sid].copy_(self.gdn_state[j, row])
             bank.gdn_conv[j, cid].copy_(self.gdn_conv[j, row])
         n, start = bank.slot_len(slots), self.synced_len[row]
-        if self.layout.n_attn and self.ring:
+        if self.layout.n_attn and self.routed:
+            if n > start:
+                bank.rstore.copy_row(self.rstore, row, slots[GUEST_KV_FAMILY])
+        elif self.layout.n_attn and self.ring:
             if n > start:
                 g = slots[GUEST_KV_FAMILY]
                 bank.ring_k[:, g].copy_(self.k_win[:, row])
@@ -296,7 +356,9 @@ class HybridDecodeGraphs:
             n = self.bank.slot_len(moved)
             self.gdn_state[:, row].copy_(self.gdn_state[:, last])
             self.gdn_conv[:, row].copy_(self.gdn_conv[:, last])
-            if self.layout.n_attn and self.ring:
+            if self.layout.n_attn and self.routed:
+                self.rstore.copy_row(self.rstore, last, row)
+            elif self.layout.n_attn and self.ring:
                 self.k_win[:, row].copy_(self.k_win[:, last])
                 self.v_win[:, row].copy_(self.v_win[:, last])
             elif n and self.layout.n_attn:
@@ -306,6 +368,8 @@ class HybridDecodeGraphs:
             self.slots_of[row] = moved
             self.synced_len[row] = self.synced_len[last]
             self.stats["row_moves"] += 1
+        if self.routed:  # a vacated row must not keep valid columns (it may pad a bucket later)
+            self.rstore.reset(last)
         self.slots_of[last] = None
         self.synced_len[last] = 0
         self.n_resident = last
@@ -348,6 +412,13 @@ class HybridDecodeGraphs:
         self.stats["replays"] += 1
         for slots, ln in zip(slot_batch, lens):
             bank.guest_len[self._sid(slots)] = ln + 1
+        if self.routed:
+            # Route rows whose pending buffer reached the threshold (out-graph).
+            pend = self.rstore.pend[:n].tolist()
+            for row_i, cnt in enumerate(pend):
+                if cnt >= bank.rg.p.pending:
+                    slots = self.slots_of[row_i]
+                    bank.rg.route(self.rstore, row_i, session=self._sid(slots))
         if order == list(range(n)):
             return logits[:n]
         return logits.index_select(0, torch.tensor(order, device=self.device))

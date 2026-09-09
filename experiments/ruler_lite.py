@@ -355,7 +355,12 @@ def run_wkvm(samples, tok, args):
                                          max_tokens_per_request_per_step=1024),
         cuda_graphs=graphs if not args.no_graphs else False,
         guest_mode=args.guest_mode, sink_tokens=args.sink_tokens, ring_tokens=args.ring_tokens,
+        routed_params=dict(routed_pending=args.routed_pending, routed_slots=args.routed_slots,
+                           routed_reps=args.routed_reps, routed_max_span=args.routed_max_span),
     )
+    if engine.bank.routed:
+        p = engine.bank.rg.p
+        print(f"routed columns per layer {p.columns} ({p.columns * engine.layout.guest_bytes_per_token / 2**20:.0f} MiB per session)", flush=True)
     results = []
     for start in range(0, len(samples), slots):
         chunk = samples[start:start + slots]
@@ -373,7 +378,9 @@ def run_wkvm(samples, tok, args):
         print(f"[wkvm] {chunk[0]['task']}@{chunk[0]['max_len']} {start + len(chunk)}/{len(samples)} "
               f"{dt:.1f}s score={sum(score(x['task'], x['pred'], x['outputs']) for x in results[-len(chunk):]) / len(chunk):.2f}",
               flush=True)
-    return results, {"graph_stats": dict(engine.runner.graphs.stats) if engine.runner.graphs else None}
+    return results, {"graph_stats": dict(engine.runner.graphs.stats) if engine.runner.graphs else None,
+                     "routing_stats": dict(engine.bank.rg.stats) if engine.bank.routed else None,
+                     "routed_columns": engine.bank.rg.p.columns if engine.bank.routed else None}
 
 
 def run_hf(samples, tok, args):
@@ -445,10 +452,14 @@ def main() -> None:
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--no-graphs", action="store_true")
-    ap.add_argument("--guest-mode", choices=("paged", "ring"), default="paged",
-                    help="wkvm guest memory: exact paged pool, or sink+ring window (approximate beyond the window)")
+    ap.add_argument("--guest-mode", choices=("paged", "ring", "routed"), default="paged",
+                    help="wkvm guest memory: exact paged pool, sink+ring window, or the routed span bank")
     ap.add_argument("--sink-tokens", type=int, default=16)
     ap.add_argument("--ring-tokens", type=int, default=1024)
+    ap.add_argument("--routed-pending", type=int, default=512)
+    ap.add_argument("--routed-slots", type=int, default=64)
+    ap.add_argument("--routed-reps", type=int, default=48)
+    ap.add_argument("--routed-max-span", type=int, default=48)
     ap.add_argument("--json", default=None)
     ap.add_argument("--data-cache", default="experiments/results/ruler_lite_data.json")
     ap.add_argument("--compare", nargs=2, default=None)
@@ -492,6 +503,8 @@ def main() -> None:
     payload = {"engine": args.engine, "kernels": kernels, "cuda_graphs": not args.no_graphs and args.engine == "wkvm",
                "guest_mode": args.guest_mode if args.engine == "wkvm" else "exact",
                "sink_tokens": args.sink_tokens, "ring_tokens": args.ring_tokens,
+               "routed": {"pending": args.routed_pending, "slots": args.routed_slots, "reps": args.routed_reps,
+                          "max_span": args.routed_max_span} if args.guest_mode == "routed" else None,
                "model": args.model, "lengths": args.lengths, "samples_per_task": args.samples, "seed": args.seed,
                "haystack": "squad-validation-contexts (RULER essay haystack replaced)", "wall_s": time.time() - t0,
                "summary": summary, "results": results, **extra}
