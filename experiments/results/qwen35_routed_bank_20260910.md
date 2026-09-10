@@ -96,8 +96,27 @@ per-layer farthest-point) still scored 0.50 on the single needle at 16k and
 ## RULER-lite with the bank (R = 48, novelty)
 
 Same prompts as the exact run (all needle cells 1.00) and the ring run.
-Five-task subset first (`ruler_lite_wkvm_routed48_novelty_sub.json`); the
-full 12-task grids at R = 48 and R = 144 are running and will be appended.
+Full 12-task grid, 20 prompts per cell (`ruler_lite_wkvm_routed48.json`,
+960 prompts, 24,150 routing passes, 3,360 s on one A100; the R = 144 grid
+`ruler_lite_wkvm_routed144.json` is appended below when it completes):
+
+| task | 4k | 8k | 16k | 32k | exact 4k–32k | ring 16+1024, 4k → 32k |
+|---|---:|---:|---:|---:|---|---|
+| niah_single_1 (noise haystack) | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 0.25 → 0.10 |
+| niah_single_2 (essay) | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 0.15 → 0.00 |
+| niah_single_3 (uuid value) | 1.00 | 1.00 | 1.00 | 0.95 | 1.00 | 0.20 → 0.05 |
+| niah_multikey_1 (4 keys) | 1.00 | 0.75 | 1.00 | 1.00 | 1.00 | 0.40 → 0.00 |
+| niah_multivalue (4 values) | 1.00 | 0.85 | 0.95 | 1.00 | 1.00 | 0.33 → 0.01 |
+| niah_multiquery (4 queries) | 1.00 | 0.90 | 0.98 | 1.00 | 1.00 | 0.30 → 0.06 |
+| vt (variable tracking) | 0.99 | 0.99 | 1.00 | 1.00 | 1.00 | 0.26 → 0.06 |
+| fwe (frequent words) | 1.00 | 1.00 | 0.98 | 0.83 | 0.98–1.00 | 0.95 → 0.78 |
+| cwe (common words) | 1.00 | 0.77 | 0.79 | 0.62 | 0.90–1.00 | 0.86 → 0.32 |
+| qa_1 (SQuAD QA) | 0.95 | 0.70 | 0.45 | 0.15 | 0.85–1.00 | 1.00 → 0.10 |
+| niah_multikey_2 (haystack of needles) | 1.00 | 0.45 | 0.10 | 0.05 | 1.00 | 0.20 → 0.05 |
+| niah_multikey_3 (haystack of uuid needles) | 1.00 | 0.30 | 0.00 | 0.00 | 1.00 | 0.15 → 0.00 |
+
+Five-task subset run first (`ruler_lite_wkvm_routed48_novelty_sub.json`,
+same numbers for its five tasks):
 
 | task | 4k | 8k | 16k | 32k | exact | ring 16+1024 (4k → 32k) |
 |---|---:|---:|---:|---:|---:|---|

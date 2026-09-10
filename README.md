@@ -267,9 +267,10 @@ with the guest layers bounded the Gemma mechanism transfers: 32 sessions x
 mode (`guest_mode="ring"`, 16 sink + 1024 window, no recall beyond it) takes
 3.9 s per turn, and with the **routed span bank** (`guest_mode="routed"`,
 163 MiB per session whatever the context) 5.5 s per turn — **24x per turn,
-4.5x over 8 turns, 14x on a 48-turn session — with single-needle recall
-1.00 at 4k–32k** (ring: 0.15 → 0.00) and 4-needle recall 0.75–1.00 through
-16k on RULER-lite. The retention rule that makes this work — keep the spans
+4.5x over 8 turns, 14x on a 48-turn session — with RULER-lite single-needle
+recall 0.95–1.00, multi-needle 0.75–1.00 and variable tracking 0.99–1.00 at
+4k–32k** (ring: 0.15 → 0.00); what it cannot do is a haystack made of
+needles or open QA over ordinary paragraphs (0.15 at 32k). The retention rule that makes this work — keep the spans
 least like their neighbours in time — was found by a probe that separates
 "is the needle still in memory" from "is it answered"; mean-value
 farthest-point (the Gemma rule) and token surprisal both failed it. See

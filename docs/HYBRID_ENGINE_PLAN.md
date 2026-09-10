@@ -262,9 +262,11 @@ resume of the imported handle; per-slot bytes and slot capacity.
   span is found at its original position exactly as in the exact engine.
   Also fixed on the way: a colon in the break set split needles in half;
   per-layer decisions kept a needle in six layers and dropped it in two.
-- **Result**: RULER-lite single needle 1.00 at 4k–32k (ring: 0.15 → 0.00),
-  4-key/4-value needles 0.75–1.00 through 16k, QA 0.95 → 0.45, haystack-of-
-  needles 1.00 → 0.10 (nothing is novel there — the honest limit of a
+- **Result** (full 12-task RULER-lite grid, 20 prompts per cell): single
+  needles 0.95–1.00 at 4k–32k (ring: 0.15 → 0.00), 4-key/4-value/4-query
+  needles 0.75–1.00 at 4k–32k, variable tracking 0.99–1.00, frequent-word
+  tasks 0.62–1.00; QA 0.95 → 0.15 and the two haystack-of-needles tasks
+  1.00 → 0.00–0.05 (nothing is novel there — the honest limit of a
   query-agnostic memory). Wall workload 32 x 36,864 x 8 turns: **5.5 s per
   turn vs vLLM's 130 s (24x), 229 s vs 1036 s over 8 turns (4.5x), 14x on
   the 48-turn shape**; ring without recall is 3.9 s (20x on 48 turns).
