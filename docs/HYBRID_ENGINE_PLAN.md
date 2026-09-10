@@ -271,8 +271,7 @@ resume of the imported handle; per-slot bytes and slot capacity.
   Below the wall the routed engine is within 7% of vLLM per turn.
 - **Costs and next cuts**: routing ~25 ms per pass on the host (turn 0 pays
   58 s over 2,304 passes because each pass syncs the prefill pipeline for
-  one row — batch the rows of a prefill forward into one sync); decode
-  tokens enter the pool with no recorded signal; a second retention term
+  one row — batch the rows of a prefill forward into one sync); a second retention term
   (similarity to the prompt's instruction prefix ranked the needle at 0.998
   too) is the next probe; the resident-row copy of the store doubles its
   memory under CUDA graphs (R=144 does not fit 32 sessions on 40 GB).

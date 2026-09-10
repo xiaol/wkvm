@@ -99,20 +99,26 @@ Same prompts as the exact run (all needle cells 1.00) and the ring run.
 Five-task subset first (`ruler_lite_wkvm_routed48_novelty_sub.json`); the
 full 12-task grids at R = 48 and R = 144 are running and will be appended.
 
-| task | 4k | 8k | 16k | 32k | ring 16+1024 (4k → 32k) |
-|---|---:|---:|---:|---:|---|
-| niah_single_2 | 1.00 | 1.00 | 1.00 | pending | 0.15 → 0.00 |
-| niah_multikey_1 (4 keys) | 1.00 | 0.75 | 1.00 | pending | 0.40 → 0.00 |
-| niah_multivalue (4 values) | 1.00 | 0.85 | 0.95 | pending | 0.33 → 0.01 |
-| niah_multikey_2 (haystack of needles) | 1.00 | 0.45 | 0.10 | pending | 0.20 → 0.05 |
-| qa_1 (SQuAD QA) | 0.95 | 0.70 | 0.45 | pending | 1.00 → 0.10 |
+| task | 4k | 8k | 16k | 32k | exact | ring 16+1024 (4k → 32k) |
+|---|---:|---:|---:|---:|---:|---|
+| niah_single_2 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 0.15 → 0.00 |
+| niah_multikey_1 (4 keys) | 1.00 | 0.75 | 1.00 | 1.00 | 1.00 | 0.40 → 0.00 |
+| niah_multivalue (4 values) | 1.00 | 0.85 | 0.95 | 1.00 | 1.00 | 0.33 → 0.01 |
+| niah_multikey_2 (haystack of needles) | 1.00 | 0.45 | 0.10 | 0.05 | 1.00 | 0.20 → 0.05 |
+| qa_1 (SQuAD QA) | 0.95 | 0.70 | 0.45 | 0.15 | 0.85–1.00 | 1.00 → 0.10 |
+
+400 prompts, 10,097 routing passes, 262,795 spans, 59% of spans dropped
+overall (at 32k the pool holds ~10% of the evicted tokens).
 
 Reading: a needle in prose is recalled at every length; several needles
-share the pool fairly. Two tasks show the limits of a query-agnostic memory
-honestly: when the *haystack itself* is needles (multikey_2) nothing is
-novel and the pool holds a random 10% at 16k; QA needs the one paragraph
-the question will ask about, which no signal at eviction time can predict,
-so it degrades toward the pool fraction plus what the summaries carry.
+share the pool fairly (the 8k dips are two prompts whose four needles fell
+into one pass and competed with each other for novelty — a multi-scale
+novelty term is the fix to probe). Two tasks show the limits of a
+query-agnostic memory honestly: when the *haystack itself* is needles
+(multikey_2) nothing is novel and the pool holds a random 10% at 16k; QA
+needs the one paragraph the question will ask about, which no signal at
+eviction time can predict, so it degrades toward the pool fraction plus what
+the summaries carry.
 
 ## Wall workload: 32 sessions x 36,864-token context, 8 turns
 
@@ -154,8 +160,9 @@ now within 7% of vLLM per turn and pays 1.8x on the initial prefill.
    farthest-point and surprisal both looked principled and both failed the
    probe; local novelty passed it 30/30. The probe, not the RULER average,
    is the tool for the next signals (instruction similarity, multi-scale
-   novelty, generated-token salience — decode tokens currently enter the
-   pool with no recorded signal).
+   novelty). Novelty is computed from value features at routing time, so
+   generated tokens are scored like prompt tokens; only the surprisal
+   option lacks a signal for them.
 3. **What it does not do**: recall inside a haystack of near-identical
    facts, or predict which ordinary paragraph a later question needs. Those
    need either a query (retrieval at read time from a cold exact store) or
