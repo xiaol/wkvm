@@ -115,6 +115,24 @@ Full 12-task grid, 20 prompts per cell (`ruler_lite_wkvm_routed48.json`,
 | niah_multikey_2 (haystack of needles) | 1.00 | 0.45 | 0.10 | 0.05 | 1.00 | 0.20 → 0.05 |
 | niah_multikey_3 (haystack of uuid needles) | 1.00 | 0.30 | 0.00 | 0.00 | 1.00 | 0.15 → 0.00 |
 
+**R = 144** (`ruler_lite_wkvm_routed144.json`: 11,345 columns, 355 MiB per
+session, a 9,216-token pool ≈ 30% of the evicted tokens at 32k; 4,997 s for
+the grid). Budget buys back exactly the tasks the novelty rule cannot
+separate — the others were already at the ceiling:
+
+| task | 4k | 8k | 16k | 32k | vs R = 48 at 32k |
+|---|---:|---:|---:|---:|---|
+| niah_single_1 / 2 / 3 | 1.00 | 1.00 | 1.00 | 1.00 / 1.00 / 1.00 | 1.00 / 1.00 / 0.95 |
+| niah_multikey_1 / multivalue / multiquery | 1.00 | 1.00 | 1.00 / 0.95 / 0.97 | 1.00 / 1.00 / 1.00 | 1.00 / 1.00 / 1.00 |
+| vt | 0.99 | 1.00 | 1.00 | 0.99 | 1.00 |
+| fwe / cwe | 1.00 / 1.00 | 1.00 / 0.90 | 1.00 / 0.82 | 0.93 / 0.82 | 0.83 / 0.62 |
+| qa_1 | 0.95 | 0.85 | 0.75 | 0.50 | 0.15 |
+| niah_multikey_2 / 3 (haystacks of needles) | 1.00 / 1.00 | 1.00 / 1.00 | 0.70 / 0.50 | 0.40 / 0.05 | 0.05 / 0.00 |
+
+Under CUDA graphs the resident-row copy doubles the store, so R = 144 fits
+about 16 sessions on a 40 GB A100 next to the 9B weights rather than 32;
+de-duplicating that copy is the memory item in the plan.
+
 Five-task subset run first (`ruler_lite_wkvm_routed48_novelty_sub.json`,
 same numbers for its five tasks):
 

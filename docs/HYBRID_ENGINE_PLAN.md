@@ -267,7 +267,9 @@ resume of the imported handle; per-slot bytes and slot capacity.
   needles 0.75–1.00 at 4k–32k, variable tracking 0.99–1.00, frequent-word
   tasks 0.62–1.00; QA 0.95 → 0.15 and the two haystack-of-needles tasks
   1.00 → 0.00–0.05 (nothing is novel there — the honest limit of a
-  query-agnostic memory). Wall workload 32 x 36,864 x 8 turns: **5.5 s per
+  query-agnostic memory). Tripling the pool (R=144, 355 MiB per session)
+  moves exactly those: QA 0.50 and haystack-of-needles 0.40 / 0.05 at 32k,
+  cwe 0.82, everything else already at 0.95–1.00. Wall workload 32 x 36,864 x 8 turns: **5.5 s per
   turn vs vLLM's 130 s (24x), 229 s vs 1036 s over 8 turns (4.5x), 14x on
   the 48-turn shape**; ring without recall is 3.9 s (20x on 48 turns).
   Below the wall the routed engine is within 7% of vLLM per turn.
