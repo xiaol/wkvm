@@ -39,6 +39,8 @@ engine-global (a single-model engine has one EOS set), matching the
 
 from __future__ import annotations
 
+import dataclasses
+
 import torch
 
 from wkvm.core.arena import StateArena
@@ -80,11 +82,14 @@ class Engine:
             num_pages = 0
         self.bank = layout.make_bank(num_slots, device, num_pages=num_pages)
         self.arena = StateArena(spec, num_slots=num_slots, num_pages=num_pages)
-        self.scheduler = Scheduler(
-            scheduler_config or SchedulerConfig(max_running_requests=num_slots),
-            self.arena,
-        )
         self.runner = layout.make_runner(model, self.bank, prefill_chunk)
+        # The scheduler may hand a request at most one runner chunk per step:
+        # batched prefill needs it, and a runner can bound its chunk below
+        # ``prefill_chunk`` (routed guests: the pending buffer and the ring).
+        config = scheduler_config or SchedulerConfig(max_running_requests=num_slots)
+        if config.max_tokens_per_request_per_step > self._runner_chunk():
+            config = dataclasses.replace(config, max_tokens_per_request_per_step=self._runner_chunk())
+        self.scheduler = Scheduler(config, self.arena)
         if cuda_graphs and hasattr(self.runner, "enable_cuda_graphs"):
             kwargs = dict(cuda_graphs) if isinstance(cuda_graphs, dict) else {}
             buckets = kwargs.get("batch_buckets", (1, 2, 4, 8, 16, 32))
@@ -135,6 +140,7 @@ class Engine:
         sink_tokens: int = 16,
         ring_tokens: int = 1024,
         routed_params: dict | None = None,
+        decode_attention: str = "auto",
         **kwargs,
     ) -> "Engine":
         """Qwen3.5 hybrid (Gated DeltaNet + full-attention guests).
@@ -150,6 +156,7 @@ class Engine:
         model, layout = load_qwen35(
             model_path, device=device, dtype=dtype, page_tokens=page_tokens,
             guest_mode=guest_mode, sink_tokens=sink_tokens, ring_tokens=ring_tokens, **(routed_params or {}),
+            decode_attention=decode_attention,
         )
         num_pages = None
         if guest_pool_tokens is not None:
@@ -259,6 +266,11 @@ class Engine:
 
     # -- execution ----------------------------------------------------------------
 
+    def _runner_chunk(self) -> int:
+        """Largest prefill chunk the runner takes in one forward."""
+        chunk = getattr(self.runner, "chunk_size", None)
+        return chunk() if callable(chunk) else self.runner.prefill_chunk
+
     def _execute(self, out: SchedulerOutput) -> dict[str, list[int]]:
         """Run the scheduled token counts; sample where the gap closes.
 
@@ -283,8 +295,9 @@ class Engine:
             # Group equal-length chunks (<= one runner chunk) into one forward;
             # everything else takes the per-request path below.
             groups: dict[int, list[tuple[Request, int]]] = {}
+            chunk = self._runner_chunk()
             for req, n in prefills:
-                if n <= self.runner.prefill_chunk:
+                if n <= chunk:
                     groups.setdefault(n, []).append((req, n))
             done: set[str] = set()
             for n, members in groups.items():

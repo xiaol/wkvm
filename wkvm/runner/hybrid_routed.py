@@ -42,6 +42,7 @@ from __future__ import annotations
 import io
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 
@@ -54,7 +55,7 @@ class RoutedParams:
     reps: int = 48  # representative token budget per slot
     max_span: int = 48
     fallback_span: int = 32
-    dup_floor: float = 0.10  # a new span within 1-floor cosine of a kept one is a duplicate
+    dup_floor: float = 0.02  # a new span within 1-floor cosine of a kept one is a duplicate
     new_slot_sim: float = 0.60  # open a free slot when the best centroid cosine is below this
 
     @property
@@ -115,44 +116,49 @@ def _unit(x: torch.Tensor) -> torch.Tensor:
     return x / (x.norm(dim=-1, keepdim=True) + 1e-6)
 
 
-def farthest_point_keep(cands: list[dict], budget: int, dup_floor: float, centroid: torch.Tensor) -> list[dict]:
-    """Greedy farthest-point selection of spans under a token budget: start
-    from the span closest to the slot's centroid, repeatedly add the
-    candidate farthest from every kept span, skip near-duplicates (cosine >
-    1 - dup_floor to a kept span) and spans that no longer fit."""
+def _unit_np(x: np.ndarray) -> np.ndarray:
+    return x / (np.linalg.norm(x) + 1e-6)
+
+
+def farthest_point_keep(cands: list[dict], budget: int, dup_floor: float, centroid: np.ndarray) -> list[dict]:
+    """Greedy farthest-point selection of spans under a token budget (host
+    numpy): start from the span farthest from the slot's centroid, repeatedly
+    add the candidate farthest from every kept span, skip near-duplicates
+    (cosine > 1 - dup_floor to a kept span) and spans that no longer fit."""
     if not cands:
         return []
-    feats = torch.stack([c["feat"] for c in cands])  # [n, F]
+    feats = np.stack([c["feat"] for c in cands])  # [n, F]
     sims = feats @ feats.T
-    start = int((feats @ centroid).argmax()) if float(centroid.norm()) > 0 else 0
+    # The summary column already represents the slot's mean, so the kept
+    # spans should complement it: start from the span least like the
+    # centroid, then keep adding the one farthest from everything kept.
+    start = int((feats @ centroid).argmin()) if float(np.linalg.norm(centroid)) > 0 else 0
     kept = [start]
     used = cands[start]["len"]
     remaining = [i for i in range(len(cands)) if i != start]
     while remaining:
-        best_i, best_d = None, -1.0
-        for i in remaining:
-            d = float(1.0 - sims[i, kept].max())
-            if d > best_d:
-                best_i, best_d = i, d
-        remaining.remove(best_i)
+        d = 1.0 - sims[np.ix_(remaining, kept)].max(axis=1)
+        j = int(d.argmax())
+        i, best_d = remaining.pop(j), float(d[j])
         if best_d < dup_floor:
             continue
-        if used + cands[best_i]["len"] > budget:
+        if used + cands[i]["len"] > budget:
             continue
-        kept.append(best_i)
-        used += cands[best_i]["len"]
+        kept.append(i)
+        used += cands[i]["len"]
     return [cands[i] for i in kept]
 
 
 class SlotState:
-    """Host-side bookkeeping for one (session, layer)."""
+    """Host-side bookkeeping for one (session, layer): unit centroids and
+    span features live in numpy so routing decisions never touch the GPU."""
 
     __slots__ = ("centroid", "count", "spans")
 
-    def __init__(self, params: RoutedParams, feat_dim: int, device) -> None:
-        self.centroid = torch.zeros((params.slots, feat_dim), device=device)  # unit vectors, 0 = free
+    def __init__(self, params: RoutedParams, feat_dim: int) -> None:
+        self.centroid = np.zeros((params.slots, feat_dim), dtype=np.float32)  # unit vectors, 0 = free
         self.count = [0] * params.slots
-        self.spans: list[list[dict]] = [[] for _ in range(params.slots)]  # {"feat","len","col"}
+        self.spans: list[list[dict]] = [[] for _ in range(params.slots)]  # {"feat","len","col","src"}
 
 
 class RoutedStore:
@@ -198,15 +204,17 @@ class RoutedGuest:
         self.n_attn = n_attn
         self.feat_dim = kv_heads * head_dim
         self.device = device
+        if params.max_span > params.reps or params.fallback_span > params.reps:
+            raise ValueError("routed: max_span and fallback_span must not exceed the representative budget")
         self.state: dict[tuple[int, int], SlotState] = {}  # (session id, layer) -> state
-        self.stats = {"routing_passes": 0, "spans": 0, "new_slots": 0, "dropped_spans": 0}
+        self.stats = {"routing_passes": 0, "spans": 0, "new_slots": 0, "spills": 0, "dropped_spans": 0}
 
     # -- host state per session ------------------------------------------------------
 
     def slot_state(self, session: int, layer: int) -> SlotState:
         key = (session, layer)
         if key not in self.state:
-            self.state[key] = SlotState(self.p, self.feat_dim, self.device)
+            self.state[key] = SlotState(self.p, self.feat_dim)
         return self.state[key]
 
     def drop_session(self, session: int) -> None:
@@ -220,9 +228,9 @@ class RoutedGuest:
             st = self.state.get((session, layer))
             if st is None:
                 continue
-            payload[layer] = {"centroid": st.centroid.cpu(), "count": list(st.count),
-                              "spans": [[{"feat": s["feat"].cpu(), "len": s["len"], "col": s["col"]} for s in sl]
-                                        for sl in st.spans]}
+            payload[layer] = {"centroid": torch.from_numpy(st.centroid.copy()), "count": list(st.count),
+                              "spans": [[{"feat": torch.from_numpy(np.ascontiguousarray(s["feat"])), "len": s["len"],
+                                          "col": s["col"]} for s in sl] for sl in st.spans]}
         buf = io.BytesIO()
         torch.save(payload, buf)
         return torch.frombuffer(bytearray(buf.getvalue()), dtype=torch.uint8)
@@ -232,9 +240,9 @@ class RoutedGuest:
         payload = torch.load(io.BytesIO(blob.numpy().tobytes()), weights_only=False)
         for layer, d in payload.items():
             st = self.slot_state(session, layer)
-            st.centroid.copy_(d["centroid"].to(self.device))
+            st.centroid[:] = d["centroid"].numpy()
             st.count = list(d["count"])
-            st.spans = [[{"feat": s["feat"].to(self.device), "len": s["len"], "col": s["col"], "src": None}
+            st.spans = [[{"feat": s["feat"].numpy().astype(np.float32), "len": s["len"], "col": s["col"], "src": None}
                          for s in sl] for sl in d["spans"]]
 
     # -- column arithmetic ---------------------------------------------------------------
@@ -279,91 +287,136 @@ class RoutedGuest:
         return int(store.pend[r]) >= self.p.pending
 
     def route(self, store: RoutedStore, r: int, session: int) -> None:
-        """Route row ``r``'s pending tokens into its span bank (every layer)."""
+        """Route row ``r``'s pending tokens into its span bank, every layer.
+
+        Decisions run on the host from one device->host transfer (the spans'
+        unit mean values, all layers); the store is then updated with a few
+        batched index operations per layer: summaries blended as one linear
+        combination (equal to the sequential running mean), representatives
+        gathered from their old columns / pending and scattered into the
+        re-laid-out slot blocks."""
         p = self.p
         n = int(store.pend[r])
         if n == 0:
             return
-        pend_cols = torch.arange(p.pend_base, p.pend_base + n, device=store.device)
-        spans = split_spans(store.is_break[r, pend_cols], p.max_span, p.fallback_span)
+        dev = store.device
+        pend = slice(p.pend_base, p.pend_base + n)
+        spans = split_spans(store.is_break[r, pend].cpu(), p.max_span, p.fallback_span)
         self.stats["routing_passes"] += 1
         self.stats["spans"] += len(spans)
-        pos_p = store.pos[r, pend_cols]
-        for layer in range(self.n_attn):
-            st = self.slot_state(session, layer)
-            k_p = store.k[layer, r, :, pend_cols]  # [kvh, n, hd]
-            v_p = store.v[layer, r, :, pend_cols]
-            for a, b in spans:
-                length = b - a
-                v_span = v_p[:, a:b]
-                feat = _unit(v_span.float().mean(dim=1).flatten())
-                sims = st.centroid @ feat
-                best = int(sims.argmax())
-                free = next((i for i in range(p.slots) if st.count[i] == 0), None)
-                if free is not None and (st.count[best] == 0 or float(sims[best]) < p.new_slot_sim):
-                    target = free
-                    self.stats["new_slots"] += 1
-                else:
-                    target = best
-                c_old = st.count[target]
-                summ_col = p.summ_base + target
-                k_mean = k_p[:, a:b].float().mean(dim=1)
-                v_mean = v_span.float().mean(dim=1)
-                if c_old == 0:
-                    store.k[layer, r, :, summ_col] = k_mean.to(store.k.dtype)
-                    store.v[layer, r, :, summ_col] = v_mean.to(store.v.dtype)
-                    st.centroid[target] = feat
-                    if layer == 0:
-                        store.pos[r, summ_col] = int(pos_p[a])
-                else:
-                    w_old, w_new = c_old / (c_old + length), length / (c_old + length)
-                    store.k[layer, r, :, summ_col] = (store.k[layer, r, :, summ_col].float() * w_old + k_mean * w_new).to(store.k.dtype)
-                    store.v[layer, r, :, summ_col] = (store.v[layer, r, :, summ_col].float() * w_old + v_mean * w_new).to(store.v.dtype)
-                    st.centroid[target] = _unit(st.centroid[target] * w_old + feat * w_new)
-                st.count[target] = c_old + length
-                store.valid[layer, r, summ_col] = True
-                cand = list(st.spans[target]) + [{"feat": feat, "len": length, "src": (a, b), "col": None}]
-                kept = farthest_point_keep(cand, p.reps, p.dup_floor, st.centroid[target])
-                self.stats["dropped_spans"] += len(cand) - len(kept)
-                self._rewrite_reps(store, r, layer, target, kept, k_p, v_p, pos_p)
-                st.spans[target] = kept
-        store.valid[:, r, pend_cols] = False
-        store.pos[r, pend_cols] = -1
-        store.is_break[r, pend_cols] = False
+        n_layers, kvh, hd = self.n_attn, store.k.shape[2], store.k.shape[4]
+        feat_dim = kvh * hd
+        assign = np.zeros((len(spans), n), dtype=np.float32)
+        for i, (a, b) in enumerate(spans):
+            assign[i, a:b] = 1.0 / (b - a)
+        assign_t = torch.from_numpy(assign).to(dev)
+        k_p = store.k[:, r, :, pend].permute(0, 2, 1, 3).reshape(n_layers, n, feat_dim).float()
+        v_p = store.v[:, r, :, pend].permute(0, 2, 1, 3).reshape(n_layers, n, feat_dim).float()
+        k_mean = torch.matmul(assign_t, k_p)  # [L, S, F]
+        v_mean = torch.matmul(assign_t, v_p)
+        feats = _unit(v_mean).cpu().numpy()  # the pass's one device->host transfer
+        pos_pend = store.pos[r, pend]
+        for layer in range(n_layers):
+            plan = self._decide(self.slot_state(session, layer), spans, feats[layer])
+            self._apply(store, r, layer, plan, k_mean[layer], v_mean[layer], pos_pend)
+        store.valid[:, r, pend] = False
+        store.pos[r, pend] = -1
+        store.is_break[r, pend] = False
         store.pend[r] = 0
 
-    def _rewrite_reps(self, store: RoutedStore, r: int, layer: int, target: int, kept: list[dict],
-                      k_p: torch.Tensor, v_p: torch.Tensor, pos_p: torch.Tensor) -> None:
-        """Lay the kept spans out contiguously in the slot's rep block;
-        resident spans move within the block, the new span comes from
-        pending. Positions are one tensor shared by the layers (they are
-        bookkeeping only, K is stored after RoPE); layer 0 writes them."""
+    def _decide(self, st: SlotState, spans: list[tuple[int, int]], feats: np.ndarray):
+        """Host routing of one layer's spans, in order: slot choice, running
+        centroid/count, retention. Returns the summary blend per touched
+        slot and the column moves that lay the kept spans out."""
         p = self.p
-        b0, b1 = p.rep_block(target)
-        old_k = store.k[layer, r, :, b0:b1].clone()
-        old_v = store.v[layer, r, :, b0:b1].clone()
-        old_pos = store.pos[r, b0:b1].clone()
-        store.valid[layer, r, b0:b1] = False
-        cursor = b0
-        for sp in kept:
-            length = sp["len"]
-            if sp["col"] is not None:
-                o = sp["col"] - b0
-                store.k[layer, r, :, cursor:cursor + length] = old_k[:, o:o + length]
-                store.v[layer, r, :, cursor:cursor + length] = old_v[:, o:o + length]
-                if layer == 0:
-                    store.pos[r, cursor:cursor + length] = old_pos[o:o + length]
+        touched: dict[int, dict] = {}  # slot -> {"c0": count before the pass, "parts": [(span, len)]}
+        for si, (a, b) in enumerate(spans):
+            feat, length = feats[si], b - a
+            sims = st.centroid @ feat
+            best = int(sims.argmax())
+            free = next((i for i in range(p.slots) if st.count[i] == 0), None)
+            if free is not None and (st.count[best] == 0 or float(sims[best]) < p.new_slot_sim):
+                target = free
+                self.stats["new_slots"] += 1
+            elif (free is not None and sum(sp["len"] for sp in st.spans[best]) + length > p.reps
+                  and not any(float(sp["feat"] @ feat) > 1.0 - p.dup_floor for sp in st.spans[best])):
+                # The nearest slot would have to drop something to hold this
+                # span and it is no duplicate there: spill to a free slot, so
+                # the bank's whole representative capacity gets used before
+                # retention starts choosing.
+                target = free
+                self.stats["spills"] += 1
             else:
-                a, b = sp["src"]
-                store.k[layer, r, :, cursor:cursor + length] = k_p[:, a:b]
-                store.v[layer, r, :, cursor:cursor + length] = v_p[:, a:b]
-                if layer == 0:
-                    store.pos[r, cursor:cursor + length] = pos_p[a:b]
-            store.valid[layer, r, cursor:cursor + length] = True
-            sp["col"], sp["src"] = cursor, None  # this layer's own bookkeeping (SlotState is per layer)
-            cursor += length
+                target = best
+            c_old = st.count[target]
+            info = touched.setdefault(target, {"c0": c_old, "parts": [], "first_pos": a})
+            info["parts"].append((si, length))
+            if c_old == 0:
+                st.centroid[target] = feat
+            else:
+                w_old, w_new = c_old / (c_old + length), length / (c_old + length)
+                st.centroid[target] = _unit_np(st.centroid[target] * w_old + feat * w_new)
+            st.count[target] = c_old + length
+            cand = list(st.spans[target]) + [{"feat": feat, "len": length, "src": (a, b), "col": None}]
+            kept = farthest_point_keep(cand, p.reps, p.dup_floor, st.centroid[target])
+            self.stats["dropped_spans"] += len(cand) - len(kept)
+            st.spans[target] = kept
+        src, dst, blocks = [], [], []
+        for m in touched:
+            b0, b1 = p.rep_block(m)
+            blocks.append((b0, b1))
+            cursor = b0
+            for sp in st.spans[m]:
+                length = sp["len"]
+                src.append((sp["col"] if sp["col"] is not None else p.pend_base + sp["src"][0], length))
+                dst.append((cursor, length))
+                sp["col"], sp["src"] = cursor, None
+                cursor += length
+        return touched, src, dst, blocks
+
+    def _apply(self, store: RoutedStore, r: int, layer: int, plan, k_mean: torch.Tensor, v_mean: torch.Tensor,
+               pos_pend: torch.Tensor) -> None:
+        touched, src, dst, blocks = plan
+        if not touched:
+            return
+        p, dev = self.p, store.device
+        kvh, hd = store.k.shape[2], store.k.shape[4]
+        slots_t = list(touched)
+        # Summaries: new = w_old * old + sum_s w_s * mean_s (the running mean over tokens).
+        weights = np.zeros((len(slots_t), k_mean.shape[0]), dtype=np.float32)
+        w_old = np.zeros((len(slots_t), 1), dtype=np.float32)
+        for i, m in enumerate(slots_t):
+            info = touched[m]
+            total = info["c0"] + sum(length for _, length in info["parts"])
+            w_old[i, 0] = info["c0"] / total
+            for si, length in info["parts"]:
+                weights[i, si] += length / total
+        summ_cols = torch.tensor([p.summ_base + m for m in slots_t], device=dev)
+        weights_t, w_old_t = torch.from_numpy(weights).to(dev), torch.from_numpy(w_old).to(dev)
+        for tensor, mean in ((store.k, k_mean), (store.v, v_mean)):
+            old = tensor[layer, r, :, summ_cols].float().permute(1, 0, 2).reshape(len(slots_t), -1)  # [T, F]
+            new = w_old_t * old + weights_t @ mean
+            tensor[layer, r, :, summ_cols] = new.reshape(len(slots_t), kvh, hd).permute(1, 0, 2).to(tensor.dtype)
+        store.valid[layer, r, summ_cols] = True
         if layer == 0:
-            store.pos[r, cursor:b1] = -1
+            fresh = [(p.summ_base + m, touched[m]["first_pos"]) for m in slots_t if touched[m]["c0"] == 0]
+            if fresh:
+                cols = torch.tensor([c for c, _ in fresh], device=dev)
+                store.pos[r, cols] = pos_pend[torch.tensor([a for _, a in fresh], device=dev)]
+        # Representatives: gather every source before any block is rewritten.
+        src_t = torch.from_numpy(np.concatenate([np.arange(c, c + length) for c, length in src])).to(dev)
+        dst_t = torch.from_numpy(np.concatenate([np.arange(c, c + length) for c, length in dst])).to(dev)
+        block_t = torch.from_numpy(np.concatenate([np.arange(b0, b1) for b0, b1 in blocks])).to(dev)
+        k_src = store.k[layer, r, :, src_t]
+        v_src = store.v[layer, r, :, src_t]
+        pos_src = store.pos[r, src_t] if layer == 0 else None
+        store.valid[layer, r, block_t] = False
+        store.k[layer, r, :, dst_t] = k_src
+        store.v[layer, r, :, dst_t] = v_src
+        store.valid[layer, r, dst_t] = True
+        if layer == 0:
+            store.pos[r, block_t] = -1
+            store.pos[r, dst_t] = pos_src
 
     # -- masks ----------------------------------------------------------------------------
 

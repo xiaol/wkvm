@@ -162,6 +162,24 @@ class TestRoutedEngine(unittest.TestCase):
         # positions of valid columns are never -1
         self.assertTrue(bool((st.pos[g][valid] >= 0).all()))
 
+    def test_scheduler_step_capped_to_runner_chunk(self) -> None:
+        """A scheduler configured for 8-token steps must be capped to the
+        routed runner's 4-token chunk (pending buffer), so equal-length
+        chunks can still take the batched prefill path; results equal the
+        4-token-chunk engine."""
+        fx = _fixture()
+        ref = _engine(chunk=4)
+        reqs = [Request(prompt_token_ids=list(fx["prompts"][2]), max_new_tokens=6) for _ in range(2)]
+        for r in reqs:
+            ref.add_request(r)
+        expected = _run(ref, reqs)
+        wide = _engine(chunk=8)
+        self.assertEqual(wide.scheduler.config.max_tokens_per_request_per_step, 4)
+        reqs = [Request(prompt_token_ids=list(fx["prompts"][2]), max_new_tokens=6) for _ in range(2)]
+        for r in reqs:
+            wide.add_request(r)
+        self.assertEqual(_run(wide, reqs), expected)
+
     def test_hibernate_resume_round_trips_routing_state(self) -> None:
         fx = _fixture()
         tmp = tempfile.mkdtemp()

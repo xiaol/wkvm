@@ -325,6 +325,33 @@ def load_state_adapter(
     return {GDN_STATE_FAMILY: state}, meta
 
 
+def _gqa_attention_forward(module, query, key, value, attention_mask, dropout: float = 0.0, scaling=None, **kwargs):
+    """HF attention interface ``"wkvm_gqa"``: for a single query token with a
+    boolean mask, attend GQA-natively — the KV heads are broadcast over
+    their query group in the matmul instead of ``repeat_kv`` materialising
+    ``groups`` copies of K and V (with 5k+ columns per row that copy is
+    what a decode step costs). Anything else delegates to HF's sdpa path."""
+    from transformers.integrations.sdpa_attention import sdpa_attention_forward
+
+    if query.shape[2] != 1 or attention_mask is None or attention_mask.dtype != torch.bool:
+        return sdpa_attention_forward(module, query, key, value, attention_mask, dropout=dropout, scaling=scaling, **kwargs)
+    b, heads, _, hd = query.shape
+    kvh = key.shape[1]
+    q = query.reshape(b, kvh, heads // kvh, hd)  # heads grouped contiguously per KV head, as repeat_kv does
+    scores = torch.matmul(q, key.transpose(-1, -2)).float() * (scaling if scaling is not None else hd ** -0.5)
+    scores = scores.masked_fill(~attention_mask[:, 0, 0, :][:, None, None, :], float("-inf"))
+    probs = torch.softmax(scores, dim=-1).to(value.dtype)
+    out = torch.matmul(probs, value)  # [b, kvh, groups, hd]
+    return out.reshape(b, 1, heads, hd), None
+
+
+def _register_gqa_attention() -> None:
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    if "wkvm_gqa" not in ALL_ATTENTION_FUNCTIONS:
+        ALL_ATTENTION_FUNCTIONS.register("wkvm_gqa", _gqa_attention_forward)
+
+
 class Qwen35Decoder(torch.nn.Module):
     """The text stack of a Qwen3.5 checkpoint as wkvm drives it.
 
@@ -344,6 +371,18 @@ class Qwen35Decoder(torch.nn.Module):
         self.lm_head = lm_head
         self.config = config
         self.layer_types = tuple(config.layer_types)
+
+    def set_decode_attention(self, gqa: bool) -> None:
+        """``gqa=True`` routes single-token decode through the GQA-native
+        attention (see ``_gqa_attention_forward``); ``False`` keeps HF's
+        sdpa path everywhere (bit-exact with HF generation)."""
+        if gqa:
+            _register_gqa_attention()
+        self.config._attn_implementation = "wkvm_gqa" if gqa else "sdpa"
+
+    @property
+    def decode_attention(self) -> str:
+        return "gqa" if self.config._attn_implementation == "wkvm_gqa" else "sdpa"
 
     @classmethod
     def from_hf(cls, hf_model) -> "Qwen35Decoder":
@@ -393,6 +432,7 @@ def load_qwen35(
     guest_mode: str = "paged",
     sink_tokens: int = 16,
     ring_tokens: int = 1024,
+    decode_attention: str = "auto",
     **routed,
 ):
     """Load a Qwen3.5 checkpoint (text-only or conditional-generation layout)
@@ -425,6 +465,11 @@ def load_qwen35(
     hf = hf.to(device).eval().requires_grad_(False)
     decoder = Qwen35Decoder.from_hf(hf)
     decoder._hf_model = hf  # keep the owner alive; submodules are shared
+    if decode_attention not in ("auto", "gqa", "sdpa"):
+        raise ValueError(f"decode_attention must be auto|gqa|sdpa, got {decode_attention!r}")
+    # Approximate guests (ring/routed) take the GQA-native decode attention;
+    # paged stays on HF's sdpa so the exactness gates against HF hold.
+    decoder.set_decode_attention(decode_attention == "gqa" or (decode_attention == "auto" and guest_mode != "paged"))
     if guest_mode == "routed" and not routed.get("break_token_ids"):
         routed["break_token_ids"] = break_token_ids(model_path)
     layout = Qwen35HybridLayout.from_config(

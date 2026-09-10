@@ -63,6 +63,19 @@ class Qwen35HybridRunner:
             return min(self.prefill_chunk, self.bank.rg.p.pending, self.bank.rg.p.ring)
         return self.prefill_chunk
 
+    # Cap on the past K/V one batched prefill forward gathers from the bank
+    # (plus the concatenation with the new tokens): a routed store is 5,201
+    # columns per row, 32 rows would copy 11 GiB per forward.
+    prefill_gather_bytes = 4 << 30
+
+    def _rows_per_forward(self, t: int, lens: list[int]) -> int:
+        lay = self.bank.layout
+        if not lay.n_attn:
+            return max(1, len(lens))
+        cols = (lay.window_tokens if getattr(self.bank, "ring", False) or getattr(self.bank, "routed", False)
+                else max(lens)) + t
+        return max(1, self.prefill_gather_bytes // (2 * cols * lay.guest_bytes_per_token))
+
     @torch.inference_mode()
     def prefill_batch(self, items: list[tuple[list[int], dict]]) -> list[torch.Tensor]:
         """Prefill several requests' chunks of EQUAL length as one forward.
@@ -81,6 +94,12 @@ class Qwen35HybridRunner:
             raise ValueError("prefill_batch needs equal-length chunks")
         if t > self.chunk_size():
             raise ValueError("prefill_batch chunk exceeds the runner's chunk size")
+        cap = self._rows_per_forward(t, [self.bank.slot_len(slots) for _, slots in items])
+        if len(items) > cap:  # keep the gathered past K/V under the byte budget
+            out: list[torch.Tensor] = []
+            for i in range(0, len(items), cap):
+                out.extend(self.prefill_batch(items[i:i + cap]))
+            return out
         ids = torch.tensor([tokens for tokens, _ in items], dtype=torch.long, device=self.device)
         slot_batch = [slots for _, slots in items]
         cache = self.bank.gather(slot_batch, new_tokens=t, token_ids=ids)
