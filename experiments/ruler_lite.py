@@ -23,6 +23,11 @@ length — the score is the model's, the agreement is the engine's.
 
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("OMP_NUM_THREADS", "8")  # 128-core host: BLAS/torch thread fan-out on tiny host ops is a 10x slowdown
+os.environ.setdefault("MKL_NUM_THREADS", "8")
+
 import argparse
 import json
 import random
@@ -356,7 +361,8 @@ def run_wkvm(samples, tok, args):
         cuda_graphs=graphs if not args.no_graphs else False,
         guest_mode=args.guest_mode, sink_tokens=args.sink_tokens, ring_tokens=args.ring_tokens,
         routed_params=dict(routed_pending=args.routed_pending, routed_slots=args.routed_slots,
-                           routed_reps=args.routed_reps, routed_max_span=args.routed_max_span),
+                           routed_reps=args.routed_reps, routed_max_span=args.routed_max_span,
+                           routed_retention=args.routed_retention),
     )
     if engine.bank.routed:
         p = engine.bank.rg.p
@@ -460,6 +466,7 @@ def main() -> None:
     ap.add_argument("--routed-slots", type=int, default=64)
     ap.add_argument("--routed-reps", type=int, default=48)
     ap.add_argument("--routed-max-span", type=int, default=48)
+    ap.add_argument("--routed-retention", choices=("novelty", "surprisal", "fps"), default="novelty")
     ap.add_argument("--json", default=None)
     ap.add_argument("--data-cache", default="experiments/results/ruler_lite_data.json")
     ap.add_argument("--compare", nargs=2, default=None)

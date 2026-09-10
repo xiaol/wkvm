@@ -97,6 +97,7 @@ class HybridDecodeGraphs:
         self.ids = torch.zeros((bmax, 1), dtype=torch.long, device=self.device)
         self.lens = torch.zeros((bmax,), dtype=torch.long, device=self.device)
         self.true_b = torch.ones(bmax, dtype=torch.bool, device=self.device)
+        self.zero_f = torch.zeros(bmax, dtype=torch.float32, device=self.device)
         self.rows_idx = torch.arange(bmax, device=self.device)
         self.gdn_state = torch.zeros((lay.n_gdn, bmax, *lay.gdn_state_shape), dtype=GDN_STATE_DTYPE, device=self.device)
         self.gdn_conv = torch.zeros((lay.n_gdn, bmax, *lay.gdn_conv_shape), dtype=dt, device=self.device)
@@ -162,10 +163,12 @@ class HybridDecodeGraphs:
                 st.valid[j][rows, dst] = do_evict
             st.pos[rows, dst] = st.pos[rows, col]
             st.is_break[rows, dst] = st.is_break[rows, col]
+            st.sal[rows, dst] = st.sal[rows, col]
             st.pend[:b] += do_evict.long()
             st.valid[:, rows, col] = self.true_b[:b]  # device bool, no host scalar under capture
             st.pos[rows, col] = lens
             st.is_break[rows, col] = self.bank.break_lut[ids[:, 0]]
+            st.sal[rows, col] = self.zero_f[:b]  # generated tokens: no surprisal recorded
             cache.col_t = col
             mask = st.valid[0, :b][:, None, None, :]
             return self.model(ids, cache, positions, mask)
@@ -241,14 +244,15 @@ class HybridDecodeGraphs:
             r = rows[:, None].expand_as(cols)
             return ("routed", self.gdn_state[:, :b].clone(), self.gdn_conv[:, :b].clone(),
                     st.k[:, r, :, cols].clone(), st.v[:, r, :, cols].clone(), st.valid[:, r, cols].clone(),
-                    st.pos[r, cols].clone(), st.is_break[r, cols].clone(), st.pend[:b].clone(), r, cols)
+                    st.pos[r, cols].clone(), st.is_break[r, cols].clone(), st.sal[r, cols].clone(),
+                    st.pend[:b].clone(), r, cols)
         cols = self.bank.ring_columns(self.lens[:b]) if self.ring else self.lens[:b]
         return ("plain", self.gdn_state[:, :b].clone(), self.gdn_conv[:, :b].clone(),
                 self.k_win[:, rows, :, cols].clone(), self.v_win[:, rows, :, cols].clone(), rows, cols)
 
     def _restore_rows(self, b: int, l: int, saved) -> None:
         if saved[0] == "routed":
-            _, gdn_state, gdn_conv, k, v, valid, pos, brk, pend, r, cols = saved
+            _, gdn_state, gdn_conv, k, v, valid, pos, brk, sal, pend, r, cols = saved
             st = self.rstore
             self.gdn_state[:, :b].copy_(gdn_state)
             self.gdn_conv[:, :b].copy_(gdn_conv)
@@ -257,6 +261,7 @@ class HybridDecodeGraphs:
             st.valid[:, r, cols] = valid
             st.pos[r, cols] = pos
             st.is_break[r, cols] = brk
+            st.sal[r, cols] = sal
             st.pend[:b].copy_(pend)
             return
         _, gdn_state, gdn_conv, k_cols, v_cols, rows, cols = saved

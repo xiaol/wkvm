@@ -308,7 +308,8 @@ class TestHybridGraphs(unittest.TestCase):
             row, G = gg, graphed.bank.rstore
         for name, a, b in (("k", E.k[:, ge], G.k[:, row]), ("v", E.v[:, ge], G.v[:, row]),
                            ("valid", E.valid[:, ge], G.valid[:, row]), ("pos", E.pos[ge], G.pos[row]),
-                           ("is_break", E.is_break[ge], G.is_break[row]), ("pend", E.pend[ge], G.pend[row])):
+                           ("is_break", E.is_break[ge], G.is_break[row]), ("sal", E.sal[ge], G.sal[row]),
+                           ("pend", E.pend[ge], G.pend[row])):
             self.assertTrue(torch.equal(a, b), f"request {i}: routed store '{name}' differs")
 
     def test_gqa_decode_attention_matches_sdpa(self) -> None:

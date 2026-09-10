@@ -27,6 +27,11 @@ comparison is throughput at a stated semantics, like the Gemma rows.
 
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("OMP_NUM_THREADS", "8")  # 128-core host: BLAS/torch thread fan-out on tiny host ops is a 10x slowdown
+os.environ.setdefault("MKL_NUM_THREADS", "8")
+
 import argparse
 import json
 import os
@@ -79,7 +84,8 @@ def run_wkvm(args, tok, prompts):
                                          max_running_requests=b, max_tokens_per_request_per_step=args.prefill_chunk),
         cuda_graphs=graphs, guest_mode=args.guest_mode, sink_tokens=args.sink_tokens, ring_tokens=args.ring_tokens,
         routed_params=dict(routed_pending=args.routed_pending, routed_slots=args.routed_slots,
-                           routed_reps=args.routed_reps, routed_max_span=args.routed_max_span),
+                           routed_reps=args.routed_reps, routed_max_span=args.routed_max_span,
+                           routed_retention=args.routed_retention),
     )
     weights_gib = torch.cuda.memory_allocated(dev) / 2**30
     reqs = [Request(prompt_token_ids=list(p), max_new_tokens=args.out) for p in prompts]
@@ -177,6 +183,7 @@ def main() -> None:
     ap.add_argument("--routed-slots", type=int, default=64)
     ap.add_argument("--routed-reps", type=int, default=48)
     ap.add_argument("--routed-max-span", type=int, default=48)
+    ap.add_argument("--routed-retention", choices=("novelty", "surprisal", "fps"), default="novelty")
     ap.add_argument("--vllm-gpu-mem-util", type=float, default=0.85)
     ap.add_argument("--json", default=None)
     args = ap.parse_args()

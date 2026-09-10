@@ -381,6 +381,7 @@ class Qwen35StateBank:
                 )
             cache = RoutedSlotCache(self.layout, lens, layers, self, rows)
             cache.new_ids = token_ids
+            cache.wants_surprisal = self.rg.p.retention == "surprisal"
             return cache
         if self.layout.n_attn and self.ring:
             gids = self._ids(slot_batch, GUEST_KV_FAMILY)
@@ -483,6 +484,7 @@ class Qwen35StateBank:
         st = self.rstore
         idx_all = torch.arange(t, device=self.device)
         breaks = self.break_lut[cache.new_ids]  # [B, T]
+        sal = getattr(cache, "surprisal", None)  # [B, T] float32 or None (decode tokens: 0)
         for row, slots in enumerate(slot_batch):
             g = slots[GUEST_KV_FAMILY]
             start = cache.lens[row]  # ring columns already evicted in gather()
@@ -497,6 +499,7 @@ class Qwen35StateBank:
             st.valid[:, g, cols] = True
             st.pos[g, cols] = pos_k
             st.is_break[g, cols] = breaks[row][idx_k]
+            st.sal[g, cols] = sal[row][idx_k] if sal is not None else 0.0
 
     # -- durable-state protocol (wkvm/store.py) ------------------------------------
 
@@ -530,7 +533,7 @@ class Qwen35StateBank:
         if self.layout.n_attn and self.routed:
             g, st = slots[GUEST_KV_FAMILY], self.rstore
             out.update({"rt_k": st.k[:, g], "rt_v": st.v[:, g], "rt_valid": st.valid[:, g], "rt_pos": st.pos[g],
-                        "rt_break": st.is_break[g], "rt_pend": st.pend[g:g + 1]})
+                        "rt_break": st.is_break[g], "rt_sal": st.sal[g], "rt_pend": st.pend[g:g + 1]})
             host = {k: _to_host(v) for k, v in out.items()}
             host["rt_state"] = self.rg.export_session(slots[GDN_STATE_FAMILY])
             host["guest_len"] = torch.tensor([n], dtype=torch.int64)
@@ -556,7 +559,7 @@ class Qwen35StateBank:
         only ``gdn_state`` present — a valid request."""
         self.zero_slots(slots)
         known = {GDN_STATE_FAMILY, GDN_CONV_FAMILY, "guest_k", "guest_v", "guest_len", "ring_k", "ring_v", "ring_pos",
-                 "rt_k", "rt_v", "rt_valid", "rt_pos", "rt_break", "rt_pend", "rt_state"}
+                 "rt_k", "rt_v", "rt_valid", "rt_pos", "rt_break", "rt_sal", "rt_pend", "rt_state"}
         unknown = set(tensors) - known
         if unknown:
             raise KeyError(f"unknown state tensors for Qwen3.5 bank: {sorted(unknown)}")
@@ -579,6 +582,8 @@ class Qwen35StateBank:
             st.valid[:, g].copy_(tensors["rt_valid"].to(self.device))
             st.pos[g].copy_(tensors["rt_pos"].to(self.device))
             st.is_break[g].copy_(tensors["rt_break"].to(self.device))
+            if "rt_sal" in tensors:
+                st.sal[g].copy_(tensors["rt_sal"].to(self.device))
             st.pend[g] = int(tensors["rt_pend"].reshape(-1)[0])
             self.rg.import_session(slots[GDN_STATE_FAMILY], tensors["rt_state"])
             self.guest_len[slots[GDN_STATE_FAMILY]] = int(tensors["guest_len"].reshape(-1)[0])

@@ -57,6 +57,9 @@ class RoutedParams:
     fallback_span: int = 32
     dup_floor: float = 0.02  # a new span within 1-floor cosine of a kept one is a duplicate
     new_slot_sim: float = 0.60  # open a free slot when the best centroid cosine is below this
+    shared: bool = True  # decide once per session from all layers' features; else per layer
+    retention: str = "novelty"  # "novelty": one pool, spans unlike their neighbours in time; "surprisal": one pool by
+    # token surprisal; "fps": per-slot farthest-point retention (the original Gemma rule)
 
     @property
     def pend_cap(self) -> int:
@@ -153,12 +156,13 @@ class SlotState:
     """Host-side bookkeeping for one (session, layer): unit centroids and
     span features live in numpy so routing decisions never touch the GPU."""
 
-    __slots__ = ("centroid", "count", "spans")
+    __slots__ = ("centroid", "count", "spans", "pool")
 
     def __init__(self, params: RoutedParams, feat_dim: int) -> None:
         self.centroid = np.zeros((params.slots, feat_dim), dtype=np.float32)  # unit vectors, 0 = free
         self.count = [0] * params.slots
-        self.spans: list[list[dict]] = [[] for _ in range(params.slots)]  # {"feat","len","col","src"}
+        self.spans: list[list[dict]] = [[] for _ in range(params.slots)]  # {"feat","len","col","src","pos"}
+        self.pool: list[dict] = []  # retention="surprisal": the one global pool of kept spans (+"sal")
 
 
 class RoutedStore:
@@ -174,6 +178,7 @@ class RoutedStore:
         self.valid = torch.zeros((n_attn, rows, c), dtype=torch.bool, device=device)
         self.pos = torch.full((rows, c), -1, dtype=torch.long, device=device)
         self.is_break = torch.zeros((rows, c), dtype=torch.bool, device=device)
+        self.sal = torch.zeros((rows, c), dtype=torch.float32, device=device)  # token surprisal per column
         self.pend = torch.zeros((rows,), dtype=torch.long, device=device)
         self.device = device
 
@@ -181,6 +186,7 @@ class RoutedStore:
         self.valid[:, r].zero_()
         self.pos[r].fill_(-1)
         self.is_break[r].zero_()
+        self.sal[r].zero_()
         self.pend[r] = 0
 
     def copy_row(self, src: "RoutedStore", src_r: int, dst_r: int) -> None:
@@ -189,10 +195,11 @@ class RoutedStore:
         self.valid[:, dst_r].copy_(src.valid[:, src_r])
         self.pos[dst_r].copy_(src.pos[src_r])
         self.is_break[dst_r].copy_(src.is_break[src_r])
+        self.sal[dst_r].copy_(src.sal[src_r])
         self.pend[dst_r] = src.pend[src_r]
 
     def state_bytes(self) -> int:
-        return sum(t.numel() * t.element_size() for t in (self.k, self.v, self.valid, self.pos, self.is_break))
+        return sum(t.numel() * t.element_size() for t in (self.k, self.v, self.valid, self.pos, self.is_break, self.sal))
 
 
 class RoutedGuest:
@@ -202,20 +209,31 @@ class RoutedGuest:
     def __init__(self, params: RoutedParams, n_attn: int, kv_heads: int, head_dim: int, device) -> None:
         self.p = params
         self.n_attn = n_attn
-        self.feat_dim = kv_heads * head_dim
+        self.feat_dim = (kv_heads * head_dim) * (n_attn if params.shared else 1)
         self.device = device
+        if params.retention not in ("novelty", "surprisal", "fps"):
+            raise ValueError(f"routed retention must be novelty|surprisal|fps, got {params.retention!r}")
         if params.max_span > params.reps or params.fallback_span > params.reps:
             raise ValueError("routed: max_span and fallback_span must not exceed the representative budget")
         self.state: dict[tuple[int, int], SlotState] = {}  # (session id, layer) -> state
         self.stats = {"routing_passes": 0, "spans": 0, "new_slots": 0, "spills": 0, "dropped_spans": 0}
+        self.trace: list[dict] | None = None  # set to a list to record per-span salience signals (diagnostics)
+        self._sink_feat: np.ndarray | None = None
 
     # -- host state per session ------------------------------------------------------
 
     def slot_state(self, session: int, layer: int) -> SlotState:
-        key = (session, layer)
+        key = (session, 0 if self.p.shared else layer)
         if key not in self.state:
             self.state[key] = SlotState(self.p, self.feat_dim)
         return self.state[key]
+
+    def spans_for(self, session: int, layer: int) -> list[list[dict]]:
+        """Kept spans per slot as seen by ``layer`` (shared: the same for all)."""
+        st = self.state.get((session, 0 if self.p.shared else layer))
+        if st is None:
+            return []
+        return st.spans if self.p.retention == "fps" else [st.pool]
 
     def drop_session(self, session: int) -> None:
         for layer in range(self.n_attn):
@@ -228,9 +246,12 @@ class RoutedGuest:
             st = self.state.get((session, layer))
             if st is None:
                 continue
+            def pack(sp):
+                return {"feat": torch.from_numpy(np.ascontiguousarray(sp["feat"])), "len": sp["len"], "col": sp["col"],
+                        "pos": sp.get("pos", -1), "sal": sp.get("sal", 0.0)}
+
             payload[layer] = {"centroid": torch.from_numpy(st.centroid.copy()), "count": list(st.count),
-                              "spans": [[{"feat": torch.from_numpy(np.ascontiguousarray(s["feat"])), "len": s["len"],
-                                          "col": s["col"]} for s in sl] for sl in st.spans]}
+                              "spans": [[pack(sp) for sp in sl] for sl in st.spans], "pool": [pack(sp) for sp in st.pool]}
         buf = io.BytesIO()
         torch.save(payload, buf)
         return torch.frombuffer(bytearray(buf.getvalue()), dtype=torch.uint8)
@@ -242,8 +263,12 @@ class RoutedGuest:
             st = self.slot_state(session, layer)
             st.centroid[:] = d["centroid"].numpy()
             st.count = list(d["count"])
-            st.spans = [[{"feat": s["feat"].numpy().astype(np.float32), "len": s["len"], "col": s["col"], "src": None}
-                         for s in sl] for sl in d["spans"]]
+            def unpack(sp):
+                return {"feat": sp["feat"].numpy().astype(np.float32), "len": sp["len"], "col": sp["col"], "src": None,
+                        "pos": sp.get("pos", -1), "sal": sp.get("sal", 0.0)}
+
+            st.spans = [[unpack(sp) for sp in sl] for sl in d["spans"]]
+            st.pool = [unpack(sp) for sp in d.get("pool", [])]
 
     # -- column arithmetic ---------------------------------------------------------------
 
@@ -279,6 +304,7 @@ class RoutedGuest:
         store.valid[:, r, dst] = True
         store.pos[r, dst] = store.pos[r, cols]
         store.is_break[r, dst] = store.is_break[r, cols]
+        store.sal[r, dst] = store.sal[r, cols]
         store.pend[r] = cur + n
 
     # -- routing pass -----------------------------------------------------------------------
@@ -301,7 +327,15 @@ class RoutedGuest:
             return
         dev = store.device
         pend = slice(p.pend_base, p.pend_base + n)
-        spans = split_spans(store.is_break[r, pend].cpu(), p.max_span, p.fallback_span)
+        is_break = store.is_break[r, pend].cpu()
+        spans = split_spans(is_break, p.max_span, p.fallback_span)
+        tail = None
+        if len(spans) > 1 and n < p.pend_cap and not bool(is_break[spans[-1][1] - 1]):
+            # The buffer ends mid-sentence: leave that tail pending for the
+            # next pass instead of cutting a span at an arbitrary boundary.
+            tail = spans.pop()
+            n = tail[0]
+            pend = slice(p.pend_base, p.pend_base + n)
         self.stats["routing_passes"] += 1
         self.stats["spans"] += len(spans)
         n_layers, kvh, hd = self.n_attn, store.k.shape[2], store.k.shape[4]
@@ -314,21 +348,56 @@ class RoutedGuest:
         v_p = store.v[:, r, :, pend].permute(0, 2, 1, 3).reshape(n_layers, n, feat_dim).float()
         k_mean = torch.matmul(assign_t, k_p)  # [L, S, F]
         v_mean = torch.matmul(assign_t, v_p)
-        feats = _unit(v_mean).cpu().numpy()  # the pass's one device->host transfer
         pos_pend = store.pos[r, pend]
-        for layer in range(n_layers):
-            plan = self._decide(self.slot_state(session, layer), spans, feats[layer])
-            self._apply(store, r, layer, plan, k_mean[layer], v_mean[layer], pos_pend)
-        store.valid[:, r, pend] = False
-        store.pos[r, pend] = -1
-        store.is_break[r, pend] = False
+        pos_host = pos_pend.cpu().numpy()
+        sal_host = store.sal[r, pend].cpu().numpy() if p.retention == "surprisal" else None
+        if tail is not None:  # snapshot the tail before pending is cleared
+            ta, tb = tail
+            tcols = slice(p.pend_base + ta, p.pend_base + tb)
+            keep = (store.k[:, r, :, tcols].clone(), store.v[:, r, :, tcols].clone(), store.pos[r, tcols].clone(),
+                    store.is_break[r, tcols].clone(), store.sal[r, tcols].clone())
+        if self.trace is not None:  # diagnostics: the prompt's own prefix (sink columns) as a standing query
+            sink_v = store.v[:, r, :, :p.sink].float().mean(dim=2).reshape(n_layers, -1)  # [L, F]
+            self._sink_feat = _unit(_unit(sink_v).reshape(-1)).cpu().numpy()
+        if p.shared:
+            # One decision per span from every layer's unit mean value
+            # (concatenated, re-normalised), applied to all layers: the bank
+            # is one memory, every layer keeps the same spans.
+            feats = _unit(_unit(v_mean).permute(1, 0, 2).reshape(len(spans), -1)).cpu().numpy()
+            plan = self._decide(self.slot_state(session, 0), spans, feats, pos_host, sal_host)
+            for layer in range(n_layers):
+                self._apply(store, r, layer, plan, k_mean[layer], v_mean[layer], pos_pend)
+        else:
+            feats = _unit(v_mean).cpu().numpy()  # the pass's one device->host transfer
+            for layer in range(n_layers):
+                plan = self._decide(self.slot_state(session, layer), spans, feats[layer], pos_host, sal_host)
+                self._apply(store, r, layer, plan, k_mean[layer], v_mean[layer], pos_pend)
+        full = slice(p.pend_base, p.pend_base + int(store.pend[r]))
+        store.valid[:, r, full] = False
+        store.pos[r, full] = -1
+        store.is_break[r, full] = False
+        store.sal[r, full] = 0.0
         store.pend[r] = 0
+        if tail is not None:  # the unfinished span moves to the front of pending
+            k_t, v_t, pos_t, brk_t, sal_t = keep
+            m = tb - ta
+            head = slice(p.pend_base, p.pend_base + m)
+            store.k[:, r, :, head] = k_t
+            store.v[:, r, :, head] = v_t
+            store.valid[:, r, head] = True
+            store.pos[r, head] = pos_t
+            store.is_break[r, head] = brk_t
+            store.sal[r, head] = sal_t
+            store.pend[r] = m
 
-    def _decide(self, st: SlotState, spans: list[tuple[int, int]], feats: np.ndarray):
+    def _decide(self, st: SlotState, spans: list[tuple[int, int]], feats: np.ndarray, pos_host: np.ndarray,
+                sal_host: np.ndarray | None = None):
         """Host routing of one layer's spans, in order: slot choice, running
         centroid/count, retention. Returns the summary blend per touched
         slot and the column moves that lay the kept spans out."""
         p = self.p
+        if p.retention != "fps":
+            return self._decide_pool(st, spans, feats, pos_host, sal_host)
         touched: dict[int, dict] = {}  # slot -> {"c0": count before the pass, "parts": [(span, len)]}
         for si, (a, b) in enumerate(spans):
             feat, length = feats[si], b - a
@@ -357,7 +426,8 @@ class RoutedGuest:
                 w_old, w_new = c_old / (c_old + length), length / (c_old + length)
                 st.centroid[target] = _unit_np(st.centroid[target] * w_old + feat * w_new)
             st.count[target] = c_old + length
-            cand = list(st.spans[target]) + [{"feat": feat, "len": length, "src": (a, b), "col": None}]
+            cand = list(st.spans[target]) + [{"feat": feat, "len": length, "src": (a, b), "col": None,
+                                              "pos": int(pos_host[a])}]
             kept = farthest_point_keep(cand, p.reps, p.dup_floor, st.centroid[target])
             self.stats["dropped_spans"] += len(cand) - len(kept)
             st.spans[target] = kept
@@ -373,6 +443,84 @@ class RoutedGuest:
                 sp["col"], sp["src"] = cursor, None
                 cursor += length
         return touched, src, dst, blocks
+
+    def _decide_pool(self, st: SlotState, spans, feats: np.ndarray, pos_host: np.ndarray, sal_host: np.ndarray):
+        """Summaries by value cluster as before; representatives are ONE pool
+        under the whole budget (slots x reps tokens), kept by token
+        surprisal (mean of a span's top-4 -log p): the least predictable
+        spans — random keys, numbers, names — are what the summaries and
+        the recurrent state cannot reconstruct, so they stay exact."""
+        p = self.p
+        touched: dict[int, dict] = {}
+        new = []
+        for si, (a, b) in enumerate(spans):
+            feat, length = feats[si], b - a
+            sims = st.centroid @ feat
+            best = int(sims.argmax())
+            free = next((i for i in range(p.slots) if st.count[i] == 0), None)
+            if free is not None and (st.count[best] == 0 or float(sims[best]) < p.new_slot_sim):
+                target = free
+                self.stats["new_slots"] += 1
+            else:
+                target = best
+            c_old = st.count[target]
+            info = touched.setdefault(target, {"c0": c_old, "parts": [], "first_pos": a})
+            info["parts"].append((si, length))
+            if c_old == 0:
+                st.centroid[target] = feat
+            else:
+                w_old, w_new = c_old / (c_old + length), length / (c_old + length)
+                st.centroid[target] = _unit_np(st.centroid[target] * w_old + feat * w_new)
+            st.count[target] = c_old + length
+            new.append({"feat": feat, "len": length, "src": (a, b), "col": None, "pos": int(pos_host[a]),
+                        "sal": float(np.sort(sal_host[a:b])[-4:].mean()) if sal_host is not None else 0.0})
+        if p.retention == "novelty" and new:
+            # Local novelty: 1 - max cosine to the other spans of this pass —
+            # a span unlike its neighbours in time (a needle in prose, a new
+            # entry in a ledger) is what the summaries cannot stand in for.
+            f_new = np.stack([c["feat"] for c in new])
+            sims_new = f_new @ f_new.T
+            np.fill_diagonal(sims_new, -1.0)
+            for i, c in enumerate(new):
+                c["sal"] = float(1.0 - sims_new[i].max()) if len(new) > 1 else 0.5
+        if self.trace is not None and new:
+            f_new = np.stack([c["feat"] for c in new])
+            sims_new = f_new @ f_new.T
+            np.fill_diagonal(sims_new, -1.0)
+            for i, c in enumerate(new):
+                a, b = c["src"]
+                sal_span = sal_host[a:b] if sal_host is not None else np.zeros(1, dtype=np.float32)
+                self.trace.append({"pos": c["pos"], "len": c["len"], "sal": c["sal"],
+                                   "sal_top4": float(np.sort(sal_span)[-4:].mean()),
+                                   "sal_mean": float(sal_span.mean()), "sal_sum": float(sal_span.sum()),
+                                   "distinct": float(1.0 - sims_new[i].max()) if len(new) > 1 else 1.0,
+                                   "sink_sim": float(c["feat"] @ self._sink_feat) if self._sink_feat is not None else 0.0})
+        cand = list(st.pool) + new  # stable sort: on ties the resident span wins
+        order = sorted(range(len(cand)), key=lambda i: -cand[i]["sal"])
+        feats_all = np.stack([c["feat"] for c in cand])
+        sims_all = feats_all @ feats_all.T
+        budget = p.slots * p.reps
+        kept_idx: list[int] = []
+        used = 0
+        for i in order:
+            if used + cand[i]["len"] > budget:
+                continue
+            if kept_idx and float(sims_all[i, kept_idx].max()) > 1.0 - p.dup_floor:
+                continue
+            kept_idx.append(i)
+            used += cand[i]["len"]
+        kept = [cand[i] for i in sorted(kept_idx, key=lambda i: cand[i]["pos"])]  # pool laid out in position order
+        self.stats["dropped_spans"] += len(cand) - len(kept)
+        st.pool = kept
+        src, dst = [], []
+        cursor = p.reps_base
+        for sp in kept:
+            length = sp["len"]
+            src.append((sp["col"] if sp["col"] is not None else p.pend_base + sp["src"][0], length))
+            dst.append((cursor, length))
+            sp["col"], sp["src"] = cursor, None
+            cursor += length
+        return touched, src, dst, [(p.reps_base, p.scratch)]
 
     def _apply(self, store: RoutedStore, r: int, layer: int, plan, k_mean: torch.Tensor, v_mean: torch.Tensor,
                pos_pend: torch.Tensor) -> None:
@@ -404,12 +552,18 @@ class RoutedGuest:
                 cols = torch.tensor([c for c, _ in fresh], device=dev)
                 store.pos[r, cols] = pos_pend[torch.tensor([a for _, a in fresh], device=dev)]
         # Representatives: gather every source before any block is rewritten.
+        block_t = torch.from_numpy(np.concatenate([np.arange(b0, b1) for b0, b1 in blocks])).to(dev)
+        if not src:
+            store.valid[layer, r, block_t] = False
+            if layer == 0:
+                store.pos[r, block_t] = -1
+            return
         src_t = torch.from_numpy(np.concatenate([np.arange(c, c + length) for c, length in src])).to(dev)
         dst_t = torch.from_numpy(np.concatenate([np.arange(c, c + length) for c, length in dst])).to(dev)
-        block_t = torch.from_numpy(np.concatenate([np.arange(b0, b1) for b0, b1 in blocks])).to(dev)
         k_src = store.k[layer, r, :, src_t]
         v_src = store.v[layer, r, :, src_t]
         pos_src = store.pos[r, src_t] if layer == 0 else None
+        sal_src = store.sal[r, src_t] if layer == 0 else None
         store.valid[layer, r, block_t] = False
         store.k[layer, r, :, dst_t] = k_src
         store.v[layer, r, :, dst_t] = v_src
@@ -417,6 +571,8 @@ class RoutedGuest:
         if layer == 0:
             store.pos[r, block_t] = -1
             store.pos[r, dst_t] = pos_src
+            store.sal[r, block_t] = 0.0
+            store.sal[r, dst_t] = sal_src
 
     # -- masks ----------------------------------------------------------------------------
 

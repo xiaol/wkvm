@@ -60,12 +60,14 @@ def _fixture():
         decoder = Qwen35Decoder.from_hf(hf)
         routed = Qwen35HybridLayout.from_config(config, dtype=torch.float32, guest_mode="routed",
                                                 sink_tokens=2, ring_tokens=8, **ROUTED)
+        routed_fps = Qwen35HybridLayout.from_config(config, dtype=torch.float32, guest_mode="routed",
+                                                    sink_tokens=2, ring_tokens=8, routed_retention="fps", **ROUTED)
         ring = Qwen35HybridLayout.from_config(config, dtype=torch.float32, guest_mode="ring",
                                               sink_tokens=2, ring_tokens=8)
         exact = Qwen35HybridLayout.from_config(config, dtype=torch.float32, page_tokens=8)
         gen = torch.Generator().manual_seed(1)
         prompts = [torch.randint(1, 128, (n,), generator=gen).tolist() for n in (23, 7, 31)]
-        _shared.update(hf=hf, decoder=decoder, routed=routed, ring=ring, exact=exact, prompts=prompts)
+        _shared.update(hf=hf, decoder=decoder, routed=routed, routed_fps=routed_fps, ring=ring, exact=exact, prompts=prompts)
     return _shared
 
 
@@ -124,15 +126,20 @@ class TestRoutedEngine(unittest.TestCase):
         self.assertEqual(engine.bank.rg.stats["routing_passes"], 0)
 
     def test_routing_invariants_and_batch_independence(self) -> None:
+        for layout_key in ("routed", "routed_fps"):
+            with self.subTest(retention=layout_key):
+                self._invariants_and_batch_independence(layout_key)
+
+    def _invariants_and_batch_independence(self, layout_key: str) -> None:
         fx = _fixture()
         alone = []
         for p in fx["prompts"]:
-            e = _engine()
+            e = _engine(layout_key)
             req = Request(prompt_token_ids=list(p), max_new_tokens=12)
             e.add_request(req)
             alone.append(_run(e, [req])[0])
             self.assertGreater(e.bank.rg.stats["routing_passes"], 0)
-        engine = _engine()
+        engine = _engine(layout_key)
         reqs = [Request(prompt_token_ids=list(p), max_new_tokens=12) for p in fx["prompts"]]
         for r in reqs:
             engine.add_request(r)
@@ -153,12 +160,20 @@ class TestRoutedEngine(unittest.TestCase):
         valid = st.valid[0, g]
         self.assertFalse(bool(valid[p.scratch]))
         self.assertLessEqual(int(valid[p.pend_base:p.summ_base].sum()), int(st.pend[g]))
+        state = bank.rg.state.get((slots["gdn_state"], 0))
+        if p.retention == "fps":
+            for s in range(p.slots):
+                b0, b1 = p.rep_block(s)
+                self.assertLessEqual(int(valid[b0:b1].sum()), p.reps)
+        else:
+            self.assertLessEqual(int(valid[p.reps_base:p.scratch].sum()), p.slots * p.reps)
+            if state is not None:
+                self.assertEqual(int(valid[p.reps_base:p.scratch].sum()), sum(sp["len"] for sp in state.pool))
         for s in range(p.slots):
-            b0, b1 = p.rep_block(s)
-            self.assertLessEqual(int(valid[b0:b1].sum()), p.reps)
-            state = bank.rg.state.get((slots["gdn_state"], 0))
             if state is not None:
                 self.assertEqual(bool(valid[p.summ_base + s]), state.count[s] > 0)
+        # surprisal is recorded for prompt tokens still materialised
+        self.assertTrue(bool((st.sal[g][valid] >= 0).all()))
         # positions of valid columns are never -1
         self.assertTrue(bool((st.pos[g][valid] >= 0).all()))
 

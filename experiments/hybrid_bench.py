@@ -19,6 +19,11 @@ the approximate routed-span comparison of the Gemma line.
 
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("OMP_NUM_THREADS", "8")  # 128-core host: BLAS/torch thread fan-out on tiny host ops is a 10x slowdown
+os.environ.setdefault("MKL_NUM_THREADS", "8")
+
 import argparse
 import hashlib
 import json

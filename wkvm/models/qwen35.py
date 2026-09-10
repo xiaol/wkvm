@@ -89,8 +89,10 @@ class Qwen35HybridLayout:
     routed_reps: int = 48
     routed_max_span: int = 48
     routed_fallback_span: int = 32
-    routed_dup_floor: float = 0.10
+    routed_dup_floor: float = 0.02
     routed_new_slot_sim: float = 0.60
+    routed_shared: bool = True  # one routing decision per session applied to every attention layer
+    routed_retention: str = "novelty"  # "novelty" | "surprisal": one pool of spans unlike their neighbours / least predictable; "fps": per-slot farthest-point
     break_token_ids: tuple[int, ...] = ()  # tokens that end a span (sentence punctuation, newline)
 
     def __post_init__(self) -> None:
@@ -116,7 +118,8 @@ class Qwen35HybridLayout:
         return RoutedParams(
             sink=self.sink_tokens, ring=self.ring_tokens, pending=self.routed_pending, slots=self.routed_slots,
             reps=self.routed_reps, max_span=self.routed_max_span, fallback_span=self.routed_fallback_span,
-            dup_floor=self.routed_dup_floor, new_slot_sim=self.routed_new_slot_sim,
+            dup_floor=self.routed_dup_floor, new_slot_sim=self.routed_new_slot_sim, shared=self.routed_shared,
+            retention=self.routed_retention,
         )
 
     @property
@@ -418,8 +421,30 @@ class Qwen35Decoder(torch.nn.Module):
                 position_ids=positions,
                 past_key_values=cache,
             )
+        if getattr(cache, "wants_surprisal", False):
+            cache.surprisal = self._surprisal(hidden, input_ids)
         hidden = self.norm(hidden[:, -1:])
         return self.lm_head(hidden)[:, -1]
+
+    def _surprisal(self, hidden: torch.Tensor, input_ids: torch.Tensor, slice_len: int = 64) -> torch.Tensor:
+        """Per-token surprisal -log p(x_t | x_<t) of this chunk's tokens, [B, T]
+        float32, from the chunk's own logits (position t-1 predicts x_t; the
+        first token borrows its successor's value). Sliced so the vocab-wide
+        log-softmax never materialises for the whole chunk. Feeds the routed
+        bank's retention: unpredictable spans are what a query-agnostic
+        memory has to keep exact."""
+        b, t = input_ids.shape
+        out = torch.zeros((b, t), dtype=torch.float32, device=hidden.device)
+        if t < 2:
+            return out
+        h = self.norm(hidden[:, :-1])
+        targets = input_ids[:, 1:]
+        for s0 in range(0, t - 1, slice_len):
+            lg = self.lm_head(h[:, s0:s0 + slice_len]).float()
+            lp = torch.log_softmax(lg, dim=-1)
+            out[:, 1 + s0:1 + s0 + lg.shape[1]] = -lp.gather(-1, targets[:, s0:s0 + lg.shape[1], None])[..., 0]
+        out[:, 0] = out[:, 1]
+        return out
 
 
 def load_qwen35(
@@ -479,7 +504,7 @@ def load_qwen35(
     return decoder, layout
 
 
-BREAK_CHARS = ".!?;:。！？；：\n"
+BREAK_CHARS = ".!?。！？\n"  # sentence ends only: a colon would cut "X is: 1234567" in half
 
 
 def break_token_ids(model_path: str) -> tuple[int, ...]:
