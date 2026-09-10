@@ -175,6 +175,14 @@ resume of the imported handle; per-slot bytes and slot capacity.
   glue (`aten::to/copy_/mul` dominate CPU time, the GEMMs dominate GPU
   time). At B=16: forward 94 ms (GPU ~26 ms), gather 12 ms, scatter 9 ms.
   Conclusion: the floor is launch overhead, not kernels.
+- **GQA-native decode attention ✅** (`wkvm_gqa`, registered as an HF
+  attention implementation in `wkvm/models/qwen35.py`): with any mask
+  present HF's sdpa path calls `repeat_kv`, materialising 4 copies of K and
+  V per layer per step — at 32 rows x 5.7k routed columns that copy *was*
+  the step. The single-query path broadcasts the KV heads over their query
+  group in the matmul instead. Default for ring/routed guests (paged keeps
+  HF's sdpa so the bit-exact gates hold): 16 x 13.8k ring turn 5.4 → 3.1 s,
+  routed 6.7 → 3.8 s. Gate: logits vs sdpa in `tests/test_hybrid_graph_gpu.py`.
 - **Next, in order:** (1) the replay itself is now the floor (18 ms at B=1
   for 32 layers of bf16 GEMMs on a 9B: weight-read bound, as expected); the
   levers left are within-graph — a fused GDN step over all 24 layers is not
@@ -207,7 +215,7 @@ resume of the imported handle; per-slot bytes and slot capacity.
   were silent no-ops. Capture/replay now run under `torch.cuda.device(bank)`
   and a post-capture replay check refuses graphs that do not recompute.
 
-### H9. Ten times, the way Gemma got it: bounded guest memory ✅ (ring), ▶ (routed bank)
+### H9. Ten times, the way Gemma got it: bounded guest memory ✅ (ring), ✅ (routed bank)
 
 - **Insight.** On an exact hybrid both engines carry the same bytes per
   token, so the memory physics is a wash and vLLM's kernels win. The
@@ -230,15 +238,44 @@ resume of the imported handle; per-slot bytes and slot capacity.
 - **Price** (RULER-lite, ring 16+1024): needle recall only inside the
   window (0.25 at 4k -> ~0 at 32k); the GDN layers do not carry retrievable
   content. Same as Gemma's ring column.
-- **Next ▶: routed span bank on the hybrid** — the Gemma mechanism
-  (`docs/gemma_native_contract.md`): evicted ring tokens -> pending buffer ->
-  sentence/punctuation spans routed atomically by mean *value* to 64 slots,
-  each slot keeps a mean-KV summary plus exact representatives under a
-  144-token budget (farthest-point retention, near-duplicate floor), readout
-  = sink + summaries + representatives + pending + ring. Target: Gemma's
-  ~0.90 recall at 8k–32k with ~4k materialized columns, measured with
-  RULER-lite; then the wall workload again to see what the extra columns
-  cost per turn.
+- **Routed span bank ✅** (`guest_mode="routed"`, `wkvm/runner/hybrid_routed.py`,
+  results in `experiments/results/qwen35_routed_bank_20260910.md`): per
+  session and layer one static column space `[sink 16 | ring 1024 | pending
+  2x512 | 64 summaries | 3,072 representatives | scratch]` = 5,201 columns,
+  163 MiB across the 8 layers whatever the context. Ring evictions go to
+  pending (in-graph during decode), a pass every 512 tokens cuts pending
+  into sentence spans, assigns each by mean value to one of 64 slots (a
+  running mean-K/V summary column per slot) and keeps exact representatives
+  in one pool under the budget. Decisions are made once per session from all
+  layers' features and applied to every layer; hibernate/resume carries the
+  store and the host bookkeeping. Gates: `tests/test_qwen35_routed_cpu.py`,
+  lockstep eager-vs-graph store comparison in `tests/test_hybrid_graph_gpu.py`.
+- **The retention signal was found by measurement, not design**
+  (`experiments/routed_probe.py`: one needle at a controlled depth, per-layer
+  retention vs answer, `--trace` ranks the needle among all routed spans per
+  signal). Gemma's rule — farthest-point in mean-V space — kept the needle in
+  5/30 probes; token surprisal 11/30 (7-digit needles are single-digit tokens
+  at ~2.3 nats; SQuAD names and dates score higher); **local novelty** (1 -
+  max cosine to the other spans of the same pass) ranks the needle at the
+  0.98–0.99 percentile in every prompt and keeps it **30/30 at 8k/16k/32k,
+  all depths, answered correctly**. Readout was never the problem: a kept
+  span is found at its original position exactly as in the exact engine.
+  Also fixed on the way: a colon in the break set split needles in half;
+  per-layer decisions kept a needle in six layers and dropped it in two.
+- **Result**: RULER-lite single needle 1.00 at 4k–32k (ring: 0.15 → 0.00),
+  4-key/4-value needles 0.75–1.00 through 16k, QA 0.95 → 0.45, haystack-of-
+  needles 1.00 → 0.10 (nothing is novel there — the honest limit of a
+  query-agnostic memory). Wall workload 32 x 36,864 x 8 turns: **5.5 s per
+  turn vs vLLM's 130 s (24x), 229 s vs 1036 s over 8 turns (4.5x), 14x on
+  the 48-turn shape**; ring without recall is 3.9 s (20x on 48 turns).
+  Below the wall the routed engine is within 7% of vLLM per turn.
+- **Costs and next cuts**: routing ~25 ms per pass on the host (turn 0 pays
+  58 s over 2,304 passes because each pass syncs the prefill pipeline for
+  one row — batch the rows of a prefill forward into one sync); decode
+  tokens enter the pool with no recorded signal; a second retention term
+  (similarity to the prompt's instruction prefix ranked the needle at 0.998
+  too) is the next probe; the resident-row copy of the store doubles its
+  memory under CUDA graphs (R=144 does not fit 32 sessions on 40 GB).
 
 ### H8. What the comparison says to build next ▶
 

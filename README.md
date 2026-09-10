@@ -262,15 +262,22 @@ bucket with running requests resident in the static rows (`cuda_graphs=True`):
 on one A100 the 9B decodes at 21 ms/step (B=1) and 26 ms/step (B=16,
 616 tok/s) vs 82/96 ms eager. Against vLLM 0.29 on the same GPU and prompts
 (exact semantics on both sides) wkvm is 1.3x–2.2x slower end to end;
-with the guest layers in ring mode (`guest_mode="ring"`, 16 sink + 1024
-window, approximate beyond the window) the Gemma mechanism transfers: 32
-sessions x 36,864 tokens x 8 turns, vLLM re-prefills every turn at ~130 s,
-wkvm takes 5.25 s per turn (24.6x per turn, 6.2x over 8 turns,
-[`experiments/results/qwen35_ring_wall_20260910.md`](experiments/results/qwen35_ring_wall_20260910.md));
-the price is needle recall beyond the window, the routed span bank is next
-([`experiments/results/qwen35_hybrid_vs_vllm_20260910.md`](experiments/results/qwen35_hybrid_vs_vllm_20260910.md));
-the gap is prefill batching, a paged attention kernel and kernel fusion, not
-the recurrent state. RULER-lite quality at 4k–32k is in
+with the guest layers bounded the Gemma mechanism transfers: 32 sessions x
+36,864 tokens x 8 turns, vLLM re-prefills every turn at ~130 s; wkvm in ring
+mode (`guest_mode="ring"`, 16 sink + 1024 window, no recall beyond it) takes
+3.9 s per turn, and with the **routed span bank** (`guest_mode="routed"`,
+163 MiB per session whatever the context) 5.5 s per turn — **24x per turn,
+4.5x over 8 turns, 14x on a 48-turn session — with single-needle recall
+1.00 at 4k–32k** (ring: 0.15 → 0.00) and 4-needle recall 0.75–1.00 through
+16k on RULER-lite. The retention rule that makes this work — keep the spans
+least like their neighbours in time — was found by a probe that separates
+"is the needle still in memory" from "is it answered"; mean-value
+farthest-point (the Gemma rule) and token surprisal both failed it. See
+[`experiments/results/qwen35_routed_bank_20260910.md`](experiments/results/qwen35_routed_bank_20260910.md),
+[`experiments/results/qwen35_ring_wall_20260910.md`](experiments/results/qwen35_ring_wall_20260910.md)
+and [`experiments/results/qwen35_hybrid_vs_vllm_20260910.md`](experiments/results/qwen35_hybrid_vs_vllm_20260910.md).
+The remaining gap at equal residency is prefill and kernel fusion, not the
+recurrent state. RULER-lite quality at 4k–32k is in
 `experiments/results/ruler_lite_*.json`.
 The native RWKV-7 path now also runs from official `.pth` weights via
 [`scripts/convert_rwkv7_pth.py`](scripts/convert_rwkv7_pth.py) and matches the
